@@ -55,6 +55,15 @@ The bottom-right box is a live dashboard:
 - **Recent actions:** a running log of what it actually built / researched / upgraded,
   kept across the session so you can see it working.
 
+## Pick a goal
+
+The second dropdown steers the advisor toward a target you choose — **Balanced**,
+**Rush Space**, **Max production**, or **Max population**. It adds a **🏁 goal line**
+showing progress to that milestone (e.g. *Rush Space → Rocketry locked, researching
+toward it*), prioritises goal-relevant research in **🔬 Next science**, and highlights
+goal buildings in **🎯 Now**. Autopilot still grows the whole economy so you never stall
+waiting on a single branch.
+
 ## If nothing seems to move
 
 - Check the **KS engine:** line in the box — it should say **running ✓**. If it says

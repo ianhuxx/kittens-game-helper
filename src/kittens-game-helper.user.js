@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.7.0
+// @version      0.7.1
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, fixes the economy (refines surplus catnip into wood), shows the bottleneck + next science + a live action log. Prestige resets stay OFF, so it continues your existing save.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -65,6 +65,41 @@
   const getProfileName = () => {
     const stored = localStorage.getItem(STORAGE_KEY);
     return PROFILE_INFO[stored] ? stored : DEFAULT_PROFILE;
+  };
+
+  // Goals steer the advisor toward a target you pick (autopilot still grows the
+  // whole economy so you never stall). Each goal has a named milestone "target"
+  // plus keywords used to prioritize matching research/buildings.
+  const GOAL_KEY = "kgh.goal";
+  const DEFAULT_GOAL = "balanced";
+  const GOALS = {
+    balanced: { label: "Balanced", target: null, keywords: [] },
+    space: {
+      label: "Rush Space",
+      target: "rocketry",
+      keywords: ["space", "rocket", "satellite", "orbital", "moon", "oil"],
+    },
+    production: {
+      label: "Max production",
+      target: "factory",
+      keywords: ["mine", "lumber", "steam", "magneto", "factory", "accelerator", "calciner", "smelt", "reactor", "quarry", "mint"],
+    },
+    population: {
+      label: "Max population",
+      target: "mansion",
+      keywords: ["hut", "house", "mansion", "aqueduct", "pasture", "amphitheat", "brewery"],
+    },
+  };
+
+  const getGoal = () => {
+    const stored = localStorage.getItem(GOAL_KEY);
+    return GOALS[stored] ? stored : DEFAULT_GOAL;
+  };
+
+  const metaText = (meta) => `${meta.name || ""} ${meta.label || ""} ${meta.title || ""}`.toLowerCase();
+  const matchesKeywords = (meta, keywords) => {
+    const text = metaText(meta);
+    return keywords.some((k) => text.includes(k));
   };
 
   /* --------------------------- settings management --------------------------- */
@@ -322,11 +357,16 @@
     return "economy looks balanced";
   };
 
-  const getNextScience = (resources) => {
+  const getNextScience = (resources, goalKey) => {
     try {
       const techs = (window.gamePage.science.techs || []).filter(isOpen);
       if (!techs.length) return "all researched / none unlocked";
-      const scored = techs.map((t) => ({ t, ...evaluate("research", t, resources) }));
+      let scored = techs.map((t) => ({ t, ...evaluate("research", t, resources) }));
+      const goal = GOALS[goalKey];
+      if (goal && goal.keywords.length) {
+        const matches = scored.filter((s) => matchesKeywords(s.t, goal.keywords));
+        if (matches.length) scored = matches; // prefer goal-relevant research
+      }
       const ready = scored.find((s) => s.affordable);
       if (ready) return `${labelOf(ready.t)} (ready now)`;
       const near = scored.filter((s) => s.progress > 0).sort((a, b) => b.progress - a.progress)[0];
@@ -336,7 +376,34 @@
     }
   };
 
-  const getNowAction = (resources) => {
+  // One line summarising progress toward the chosen goal's milestone.
+  const getGoalLine = (resources, goalKey) => {
+    const goal = GOALS[goalKey];
+    if (!goal || !goal.target) return "";
+    try {
+      for (const t of window.gamePage.science.techs || []) {
+        if (metaText(t).includes(goal.target)) {
+          if (t.researched) return `🏁 ${goal.label}: ${labelOf(t)} researched ✓`;
+          if (t.unlocked === false) return `🏁 ${goal.label}: ${labelOf(t)} locked — researching toward it`;
+          const e = evaluate("research", t, resources);
+          return `🏁 ${goal.label}: ${labelOf(t)} — ${e.affordable ? "ready!" : "need " + e.missing}`;
+        }
+      }
+      for (const b of buildingMetas()) {
+        if (metaText(b).includes(goal.target)) {
+          if (b.unlocked === false) return `🏁 ${goal.label}: ${labelOf(b)} locked`;
+          const e = evaluate("build", b, resources);
+          return `🏁 ${goal.label}: ${labelOf(b)} ×${b.val || 0} — ${e.affordable ? "can build now" : "need " + e.missing}`;
+        }
+      }
+      return `🏁 ${goal.label}: target not unlocked yet`;
+    } catch (error) {
+      return `🏁 ${goal.label}`;
+    }
+  };
+
+  const getNowAction = (resources, goalKey) => {
+    const goal = GOALS[goalKey];
     const candidates = [];
     try {
       for (const u of window.gamePage.workshop.upgrades || []) {
@@ -355,6 +422,10 @@
     const affordable = candidates
       .map((c) => ({ ...c, ...evaluate(c.kind, c.meta, resources) }))
       .filter((c) => c.affordable)
+      .map((c) => ({
+        ...c,
+        weight: c.weight + (goal && goal.keywords.length && matchesKeywords(c.meta, goal.keywords) ? 10 : 0),
+      }))
       .sort((a, b) => b.weight - a.weight)[0];
     return affordable ? `${affordable.kind} ${labelOf(affordable.meta)}` : "gathering…";
   };
@@ -424,6 +495,7 @@
   /* ------------------------------- main loop -------------------------------- */
 
   let statusEl;
+  let goalEl;
   let bottleneckEl;
   let scienceEl;
   let nowEl;
@@ -441,10 +513,16 @@
     trackActions();
     try {
       const resources = resourceMap();
+      const goal = getGoal();
       if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
+      if (goalEl) {
+        const line = getGoalLine(resources, goal);
+        goalEl.textContent = line;
+        goalEl.style.display = line ? "" : "none";
+      }
       if (bottleneckEl) bottleneckEl.textContent = `⚖ ${getBottleneck(resources)}`;
-      if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources)}`;
-      if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources)}`;
+      if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
+      if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
       /* ignore */
     }
@@ -464,8 +542,15 @@
       '<option value="autopilot">Autopilot: play forward</option>',
       '<option value="assist">Assist: jobs + advice</option>',
       "</select><button type=\"button\" style=\"cursor:pointer\">Apply</button></div>",
+      '<select class="kgh-goal" aria-label="goal" style="width:100%">',
+      '<option value="balanced">🏁 Goal: Balanced</option>',
+      '<option value="space">🏁 Goal: Rush Space</option>',
+      '<option value="production">🏁 Goal: Max production</option>',
+      '<option value="population">🏁 Goal: Max population</option>',
+      "</select>",
       '<small class="kgh-status" style="color:#9fd0ff">…</small>',
       '<small class="kgh-note" style="opacity:.8"></small>',
+      '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
       '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
       '<small class="kgh-science" style="color:#bfe6a0">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
@@ -476,9 +561,11 @@
     ].join("");
 
     const select = box.querySelector("select");
+    const goalSelect = box.querySelector(".kgh-goal");
     const button = box.querySelector("button");
     const note = box.querySelector(".kgh-note");
     statusEl = box.querySelector(".kgh-status");
+    goalEl = box.querySelector(".kgh-goal-line");
     bottleneckEl = box.querySelector(".kgh-bottleneck");
     scienceEl = box.querySelector(".kgh-science");
     nowEl = box.querySelector(".kgh-now");
@@ -487,6 +574,11 @@
     select.value = getProfileName();
     select.addEventListener("change", () => {
       note.textContent = PROFILE_INFO[select.value].note;
+    });
+    goalSelect.value = getGoal();
+    goalSelect.addEventListener("change", () => {
+      localStorage.setItem(GOAL_KEY, goalSelect.value);
+      tick();
     });
     button.addEventListener("click", () => applyProfile(select.value));
 
