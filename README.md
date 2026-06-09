@@ -35,7 +35,7 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, resource-fixing workshop upgrades, target-aware workshop crafting, building, research, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
 | **Assist: jobs + advice** | Only rebalances jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
@@ -54,7 +54,6 @@ The bottom-right box is a live dashboard:
 - **🧭 Plan:** the concrete building/research/upgrade target, what is missing, and a compact
   have/need resource sheet.
 - **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
-- **🧰 Craft:** intermediate workshop input it is making right now, such as steel for gear.
 - **🎯 Now:** what it can build/buy right this second.
 - **Recent actions:** a running log of what it actually built / researched / upgraded,
   kept across the session so you can see it working.
