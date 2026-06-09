@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.6.0
+// @version      0.6.1
 // @description  One-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation (jobs, building, research, crafting, trade, faith, hunting, festivals), and shows what to build/research next. Prestige resets stay OFF, so it continues your existing save.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -41,10 +41,19 @@
   // Official KS loader, used only as a fallback if the pinned @require ever fails.
   const KS_FALLBACK_LOADER = "https://kitten-science.com/stable.js";
 
-  // Automations that are irreversible or spend hoardable resources. These are
-  // matched by key name anywhere in the KS settings tree and forced OFF.
+  // Automations that are irreversible, spend hoardable resources, make permanent
+  // strategic choices, or just hide the log. Matched by key name anywhere in the
+  // KS settings tree and forced OFF.
+  //   - policies: permanent, often mutually-exclusive choices — leave to you.
+  //   - filters:  KS log filters; keep them off so the activity log stays visible.
   const DENY_SUBSTRINGS = ["reset", "transcend", "sacrifice", "shatter", "timeskip"];
-  const DENY_EXACT = new Set(["adore", "upgradeBuildings", "promoteKittens"]);
+  const DENY_EXACT = new Set([
+    "adore",
+    "upgradeBuildings",
+    "promoteKittens",
+    "policies",
+    "filters",
+  ]);
 
   const PROFILE_INFO = {
     autopilot: {
@@ -96,7 +105,9 @@
   // buys an item when every capped material is at >= trigger of its max storage.
   // The default trigger is high, so on a save with low stockpiles KS "does
   // nothing". Setting these triggers to 0 means "buy as soon as it's affordable".
-  const PURCHASE_SECTIONS = ["bonfire", "science", "workshop", "religion", "space", "time", "trade"];
+  // NOTE: "workshop" is deliberately excluded — zeroing craft triggers would make
+  // KS convert ALL raw resources into crafted goods and starve building/research.
+  const PURCHASE_SECTIONS = ["bonfire", "science", "religion", "space", "time", "trade"];
 
   const setTriggersDeep = (node, value) => {
     if (!node || typeof node !== "object") return;
