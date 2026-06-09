@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Build output (generated; not committed)
+build/*.min.js
+
+# Logs / debug
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2026 ianhuxx
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+This project is a thin configuration/loader layer that builds on, and depends
+on, two third-party projects, each under their own license:
+
+  - Kitten Scientists (https://github.com/kitten-science/kitten-scientists)
+    Licensed under the MIT License. This project loads Kitten Scientists and
+    applies configuration presets to it; it does not vendor or modify its
+    source except for an optional pinned build kept in `vendor/` for offline
+    use, which remains under its original MIT License.
+
+  - Kittens Game by Nuclear Unicorn (https://kittensgame.com)
+    The game this project helps automate. All game assets and code are the
+    property of their respective authors. This project does not redistribute
+    the game.

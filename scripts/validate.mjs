@@ -1,23 +1,45 @@
+// Sanity check for the userscript. Run with: npm run validate
+//
+// It does not (and cannot) drive a browser. It verifies that:
+//   1. the userscript body parses (no syntax errors),
+//   2. the Kitten Scientists @require pin is present,
+//   3. the reset-safety denylist is intact (so we never auto-reset a save),
+//   4. both profiles still exist.
+
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-const root = new URL("..", import.meta.url);
-const presetNames = ["assisted", "autonomous"];
+const scriptPath = fileURLToPath(new URL("../src/kittens-game-helper.user.js", import.meta.url));
+const source = await readFile(scriptPath, "utf8");
 
-for (const name of presetNames) {
-  const raw = await readFile(new URL(`presets/${name}.json`, root), "utf8");
-  const preset = JSON.parse(raw);
-  if (!preset.settings?.engine?.enabled) {
-    throw new Error(`${name} profile must enable the Kitten Scientists engine.`);
-  }
-  if (preset.settings?.timeControl?.reset?.enabled !== false) {
-    throw new Error(`${name} profile must keep reset automation disabled by default.`);
-  }
+const required = [
+  // KS must be pinned so behavior is reproducible.
+  "kitten-scientists/releases/download/v2.0.0-beta.11/",
+  // Safety: irreversible automations must stay denied.
+  "DENY_SUBSTRINGS",
+  '"reset"',
+  '"transcend"',
+  '"sacrifice"',
+  // Both profiles must exist.
+  "autopilot",
+  "assist",
+];
+
+const missing = required.filter((token) => !source.includes(token));
+if (missing.length > 0) {
+  console.error("✗ Missing required tokens:", missing.join(", "));
+  process.exit(1);
 }
 
-const userscript = await readFile(new URL("src/kittens-game-helper.user.js", root), "utf8");
-const body = userscript.replace(/^\/\/ ==UserScript==[\s\S]*?^\/\/ ==\/UserScript==/m, "");
-new vm.Script(body, { filename: join("src", "kittens-game-helper.user.js") });
+// Strip the // ==UserScript== metadata block, then compile the body. Compiling
+// (not running) catches syntax errors without needing browser globals.
+const body = source.replace(/\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==/, "");
+try {
+  new vm.Script(body, { filename: "kittens-game-helper.user.js" });
+} catch (error) {
+  console.error("✗ Userscript failed to parse:", error.message);
+  process.exit(1);
+}
 
-console.log("Profiles are valid and the userscript parses.");
+console.log("✓ Userscript parses, KS is pinned, and reset-safety denylist is intact.");

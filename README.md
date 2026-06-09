@@ -1,18 +1,81 @@
-# Kittens Game Helper
+# 🐱 Kittens Game Helper
 
-A small Tampermonkey helper for running [Kitten Scientists](https://github.com/kitten-science/kitten-scientists) against an existing [Kittens Game](https://kittensgame.com/web/) browser save.
+One-click **autopilot** for [Kittens Game](https://kittensgame.com/web/) that runs in
+your browser, **continues the save you already have**, and shows you what to build or
+research next.
 
-The helper does **not** create a new save and does **not** log into an online account. Kittens Game stores progress in the browser tab's `localStorage`, and this userscript runs in that same tab. When you open `kittensgame.com`, Kitten Scientists loads, the selected helper profile is applied, and automation continues from the game state already present in your browser.
+It is a thin wrapper around [**Kitten Scientists**](https://github.com/kitten-science/kitten-scientists)
+(KS) — the proven, open-source automation engine for this game. This project doesn't
+re-invent the automation; it loads KS, turns on every **safe** automation for you, and
+keeps the dangerous stuff (prestige **resets**) off so your progress is never wiped.
 
-## What this gives you
+> **Why not machine learning?** Kittens Game is deterministic and already "solved" by
+> well-known heuristics. There is no published ML/RL bot for it, and rule-based tools
+> like KS beat ML here. ML would be slower, harder, and worse — so this uses the proven
+> rule-based engine instead.
 
-- **Assisted profile (default):** starts the automation engine, keeps prestige/reset automation off, and is intended for a save you already care about.
-- **Autonomous profile:** more hands-off time-control settings, still with reset automation off by default for safety.
-- **In-game switcher:** a small bottom-right panel lets you switch between Assisted and Autonomous.
-- **Pinned engine:** the helper loads Kitten Scientists `v2.0.0-beta.11` so the settings API and profile behavior are predictable.
+## Quick start (about 2 minutes)
 
-## Safety first
+1. **Back up your save first.** In the game: **Options → Export**, and copy the text
+   somewhere safe. (Automation changes your real save; this is your undo.)
+2. Install a userscript manager: **[Tampermonkey](https://www.tampermonkey.net/)**
+   (Chrome/Edge/Firefox/Safari).
+3. Install this script: open
+   [`src/kittens-game-helper.user.js`](src/kittens-game-helper.user.js) → click **Raw**
+   → Tampermonkey offers to install it → **Install**.
+   (Or open Tampermonkey → *Create a new script*, paste the file contents, save.)
+4. Open / refresh **<https://kittensgame.com/web/>**.
+5. A 🐱 **Kittens Helper** box appears bottom-right. It already started on
+   **Autopilot**. To switch modes, pick one and click **Apply**.
 
-Prestige/reset automation can intentionally wipe current-run progress for long-term gain. Because this repository cannot inspect or validate your live save, both shipped profiles keep `timeControl.reset.enabled` set to `false`. If you later want true reset automation, export a backup first and then configure reset thresholds inside Kitten Scientists itself.
+That's it — it plays in the same browser tab where your save lives. There is no account
+to log into; the game is stored locally in your browser.
 
-See [the install guide](docs/install.md) and [save safety notes](docs/save-safety.md) before using the autonomous profile.
+## The two modes
+
+| Mode | What it does |
+| --- | --- |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: job assignment, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It plays the game for you. |
+| **Assist: jobs + advice** | Only assigns jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
+
+**Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
+actions (transcend, sacrifice unicorns/alicorns, time-skip, shatter time crystals).
+So it always *continues* your existing game — it will never reset it behind your back.
+
+## The "what next" advisor
+
+The bottom-right box shows two live lines:
+
+- **NOW:** something you can afford right now (Autopilot buys these for you).
+- **NEXT:** the closest thing you can't afford yet, and exactly how much you're missing,
+  e.g. `NEXT: research Construction — need 1.20K science, 300 minerals`.
+
+## If nothing seems to move
+
+- Make sure Kitten Scientists actually loaded (you should see its panel/columns).
+- Open the browser console (F12) and look for `[KGH] Applied "Autopilot…"`.
+- Click **Apply** once. Autopilot re-enables every safe section every time.
+- Early game is resource-limited: read the **NEXT:** line — it's waiting on the listed
+  resource. Hunting/crafting will catch up.
+
+## Turning on resets later (advanced, optional)
+
+Resets trade your current run for permanent bonuses (Paragon/Karma). This **wipes the
+current game**, so it's intentionally not automated here. If you want it after you've
+**exported a backup**, enable it yourself in **KS → Time Control → Reset** and configure
+the thresholds.
+
+## Files
+
+```
+src/kittens-game-helper.user.js   The userscript (the whole thing)
+scripts/validate.mjs              Sanity check: script parses + reset-safety intact
+package.json                      npm run validate
+LICENSE                           MIT (this wrapper). Kitten Scientists is MIT too.
+```
+
+## Credits
+
+Built on **[Kitten Scientists](https://github.com/kitten-science/kitten-scientists)**
+(MIT) and **[Kittens Game](https://kittensgame.com)** by Nuclear Unicorn. This wrapper is
+MIT-licensed.
