@@ -1,0 +1,17 @@
+{
+  "description": "Default profile for an existing Kittens Game save. Starts Kitten Scientists, keeps reset automation off, and avoids surprise irreversible actions.",
+  "settings": {
+    "engine": {
+      "enabled": true,
+      "interval": 2000,
+      "ksColumn": { "enabled": true },
+      "highlighStock": { "enabled": false }
+    },
+    "timeControl": {
+      "enabled": true,
+      "accelerateTime": { "enabled": true, "trigger": 1 },
+      "timeSkip": { "enabled": false, "trigger": 5, "max": 0 },
+      "reset": { "enabled": false }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "kittens-game-helper",
+  "version": "0.2.0",
+  "private": true,
+  "description": "A Tampermonkey helper that loads Kitten Scientists with safe assisted/autonomous profiles for an existing Kittens Game browser save.",
+  "scripts": {
+    "validate": "node scripts/validate.mjs"
+  },
+  "license": "MIT"
+}
