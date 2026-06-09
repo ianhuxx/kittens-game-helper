@@ -114,9 +114,12 @@ turned off so they don't fight it):
 - **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs
   *farmer* (catnip, which it refines into wood) using live production rates, and picks
   whichever gives more wood per kitten.
-- **Hunters** are sent automatically from the real game resource (`manpower`, displayed as
-  catpower) once there is enough for at least one hunt and before storage fills, so luxury
-  items get replenished instead of wasting capped catpower.
+- **Luxury-aware hunting:** the helper now values hunters as an economic production boost,
+  not just a capped-resource dump. If furs/ivory/spice are low or village happiness is
+  below normal, it assigns settlement kittens to hunters so they generate catpower for
+  hunts, then hunts earlier to refill luxuries and recover the global mood multiplier.
+  If luxuries are healthy, it falls back to the old anti-waste rule and hunts before
+  catpower storage fills.
 
 ## If the helper disappears after reinstalling
 
