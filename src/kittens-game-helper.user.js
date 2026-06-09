@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.10.2
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.10.3
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -52,11 +52,11 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
-      note: "Only job rebalancing, hunting, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
+      note: "Only job rebalancing, luxury-aware hunting, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
     },
   };
 
@@ -562,6 +562,7 @@
     priest: "faith",
     geologist: "coal",
   };
+  const LUXURY_RESOURCES = ["furs", "ivory", "spice"];
   const JOB_REBALANCE_MIN_MS = 3500;
   let lastJobRun = 0;
   let lastJobLog = 0;
@@ -579,6 +580,62 @@
     const r = getRes(resources, name);
     if (name === "manpower" || name === "catpower") return (r && r.title) || "Catpower";
     return (r && r.title) || name;
+  };
+
+
+  const villageKittens = () => {
+    try {
+      return Math.max(0, Math.floor(window.gamePage.village.getKittens ? window.gamePage.village.getKittens() : 0));
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const currentHappinessRatio = () => {
+    try {
+      const village = window.gamePage.village;
+      const raw = typeof village.getHappiness === "function" ? village.getHappiness() : village.happiness;
+      if (!isFinite(raw) || raw <= 0) return 1;
+      return raw > 2 ? raw / 100 : raw;
+    } catch (error) {
+      return 1;
+    }
+  };
+
+  const luxuryStockTarget = (resources, name) => {
+    const kittens = Math.max(1, villageKittens());
+    const res = getRes(resources, name);
+    if (res && res.maxValue > 0) return Math.max(25, Math.min(res.maxValue * 0.25, kittens * 4));
+    return Math.max(25, kittens * 4);
+  };
+
+  const luxuryShortageScore = (resources) => {
+    let score = 0;
+    for (const name of LUXURY_RESOURCES) {
+      const res = getRes(resources, name);
+      if (!res || res.unlocked === false) continue;
+      const value = Math.max(0, res.value || 0);
+      const target = luxuryStockTarget(resources, name);
+      if (target <= 0) continue;
+      score += Math.max(0, 1 - Math.min(1, value / target));
+    }
+    return score;
+  };
+
+  // Hunting is not just "avoid capped catpower": furs/ivory/spice lift village
+  // happiness, and happiness is a global production multiplier.  If luxuries are
+  // empty or mood is below normal, keep some settlement kittens on hunters so the
+  // next hunt can restore that multiplier instead of assigning everyone to raw
+  // gathering jobs.
+  const huntingEconomyNeed = (resources) => {
+    if (!jobByName("hunter")) return 0;
+    const cpRatio = resRatio(resources, "manpower", 0);
+    const shortage = luxuryShortageScore(resources);
+    const happinessGap = Math.max(0, 1 - currentHappinessRatio());
+    let need = shortage * 5 + happinessGap * 18;
+    if (cpRatio < 0.25 && (shortage > 0.35 || happinessGap > 0.02)) need += 4;
+    if (cpRatio > 0.9 && shortage < 0.5 && happinessGap < 0.02) need = Math.min(need, 0.5);
+    return need;
   };
 
   const scoreNeed = (needs, name, weight) => {
@@ -700,10 +757,12 @@
     if (resRatio(resources, "wood") < 0.3) scoreNeed(needs, "wood", 7 * (0.3 - resRatio(resources, "wood")) / 0.3);
     if (resRatio(resources, "minerals") < 0.3) scoreNeed(needs, "minerals", 6 * (0.3 - resRatio(resources, "minerals")) / 0.3);
     if (goalKey === "space" && resRatio(resources, "science") < 0.92) scoreNeed(needs, "science", 3);
+    scoreNeed(needs, "manpower", huntingEconomyNeed(resources));
     if (goalKey === "production") scoreNeed(needs, resRatio(resources, "minerals") <= resRatio(resources, "wood") ? "minerals" : "wood", 3);
     if (goalKey === "population") scoreNeed(needs, "catnip", 3);
 
     for (const name of ["science", "faith", "culture", "manpower"]) {
+      if (name === "manpower" && huntingEconomyNeed(resources) > 0.5) continue;
       if (resRatio(resources, name) > 0.94) needs[name] = 0;
     }
     for (const name of ["wood", "minerals", "catnip", "coal"]) {
@@ -766,7 +825,7 @@
       }
       if (job.name === "scholar" && resRatio(resources, "science") > 0.94) weight = 0;
       if (job.name === "priest" && resRatio(resources, "faith") > 0.94) weight = 0;
-      if (job.name === "hunter" && resRatio(resources, "manpower") > 0.94) weight = 0;
+      if (job.name === "hunter" && resRatio(resources, "manpower") > 0.94 && huntingEconomyNeed(resources) <= 0.5) weight = 0;
       if (job.name === "geologist" && resRatio(resources, "coal") > 0.96) weight = 0;
       weights[job.name] = Math.max(0, weight);
     }
@@ -864,11 +923,15 @@
       const village = window.gamePage.village;
       const cp = resources.get("manpower") || resources.get("catpower");
       if (!village || !cp || !cp.maxValue || typeof village.huntAll !== "function") return;
-      const huntCost = 100 - (typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0);
-      if (cp.value >= Math.max(huntCost, cp.maxValue * 0.75)) {
+      const discount = typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0;
+      const huntCost = Math.max(1, 100 - discount);
+      const economyNeed = huntingEconomyNeed(resources);
+      const threshold = economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
+      if (cp.value >= threshold) {
         village.huntAll();
         if (Date.now() - lastHuntLog > 30000) {
-          pushLog("🏹 sent hunters");
+          const reason = economyNeed > 0.5 ? " for luxuries/mood" : "";
+          pushLog(`🏹 sent hunters${reason}`);
           lastHuntLog = Date.now();
         }
       }
