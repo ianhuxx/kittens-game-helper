@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.7.1
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, fixes the economy (refines surplus catnip into wood), shows the bottleneck + next science + a live action log. Prestige resets stay OFF, so it continues your existing save.
+// @version      0.8.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, auto-assigns idle kittens (with wood-vs-catnip pathway math), sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -52,7 +52,7 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Every safe automation is ON, builds the instant things are affordable, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, auto-assigns idle kittens to the best job (with wood-vs-catnip pathway math), sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
@@ -154,16 +154,19 @@
     }
   };
 
-  const enableAllJobs = (settings) => {
+  // We manage jobs + hunting ourselves (goal-aware, with pathway math), so turn
+  // OFF KS's own job/hunt automation to stop the two systems fighting. Festivals,
+  // leader, and the rest of the Village section stay on.
+  const disableKSJobsAndHunt = (settings) => {
     const village = settings && settings.village;
-    const jobs = village && (village.jobs || village.job);
-    if (!jobs || typeof jobs !== "object") return;
-    for (const job of Object.values(jobs)) {
-      if (job && typeof job === "object") {
-        job.enabled = true;
-        if ("max" in job) job.max = -1; // let KS balance them
+    if (!village) return;
+    const jobs = village.jobs || village.job;
+    if (jobs && typeof jobs === "object") {
+      for (const job of Object.values(jobs)) {
+        if (job && typeof job === "object") job.enabled = false;
       }
     }
+    if (village.hunt && typeof village.hunt === "object") village.hunt.enabled = false;
   };
 
   // Tell KS to refine surplus catnip into wood. Catnip is the one resource that
@@ -206,7 +209,7 @@
       enableCatnipRefining(settings);
     }
 
-    enableAllJobs(settings);
+    disableKSJobsAndHunt(settings);
     return settings;
   };
 
@@ -329,6 +332,106 @@
       }
       const woodToMake = Math.floor(spendable / costPer);
       if (woodToMake >= 1) game.craft("wood", woodToMake);
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  /* ----------------------- job balancing & hunting (ours) ------------------- */
+
+  const jobByName = (name) => {
+    try {
+      return (window.gamePage.village.jobs || []).find((j) => j.name === name && j.unlocked !== false) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const woodCatnipCost = () => {
+    try {
+      const craft = window.gamePage.workshop.getCraft && window.gamePage.workshop.getCraft("wood");
+      const price = craft && craft.prices && craft.prices.find((p) => p.name === "catnip");
+      if (price && price.val > 0) return price.val;
+    } catch (error) {
+      /* default */
+    }
+    return 100;
+  };
+
+  // Pathway math: to get more WOOD, is it better to add a Woodcutter (direct) or
+  // a Farmer (catnip, which we refine into wood)? Compare wood-per-kitten of each.
+  const bestWoodJob = () => {
+    try {
+      const prod = window.gamePage.village.getResProduction ? window.gamePage.village.getResProduction() : {};
+      const cutter = jobByName("woodcutter");
+      const farmer = jobByName("farmer");
+      if (!cutter) return farmer;
+      if (!farmer) return cutter;
+      const woodPerCutter = cutter.value > 0 && prod.wood ? prod.wood / cutter.value : null;
+      const catnipPerFarmer = farmer.value > 0 && prod.catnip ? prod.catnip / farmer.value : null;
+      if (woodPerCutter == null || catnipPerFarmer == null) return cutter; // not enough data → direct
+      const woodViaRefine = catnipPerFarmer / woodCatnipCost();
+      return woodViaRefine > woodPerCutter ? farmer : cutter;
+    } catch (error) {
+      return jobByName("woodcutter");
+    }
+  };
+
+  const RES_JOB = { minerals: "miner", science: "scholar", catnip: "farmer", coal: "geologist", faith: "priest" };
+
+  // Decide which job idle kittens should go to, based on food safety, the current
+  // bottleneck, and your chosen goal.
+  const chooseJob = (goalKey, resources) => {
+    const ratio = (n) => {
+      const r = resources.get(n);
+      return r && r.maxValue > 0 ? r.value / r.maxValue : 1;
+    };
+    if (ratio("catnip") < 0.15) return jobByName("farmer") || jobByName("woodcutter"); // food first
+    let target;
+    if (ratio("wood") < 0.1) target = "wood";
+    else if (ratio("minerals") < 0.1) target = "minerals";
+    else if (goalKey === "space") target = "science";
+    else if (goalKey === "production") target = ratio("minerals") <= ratio("wood") ? "minerals" : "wood";
+    else if (goalKey === "population") target = "catnip";
+    else {
+      const opts = ["wood", "minerals", "science"]
+        .filter((n) => ratio(n) < 0.95)
+        .sort((a, b) => ratio(a) - ratio(b));
+      target = opts[0] || "science";
+    }
+    if (target === "wood") return bestWoodJob() || jobByName("woodcutter");
+    return jobByName(RES_JOB[target]) || jobByName("scholar") || jobByName("farmer");
+  };
+
+  const balanceJobs = (goalKey, resources) => {
+    try {
+      const village = window.gamePage.village;
+      if (!village || typeof village.getFreeKittens !== "function") return;
+      const free = Math.floor(village.getFreeKittens());
+      if (free <= 0) return;
+      const job = chooseJob(goalKey, resources);
+      if (job && typeof village.assignJob === "function") {
+        village.assignJob(job, free);
+        pushLog(`👷 ${free} → ${job.title || job.name}`);
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  let lastHuntLog = 0;
+  const autoHunt = (resources) => {
+    try {
+      const village = window.gamePage.village;
+      const cp = resources.get("catpower");
+      if (!village || !cp || !cp.maxValue || typeof village.huntAll !== "function") return;
+      if (cp.value >= cp.maxValue * 0.9) {
+        village.huntAll();
+        if (Date.now() - lastHuntLog > 30000) {
+          pushLog("🏹 sent hunters");
+          lastHuntLog = Date.now();
+        }
+      }
     } catch (error) {
       /* ignore */
     }
@@ -509,11 +612,13 @@
   };
 
   const tick = () => {
-    refineSurplusCatnip();
-    trackActions();
     try {
       const resources = resourceMap();
       const goal = getGoal();
+      refineSurplusCatnip();
+      balanceJobs(goal, resources);
+      autoHunt(resources);
+      trackActions();
       if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
       if (goalEl) {
         const line = getGoalLine(resources, goal);

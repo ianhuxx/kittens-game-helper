@@ -64,6 +64,20 @@ toward it*), prioritises goal-relevant research in **🔬 Next science**, and hi
 goal buildings in **🎯 Now**. Autopilot still grows the whole economy so you never stall
 waiting on a single branch.
 
+## Jobs & hunting (managed for you)
+
+The helper takes over **job assignment** and **hunting** directly (KS's own versions are
+turned off so they don't fight it):
+
+- **Idle kittens** are auto-assigned every few seconds to whatever's most needed —
+  food safety first, then the current bottleneck, then your goal (e.g. *Rush Space* favours
+  scholars). You'll see `👷 N → woodcutter` lines in the log.
+- **Pathway math:** when wood is short it compares *adding a woodcutter* (direct wood) vs
+  *adding a farmer* (catnip, which it refines into wood) using live production rates, and
+  picks whichever gives more wood per kitten.
+- **Hunters** are sent automatically whenever catpower is near full (`🏹 sent hunters`),
+  so you stop wasting it — hunting frequency is naturally limited by your catpower regen.
+
 ## If nothing seems to move
 
 - Check the **KS engine:** line in the box — it should say **running ✓**. If it says
