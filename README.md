@@ -78,6 +78,30 @@ The helper bar has two buttons in its header:
 
 Both choices are remembered between sessions.
 
+## Smarter target choice
+
+The helper no longer blindly chases the next visible button. It scores research, workshop
+upgrades, and buildings together, with extra priority for automation/unlock steps,
+production scale, resource-fixing workshop upgrades, storage when resources are capping,
+and population growth. That means it can choose to scale first when growth is better long-term, rush science/automation when
+that unlocks the next important branch, or prioritize an upgrade like **Coal Furnace**
+when coal production is the thing blocking progress.
+
+Resource-starvation upgrades are part of that scoring too: if coal is depleted, upgrades
+whose names/effects/unlocks help coal or smelters get a large boost, so **Coal Furnace**
+can beat a random affordable build and become the active plan. Similar hints exist for
+wood, minerals/iron, catnip, science, manpower/hunting, and faith.
+
+## Workshop crafting prerequisites
+
+When the active target needs a crafted resource, the helper now follows the recipe chain
+and crafts the missing intermediate instead of waiting forever. For example, if a target
+needs **gear**, and you have enough ingredients to make **steel**, it will craft steel
+from iron + coal, then craft the higher-level item when possible. The same recipe-chain
+logic feeds job balancing, so missing steel pushes work toward the raw inputs behind it
+(coal/geologists and minerals/iron support) instead of treating steel as an impossible
+resource.
+
 ## Jobs & hunting (managed for you)
 
 The helper takes over **job rebalancing** and **hunting** directly (KS's own versions are

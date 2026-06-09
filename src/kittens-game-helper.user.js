@@ -299,10 +299,12 @@
     for (const cost of costs) {
       const res = getRes(resources, cost.name);
       const have = (res && res.value) || 0;
-      progress = Math.min(progress, have / cost.val);
+      const possible = have + craftablePotential(cost.name);
+      progress = Math.min(progress, possible / cost.val);
       if (have < cost.val) {
         affordable = false;
-        missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}`);
+        const craftHint = craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
+        missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${craftHint}`);
       }
     }
     return { affordable, progress, missing: missing.slice(0, 3).join(", ") };
@@ -335,6 +337,167 @@
       }
       const woodToMake = Math.floor(spendable / costPer);
       if (woodToMake >= 1) game.craft("wood", woodToMake);
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+
+  const craftByName = (name) => {
+    try {
+      const craft = window.gamePage.workshop.getCraft && window.gamePage.workshop.getCraft(name);
+      return craft && craft.unlocked !== false ? craft : null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const craftPricesFor = (craft) => {
+    try {
+      if (window.gamePage.workshop.getCraftPrice) return window.gamePage.workshop.getCraftPrice(craft) || craft.prices || [];
+    } catch (error) {
+      /* fall through */
+    }
+    return (craft && craft.prices) || [];
+  };
+
+  const craftRatioFor = (name) => {
+    try {
+      return typeof window.gamePage.getResCraftRatio === "function" ? window.gamePage.getResCraftRatio(name) || 0 : 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const craftReserveFor = (resources, name) => {
+    const res = getRes(resources, name);
+    if (!res || !res.maxValue) return 0;
+    if (name === "catnip") return res.maxValue * 0.5;
+    if (name === "manpower" || name === "catpower") return 100;
+    return 0;
+  };
+
+  const craftLabel = (name) => {
+    const craft = craftByName(name);
+    const res = resourceMap().get(name);
+    return (craft && craft.label) || (res && res.title) || name;
+  };
+
+  const rawWorkNeedName = (name) => {
+    if (["wood", "beam", "scaffold", "ship"].includes(name)) return "wood";
+    if (["minerals", "iron", "titanium", "uranium"].includes(name)) return "minerals";
+    if (["coal", "gold"].includes(name)) return "coal";
+    if (["furs", "ivory", "unicorns"].includes(name)) return "manpower";
+    if (["science", "blueprint", "compendium"].includes(name)) return "science";
+    if (name === "faith") return "faith";
+    return name;
+  };
+
+
+  const craftablePotential = (name, depth = 0) => {
+    if (depth > 4) return 0;
+    const craft = craftByName(name);
+    if (!craft) return 0;
+    const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+    if (!prices.length) return 0;
+    const resources = resourceMap();
+    let baseUnits = Number.MAX_VALUE;
+    for (const price of prices) {
+      const res = getRes(resources, price.name);
+      const reserve = craftReserveFor(resources, price.name);
+      const direct = Math.max(0, ((res && res.value) || 0) - reserve);
+      const recursive = craftablePotential(price.name, depth + 1);
+      baseUnits = Math.min(baseUnits, (direct + recursive) / price.val);
+    }
+    return baseUnits === Number.MAX_VALUE ? 0 : Math.floor(baseUnits) * (1 + craftRatioFor(name));
+  };
+
+  const scoreResourcePathNeed = (needs, name, weight, depth = 0) => {
+    if (depth > 4) {
+      scoreNeed(needs, rawWorkNeedName(name), weight);
+      return;
+    }
+    const craft = craftByName(name);
+    if (!craft) {
+      scoreNeed(needs, rawWorkNeedName(name), weight);
+      return;
+    }
+    const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+    if (!prices.length) {
+      scoreNeed(needs, rawWorkNeedName(name), weight);
+      return;
+    }
+    for (const price of prices) scoreResourcePathNeed(needs, price.name, weight / prices.length, depth + 1);
+  };
+
+  let craftPlanText = "Craft: waiting…";
+  let lastCraftLog = 0;
+
+  const tryCraftResource = (name, targetAmount, depth = 0) => {
+    if (depth > 5 || !isFinite(targetAmount) || targetAmount <= 0) return false;
+    const resources = resourceMap();
+    const current = getRes(resources, name);
+    const have = (current && current.value) || 0;
+    if (have >= targetAmount) return true;
+
+    const craft = craftByName(name);
+    if (!craft) return false;
+    const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+    if (!prices.length) return false;
+
+    const deficit = targetAmount - have;
+    const baseUnits = Math.max(1, Math.ceil(deficit / (1 + craftRatioFor(name))));
+    for (const price of prices) {
+      const neededInput = price.val * baseUnits;
+      const input = getRes(resourceMap(), price.name);
+      if (((input && input.value) || 0) < neededInput && !tryCraftResource(price.name, neededInput, depth + 1)) {
+        return false;
+      }
+    }
+
+    const fresh = resourceMap();
+    for (const price of prices) {
+      const input = getRes(fresh, price.name);
+      const value = (input && input.value) || 0;
+      if (value - price.val * baseUnits < craftReserveFor(fresh, price.name)) return false;
+    }
+
+    try {
+      const workshop = window.gamePage.workshop;
+      const crafted = workshop && typeof workshop.craft === "function"
+        ? workshop.craft(name, baseUnits, true)
+        : window.gamePage.craft(name, baseUnits);
+      if (crafted !== false) {
+        craftPlanText = `Craft: made ${fmt(baseUnits * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
+        if (Date.now() - lastCraftLog > 15000) {
+          pushLog(`🧰 ${craftPlanText}`);
+          lastCraftLog = Date.now();
+        }
+        return true;
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return false;
+  };
+
+  const craftTowardTarget = (resources, goalKey) => {
+    try {
+      const target = chooseWorkTarget(resources, goalKey);
+      if (!target || target.affordable) {
+        craftPlanText = "Craft: no intermediate needed";
+        return;
+      }
+      for (const cost of pricesFor(target.kind, target.meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        const have = (getRes(resourceMap(), cost.name) || { value: 0 }).value || 0;
+        if (have < cost.val && craftByName(cost.name)) {
+          craftPlanText = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
+          tryCraftResource(cost.name, cost.val);
+          return;
+        }
+      }
+      craftPlanText = "Craft: gathering raw inputs";
     } catch (error) {
       /* ignore */
     }
@@ -760,22 +923,24 @@
     } catch (error) {
       /* ignore */
     }
+    return parts.slice(0, 4).join(" · ");
+  };
+
+  const getPlanLine = (resources, goalKey) => {
     try {
-      for (const b of buildingMetas()) {
-        if (b && b.unlocked !== false) candidates.push({ kind: "build", weight: 2, meta: b });
-      }
+      const target = chooseWorkTarget(resources, goalKey);
+      if (!target) return "🧭 Plan: scanning unlocked buildings/research";
+      const reqs = formatRequirements(target.kind, target.meta, resources);
+      const state = target.affordable ? "ready now" : `missing ${target.missing || "prerequisites"}`;
+      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
-      /* ignore */
+      return "🧭 Plan: —";
     }
-    const affordable = candidates
-      .map((c) => ({ ...c, ...evaluate(c.kind, c.meta, resources) }))
-      .filter((c) => c.affordable)
-      .map((c) => ({
-        ...c,
-        weight: c.weight + (goal && goal.keywords.length && matchesKeywords(c.meta, goal.keywords) ? 10 : 0),
-      }))
-      .sort((a, b) => b.weight - a.weight)[0];
-    return affordable ? `${affordable.kind} ${labelOf(affordable.meta)}` : "gathering…";
+  };
+
+  const getNowAction = (resources, goalKey) => {
+    const ready = gatherCandidates(resources, goalKey).find((c) => c.affordable);
+    return ready ? `${ready.kind} ${labelOf(ready.meta)}` : "gathering…";
   };
 
   /* ------------------------------ action log -------------------------------- */
@@ -863,6 +1028,7 @@
       const resources = resourceMap();
       const goal = getGoal();
       refineSurplusCatnip();
+      craftTowardTarget(resources, goal);
       balanceJobs(goal, resources);
       autoHunt(resources);
       trackActions();
