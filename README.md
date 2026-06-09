@@ -118,6 +118,13 @@ turned off so they don't fight it):
   catpower) once there is enough for at least one hunt and before storage fills, so luxury
   items get replenished instead of wasting capped catpower.
 
+## If the helper disappears after reinstalling
+
+Version **0.10.2** fixes a userscript syntax conflict that could stop the entire
+plugin before the 🐱 helper panel was drawn. If the box is missing after an update,
+open Tampermonkey and make sure the installed script header shows `@version 0.10.2`
+or newer, then refresh the Kittens Game tab.
+
 ## If nothing seems to move
 
 - Check the **KS engine:** line in the box — it should say **running ✓**. If it says

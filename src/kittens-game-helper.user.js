@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.9.0
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.10.2
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -52,7 +52,7 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
@@ -587,6 +587,63 @@
     needs[key] = (needs[key] || 0) + weight;
   };
 
+  const SHORTAGE_KEYWORDS = {
+    coal: ["coal", "furnace", "pyrolysis", "combustion", "injector", "smelter", "calciner"],
+    wood: ["wood", "lumber", "sawmill", "forestry", "beam", "scaffold"],
+    minerals: ["minerals", "mine", "quarry", "iron", "smelter", "calciner"],
+    catnip: ["catnip", "field", "pasture", "aqueduct", "unicorn pasture", "hydroponics"],
+    science: ["science", "library", "academy", "observatory", "biolab", "data center"],
+    manpower: ["manpower", "catpower", "hunter", "archery", "composite bow", "crossbow", "bolas"],
+    faith: ["faith", "temple", "chapel", "solar", "religion"],
+  };
+
+  const effectText = (meta) => {
+    const parts = [metaText(meta)];
+    for (const key of ["effects", "calculateEffects", "unlocks", "upgrades", "stages"]) {
+      const value = meta && meta[key];
+      if (!value || typeof value !== "object") continue;
+      try {
+        parts.push(JSON.stringify(value));
+      } catch (error) {
+        parts.push(Object.keys(value).join(" "));
+      }
+    }
+    return parts.join(" ").toLowerCase();
+  };
+
+  const helpsShortage = (meta, resourceName) => {
+    const text = effectText(meta);
+    const keywords = SHORTAGE_KEYWORDS[resourceName] || [resourceName];
+    return keywords.some((word) => text.includes(word));
+  };
+
+  const shortageBoost = (meta, resources) => {
+    let boost = 0;
+    for (const [name, keywords] of Object.entries(SHORTAGE_KEYWORDS)) {
+      const ratio = resRatio(resources, name, 1);
+      if (ratio > 0.35) continue;
+      if (helpsShortage(meta, name)) boost += (0.35 - ratio) * (name === "coal" ? 34 : 24);
+      if (name === "coal" && keywords.some((word) => metaText(meta).includes(word))) boost += (0.35 - ratio) * 18;
+    }
+    return boost;
+  };
+
+  const strategicBoost = (kind, meta, resources, goal) => {
+    const text = effectText(meta);
+    let boost = 0;
+    if (/automation|factory|engineer|steam|magneto|reactor|accelerator|calciner/.test(text)) boost += 8;
+    if (/storage|barn|warehouse|harbor|container|tank|library|academy/.test(text)) {
+      const capped = ["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some(
+        (name) => resRatio(resources, name, 0) > 0.9,
+      );
+      boost += capped ? 7 : 2;
+    }
+    if (/hut|house|mansion|population|kitten/.test(text)) boost += 4;
+    if (kind === "upgrade" && /furnace|coal|pyrolysis|combustion|smelter/.test(text)) boost += 5;
+    if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) boost += 10;
+    return boost;
+  };
+
   const gatherCandidates = (resources, goalKey) => {
     const goal = GOALS[goalKey];
     const candidates = [];
@@ -612,12 +669,12 @@
       /* ignore */
     }
     return candidates
-      .map((c) => ({
-        ...c,
-        ...evaluate(c.kind, c.meta, resources),
-        goalBoost: goal && goal.keywords.length && matchesKeywords(c.meta, goal.keywords) ? 10 : 0,
-      }))
-      .sort((a, b) => (b.goalBoost + b.weight + b.progress) - (a.goalBoost + a.weight + a.progress));
+      .map((c) => {
+        const evaluation = evaluate(c.kind, c.meta, resources);
+        const score = c.weight + evaluation.progress + shortageBoost(c.meta, resources) + strategicBoost(c.kind, c.meta, resources, goal);
+        return { ...c, ...evaluation, score };
+      })
+      .sort((a, b) => b.score - a.score);
   };
 
   const chooseWorkTarget = (resources, goalKey) => {
@@ -633,7 +690,7 @@
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         const res = getRes(resources, cost.name);
         const have = (res && res.value) || 0;
-        if (have < cost.val) scoreNeed(needs, cost.name, 8 * (1 - Math.min(0.98, have / cost.val)) + 2);
+        if (have < cost.val) scoreResourcePathNeed(needs, cost.name, 8 * (1 - Math.min(0.98, have / cost.val)) + 2);
       }
     }
 
@@ -897,31 +954,6 @@
       const have = (res && res.value) || 0;
       const title = resTitle(resources, cost.name);
       parts.push(`${title} ${fmt(Math.min(have, cost.val))}/${fmt(cost.val)}`);
-    }
-    return parts.slice(0, 4).join(" · ");
-  };
-
-  const getPlanLine = (resources, goalKey) => {
-    try {
-      const target = chooseWorkTarget(resources, goalKey);
-      if (!target) return "🧭 Plan: scanning unlocked buildings/research";
-      const reqs = formatRequirements(target.kind, target.meta, resources);
-      const state = target.affordable ? "ready now" : `missing ${target.missing || "prerequisites"}`;
-      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state}${reqs ? ` (${reqs})` : ""}`;
-    } catch (error) {
-      return "🧭 Plan: —";
-    }
-  };
-
-  const getNowAction = (resources, goalKey) => {
-    const goal = GOALS[goalKey];
-    const candidates = [];
-    try {
-      for (const u of window.gamePage.workshop.upgrades || []) {
-        if (isOpen(u)) candidates.push({ kind: "upgrade", weight: 3, meta: u });
-      }
-    } catch (error) {
-      /* ignore */
     }
     return parts.slice(0, 4).join(" · ");
   };
