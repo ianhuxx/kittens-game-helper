@@ -35,7 +35,7 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: job assignment, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It plays the game for you. |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: job assignment, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It also **auto-tunes every build threshold** so it buys the moment something is affordable — you never touch a number. It plays the game for you. |
 | **Assist: jobs + advice** | Only assigns jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
@@ -52,9 +52,10 @@ The bottom-right box shows two live lines:
 
 ## If nothing seems to move
 
-- Make sure Kitten Scientists actually loaded (you should see its panel/columns).
-- Open the browser console (F12) and look for `[KGH] Applied "Autopilot…"`.
-- Click **Apply** once. Autopilot re-enables every safe section every time.
+- Check the **KS engine:** line in the box — it should say **running ✓**. If it says
+  *stopped*, click **Apply**.
+- Autopilot auto-sets every build/research/craft **trigger to "as soon as affordable"**,
+  so you never have to tune thresholds. Click **Apply** to re-apply.
 - Early game is resource-limited: read the **NEXT:** line — it's waiting on the listed
   resource. Hunting/crafting will catch up.
 

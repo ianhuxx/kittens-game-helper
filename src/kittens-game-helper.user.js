@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.5.0
+// @version      0.6.0
 // @description  One-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation (jobs, building, research, crafting, trade, faith, hunting, festivals), and shows what to build/research next. Prestige resets stay OFF, so it continues your existing save.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -92,6 +92,38 @@
     }
   };
 
+  // Sections whose purchases are gated by a storage-percent "trigger": KS only
+  // buys an item when every capped material is at >= trigger of its max storage.
+  // The default trigger is high, so on a save with low stockpiles KS "does
+  // nothing". Setting these triggers to 0 means "buy as soon as it's affordable".
+  const PURCHASE_SECTIONS = ["bonfire", "science", "workshop", "religion", "space", "time", "trade"];
+
+  const setTriggersDeep = (node, value) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) setTriggersDeep(child, value);
+      return;
+    }
+    if (typeof node.trigger === "number") node.trigger = value;
+    for (const child of Object.values(node)) {
+      if (child && typeof child === "object") setTriggersDeep(child, value);
+    }
+  };
+
+  // A build limit ("max") of 0 means "never build this". Raise those to
+  // effectively unlimited so every unlocked structure keeps getting built.
+  const raiseZeroMaxes = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) raiseZeroMaxes(child);
+      return;
+    }
+    if (typeof node.max === "number" && node.max === 0) node.max = 1e9;
+    for (const child of Object.values(node)) {
+      if (child && typeof child === "object") raiseZeroMaxes(child);
+    }
+  };
+
   // Make sure idle kittens actually get distributed across all jobs.
   const enableAllJobs = (settings) => {
     const village = settings && settings.village;
@@ -129,25 +161,32 @@
         // Resource control can auto-sell/consume stockpiles — keep it off.
         if (settings.engine.resources) settings.engine.resources.enabled = false;
       }
+      // Build/research/craft as soon as it's affordable, instead of waiting for
+      // storage to fill — the key fix for "KS is on but nothing happens". Also
+      // un-cap any structures stuck at a build limit of 0.
+      for (const section of PURCHASE_SECTIONS) {
+        if (settings[section]) setTriggersDeep(settings[section], 0);
+      }
+      for (const section of ["bonfire", "space", "time"]) {
+        if (settings[section]) raiseZeroMaxes(settings[section]);
+      }
     }
 
     enableAllJobs(settings);
     return settings;
   };
 
-  let started = false;
   const ensureEngineRunning = () => {
-    if (started) return;
-    started = true;
-    // KS auto-runs when engine.enabled is true, but on a brand-new install the
-    // loop may not have started yet. Nudge it once, defensively.
+    // setSettings() already auto-starts the loop when engine.enabled is true.
+    // Fallback: start it only if it isn't already running. KS stores the loop
+    // handle in engine._timeoutMainLoop (null/undefined when stopped).
     try {
       const engine = window.kittenScientists && window.kittenScientists.engine;
-      if (engine && typeof engine.start === "function" && engine.isProcessing !== true) {
-        engine.start();
+      if (engine && engine._timeoutMainLoop == null && typeof engine.start === "function") {
+        engine.start(false);
       }
     } catch (error) {
-      /* enabled flag will start it on the next KS tick */
+      /* the enabled flag will start it on the next KS tick */
     }
   };
 
@@ -287,9 +326,24 @@
     return { now, next };
   };
 
+  let statusLine;
   let nowLine;
   let nextLine;
+
+  const engineRunning = () => {
+    try {
+      return window.kittenScientists.engine._timeoutMainLoop != null;
+    } catch (error) {
+      return false;
+    }
+  };
+
   const updateAdvisor = () => {
+    if (statusLine) {
+      statusLine.textContent = engineRunning()
+        ? "KS engine: running ✓"
+        : "KS engine: stopped ✗ — click Apply";
+    }
     if (!nowLine || !nextLine) return;
     try {
       const advice = getAdvice();
@@ -316,6 +370,7 @@
       '<option value="assist">Assist: jobs + advice</option>',
       "</select>",
       '<button type="button" style="cursor:pointer">Apply</button></div>',
+      '<small class="kgh-status" style="color:#9fd0ff">…</small>',
       '<small class="kgh-note" style="opacity:.85"></small>',
       '<small class="kgh-now" style="color:#bfe6a0">…</small>',
       '<small class="kgh-next" style="color:#e6d79a"></small>',
@@ -325,6 +380,7 @@
     const select = box.querySelector("select");
     const button = box.querySelector("button");
     const note = box.querySelector(".kgh-note");
+    statusLine = box.querySelector(".kgh-status");
     nowLine = box.querySelector(".kgh-now");
     nextLine = box.querySelector(".kgh-next");
 

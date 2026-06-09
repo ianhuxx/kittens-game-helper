@@ -24,6 +24,9 @@ const required = [
   // Both profiles must exist.
   "autopilot",
   "assist",
+  // The "build as soon as affordable" trigger fix must stay in place.
+  "PURCHASE_SECTIONS",
+  "setTriggersDeep",
 ];
 
 const missing = required.filter((token) => !source.includes(token));
