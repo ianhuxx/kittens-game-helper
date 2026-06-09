@@ -35,7 +35,7 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, target-aware workshop crafting, building, research, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, resource-fixing workshop upgrades, target-aware workshop crafting, building, research, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
 | **Assist: jobs + advice** | Only rebalances jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
@@ -83,9 +83,15 @@ Both choices are remembered between sessions.
 
 The helper no longer blindly chases the next visible button. It scores research, workshop
 upgrades, and buildings together, with extra priority for automation/unlock steps,
-production scale, storage when resources are capping, and population growth. That means it
-can choose to scale first when growth is better long-term, or rush science/automation when
-that unlocks the next important branch.
+production scale, resource-fixing workshop upgrades, storage when resources are capping,
+and population growth. That means it can choose to scale first when growth is better long-term, rush science/automation when
+that unlocks the next important branch, or prioritize an upgrade like **Coal Furnace**
+when coal production is the thing blocking progress.
+
+Resource-starvation upgrades are part of that scoring too: if coal is depleted, upgrades
+whose names/effects/unlocks help coal or smelters get a large boost, so **Coal Furnace**
+can beat a random affordable build and become the active plan. Similar hints exist for
+wood, minerals/iron, catnip, science, manpower/hunting, and faith.
 
 ## Workshop crafting prerequisites
 
