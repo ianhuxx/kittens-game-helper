@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.8.1
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, auto-assigns idle kittens (with wood-vs-catnip pathway math), sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.9.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -52,11 +52,11 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, auto-assigns idle kittens to the best job (with wood-vs-catnip pathway math), sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
-      note: "Only jobs, hunting, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
+      note: "Only job rebalancing, hunting, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
     },
   };
 
@@ -246,7 +246,10 @@
   const resourceMap = () => {
     const map = new Map();
     try {
-      for (const res of window.gamePage.resPool.resources) map.set(res.name, res);
+      for (const res of window.gamePage.resPool.resources) {
+        map.set(res.name, res);
+        if (res.name === "manpower") map.set("catpower", res);
+      }
     } catch (error) {
       /* ignore */
     }
@@ -294,7 +297,7 @@
     let progress = 1;
     const missing = [];
     for (const cost of costs) {
-      const res = resources.get(cost.name);
+      const res = getRes(resources, cost.name);
       const have = (res && res.value) || 0;
       progress = Math.min(progress, have / cost.val);
       if (have < cost.val) {
@@ -377,42 +380,258 @@
     }
   };
 
-  const RES_JOB = { minerals: "miner", science: "scholar", catnip: "farmer", coal: "geologist", faith: "priest" };
+  const RES_JOB = {
+    minerals: "miner",
+    science: "scholar",
+    catnip: "farmer",
+    coal: "geologist",
+    faith: "priest",
+    manpower: "hunter",
+    catpower: "hunter",
+  };
+  const MANAGED_JOBS = ["woodcutter", "farmer", "miner", "scholar", "hunter", "priest", "geologist"];
+  const JOB_RESOURCE = {
+    woodcutter: "wood",
+    farmer: "catnip",
+    miner: "minerals",
+    scholar: "science",
+    hunter: "manpower",
+    priest: "faith",
+    geologist: "coal",
+  };
+  const JOB_REBALANCE_MIN_MS = 3500;
+  let lastJobRun = 0;
+  let lastJobLog = 0;
+  let lastJobSignature = "";
+  let jobPlanText = "Jobs: waiting…";
 
-  // Decide which job idle kittens should go to, based on food safety, the current
-  // bottleneck, and your chosen goal.
-  const chooseJob = (goalKey, resources) => {
-    const ratio = (n) => {
-      const r = resources.get(n);
-      return r && r.maxValue > 0 ? r.value / r.maxValue : 1;
-    };
-    if (ratio("catnip") < 0.15) return jobByName("farmer") || jobByName("woodcutter"); // food first
-    let target;
-    if (ratio("wood") < 0.1) target = "wood";
-    else if (ratio("minerals") < 0.1) target = "minerals";
-    else if (goalKey === "space") target = "science";
-    else if (goalKey === "production") target = ratio("minerals") <= ratio("wood") ? "minerals" : "wood";
-    else if (goalKey === "population") target = "catnip";
-    else {
-      const opts = ["wood", "minerals", "science"]
-        .filter((n) => ratio(n) < 0.95)
-        .sort((a, b) => ratio(a) - ratio(b));
-      target = opts[0] || "science";
+  const getRes = (resources, name) => resources.get(name) || (name === "catpower" ? resources.get("manpower") : null);
+
+  const resRatio = (resources, name, fallback = 1) => {
+    const r = getRes(resources, name);
+    return r && r.maxValue > 0 ? r.value / r.maxValue : fallback;
+  };
+
+  const resTitle = (resources, name) => {
+    const r = getRes(resources, name);
+    if (name === "manpower" || name === "catpower") return (r && r.title) || "Catpower";
+    return (r && r.title) || name;
+  };
+
+  const scoreNeed = (needs, name, weight) => {
+    if (!name || !isFinite(weight) || weight <= 0) return;
+    const key = name === "catpower" ? "manpower" : name;
+    needs[key] = (needs[key] || 0) + weight;
+  };
+
+  const gatherCandidates = (resources, goalKey) => {
+    const goal = GOALS[goalKey];
+    const candidates = [];
+    try {
+      for (const t of window.gamePage.science.techs || []) {
+        if (isOpen(t)) candidates.push({ kind: "research", weight: 4, meta: t });
+      }
+    } catch (error) {
+      /* ignore */
     }
+    try {
+      for (const u of window.gamePage.workshop.upgrades || []) {
+        if (isOpen(u)) candidates.push({ kind: "upgrade", weight: 3, meta: u });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const b of buildingMetas()) {
+        if (b && b.unlocked !== false) candidates.push({ kind: "build", weight: 2, meta: b });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return candidates
+      .map((c) => ({
+        ...c,
+        ...evaluate(c.kind, c.meta, resources),
+        goalBoost: goal && goal.keywords.length && matchesKeywords(c.meta, goal.keywords) ? 10 : 0,
+      }))
+      .sort((a, b) => (b.goalBoost + b.weight + b.progress) - (a.goalBoost + a.weight + a.progress));
+  };
+
+  const chooseWorkTarget = (resources, goalKey) => {
+    const candidates = gatherCandidates(resources, goalKey);
+    return candidates.find((c) => !c.affordable && c.missing) || candidates.find((c) => c.affordable) || null;
+  };
+
+  const resourceNeeds = (goalKey, resources) => {
+    const needs = {};
+    const target = chooseWorkTarget(resources, goalKey);
+    if (target && !target.affordable) {
+      for (const cost of pricesFor(target.kind, target.meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        const res = getRes(resources, cost.name);
+        const have = (res && res.value) || 0;
+        if (have < cost.val) scoreNeed(needs, cost.name, 8 * (1 - Math.min(0.98, have / cost.val)) + 2);
+      }
+    }
+
+    // Safety and anti-waste: do not keep producing capped spendables; push low raw
+    // resources and food instead. This is what moves scholars away when science is full.
+    if (resRatio(resources, "catnip") < 0.25) scoreNeed(needs, "catnip", 14);
+    if (resRatio(resources, "wood") < 0.3) scoreNeed(needs, "wood", 7 * (0.3 - resRatio(resources, "wood")) / 0.3);
+    if (resRatio(resources, "minerals") < 0.3) scoreNeed(needs, "minerals", 6 * (0.3 - resRatio(resources, "minerals")) / 0.3);
+    if (goalKey === "space" && resRatio(resources, "science") < 0.92) scoreNeed(needs, "science", 3);
+    if (goalKey === "production") scoreNeed(needs, resRatio(resources, "minerals") <= resRatio(resources, "wood") ? "minerals" : "wood", 3);
+    if (goalKey === "population") scoreNeed(needs, "catnip", 3);
+
+    for (const name of ["science", "faith", "culture", "manpower"]) {
+      if (resRatio(resources, name) > 0.94) needs[name] = 0;
+    }
+    for (const name of ["wood", "minerals", "catnip", "coal"]) {
+      if (resRatio(resources, name) > 0.96) needs[name] = Math.min(needs[name] || 0, 0.25);
+    }
+
+    if (!Object.values(needs).some((v) => v > 0)) {
+      scoreNeed(needs, "wood", resRatio(resources, "wood") < 0.95 ? 2 : 0);
+      scoreNeed(needs, "minerals", resRatio(resources, "minerals") < 0.95 ? 2 : 0);
+      scoreNeed(needs, "science", resRatio(resources, "science") < 0.9 ? 1 : 0);
+    }
+    return { needs, target };
+  };
+
+  // Decide which single job should receive a free/extra kitten as a fallback.
+  const chooseJob = (goalKey, resources) => {
+    const { needs } = resourceNeeds(goalKey, resources);
+    const best = Object.entries(needs).sort((a, b) => b[1] - a[1])[0];
+    const target = best && best[1] > 0 ? best[0] : "wood";
     if (target === "wood") return bestWoodJob() || jobByName("woodcutter");
-    return jobByName(RES_JOB[target]) || jobByName("scholar") || jobByName("farmer");
+    return jobByName(RES_JOB[target]) || jobByName("woodcutter") || jobByName("farmer");
+  };
+
+  const managedJobs = () => MANAGED_JOBS.map(jobByName).filter(Boolean);
+
+  const unassignJobByName = (village, name, amt) => {
+    if (amt <= 0) return;
+    if (village.sim && typeof village.sim.removeJob === "function") {
+      village.sim.removeJob(name, amt);
+      return;
+    }
+    const kittens = (village.sim && village.sim.kittens) || [];
+    for (const kitten of kittens) {
+      if (amt <= 0) break;
+      if (kitten.job === name && typeof village.unassignJob === "function") {
+        village.unassignJob(kitten);
+        amt -= 1;
+      }
+    }
+  };
+
+  const desiredJobCounts = (goalKey, resources) => {
+    const village = window.gamePage.village;
+    const jobs = managedJobs();
+    const totalWorkers = Math.max(0, Math.floor(village.getDiligentKittens ? village.getDiligentKittens() : village.getKittens()));
+    const reserved = (jobByName("engineer") && jobByName("engineer").value) || 0;
+    const total = Math.max(0, totalWorkers - reserved);
+    const { needs, target } = resourceNeeds(goalKey, resources);
+    const weights = {};
+
+    for (const job of jobs) {
+      const res = JOB_RESOURCE[job.name];
+      let weight = needs[res] || 0;
+      if (job.name === "woodcutter" && needs.wood > 0) weight = Math.max(weight, needs.wood);
+      if (job.name === "farmer" && needs.wood > 0 && bestWoodJob() && bestWoodJob().name === "farmer") {
+        weight = Math.max(weight, needs.wood + 1);
+      }
+      if (job.name === "woodcutter" && bestWoodJob() && bestWoodJob().name === "farmer") {
+        weight = Math.min(weight, 0.25);
+      }
+      if (job.name === "scholar" && resRatio(resources, "science") > 0.94) weight = 0;
+      if (job.name === "priest" && resRatio(resources, "faith") > 0.94) weight = 0;
+      if (job.name === "hunter" && resRatio(resources, "manpower") > 0.94) weight = 0;
+      if (job.name === "geologist" && resRatio(resources, "coal") > 0.96) weight = 0;
+      weights[job.name] = Math.max(0, weight);
+    }
+
+    if (resRatio(resources, "catnip") < 0.2 && jobByName("farmer")) weights.farmer = Math.max(weights.farmer || 0, 20);
+    if (!Object.values(weights).some((w) => w > 0)) {
+      const fallback = bestWoodJob() || jobByName("woodcutter") || jobByName("farmer") || jobs[0];
+      if (fallback) weights[fallback.name] = 1;
+    }
+
+    const desired = {};
+    for (const job of jobs) desired[job.name] = 0;
+    const sum = Object.values(weights).reduce((a, b) => a + b, 0) || 1;
+    let assigned = 0;
+    for (const job of jobs) {
+      const count = Math.floor(total * ((weights[job.name] || 0) / sum));
+      desired[job.name] = Math.min(count, village.getJobLimit ? village.getJobLimit(job.name) : count);
+      assigned += desired[job.name];
+    }
+    const ranked = jobs.slice().sort((a, b) => (weights[b.name] || 0) - (weights[a.name] || 0));
+    for (let i = 0; assigned < total && ranked.length; i += 1) {
+      const job = ranked[i % ranked.length];
+      if ((weights[job.name] || 0) <= 0) break;
+      const limit = village.getJobLimit ? village.getJobLimit(job.name) : 100000;
+      if (desired[job.name] < limit) {
+        desired[job.name] += 1;
+        assigned += 1;
+      }
+      if (i > total + jobs.length) break;
+    }
+
+    const needLine = Object.entries(needs)
+      .filter(([, w]) => w > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name]) => resTitle(resources, name))
+      .join(" + ");
+    jobPlanText = `Jobs: ${needLine || "balanced"}${target ? ` for ${labelOf(target.meta)}` : ""}`;
+    return desired;
   };
 
   const balanceJobs = (goalKey, resources) => {
     try {
       const village = window.gamePage.village;
-      if (!village || typeof village.getFreeKittens !== "function") return;
-      const free = Math.floor(village.getFreeKittens());
-      if (free <= 0) return;
-      const job = chooseJob(goalKey, resources);
-      if (job && typeof village.assignJob === "function") {
-        village.assignJob(job, free);
-        pushLog(`👷 ${free} → ${job.title || job.name}`);
+      if (!village || typeof village.getFreeKittens !== "function" || typeof village.assignJob !== "function") return;
+      const desired = desiredJobCounts(goalKey, resources);
+      const jobs = managedJobs();
+      const current = {};
+      for (const job of jobs) current[job.name] = Math.max(0, Math.floor(job.value || 0));
+      const now = Date.now();
+      const signature = jobs.map((j) => `${j.name}:${desired[j.name] || 0}`).join("|");
+      if (now - lastJobRun < JOB_REBALANCE_MIN_MS && Math.floor(village.getFreeKittens()) <= 0) return;
+      if (signature === lastJobSignature && Math.floor(village.getFreeKittens()) <= 0) return;
+      lastJobRun = now;
+
+      for (const job of jobs) {
+        const extra = current[job.name] - (desired[job.name] || 0);
+        if (extra > 0) unassignJobByName(village, job.name, extra);
+      }
+      let moved = 0;
+      for (const job of jobs) {
+        const fresh = jobByName(job.name);
+        const need = (desired[job.name] || 0) - ((fresh && fresh.value) || 0);
+        if (need > 0) {
+          village.assignJob(fresh || job, need);
+          moved += need;
+        }
+      }
+      try {
+        if (typeof village.updateResourceProduction === "function") village.updateResourceProduction();
+        if (window.gamePage.villageTab && typeof window.gamePage.villageTab.updateTab === "function") window.gamePage.villageTab.updateTab();
+        if (typeof window.gamePage.updateResources === "function") window.gamePage.updateResources();
+      } catch (error) {
+        /* ignore UI refresh failures */
+      }
+      lastJobSignature = signature;
+      if (moved > 0 && now - lastJobLog > 15000) {
+        const summary = jobs
+          .filter((j) => desired[j.name] > 0)
+          .sort((a, b) => desired[b.name] - desired[a.name])
+          .slice(0, 3)
+          .map((j) => `${j.title || j.name} ${desired[j.name]}`)
+          .join(", ");
+        pushLog(`👷 rebalanced: ${summary}`);
+        lastJobLog = now;
       }
     } catch (error) {
       /* ignore */
@@ -423,9 +642,10 @@
   const autoHunt = (resources) => {
     try {
       const village = window.gamePage.village;
-      const cp = resources.get("catpower");
+      const cp = resources.get("manpower") || resources.get("catpower");
       if (!village || !cp || !cp.maxValue || typeof village.huntAll !== "function") return;
-      if (cp.value >= cp.maxValue * 0.9) {
+      const huntCost = 100 - (typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0);
+      if (cp.value >= Math.max(huntCost, cp.maxValue * 0.75)) {
         village.huntAll();
         if (Date.now() - lastHuntLog > 30000) {
           pushLog("🏹 sent hunters");
@@ -439,14 +659,14 @@
 
   /* ------------------------------ the advisor ------------------------------- */
 
-  const SPENDABLE = ["science", "culture", "faith", "catpower"];
+  const SPENDABLE = ["science", "culture", "faith", "manpower"];
   const RAW = ["wood", "minerals", "iron", "coal"];
 
   const getBottleneck = (resources) => {
     for (const name of SPENDABLE) {
       const r = resources.get(name);
       if (r && r.maxValue > 0 && r.value >= r.maxValue * 0.99) {
-        const fix = name === "catpower" ? "send hunters" : "build more storage / spend it";
+        const fix = name === "manpower" ? "send hunters" : "build more storage / spend it";
         return `${r.title || name} is capped — ${fix}`;
       }
     }
@@ -502,6 +722,31 @@
       return `🏁 ${goal.label}: target not unlocked yet`;
     } catch (error) {
       return `🏁 ${goal.label}`;
+    }
+  };
+
+
+  const formatRequirements = (kind, meta, resources) => {
+    const parts = [];
+    for (const cost of pricesFor(kind, meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const res = getRes(resources, cost.name);
+      const have = (res && res.value) || 0;
+      const title = resTitle(resources, cost.name);
+      parts.push(`${title} ${fmt(Math.min(have, cost.val))}/${fmt(cost.val)}`);
+    }
+    return parts.slice(0, 4).join(" · ");
+  };
+
+  const getPlanLine = (resources, goalKey) => {
+    try {
+      const target = chooseWorkTarget(resources, goalKey);
+      if (!target) return "🧭 Plan: scanning unlocked buildings/research";
+      const reqs = formatRequirements(target.kind, target.meta, resources);
+      const state = target.affordable ? "ready now" : `missing ${target.missing || "prerequisites"}`;
+      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state}${reqs ? ` (${reqs})` : ""}`;
+    } catch (error) {
+      return "🧭 Plan: —";
     }
   };
 
@@ -601,6 +846,8 @@
   let goalEl;
   let bottleneckEl;
   let scienceEl;
+  let planEl;
+  let jobsEl;
   let nowEl;
 
   const engineRunning = () => {
@@ -627,6 +874,8 @@
       }
       if (bottleneckEl) bottleneckEl.textContent = `⚖ ${getBottleneck(resources)}`;
       if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
+      if (planEl) planEl.textContent = getPlanLine(resources, goal);
+      if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
       /* ignore */
@@ -684,6 +933,8 @@
       '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
       '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
       '<small class="kgh-science" style="color:#bfe6a0">…</small>',
+      '<small class="kgh-plan" style="color:#a7e8e0">…</small>',
+      '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
       '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
@@ -703,6 +954,8 @@
     goalEl = box.querySelector(".kgh-goal-line");
     bottleneckEl = box.querySelector(".kgh-bottleneck");
     scienceEl = box.querySelector(".kgh-science");
+    planEl = box.querySelector(".kgh-plan");
+    jobsEl = box.querySelector(".kgh-jobs");
     nowEl = box.querySelector(".kgh-now");
     logBox = box.querySelector(".kgh-log");
 
