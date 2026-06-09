@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.8.0
+// @version      0.8.1
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, auto-assigns idle kittens (with wood-vs-catnip pathway math), sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -635,18 +635,44 @@
 
   /* ------------------------------- the panel -------------------------------- */
 
+  const KS_HIDE_KEY = "kgh.hideKS";
+  const MIN_KEY = "kgh.min";
+
+  // Hide/show the Kitten Scientists panel (its UI root is .kitten-scientists,
+  // inside #ksColumn). Automation keeps running either way.
+  const applyKSHidden = (hidden, btn) => {
+    document.body.classList.toggle("kgh-hide-ks", hidden);
+    localStorage.setItem(KS_HIDE_KEY, hidden ? "1" : "0");
+    if (btn) {
+      btn.textContent = hidden ? "Show KS" : "Hide KS";
+      btn.title = hidden ? "Show the Kitten Scientists settings panel" : "Hide the Kitten Scientists settings panel";
+    }
+  };
+
   const buildPanel = () => {
+    const style = document.createElement("style");
+    style.id = "kgh-style";
+    style.textContent =
+      "body.kgh-hide-ks #ksColumn,body.kgh-hide-ks .kitten-scientists{display:none!important}" +
+      ".kgh-hbtn{cursor:pointer;background:transparent;color:#f7ead0;border:1px solid #9b7a4d;" +
+      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px}";
+    document.head.appendChild(style);
+
     const box = document.createElement("div");
     box.style.cssText =
       "position:fixed;right:12px;bottom:12px;z-index:99999;width:300px;padding:9px 10px;" +
       "background:#2b2118;color:#f7ead0;border:1px solid #9b7a4d;border-radius:5px;" +
       "font:12px/1.4 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
     box.innerHTML = [
+      '<div style="display:flex;justify-content:space-between;align-items:center">',
       '<strong style="font-size:13px">🐱 Kittens Helper</strong>',
+      '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-ks">Show KS</button>',
+      '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
+      '<div class="kgh-body" style="display:grid;gap:5px">',
       '<div style="display:flex;gap:6px"><select style="flex:1" aria-label="profile">',
       '<option value="autopilot">Autopilot: play forward</option>',
       '<option value="assist">Assist: jobs + advice</option>',
-      "</select><button type=\"button\" style=\"cursor:pointer\">Apply</button></div>",
+      "</select><button type=\"button\" class=\"kgh-apply\" style=\"cursor:pointer\">Apply</button></div>",
       '<select class="kgh-goal" aria-label="goal" style="width:100%">',
       '<option value="balanced">🏁 Goal: Balanced</option>',
       '<option value="space">🏁 Goal: Rush Space</option>',
@@ -663,12 +689,16 @@
       '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
         'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
       '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
+      "</div>",
     ].join("");
 
     const select = box.querySelector("select");
     const goalSelect = box.querySelector(".kgh-goal");
-    const button = box.querySelector("button");
+    const button = box.querySelector(".kgh-apply");
     const note = box.querySelector(".kgh-note");
+    const ksBtn = box.querySelector(".kgh-ks");
+    const minBtn = box.querySelector(".kgh-min");
+    const body = box.querySelector(".kgh-body");
     statusEl = box.querySelector(".kgh-status");
     goalEl = box.querySelector(".kgh-goal-line");
     bottleneckEl = box.querySelector(".kgh-bottleneck");
@@ -687,8 +717,20 @@
     });
     button.addEventListener("click", () => applyProfile(select.value));
 
+    ksBtn.addEventListener("click", () => {
+      applyKSHidden(!document.body.classList.contains("kgh-hide-ks"), ksBtn);
+    });
+    const applyMin = (min) => {
+      body.style.display = min ? "none" : "grid";
+      minBtn.textContent = min ? "+" : "–";
+      localStorage.setItem(MIN_KEY, min ? "1" : "0");
+    };
+    minBtn.addEventListener("click", () => applyMin(body.style.display !== "none"));
+
     document.body.appendChild(box);
     note.textContent = PROFILE_INFO[select.value].note;
+    applyKSHidden(localStorage.getItem(KS_HIDE_KEY) !== "0", ksBtn); // default hidden = minimal
+    applyMin(localStorage.getItem(MIN_KEY) === "1");
     renderLog();
     tick();
     setInterval(tick, 4000);

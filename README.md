@@ -64,6 +64,17 @@ toward it*), prioritises goal-relevant research in **🔬 Next science**, and hi
 goal buildings in **🎯 Now**. Autopilot still grows the whole economy so you never stall
 waiting on a single branch.
 
+## Minimal UI
+
+The helper bar has two buttons in its header:
+
+- **Show KS / Hide KS** — hides the big Kitten Scientists settings panel for a clean,
+  minimal screen (automation keeps running). It's **hidden by default**; click **Show KS**
+  any time you want to tweak KS directly.
+- **– / +** — minimizes the helper bar down to just its title, and restores it.
+
+Both choices are remembered between sessions.
+
 ## Jobs & hunting (managed for you)
 
 The helper takes over **job assignment** and **hunting** directly (KS's own versions are
