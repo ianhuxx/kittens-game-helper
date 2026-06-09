@@ -433,6 +433,27 @@
   let craftPlanText = "Craft: waiting…";
   let lastCraftLog = 0;
 
+  const craftUnits = (name, units) => {
+    if (!isFinite(units) || units <= 0) return false;
+    const before = (getRes(resourceMap(), name) || { value: 0 }).value || 0;
+    const craft = craftByName(name);
+    const attempts = [
+      () => (typeof window.gamePage.craft === "function" ? window.gamePage.craft(name, units) : false),
+      () => (window.gamePage.workshop && typeof window.gamePage.workshop.craft === "function" ? window.gamePage.workshop.craft(craft || name, units) : false),
+      () => (window.gamePage.workshop && typeof window.gamePage.workshop.craft === "function" ? window.gamePage.workshop.craft(name, units, true) : false),
+    ];
+    for (const attempt of attempts) {
+      try {
+        const result = attempt();
+        const after = (getRes(resourceMap(), name) || { value: 0 }).value || 0;
+        if (result !== false && after > before) return true;
+      } catch (error) {
+        /* try the next API shape */
+      }
+    }
+    return false;
+  };
+
   const tryCraftResource = (name, targetAmount, depth = 0) => {
     if (depth > 5 || !isFinite(targetAmount) || targetAmount <= 0) return false;
     const resources = resourceMap();
@@ -446,7 +467,7 @@
     if (!prices.length) return false;
 
     const deficit = targetAmount - have;
-    const baseUnits = Math.max(1, Math.ceil(deficit / (1 + craftRatioFor(name))));
+    const baseUnits = Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name))));
     for (const price of prices) {
       const neededInput = price.val * baseUnits;
       const input = getRes(resourceMap(), price.name);
@@ -462,21 +483,13 @@
       if (value - price.val * baseUnits < craftReserveFor(fresh, price.name)) return false;
     }
 
-    try {
-      const workshop = window.gamePage.workshop;
-      const crafted = workshop && typeof workshop.craft === "function"
-        ? workshop.craft(name, baseUnits, true)
-        : window.gamePage.craft(name, baseUnits);
-      if (crafted !== false) {
-        craftPlanText = `Craft: made ${fmt(baseUnits * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
-        if (Date.now() - lastCraftLog > 15000) {
-          pushLog(`🧰 ${craftPlanText}`);
-          lastCraftLog = Date.now();
-        }
-        return true;
+    if (craftUnits(name, baseUnits)) {
+      craftPlanText = `Craft: made ${fmt(baseUnits * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
+      if (Date.now() - lastCraftLog > 15000) {
+        pushLog(`🧰 ${craftPlanText}`);
+        lastCraftLog = Date.now();
       }
-    } catch (error) {
-      /* ignore */
+      return true;
     }
     return false;
   };
@@ -645,7 +658,7 @@
   };
 
   const SHORTAGE_KEYWORDS = {
-    coal: ["coal", "furnace", "pyrolysis", "combustion", "injector", "smelter", "calciner"],
+    coal: ["coal", "furnace", "steel", "pyrolysis", "combustion", "injector", "smelter", "calciner"],
     wood: ["wood", "lumber", "sawmill", "forestry", "beam", "scaffold"],
     minerals: ["minerals", "mine", "quarry", "iron", "smelter", "calciner"],
     catnip: ["catnip", "field", "pasture", "aqueduct", "unicorn pasture", "hydroponics"],
@@ -674,13 +687,73 @@
     return keywords.some((word) => text.includes(word));
   };
 
+  const productionFor = (name) => {
+    try {
+      const prod = window.gamePage.village.getResProduction ? window.gamePage.village.getResProduction() : {};
+      const value = prod[name === "catpower" ? "manpower" : name];
+      return isFinite(value) ? value : 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const rawPathRequirements = (name, amount, out = {}, depth = 0) => {
+    if (depth > 5 || !isFinite(amount) || amount <= 0) return out;
+    const craft = craftByName(name);
+    if (!craft) {
+      const raw = rawWorkNeedName(name);
+      out[raw] = (out[raw] || 0) + amount;
+      return out;
+    }
+    const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+    if (!prices.length) {
+      const raw = rawWorkNeedName(name);
+      out[raw] = (out[raw] || 0) + amount;
+      return out;
+    }
+    const baseUnits = Math.max(1, Math.ceil(amount / Math.max(1, 1 + craftRatioFor(name))));
+    for (const price of prices) rawPathRequirements(price.name, price.val * baseUnits, out, depth + 1);
+    return out;
+  };
+
+  const scoreRawDeficits = (needs, resources, requirements, baseWeight) => {
+    const entries = Object.entries(requirements).filter(([, required]) => required > 0);
+    if (!entries.length) return;
+    const pressures = entries.map(([name, required]) => {
+      const res = getRes(resources, name);
+      const have = Math.max(0, (res && res.value) || 0);
+      const shortage = Math.max(0, required - have);
+      const shortageRatio = shortage / required;
+      const lowStock = 1 - Math.min(1, resRatio(resources, name, have >= required ? 1 : 0));
+      const prod = productionFor(name);
+      const prodPenalty = prod <= 0 ? 1 : Math.min(1, shortage / Math.max(1, prod * 600));
+      return [name, Math.max(0, shortageRatio * 1.6 + lowStock * 0.8 + prodPenalty * 0.6)];
+    });
+    const totalPressure = pressures.reduce((sum, [, pressure]) => sum + pressure, 0) || 1;
+    for (const [name, pressure] of pressures) {
+      if (pressure <= 0) continue;
+      const imbalanceBoost = name === "coal" && (requirements.iron || 0) > 0 ? 1.45 : 1;
+      scoreNeed(needs, name, baseWeight * imbalanceBoost * (pressure / totalPressure));
+    }
+  };
+
   const shortageBoost = (meta, resources) => {
     let boost = 0;
     for (const [name, keywords] of Object.entries(SHORTAGE_KEYWORDS)) {
       const ratio = resRatio(resources, name, 1);
-      if (ratio > 0.35) continue;
-      if (helpsShortage(meta, name)) boost += (0.35 - ratio) * (name === "coal" ? 34 : 24);
-      if (name === "coal" && keywords.some((word) => metaText(meta).includes(word))) boost += (0.35 - ratio) * 18;
+      const stockBoost = Math.max(0, 0.45 - ratio);
+      const prod = productionFor(name);
+      const prodBoost = prod <= 0 && ratio < 0.8 ? 0.25 : 0;
+      if (stockBoost <= 0 && prodBoost <= 0) continue;
+      if (helpsShortage(meta, name)) boost += (stockBoost + prodBoost) * (name === "coal" ? 42 : 26);
+      if (name === "coal" && keywords.some((word) => metaText(meta).includes(word))) boost += (stockBoost + prodBoost) * 22;
+    }
+    const iron = getRes(resources, "iron");
+    const coal = getRes(resources, "coal");
+    if (iron && coal && iron.unlocked !== false && coal.unlocked !== false && helpsShortage(meta, "coal")) {
+      const ironRatio = resRatio(resources, "iron", 0);
+      const coalRatio = resRatio(resources, "coal", 0);
+      boost += Math.max(0, ironRatio - coalRatio) * 30;
     }
     return boost;
   };
@@ -734,21 +807,67 @@
       .sort((a, b) => b.score - a.score);
   };
 
+  const TARGET_LOCK_MIN_MS = 120000;
+  const TARGET_LOCK_MAX_MS = 360000;
+  const TARGET_READY_GRACE_MS = 20000;
+  let activeTarget = null;
+
+  const targetId = (candidate) => candidate && candidate.meta ? `${candidate.kind}:${candidate.meta.name || labelOf(candidate.meta)}` : "";
+
+  const findCandidateById = (candidates, id) => candidates.find((candidate) => targetId(candidate) === id) || null;
+
+  const targetComplete = (candidate) => {
+    if (!candidate || !candidate.meta) return true;
+    if (candidate.kind === "research" || candidate.kind === "upgrade") return !!candidate.meta.researched;
+    if (candidate.kind === "build" && activeTarget && activeTarget.id === targetId(candidate)) {
+      return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
+    }
+    return false;
+  };
+
   const chooseWorkTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
-    return candidates.find((c) => !c.affordable && c.missing) || candidates.find((c) => c.affordable) || null;
+    const preferred = candidates.find((c) => !c.affordable && c.missing) || candidates.find((c) => c.affordable) || null;
+    const now = Date.now();
+
+    if (activeTarget) {
+      const locked = findCandidateById(candidates, activeTarget.id);
+      const age = now - activeTarget.startedAt;
+      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
+        activeTarget = null;
+      } else if (age < TARGET_LOCK_MIN_MS || !preferred || locked.score >= preferred.score * 0.7) {
+        return locked;
+      } else {
+        activeTarget = null;
+      }
+    }
+
+    if (preferred) {
+      activeTarget = {
+        id: targetId(preferred),
+        startedAt: now,
+        initialVal: preferred.kind === "build" ? preferred.meta.val || 0 : 0,
+      };
+    }
+    return preferred;
   };
 
   const resourceNeeds = (goalKey, resources) => {
     const needs = {};
     const target = chooseWorkTarget(resources, goalKey);
     if (target && !target.affordable) {
+      const rawRequirements = {};
       for (const cost of pricesFor(target.kind, target.meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         const res = getRes(resources, cost.name);
         const have = (res && res.value) || 0;
-        if (have < cost.val) scoreResourcePathNeed(needs, cost.name, 8 * (1 - Math.min(0.98, have / cost.val)) + 2);
+        if (have < cost.val) {
+          const missing = cost.val - have;
+          scoreResourcePathNeed(needs, cost.name, 4 * (1 - Math.min(0.98, have / cost.val)) + 1);
+          rawPathRequirements(cost.name, missing, rawRequirements);
+        }
       }
+      scoreRawDeficits(needs, resources, rawRequirements, 14);
     }
 
     // Safety and anti-waste: do not keep producing capped spendables; push low raw
