@@ -35,8 +35,8 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: job assignment, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
-| **Assist: jobs + advice** | Only assigns jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, target-aware workshop crafting, building, research, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
+| **Assist: jobs + advice** | Only rebalances jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
 actions (transcend, sacrifice unicorns/alicorns, time-skip, shatter time crystals).
@@ -51,6 +51,10 @@ The bottom-right box is a live dashboard:
   wasted (e.g. `science capped — build more storage`) or a *starved* one
   (e.g. `wood starved (refining catnip)`).
 - **🔬 Next science:** the next tech to aim for and what you still need for it.
+- **🧭 Plan:** the concrete building/research/upgrade target, what is missing, and a compact
+  have/need resource sheet.
+- **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
+- **🧰 Craft:** intermediate workshop input it is making right now, such as steel for gear.
 - **🎯 Now:** what it can build/buy right this second.
 - **Recent actions:** a running log of what it actually built / researched / upgraded,
   kept across the session so you can see it working.
@@ -75,19 +79,39 @@ The helper bar has two buttons in its header:
 
 Both choices are remembered between sessions.
 
+## Smarter target choice
+
+The helper no longer blindly chases the next visible button. It scores research, workshop
+upgrades, and buildings together, with extra priority for automation/unlock steps,
+production scale, storage when resources are capping, and population growth. That means it
+can choose to scale first when growth is better long-term, or rush science/automation when
+that unlocks the next important branch.
+
+## Workshop crafting prerequisites
+
+When the active target needs a crafted resource, the helper now follows the recipe chain
+and crafts the missing intermediate instead of waiting forever. For example, if a target
+needs **gear**, and you have enough ingredients to make **steel**, it will craft steel
+from iron + coal, then craft the higher-level item when possible. The same recipe-chain
+logic feeds job balancing, so missing steel pushes work toward the raw inputs behind it
+(coal/geologists and minerals/iron support) instead of treating steel as an impossible
+resource.
+
 ## Jobs & hunting (managed for you)
 
-The helper takes over **job assignment** and **hunting** directly (KS's own versions are
+The helper takes over **job rebalancing** and **hunting** directly (KS's own versions are
 turned off so they don't fight it):
 
-- **Idle kittens** are auto-assigned every few seconds to whatever's most needed —
-  food safety first, then the current bottleneck, then your goal (e.g. *Rush Space* favours
-  scholars). You'll see `👷 N → woodcutter` lines in the log.
-- **Pathway math:** when wood is short it compares *adding a woodcutter* (direct wood) vs
-  *adding a farmer* (catnip, which it refines into wood) using live production rates, and
-  picks whichever gives more wood per kitten.
-- **Hunters** are sent automatically whenever catpower is near full (`🏹 sent hunters`),
-  so you stop wasting it — hunting frequency is naturally limited by your catpower regen.
+- **All non-engineer kittens are rebalanced continuously**, not just idle kittens. If science
+  is capped, scholars are moved away; if faith is capped, priests are moved away; if the
+  current target mostly needs wood, workers move toward the best wood route. You'll see
+  `👷 rebalanced` lines in the log.
+- **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs
+  *farmer* (catnip, which it refines into wood) using live production rates, and picks
+  whichever gives more wood per kitten.
+- **Hunters** are sent automatically from the real game resource (`manpower`, displayed as
+  catpower) once there is enough for at least one hunt and before storage fills, so luxury
+  items get replenished instead of wasting capped catpower.
 
 ## If nothing seems to move
 
