@@ -1,0 +1,37 @@
+{
+  "description": "Control-friendly profile for an existing Kittens Game save. Automates job assignment, hunting, observing, time acceleration, and next-step advice while leaving most purchases/research in your control.",
+  "settings": {
+    "engine": {
+      "enabled": true,
+      "interval": 1500,
+      "ksColumn": { "enabled": true },
+      "highlighStock": { "enabled": false }
+    },
+    "village": {
+      "enabled": true,
+      "hunt": { "enabled": true, "trigger": 0.95 },
+      "promoteLeader": { "enabled": true },
+      "promoteKittens": { "enabled": false },
+      "jobs": {
+        "farmer": { "enabled": true, "max": 3 },
+        "woodcutter": { "enabled": true, "max": -1 },
+        "scholar": { "enabled": true, "max": -1 },
+        "miner": { "enabled": true, "max": -1 },
+        "hunter": { "enabled": true, "max": 4 },
+        "geologist": { "enabled": true, "max": -1 },
+        "priest": { "enabled": true, "max": -1 },
+        "engineer": { "enabled": true, "max": -1 }
+      }
+    },
+    "science": {
+      "enabled": true,
+      "observe": { "enabled": true }
+    },
+    "timeControl": {
+      "enabled": true,
+      "accelerateTime": { "enabled": true, "trigger": 1 },
+      "timeSkip": { "enabled": false, "trigger": 5, "max": 0 },
+      "reset": { "enabled": false }
+    }
+  }
+}

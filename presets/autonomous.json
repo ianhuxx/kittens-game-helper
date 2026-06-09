@@ -1,0 +1,56 @@
+{
+  "description": "Hands-off profile for an existing Kittens Game save. Automates safe forward progress: jobs, hunting, bonfire building, science, workshop upgrades, crafting, observing, and time acceleration. Prestige/reset automation remains disabled until you opt in after exporting a backup.",
+  "settings": {
+    "engine": {
+      "enabled": true,
+      "interval": 1000,
+      "ksColumn": { "enabled": true },
+      "highlighStock": { "enabled": false }
+    },
+    "bonfire": {
+      "enabled": true,
+      "trigger": 0.95,
+      "gatherCatnip": { "enabled": true },
+      "turnOnSteamworks": { "enabled": true },
+      "turnOnMagnetos": { "enabled": true },
+      "turnOnReactors": { "enabled": true },
+      "upgradeBuildings": { "enabled": false }
+    },
+    "village": {
+      "enabled": true,
+      "hunt": { "enabled": true, "trigger": 0.95 },
+      "holdFestivals": { "enabled": true },
+      "promoteLeader": { "enabled": true },
+      "promoteKittens": { "enabled": false },
+      "jobs": {
+        "farmer": { "enabled": true, "max": 2 },
+        "woodcutter": { "enabled": true, "max": -1 },
+        "scholar": { "enabled": true, "max": -1 },
+        "miner": { "enabled": true, "max": -1 },
+        "hunter": { "enabled": true, "max": 3 },
+        "geologist": { "enabled": true, "max": -1 },
+        "priest": { "enabled": true, "max": -1 },
+        "engineer": { "enabled": true, "max": -1 }
+      }
+    },
+    "science": {
+      "enabled": true,
+      "observe": { "enabled": true }
+    },
+    "workshop": {
+      "enabled": true,
+      "trigger": 0.95
+    },
+    "timeControl": {
+      "enabled": true,
+      "accelerateTime": { "enabled": true, "trigger": 1 },
+      "timeSkip": {
+        "enabled": true,
+        "trigger": 5,
+        "max": 0,
+        "ignoreOverheat": { "enabled": false }
+      },
+      "reset": { "enabled": false }
+    }
+  }
+}
