@@ -35,29 +35,34 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: job assignment, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It also **auto-tunes every build threshold** so it buys the moment something is affordable — you never touch a number. It plays the game for you. |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: job assignment, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
 | **Assist: jobs + advice** | Only assigns jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
 actions (transcend, sacrifice unicorns/alicorns, time-skip, shatter time crystals).
 So it always *continues* your existing game — it will never reset it behind your back.
 
-## The "what next" advisor
+## What the panel shows
 
-The bottom-right box shows two live lines:
+The bottom-right box is a live dashboard:
 
-- **NOW:** something you can afford right now (Autopilot buys these for you).
-- **NEXT:** the closest thing you can't afford yet, and exactly how much you're missing,
-  e.g. `NEXT: research Construction — need 1.20K science, 300 minerals`.
+- **KS engine:** `running ✓` / `stopped` — confirms automation is actually ticking.
+- **⚖ Bottleneck:** the thing currently holding you back — a *capped* resource being
+  wasted (e.g. `science capped — build more storage`) or a *starved* one
+  (e.g. `wood starved (refining catnip)`).
+- **🔬 Next science:** the next tech to aim for and what you still need for it.
+- **🎯 Now:** what it can build/buy right this second.
+- **Recent actions:** a running log of what it actually built / researched / upgraded,
+  kept across the session so you can see it working.
 
 ## If nothing seems to move
 
 - Check the **KS engine:** line in the box — it should say **running ✓**. If it says
   *stopped*, click **Apply**.
-- Autopilot auto-sets every build/research/craft **trigger to "as soon as affordable"**,
-  so you never have to tune thresholds. Click **Apply** to re-apply.
-- Early game is resource-limited: read the **NEXT:** line — it's waiting on the listed
-  resource. Hunting/crafting will catch up.
+- Autopilot auto-sets every build/research **trigger to "as soon as affordable"** and
+  refines surplus catnip into wood, so you never tune thresholds. Click **Apply** to re-apply.
+- Read the **⚖ Bottleneck** line — it names the exact resource holding you back and what
+  the helper is doing about it.
 
 ## Turning on resets later (advanced, optional)
 
