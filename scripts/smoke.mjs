@@ -427,7 +427,18 @@ check("gateway: Machinery (unlocks Steamworks) researched first", techs[1].resea
 check("gateway: filler tech with no unlocks left waiting", techs[2].researched === false);
 check("reservation: Mine never bought during the whole run", buildings[1].val === 2);
 
-/* Stage 4 — crafted intermediates must be bought in the same tick, even while throttled */
+/* Stage 4 — focused goals must not turn capped science into endless Libraries */
+storage.set("kgh.goal", "production");
+fakeNow += 370000; // let the previous balanced-mode lock expire
+res("wood").value = 800;
+res("science").maxValue = 6000;
+res("science").value = 6000;
+const libraryBeforeProductionFocus = buildings[0].val;
+const mineBeforeProductionFocus = buildings[1].val;
+tickFn();
+check("focus: production goal spends on Mine instead of science storage", buildings[1].val === mineBeforeProductionFocus + 1 && buildings[0].val === libraryBeforeProductionFocus);
+
+/* Stage 5 — crafted intermediates must be bought in the same tick, even while throttled */
 techs.forEach((tech) => { tech.researched = true; });
 policies.forEach((policy) => { policy.researched = true; });
 religionUpgrades.forEach((upgrade) => { upgrade.researched = true; upgrade.on = 1; upgrade.val = 1; });

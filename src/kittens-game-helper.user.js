@@ -524,8 +524,10 @@
     return tickCache.target;
   };
 
-  const getStoragePressureCached = (resources, goal) => {
-    if (!tickCache.pressure) tickCache.pressure = storageBlockPressure(resources, goal);
+  const goalKeyFor = (goal) => Object.entries(GOALS).find(([, info]) => info === goal)?.[0] || getGoal();
+
+  const getStoragePressureCached = (resources, goal, goalKey = goalKeyFor(goal)) => {
+    if (!tickCache.pressure) tickCache.pressure = storageBlockPressure(resources, goal, goalKey);
     return tickCache.pressure;
   };
 
@@ -1155,17 +1157,30 @@
     return resources;
   };
 
-  const storageBlockPressure = (resources, goal) => {
+  const storageBlockPressure = (resources, goal, goalKey) => {
     const pressure = {};
+    const goalFrontier = goalFrontierNames(goalKey);
+    const storageBlockerIsFocused = (kind, meta) => {
+      const text = metaText(meta);
+      if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) return true;
+      if (kind === "research") {
+        if (goalFrontier.has(meta.name)) return true;
+        // Balanced mode may still chase true gateway techs, but focused modes
+        // should not convert every capped science bank into more Libraries.
+        return goalKey === "balanced" && (gatewayValue(meta) >= 1 || /theology|philosophy|machinery|rocketry/.test(text));
+      }
+      if (kind === "upgrade" || kind === "religion") return true;
+      return /steamworks|factory|magneto|reactor|accelerator|harbor|warehouse|tank|container|mansion|amphitheat|temple/.test(text);
+    };
     const visit = (kind, meta) => {
       if (!isOpen(meta)) return;
       const blockers = directStorageBlockers(kind, meta, resources);
-      if (!blockers.length) return;
+      if (!blockers.length || !storageBlockerIsFocused(kind, meta)) return;
       let weight = kind === "research" ? 34 : kind === "upgrade" ? 24 : 14;
       if (/theology|philosophy|cryptotheology|scholasticism|rocketry/.test(metaText(meta))) weight += 26;
       if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) weight += 18;
       for (const blocker of blockers) {
-        // Prefer storage that makes near-term goals reachable.  A tech that is
+        // Prefer storage that makes the current focus reachable. A tech that is
         // wildly beyond the current cap (e.g. 617K science vs 29K cap) should not
         // drown out a plan that is only waiting on gatherable resources.
         const closeness = Math.max(0.05, Math.min(1, blocker.max / Math.max(1, blocker.need)));
@@ -1198,8 +1213,8 @@
     return pressure;
   };
 
-  const storageReliefBoost = (meta, resources, goal) => {
-    const pressure = getStoragePressureCached(resources, goal);
+  const storageReliefBoost = (meta, resources, goal, goalKey) => {
+    const pressure = getStoragePressureCached(resources, goal, goalKey);
     const relieves = storageReliefResources(meta);
     let boost = 0;
     for (const [name, amount] of Object.entries(pressure)) {
@@ -1306,22 +1321,23 @@
     return names;
   };
 
-  const strategicBoost = (kind, meta, resources, goal) => {
+  const strategicBoost = (kind, meta, resources, goal, goalKey) => {
     const text = effectText(meta);
+    const pressure = getStoragePressureCached(resources, goal, goalKey);
     let boost = 0;
     if (/automation|factory|engineer|steam|steamworks|magneto|reactor|accelerator|calciner/.test(text)) boost += 12;
     if (kind === "upgrade") boost += 10;
     if (/machinery|steel|workshop automation|printing press|factory automation|coal furnace|geodesy|astrophysicists/.test(text)) boost += 14;
     if (kind === "build" && /steamworks/.test(metaText(meta))) boost += 28;
-    const storageRelief = storageReliefBoost(meta, resources, goal);
+    const storageRelief = storageReliefBoost(meta, resources, goal, goalKey);
     if (storageRelief > 0) boost += storageRelief;
     if (isStorageMeta(meta)) {
-      const capped = ["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some(
+      const rawCapped = ["wood", "minerals", "iron", "coal", "oil", "uranium"].some(
         (name) => resRatio(resources, name, 0) > 0.9,
       );
-      boost += capped || storageRelief > 0 ? 10 : -3;
+      boost += rawCapped || storageRelief > 0 ? 10 : -3;
     }
-    if (/library|academy|observatory|biolab|data center/.test(text)) boost += resRatio(resources, "science", 0) > 0.75 ? 6 : 2;
+    if (/library|academy|observatory|biolab|data center/.test(text)) boost += pressure.science > 0 ? (resRatio(resources, "science", 0) > 0.75 ? 6 : 2) : -8;
     if (/hut|house|mansion|population|kitten/.test(text)) boost += 4;
     if (kind === "upgrade" && /furnace|coal|pyrolysis|combustion|smelter/.test(text)) boost += 5;
     if (kind === "research" && hasPrice(kind, meta, "science") && resRatio(resources, "science", 0) > 0.7) boost += 10;
@@ -1525,7 +1541,7 @@
     }
     return kindWeight + affordBonus + recursiveBoost +
       shortageBoost(candidate.meta, resources) +
-      strategicBoost(candidate.kind, candidate.meta, resources, goal) -
+      strategicBoost(candidate.kind, candidate.meta, resources, goal, goalKey) -
       waitPenalty - storagePenalty - storageBlockPenalty;
   };
 
@@ -1655,7 +1671,7 @@
       }
     }
 
-    for (const [name, amount] of Object.entries(getStoragePressureCached(resources, GOALS[goalKey]))) {
+    for (const [name, amount] of Object.entries(getStoragePressureCached(resources, GOALS[goalKey], goalKey))) {
       scoreNeed(needs, name, Math.min(18, amount / 3));
     }
 
@@ -2516,7 +2532,7 @@
     const goal = GOALS[goalKey];
     const text = effectText(meta);
     const { cons } = summarizeEffects(meta);
-    let score = strategicBoost("policy", meta, resources, goal) + shortageBoost(meta, resources);
+    let score = strategicBoost("policy", meta, resources, goal, goalKey) + shortageBoost(meta, resources);
     if (/liberty|tradition|monarchy|republic|technocracy|liberalism|communism|fascism/.test(text)) score += 8;
     if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) score += 18;
     if (goalKey === "production" && /production|worker|mineral|wood|coal|craft|engineer|communism/.test(text)) score += 18;
