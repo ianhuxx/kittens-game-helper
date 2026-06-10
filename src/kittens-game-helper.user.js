@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.10.3
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.11.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -52,7 +52,7 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, selects productive leaders, converts near-capped resources into useful crafts, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
@@ -388,7 +388,7 @@
     if (["minerals", "iron", "titanium", "uranium"].includes(name)) return "minerals";
     if (["coal", "gold"].includes(name)) return "coal";
     if (["furs", "ivory", "unicorns"].includes(name)) return "manpower";
-    if (["science", "blueprint", "compendium"].includes(name)) return "science";
+    if (["science", "blueprint", "compendium", "compedium"].includes(name)) return "science";
     if (name === "faith") return "faith";
     return name;
   };
@@ -492,6 +492,67 @@
       return true;
     }
     return false;
+  };
+
+
+  const OVERFLOW_CRAFTS = ["beam", "slab", "plate", "steel", "gear", "concrate", "alloy", "eludium", "scaffold", "ship", "parchment", "manuscript", "compedium", "blueprint"];
+  let overflowPlanText = "Overflow: watching storage";
+  let lastOverflowLog = 0;
+
+  const wouldWasteResource = (resources, name) => {
+    const res = getRes(resources, name);
+    if (!res || !res.maxValue || res.unlocked === false) return false;
+    const ratio = res.value / res.maxValue;
+    const net = typeof res.perTickCached === "number" ? res.perTickCached : productionFor(name);
+    return ratio > 0.93 || (ratio > 0.86 && net > 0);
+  };
+
+  const targetNeedsResource = (target, name) => {
+    if (!target) return false;
+    return pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === name && cost.val > ((getRes(resourceMap(), name) || { value: 0 }).value || 0));
+  };
+
+  const craftOverflowResources = (resources, goalKey) => {
+    try {
+      const target = chooseWorkTarget(resources, goalKey);
+      const scored = [];
+      for (const name of OVERFLOW_CRAFTS) {
+        const craft = craftByName(name);
+        if (!craft) continue;
+        const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+        if (!prices.length) continue;
+        const output = getRes(resources, name);
+        if (output && output.maxValue && output.value / output.maxValue > 0.92 && !targetNeedsResource(target, name)) continue;
+        const hotInputs = prices.filter((price) => wouldWasteResource(resources, price.name));
+        if (!hotInputs.length && !targetNeedsResource(target, name)) continue;
+        let maxUnits = Number.MAX_VALUE;
+        for (const price of prices) {
+          const input = getRes(resources, price.name);
+          const value = (input && input.value) || 0;
+          const reserve = craftReserveFor(resources, price.name);
+          maxUnits = Math.min(maxUnits, Math.floor(Math.max(0, value - reserve) / price.val));
+        }
+        if (!isFinite(maxUnits) || maxUnits < 1) continue;
+        const targetBoost = targetNeedsResource(target, name) ? 100 : 0;
+        const heat = hotInputs.reduce((sum, price) => sum + Math.max(0, resRatio(resources, price.name, 0) - 0.86), 0);
+        scored.push({ name, maxUnits, score: targetBoost + heat });
+      }
+      const best = scored.sort((a, b) => b.score - a.score)[0];
+      if (!best) {
+        overflowPlanText = "Overflow: watching storage";
+        return;
+      }
+      const units = Math.max(1, Math.min(best.maxUnits, best.score >= 100 ? Math.ceil(best.maxUnits * 0.5) : Math.ceil(best.maxUnits * 0.2)));
+      if (craftUnits(best.name, units)) {
+        overflowPlanText = `Overflow: converted surplus into ${craftLabel(best.name)}`;
+        if (Date.now() - lastOverflowLog > 20000) {
+          pushLog(`📦 ${overflowPlanText}`);
+          lastOverflowLog = Date.now();
+        }
+      }
+    } catch (error) {
+      /* ignore */
+    }
   };
 
   const craftTowardTarget = (resources, goalKey) => {
@@ -1219,6 +1280,81 @@
     }
   };
 
+
+  /* -------------------------- leader specialization -------------------------- */
+
+  const LEADER_RECHECK_MS = 90000;
+  let lastLeaderCheck = 0;
+  let leaderPlanText = "Leader: waiting…";
+
+  const desiredLeaderTraits = (goalKey, resources) => {
+    const target = chooseWorkTarget(resources, goalKey);
+    const traits = [];
+    const text = target ? `${target.kind} ${effectText(target.meta)}` : "";
+    const costs = target ? pricesFor(target.kind, target.meta).map((cost) => cost && cost.name).filter(Boolean) : [];
+
+    if ((target && target.kind === "research") || costs.includes("science") || goalKey === "space") traits.push("scientist");
+    if (costs.some((name) => ["steel", "gear", "alloy", "plate"].includes(name)) || /steel|gear|alloy|plate|coal|smelter|furnace/.test(text)) traits.push("metallurgist");
+    if (costs.some((name) => ["concrate", "kerosene", "thorium", "eludium"].includes(name)) || /concrete|concrate|kerosene|thorium|reactor|eludium/.test(text)) traits.push("chemist");
+    if (costs.some((name) => ["beam", "slab", "parchment", "manuscript", "compedium", "blueprint"].includes(name)) || /workshop|craft|beam|slab|blueprint/.test(text)) traits.push("engineer");
+    if (huntingEconomyNeed(resources) > 3 || resRatio(resources, "manpower", 0) < 0.35) traits.push("manager");
+    if (target && target.kind === "trade") traits.push("merchant");
+    if (costs.includes("faith") || goalKey === "production" && resRatio(resources, "faith", 1) < 0.6) traits.push("wise");
+    traits.push("engineer", "scientist", "manager", "metallurgist", "wise", "merchant", "chemist");
+    return [...new Set(traits)];
+  };
+
+  const kittenScore = (kitten, traitName, targetJob) => {
+    let score = 0;
+    if (kitten.trait && kitten.trait.name === traitName) score += 1000;
+    if (kitten.job && kitten.job === targetJob) score += 120;
+    if (kitten.isLeader) score += 25;
+    score += Math.min(500, (kitten.rank || 0) * 30 + ((kitten.exp || 0) / 500));
+    try {
+      const skills = kitten.skills || {};
+      const skill = skills[targetJob];
+      if (skill && isFinite(skill)) score += Math.min(150, skill / 10);
+    } catch (error) {
+      /* ignore */
+    }
+    return score;
+  };
+
+  const maybeSelectLeader = (goalKey, resources) => {
+    try {
+      const now = Date.now();
+      if (now - lastLeaderCheck < LEADER_RECHECK_MS) return;
+      lastLeaderCheck = now;
+      const village = window.gamePage.village;
+      if (!village || typeof village.makeLeader !== "function" || !village.sim || !Array.isArray(village.sim.kittens)) return;
+      const kittens = village.sim.kittens.filter((kitten) => kitten && kitten.trait && kitten.trait.name && kitten.trait.name !== "none");
+      if (!kittens.length) return;
+      const traits = desiredLeaderTraits(goalKey, resources);
+      const { needs } = resourceNeeds(goalKey, resources);
+      const bestNeed = Object.entries(needs).sort((a, b) => b[1] - a[1])[0];
+      const targetJob = bestNeed ? (RES_JOB[bestNeed[0]] || bestNeed[0]) : "engineer";
+      let best = null;
+      for (const trait of traits) {
+        const candidate = kittens
+          .filter((kitten) => kitten.trait && kitten.trait.name === trait)
+          .sort((a, b) => kittenScore(b, trait, targetJob) - kittenScore(a, trait, targetJob))[0];
+        if (candidate) {
+          best = { kitten: candidate, trait };
+          break;
+        }
+      }
+      if (!best || best.kitten.isLeader) {
+        if (village.leader) leaderPlanText = `Leader: ${village.leader.trait.title || village.leader.trait.name} (${village.leader.name || "kitten"})`;
+        return;
+      }
+      village.makeLeader(best.kitten);
+      leaderPlanText = `Leader: ${best.kitten.trait.title || best.trait} (${best.kitten.name || "kitten"})`;
+      pushLog(`👑 ${leaderPlanText}`);
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
   /* ------------------------------- main loop -------------------------------- */
 
   let statusEl;
@@ -1227,6 +1363,8 @@
   let scienceEl;
   let planEl;
   let jobsEl;
+  let leaderEl;
+  let craftEl;
   let nowEl;
 
   const engineRunning = () => {
@@ -1243,7 +1381,9 @@
       const goal = getGoal();
       refineSurplusCatnip();
       craftTowardTarget(resources, goal);
+      craftOverflowResources(resources, goal);
       balanceJobs(goal, resources);
+      maybeSelectLeader(goal, resources);
       autoHunt(resources);
       trackActions();
       if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
@@ -1256,6 +1396,8 @@
       if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
       if (planEl) planEl.textContent = getPlanLine(resources, goal);
       if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
+      if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
+      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
       /* ignore */
@@ -1315,6 +1457,8 @@
       '<small class="kgh-science" style="color:#bfe6a0">…</small>',
       '<small class="kgh-plan" style="color:#a7e8e0">…</small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
+      '<small class="kgh-leader" style="color:#ffd18f">…</small>',
+      '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
       '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
@@ -1336,6 +1480,8 @@
     scienceEl = box.querySelector(".kgh-science");
     planEl = box.querySelector(".kgh-plan");
     jobsEl = box.querySelector(".kgh-jobs");
+    leaderEl = box.querySelector(".kgh-leader");
+    craftEl = box.querySelector(".kgh-craft");
     nowEl = box.querySelector(".kgh-now");
     logBox = box.querySelector(".kgh-log");
 

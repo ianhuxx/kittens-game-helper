@@ -54,6 +54,8 @@ The bottom-right box is a live dashboard:
 - **🧭 Plan:** the concrete building/research/upgrade target, what is missing, and a compact
   have/need resource sheet.
 - **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
+- **👑 Leader:** the currently selected leader trait/kitten chosen for the active bottleneck.
+- **🧰 Craft:** prerequisite crafting plus overflow conversions that prevent near-capped inputs from being wasted.
 - **🎯 Now:** what it can build/buy right this second.
 - **Recent actions:** a running log of what it actually built / researched / upgraded,
   kept across the session so you can see it working.
@@ -90,17 +92,37 @@ when coal production is the thing blocking progress.
 Resource-starvation upgrades are part of that scoring too: if coal is depleted, upgrades
 whose names/effects/unlocks help coal or smelters get a large boost, so **Coal Furnace**
 can beat a random affordable build and become the active plan. Similar hints exist for
-wood, minerals/iron, catnip, science, manpower/hunting, and faith.
+wood, minerals/iron, catnip, science, manpower/hunting, and faith. The active plan is
+kept stable for a short lock window so the helper does not thrash between projects every
+tick when several candidates are close.
 
-## Workshop crafting prerequisites
+## Workshop crafting prerequisites and overflow control
 
-When the active target needs a crafted resource, the helper now follows the recipe chain
+When the active target needs a crafted resource, the helper follows the recipe chain
 and crafts the missing intermediate instead of waiting forever. For example, if a target
 needs **gear**, and you have enough ingredients to make **steel**, it will craft steel
 from iron + coal, then craft the higher-level item when possible. The same recipe-chain
 logic feeds job balancing, so missing steel pushes work toward the raw inputs behind it
 (coal/geologists and minerals/iron support) instead of treating steel as an impossible
 resource.
+
+It also watches resource storage pressure. If wood, minerals, iron, coal, culture/science
+inputs, or other craft inputs are close to capping, it converts a conservative slice into
+useful workshop goods such as beams, slabs, plates, steel, gears, parchment, manuscripts,
+compediums, or blueprints. It keeps reserves (especially catnip for food and catpower for
+hunting) and prefers the craft that helps the current plan, so overflow becomes progress
+instead of waste.
+
+
+## Leader selection
+
+The helper now elects a leader when the village has eligible kittens. It picks the trait
+that best matches the current bottleneck: scientists for science-heavy research,
+metallurgists for steel/gear/plate paths, chemists for concrete/kerosene/thorium paths,
+engineers for general crafting, managers when hunting and happiness are lagging, merchants
+for trade-heavy work, and wise kittens for faith/religion pressure. It does **not** promote
+kittens with gold; it only chooses the best existing leader so the run gets the free trait
+bonus without spending rare resources.
 
 ## Jobs & hunting (managed for you)
 
@@ -123,7 +145,7 @@ turned off so they don't fight it):
 
 ## If the helper disappears after reinstalling
 
-Version **0.10.2** fixes a userscript syntax conflict that could stop the entire
+Version **0.10.2** and newer fixes a userscript syntax conflict that could stop the entire
 plugin before the 🐱 helper panel was drawn. If the box is missing after an update,
 open Tampermonkey and make sure the installed script header shows `@version 0.10.2`
 or newer, then refresh the Kittens Game tab.
