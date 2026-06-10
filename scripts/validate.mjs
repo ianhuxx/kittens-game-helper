@@ -33,6 +33,14 @@ const required = [
   "maybeSelectLeader",
   "kgh-leader",
   "kgh-craft",
+  // Ready-now purchases must use the game UI controllers first so workshop
+  // upgrades and bonfire buildings behave like hand-clicked buttons.
+  "buyViaGameController",
+  "UpgradeButtonController",
+  "BuildingBtnModernController",
+  // The plan should include a rough completion estimate.
+  "formatEta",
+  "ETA",
   // Kittens Game intentionally spells this resource ID as compedium.
   "compedium",
 ];
