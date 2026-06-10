@@ -1,6 +1,6 @@
 {
   "name": "kittens-game-helper",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "One-click Kittens Game autopilot built on Kitten Scientists, with smart leader selection, overflow crafting, and a next-action advisor. Continues your existing browser save; prestige resets stay off.",
   "private": true,
   "type": "module",
