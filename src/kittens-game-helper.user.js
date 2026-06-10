@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.11.0
+// @version      0.11.1
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -1276,6 +1276,76 @@
     return ready ? `${ready.kind} ${labelOf(ready.meta)}` : "gathering…";
   };
 
+
+  const AUTOBUY_MIN_MS = 2500;
+  let lastAutoBuy = 0;
+
+  const purchaseComplete = (candidate, initialVal) => {
+    if (!candidate || !candidate.meta) return false;
+    if (candidate.kind === "build") return ((candidate.meta.val || 0) > (initialVal || 0));
+    return !!candidate.meta.researched;
+  };
+
+  const purchaseAttemptsFor = (candidate) => {
+    const game = window.gamePage;
+    const meta = candidate.meta;
+    const name = meta && meta.name;
+    if (!game || !meta || !name) return [];
+    if (candidate.kind === "research") {
+      return [
+        () => game.science && typeof game.science.research === "function" && game.science.research(name),
+        () => game.science && typeof game.science.research === "function" && game.science.research(meta),
+      ];
+    }
+    if (candidate.kind === "upgrade") {
+      return [
+        () => game.workshop && typeof game.workshop.research === "function" && game.workshop.research(name),
+        () => game.workshop && typeof game.workshop.research === "function" && game.workshop.research(meta),
+      ];
+    }
+    if (candidate.kind === "build") {
+      return [
+        () => game.bld && typeof game.bld.build === "function" && game.bld.build(name),
+        () => game.bld && typeof game.bld.build === "function" && game.bld.build(name, 1),
+        () => game.bld && typeof game.bld.construct === "function" && game.bld.construct(name),
+      ];
+    }
+    return [];
+  };
+
+  // KS sometimes leaves Workshop automation disabled because that same section also
+  // controls bulk crafting. Backstop it here: if our advisor sees a genuinely
+  // affordable item, click the same game API the button would have used instead
+  // of waiting for KS to notice. Assist mode stays advisory-only.
+  const autoBuyReady = (resources, goalKey) => {
+    try {
+      if (getProfileName() !== "autopilot") return;
+      const now = Date.now();
+      if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
+      const candidates = gatherCandidates(resources, goalKey);
+      const locked = activeTarget && findCandidateById(candidates, activeTarget.id);
+      const ready = (locked && locked.affordable ? locked : null) || candidates.find((candidate) => candidate.affordable);
+      if (!ready) return;
+      lastAutoBuy = now;
+
+      const initialVal = ready.kind === "build" ? ready.meta.val || 0 : 0;
+      for (const attempt of purchaseAttemptsFor(ready)) {
+        try {
+          attempt();
+        } catch (error) {
+          /* try the next API shape */
+        }
+        if (purchaseComplete(ready, initialVal)) {
+          if (activeTarget && activeTarget.id === targetId(ready)) activeTarget = null;
+          pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} auto ${ready.kind} ${labelOf(ready.meta)}`);
+          return;
+        }
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
   /* ------------------------------ action log -------------------------------- */
 
   let actionLog = [];
@@ -1440,6 +1510,7 @@
       refineSurplusCatnip();
       craftTowardTarget(resources, goal);
       craftOverflowResources(resources, goal);
+      autoBuyReady(resourceMap(), goal);
       balanceJobs(goal, resources);
       maybeSelectLeader(goal, resources);
       autoHunt(resources);
