@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.11.1
+// @version      0.11.2
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -751,11 +751,40 @@
     return keywords.some((word) => text.includes(word));
   };
 
+  const ticksPerSecond = () => {
+    try {
+      const game = window.gamePage;
+      for (const key of ["getTicksPerSecondUI", "getTicksPerSecond"]) {
+        if (game && typeof game[key] === "function") {
+          const value = game[key]();
+          if (isFinite(value) && value > 0) return value;
+        }
+      }
+      for (const value of [game && game.ticksPerSecond, game && game.rate]) {
+        if (isFinite(value) && value > 0) return value;
+      }
+    } catch (error) {
+      /* use the browser default below */
+    }
+    return 5;
+  };
+
+  // Kittens Game stores production as per-tick values internally, while the left
+  // resource column shows per-second rates. ETAs must use the same unit players
+  // see, and they must include buildings/processors, not only village jobs.
   const productionFor = (name) => {
     try {
-      const prod = window.gamePage.village.getResProduction ? window.gamePage.village.getResProduction() : {};
-      const value = prod[name === "catpower" ? "manpower" : name];
-      return isFinite(value) ? value : 0;
+      const game = window.gamePage;
+      const resourceName = name === "catpower" ? "manpower" : name;
+      if (game && typeof game.getResourcePerTick === "function") {
+        const perTick = game.getResourcePerTick(resourceName, true);
+        if (isFinite(perTick)) return perTick * ticksPerSecond();
+      }
+      const res = getRes(resourceMap(), resourceName);
+      if (res && isFinite(res.perTickCached)) return res.perTickCached * ticksPerSecond();
+      const prod = game && game.village && game.village.getResProduction ? game.village.getResProduction() : {};
+      const value = prod[resourceName];
+      return isFinite(value) ? value * ticksPerSecond() : 0;
     } catch (error) {
       return 0;
     }
@@ -852,6 +881,137 @@
     return Math.max(direct, direct + Math.max(0, catnipToWood));
   };
 
+  const buildingByName = (name) => buildingMetas().find((meta) => meta && meta.name === name) || null;
+
+  const effectResourceName = (effectKey) => {
+    const match = String(effectKey || "").match(/^([a-z][a-z0-9]*)(?:PerTick|PerTickBase|PerTickAutoprod)$/i);
+    return match ? match[1] : null;
+  };
+
+  const resourceNamesFromPrices = (kind, meta) =>
+    pricesFor(kind, meta)
+      .map((cost) => cost && cost.name)
+      .filter(Boolean);
+
+  const processingProfileFor = (meta) => {
+    const effects = (meta && meta.effects) || {};
+    const inputs = [];
+    const outputs = [];
+    for (const [key, value] of Object.entries(effects)) {
+      if (!isFinite(value) || value === 0) continue;
+      const name = effectResourceName(key);
+      if (!name) continue;
+      if (value < 0) inputs.push(name);
+      if (value > 0) outputs.push(name);
+    }
+    return { inputs: [...new Set(inputs)], outputs: [...new Set(outputs)] };
+  };
+
+  const PROCESSOR_NAMES = ["smelter", "calciner"];
+  const PROCESSOR_INPUTS = {
+    smelter: ["wood", "minerals"],
+    calciner: ["minerals", "oil"],
+  };
+  const PROCESSOR_OUTPUTS = {
+    smelter: ["iron", "coal", "gold", "titanium"],
+    calciner: ["iron", "titanium", "coal"],
+  };
+  const pausedProcessors = {};
+  let processingPlanText = "Processing: watching converters";
+  let lastProcessingLog = 0;
+
+  const refreshAfterProcessorChange = () => {
+    try {
+      const game = window.gamePage;
+      if (game && game.bld && typeof game.bld.updateEffects === "function") game.bld.updateEffects();
+      if (game && typeof game.updateResources === "function") game.updateResources();
+      if (game && game.bonfireTab && typeof game.bonfireTab.updateTab === "function") game.bonfireTab.updateTab();
+    } catch (error) {
+      /* ignore UI refresh failures */
+    }
+  };
+
+  const setProcessorOn = (meta, count) => {
+    if (!meta || !isFinite(count)) return false;
+    const next = Math.max(0, Math.min(meta.val || 0, Math.floor(count)));
+    if ((meta.on || 0) === next) return false;
+    meta.on = next;
+    refreshAfterProcessorChange();
+    return true;
+  };
+
+  const missingDirectCosts = (target, resources) => {
+    const missing = new Set();
+    if (!target) return missing;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources, cost.name) || {}).value) || 0;
+      if (have + craftablePotential(cost.name) < cost.val) missing.add(cost.name);
+    }
+    return missing;
+  };
+
+  const resourcesNeededForTarget = (target, resources) => {
+    const needed = new Set(resourceNamesFromPrices(target.kind, target.meta));
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources, cost.name) || {}).value) || 0;
+      const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
+      if (deficit <= 0) continue;
+      const raw = {};
+      rawPathRequirements(cost.name, deficit, raw);
+      for (const name of Object.keys(raw)) needed.add(name);
+    }
+    return needed;
+  };
+
+  const optimizeProcessing = (resources, goalKey) => {
+    try {
+      const target = chooseWorkTarget(resources, goalKey);
+      if (!target) {
+        processingPlanText = "Processing: watching converters";
+        return;
+      }
+      const missing = missingDirectCosts(target, resources);
+      const needed = resourcesNeededForTarget(target, resources);
+      const changed = [];
+
+      for (const name of PROCESSOR_NAMES) {
+        const meta = buildingByName(name);
+        if (!meta || !meta.val) continue;
+        const profile = processingProfileFor(meta);
+        const inputs = profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || [];
+        const outputs = profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || [];
+        const conflictingInputs = inputs.filter((input) => missing.has(input) && resRatio(resources, input, 1) < 0.85);
+        const usefulOutputs = outputs.filter((output) => needed.has(output));
+        const shouldPause = conflictingInputs.length > 0 && usefulOutputs.length === 0;
+        const currentOn = Math.max(0, meta.on || 0);
+
+        if (shouldPause && currentOn > 0) {
+          pausedProcessors[name] = { on: currentOn, label: labelOf(meta) };
+          if (setProcessorOn(meta, 0)) changed.push(`paused ${labelOf(meta)} (saving ${conflictingInputs.map((input) => resTitle(resources, input)).join("+")})`);
+        } else if (!shouldPause && pausedProcessors[name]) {
+          const restore = Math.min(meta.val || 0, pausedProcessors[name].on || meta.val || 0);
+          if (setProcessorOn(meta, restore)) changed.push(`resumed ${labelOf(meta)}`);
+          delete pausedProcessors[name];
+        }
+      }
+
+      if (changed.length) {
+        processingPlanText = `Processing: ${changed.join("; ")} for ${labelOf(target.meta)}`;
+        if (Date.now() - lastProcessingLog > 20000) {
+          pushLog(`⚙ ${processingPlanText}`);
+          lastProcessingLog = Date.now();
+        }
+      } else {
+        const paused = Object.values(pausedProcessors).map((item) => item.label).filter(Boolean);
+        processingPlanText = paused.length ? `Processing: paused ${paused.join(", ")}` : "Processing: converters balanced";
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
   const waitSecondsForCandidate = (candidate, resources) => {
     if (candidate.affordable) return 0;
     let worst = 0;
@@ -868,9 +1028,7 @@
         continue;
       }
       for (const [name, amount] of rawEntries) {
-        const res = getRes(resources, name);
-        const rawHave = Math.max(0, (res && res.value) || 0);
-        const missing = Math.max(0, amount - rawHave);
+        const missing = Math.max(0, amount);
         const prod = rawProductionForNeed(name);
         if (missing <= 0) continue;
         if (prod <= 0) return Number.POSITIVE_INFINITY;
@@ -1612,6 +1770,7 @@
   let jobsEl;
   let leaderEl;
   let craftEl;
+  let processingEl;
   let nowEl;
 
   const engineRunning = () => {
@@ -1629,6 +1788,7 @@
       refineSurplusCatnip();
       craftTowardTarget(resources, goal);
       craftOverflowResources(resources, goal);
+      optimizeProcessing(resourceMap(), goal);
       autoBuyReady(resourceMap(), goal);
       balanceJobs(goal, resources);
       maybeSelectLeader(goal, resources);
@@ -1646,6 +1806,7 @@
       if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
+      if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
       /* ignore */
@@ -1707,6 +1868,7 @@
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
+      '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
       '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
@@ -1730,6 +1892,7 @@
     jobsEl = box.querySelector(".kgh-jobs");
     leaderEl = box.querySelector(".kgh-leader");
     craftEl = box.querySelector(".kgh-craft");
+    processingEl = box.querySelector(".kgh-processing");
     nowEl = box.querySelector(".kgh-now");
     logBox = box.querySelector(".kgh-log");
 
