@@ -279,6 +279,9 @@
       if (kind === "build" && window.gamePage.bld.getPrices) {
         return window.gamePage.bld.getPrices(meta.name) || meta.prices || [];
       }
+      if (kind === "research" && window.gamePage.science.getPrices) {
+        return window.gamePage.science.getPrices(meta) || meta.prices || [];
+      }
     } catch (error) {
       /* ignore */
     }
@@ -1259,13 +1262,28 @@
     return parts.slice(0, 4).join(" · ");
   };
 
+  const formatEta = (seconds) => {
+    if (!isFinite(seconds)) return "unknown";
+    if (seconds <= 0) return "now";
+    if (seconds < 60) return `≈${Math.ceil(seconds)}s`;
+    const minutes = Math.ceil(seconds / 60);
+    if (minutes < 60) return `≈${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    const remMinutes = minutes % 60;
+    if (hours < 24) return `≈${hours}h${remMinutes ? ` ${remMinutes}m` : ""}`;
+    const days = Math.floor(hours / 24);
+    const remHours = hours % 24;
+    return `≈${days}d${remHours ? ` ${remHours}h` : ""}`;
+  };
+
   const getPlanLine = (resources, goalKey) => {
     try {
       const target = chooseWorkTarget(resources, goalKey);
       if (!target) return "🧭 Plan: scanning unlocked buildings/research";
       const reqs = formatRequirements(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : `missing ${target.missing || "prerequisites"}`;
-      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state}${reqs ? ` (${reqs})` : ""}`;
+      const eta = formatEta(waitSecondsForCandidate(target, resources));
+      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
       return "🧭 Plan: —";
     }
@@ -1286,31 +1304,132 @@
     return !!candidate.meta.researched;
   };
 
+  const getGlobalPath = (path) => {
+    try {
+      return path.reduce((node, key) => node && node[key], window);
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const controllerSpecFor = (kind) => {
+    if (kind === "research") {
+      return {
+        path: ["com", "nuclearunicorn", "game", "ui", "TechButtonController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
+    if (kind === "upgrade") {
+      return {
+        path: ["com", "nuclearunicorn", "game", "ui", "UpgradeButtonController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
+    if (kind === "build") {
+      return {
+        path: ["classes", "ui", "btn", "BuildingBtnModernController"],
+        opts: (name) => ({ building: name }),
+      };
+    }
+    return null;
+  };
+
+  const buyViaGameController = (candidate) => {
+    const game = window.gamePage;
+    const meta = candidate && candidate.meta;
+    const name = meta && meta.name;
+    const spec = controllerSpecFor(candidate && candidate.kind);
+    const Controller = spec && getGlobalPath(spec.path);
+    if (!game || !name || typeof Controller !== "function") return false;
+    const controller = new Controller(game);
+    if (!controller || typeof controller.fetchModel !== "function" || typeof controller.buyItem !== "function") return false;
+    const opts = { ...spec.opts(name), controller };
+    const model = controller.fetchModel(opts);
+    if (!model) return false;
+    if (typeof controller.updateEnabled === "function") controller.updateEnabled(model);
+    const result = controller.buyItem(model, { boughtByQueue: true });
+    return !!(result && result.itemBought) || purchaseComplete(candidate, candidate.kind === "build" ? ((meta.val || 0) - 1) : 0);
+  };
+
+  const canPayPrices = (prices) => {
+    const resources = resourceMap();
+    return prices.every((price) => {
+      const res = getRes(resources, price.name);
+      return res && (res.value || 0) >= price.val;
+    });
+  };
+
+  const rawPayPrices = (prices) => {
+    const game = window.gamePage;
+    if (!game || !game.resPool) return false;
+    if (typeof game.resPool.payPrices === "function") {
+      game.resPool.payPrices(prices);
+      return true;
+    }
+    for (const price of prices) {
+      if (typeof game.resPool.addResEvent === "function") {
+        game.resPool.addResEvent(price.name, -price.val);
+      } else {
+        const res = game.resPool.get && game.resPool.get(price.name);
+        if (!res) return false;
+        res.value -= price.val;
+      }
+    }
+    return true;
+  };
+
+  const applyRawPurchaseEffects = (candidate) => {
+    const game = window.gamePage;
+    const meta = candidate.meta;
+    if (candidate.kind === "build") {
+      meta.val = (meta.val || 0) + 1;
+      meta.on = (meta.on || 0) + 1;
+    } else {
+      meta.researched = true;
+    }
+    if (meta.handler) meta.handler(game, meta);
+    if (meta.unlocks && game.unlock) game.unlock(meta.unlocks);
+    if (meta.upgrades && game.upgrade) game.upgrade(meta.upgrades);
+    if (meta.calculateEffects) meta.calculateEffects(meta, game);
+    if (game.render) game.render();
+  };
+
+  const buyViaRawMetadata = (candidate) => {
+    const prices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && price.val > 0);
+    if (!prices.length || !canPayPrices(prices) || !rawPayPrices(prices)) return false;
+    applyRawPurchaseEffects(candidate);
+    return true;
+  };
+
   const purchaseAttemptsFor = (candidate) => {
     const game = window.gamePage;
     const meta = candidate.meta;
     const name = meta && meta.name;
     if (!game || !meta || !name) return [];
+    const attempts = [
+      () => buyViaGameController(candidate),
+      () => buyViaRawMetadata(candidate),
+    ];
     if (candidate.kind === "research") {
-      return [
+      attempts.push(
         () => game.science && typeof game.science.research === "function" && game.science.research(name),
         () => game.science && typeof game.science.research === "function" && game.science.research(meta),
-      ];
+      );
     }
     if (candidate.kind === "upgrade") {
-      return [
+      attempts.push(
         () => game.workshop && typeof game.workshop.research === "function" && game.workshop.research(name),
         () => game.workshop && typeof game.workshop.research === "function" && game.workshop.research(meta),
-      ];
+      );
     }
     if (candidate.kind === "build") {
-      return [
+      attempts.push(
         () => game.bld && typeof game.bld.build === "function" && game.bld.build(name),
         () => game.bld && typeof game.bld.build === "function" && game.bld.build(name, 1),
         () => game.bld && typeof game.bld.construct === "function" && game.bld.construct(name),
-      ];
+      );
     }
-    return [];
+    return attempts;
   };
 
   // KS sometimes leaves Workshop automation disabled because that same section also

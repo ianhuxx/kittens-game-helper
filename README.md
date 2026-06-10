@@ -51,8 +51,8 @@ The bottom-right box is a live dashboard:
   wasted (e.g. `science capped — build more storage`) or a *starved* one
   (e.g. `wood starved (refining catnip)`).
 - **🔬 Next science:** the next tech to aim for and what you still need for it.
-- **🧭 Plan:** the concrete building/research/upgrade target, what is missing, and a compact
-  have/need resource sheet.
+- **🧭 Plan:** the concrete building/research/upgrade target, what is missing, a rough ETA
+  until it should be affordable, and a compact have/need resource sheet.
 - **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
 - **👑 Leader:** the currently selected leader trait/kitten chosen for the active bottleneck.
 - **🧰 Craft:** prerequisite crafting plus overflow conversions that prevent near-capped inputs from being wasted.
