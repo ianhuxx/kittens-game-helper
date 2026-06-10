@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.11.5
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and detects storage-blocked research like Theology, pushes stuck Steamworks/workshop upgrades ahead of routine construction, keeps policy choices manual with pros/cons, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.11.6
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes recursive time-to-goal pathways and resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and detects storage-blocked research like Theology, pushes stuck Steamworks/workshop upgrades ahead of routine construction, keeps policy choices manual with pros/cons, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -1156,6 +1156,67 @@
     return worst;
   };
 
+  const missingPathResourcesFor = (target, resources) => {
+    const needed = new Set();
+    if (!target) return needed;
+    for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) needed.add(blocker.name);
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources, cost.name) || {}).value) || 0;
+      const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
+      if (deficit <= 0) continue;
+      needed.add(rawWorkNeedName(cost.name));
+      const raw = {};
+      rawPathRequirements(cost.name, deficit, raw);
+      for (const name of Object.keys(raw)) needed.add(name);
+    }
+    return needed;
+  };
+
+  const candidateHelpsPathResource = (candidate, resourceName) => {
+    if (!candidate || !resourceName) return false;
+    const relievesStorage = storageReliefResources(candidate.meta).has(resourceName);
+    return relievesStorage || helpsShortage(candidate.meta, resourceName) || resourceNamesFromPrices(candidate.kind, candidate.meta).some((name) => rawWorkNeedName(name) === resourceName);
+  };
+
+  const pathwayCandidateScore = (candidate, target, resources) => {
+    if (!candidate || !target || targetId(candidate) === targetId(target) || targetComplete(candidate)) return null;
+    if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) return null;
+    const targetWait = waitSecondsForCandidate(target, resources);
+    if (!isFinite(targetWait) || targetWait < 90) return null;
+    const wait = waitSecondsForCandidate(candidate, resources);
+    if (!candidate.affordable && (!isFinite(wait) || wait > Math.max(300, targetWait * 0.45))) return null;
+    const pathResources = missingPathResourcesFor(target, resources);
+    const helped = [...pathResources].filter((name) => candidateHelpsPathResource(candidate, name));
+    if (!helped.length) return null;
+    const readiness = candidate.affordable ? 28 : Math.max(0, 16 - Math.log10(wait + 1) * 5);
+    const kindBoost = candidate.kind === "upgrade" || candidate.kind === "research" ? 10 : 4;
+    const storageBoost = helped.some((name) => storageReliefResources(candidate.meta).has(name)) ? 12 : 0;
+    return {
+      score: candidate.score + readiness + kindBoost + storageBoost + helped.length * 6,
+      reason: `faster path to ${labelOf(target.meta)} via ${helped.map((name) => resTitle(resources, name)).slice(0, 3).join("+")}`,
+    };
+  };
+
+  // Time-optimized decision chain:
+  // 1) if the chosen target is ready, buy it;
+  // 2) if a required resource is craftable, the crafting loop recursively makes it;
+  // 3) otherwise compare waiting for the target against quick/affordable pathway
+  //    candidates that improve the missing raw resource or storage;
+  // 4) lock the selected step long enough to push through instead of thrashing.
+  const chooseTimeOptimizedTarget = (candidates, resources) => {
+    const direct = candidates[0] || null;
+    if (!direct || direct.affordable) return direct;
+    const directWait = waitSecondsForCandidate(direct, resources);
+    if (!isFinite(directWait) || directWait < 90) return direct;
+    const pathway = candidates
+      .map((candidate) => ({ candidate, plan: pathwayCandidateScore(candidate, direct, resources) }))
+      .filter((item) => item.plan)
+      .sort((a, b) => b.plan.score - a.plan.score)[0];
+    if (!pathway || pathway.plan.score < direct.score + 8) return direct;
+    return { ...pathway.candidate, pathwayReason: pathway.plan.reason, pathwayTarget: direct };
+  };
+
   const candidateScore = (candidate, resources, goal) => {
     const readiness = candidate.affordable ? 35 : Math.min(1, Math.max(0, candidate.progress || 0)) * 14;
     const wait = waitSecondsForCandidate(candidate, resources);
@@ -1223,7 +1284,7 @@
 
   const chooseWorkTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
-    const preferred = candidates[0] || null;
+    const preferred = chooseTimeOptimizedTarget(candidates, resources);
     const now = Date.now();
 
     if (activeTarget) {
@@ -1233,11 +1294,11 @@
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9);
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
-      const muchBetter = preferred && locked && preferred.score > locked.score + 10;
+      const muchBetter = preferred && locked && preferred.score > locked.score + (preferred.pathwayReason ? 18 : 12);
       if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
         activeTarget = null;
       } else if (!muchBetter && (age < TARGET_LOCK_MIN_MS || !preferred || locked.score >= preferred.score * 0.85)) {
-        return locked;
+        return activeTarget.reason ? { ...locked, pathwayReason: activeTarget.reason } : locked;
       } else {
         activeTarget = null;
       }
@@ -1246,6 +1307,7 @@
     if (preferred) {
       activeTarget = {
         id: targetId(preferred),
+        reason: preferred.pathwayReason || "",
         startedAt: now,
         initialVal: preferred.kind === "build" ? preferred.meta.val || 0 : 0,
       };
@@ -1394,6 +1456,10 @@
     return desired;
   };
 
+  const formatJobDistribution = (jobs, counts) => jobs
+    .map((job) => `${job.title || job.name} ${Math.max(0, Math.floor(counts[job.name] || 0))}`)
+    .join(", ");
+
   const balanceJobs = (goalKey, resources) => {
     try {
       const village = window.gamePage.village;
@@ -1430,13 +1496,12 @@
       }
       lastJobSignature = signature;
       if (moved > 0 && now - lastJobLog > 15000) {
-        const summary = jobs
-          .filter((j) => desired[j.name] > 0)
-          .sort((a, b) => desired[b.name] - desired[a.name])
-          .slice(0, 3)
-          .map((j) => `${j.title || j.name} ${desired[j.name]}`)
-          .join(", ");
-        pushLog(`👷 rebalanced: ${summary}`);
+        const after = {};
+        for (const job of jobs) {
+          const fresh = jobByName(job.name);
+          after[job.name] = (fresh && fresh.value) || 0;
+        }
+        pushLog(`👷 rebalanced ${moved} kittens: ${formatJobDistribution(jobs, after)}`);
         lastJobLog = now;
       }
     } catch (error) {
@@ -1572,18 +1637,20 @@
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
       const eta = formatEta(waitSecondsForCandidate(target, resources));
-      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reqs ? ` (${reqs})` : ""}`;
+      const reason = target.pathwayReason ? ` · ${target.pathwayReason}` : "";
+      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reason}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
       return "🧭 Plan: —";
     }
   };
 
   const getNowAction = (resources, goalKey) => {
-    const affordable = gatherCandidates(resources, goalKey).filter((c) => c.affordable);
-    const ready = affordable.find((candidate) => candidate.kind === "research") ||
-      affordable.find((candidate) => candidate.kind === "upgrade") ||
-      affordable[0];
-    return ready ? `${ready.kind} ${labelOf(ready.meta)}` : "gathering…";
+    const target = chooseWorkTarget(resources, goalKey);
+    if (!target) return "scanning…";
+    if (target.affordable) return `${target.kind} ${labelOf(target.meta)}`;
+    const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
+    if (craftable) return `craft ${craftLabel(craftable.name)} for ${labelOf(target.meta)}`;
+    return target.pathwayReason ? target.pathwayReason : `gather ${target.missing || "prerequisites"}`;
   };
 
 
