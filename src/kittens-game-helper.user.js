@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.11.4
+// @version      0.11.5
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and detects storage-blocked research like Theology, pushes stuck Steamworks/workshop upgrades ahead of routine construction, keeps policy choices manual with pros/cons, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -52,11 +52,11 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, fixes storage-blocked research like Theology before drifting to side projects, pushes Steamworks and workshop upgrades when they unlock progress, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, selects productive leaders, converts near-capped resources into useful crafts, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Safe autopilot is on: progress targets, jobs, crafting, hunting, and storage fixes. Resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
-      note: "Only job rebalancing, luxury-aware hunting, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
+      note: "Light mode: jobs, hunting, festivals, event watching, and advice only. You choose builds and research.",
     },
   };
 
@@ -2096,27 +2096,38 @@
   };
 
   const buildPanel = () => {
+    const oldStyle = document.getElementById("kgh-style");
+    if (oldStyle) oldStyle.remove();
     const style = document.createElement("style");
     style.id = "kgh-style";
     style.textContent =
-      "body.kgh-hide-ks #ksColumn,body.kgh-hide-ks .kitten-scientists{display:none!important}" +
-      ".kgh-panel{box-sizing:border-box;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);" +
-      "overflow:auto;overflow-x:hidden;user-select:text;-webkit-user-select:text}" +
+      "body.kgh-hide-ks #ksColumn,body.kgh-hide-ks .kitten-scientists,body.kgh-hide-ks [id*=kitten-scientists],body.kgh-hide-ks [class*=kitten-scientists]{display:none!important}" +
+      "body.kgh-helper-ready{overflow-x:hidden}" +
+      ".kgh-panel{box-sizing:border-box;width:min(320px,calc(100dvw - 16px));max-width:calc(100dvw - 16px);" +
+      "max-height:calc(100dvh - 16px);overflow:auto;overflow-x:hidden;contain:layout style;" +
+      "user-select:text;-webkit-user-select:text}" +
       ".kgh-panel *{box-sizing:border-box;min-width:0;max-width:100%}" +
       ".kgh-panel small,.kgh-panel pre,.kgh-panel div{overflow-wrap:anywhere;word-break:normal}" +
       ".kgh-panel select{width:100%;min-width:0;user-select:auto;-webkit-user-select:auto}" +
       ".kgh-row{display:flex;gap:6px;min-width:0}" +
       ".kgh-grow{flex:1 1 auto;min-width:0}" +
+      ".kgh-note{display:block;color:#d9ccae;opacity:.78}" +
+      ".kgh-details{border-top:1px solid #9b7a4d50;padding-top:3px}" +
+      ".kgh-details>summary{cursor:pointer;opacity:.82;list-style:none}" +
+      ".kgh-details>summary::-webkit-details-marker{display:none}" +
+      ".kgh-details-body{display:grid;gap:4px;margin-top:4px}" +
+      ".kgh-log{overflow:hidden auto}" +
       ".kgh-hbtn{cursor:pointer;background:transparent;color:#f7ead0;border:1px solid #9b7a4d;" +
-      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px;flex:0 0 auto}";
+      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px;flex:0 0 auto}" +
+      "@media (max-width:700px){.kgh-panel{left:8px!important;right:8px!important;bottom:8px!important;width:auto!important;max-height:45dvh}}";
     document.head.appendChild(style);
 
     const box = document.createElement("div");
     box.className = "kgh-panel";
     box.style.cssText =
-      "position:fixed;right:12px;bottom:12px;z-index:99999;width:min(360px,calc(100vw - 24px));padding:9px 10px;" +
+      "position:fixed;right:8px;bottom:8px;z-index:99999;padding:8px 9px;" +
       "background:#2b2118;color:#f7ead0;border:1px solid #9b7a4d;border-radius:5px;" +
-      "font:12px/1.4 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
+      "font:12px/1.35 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
     box.innerHTML = [
       '<div class="kgh-row" style="justify-content:space-between;align-items:center">',
       '<strong style="font-size:13px">🐱 Kittens Helper</strong>',
@@ -2134,11 +2145,13 @@
       '<option value="population">🏁 Goal: Max population</option>',
       "</select>",
       '<small class="kgh-status" style="color:#9fd0ff">…</small>',
-      '<small class="kgh-note" style="opacity:.8"></small>',
       '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
       '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
       '<small class="kgh-science" style="color:#bfe6a0">…</small>',
       '<small class="kgh-plan" style="color:#a7e8e0">…</small>',
+      '<small class="kgh-now" style="color:#e6d79a">…</small>',
+      '<details class="kgh-details"><summary>More automation details</summary><div class="kgh-details-body">',
+      '<small class="kgh-note"></small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
@@ -2146,11 +2159,11 @@
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
       '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
-      '<small class="kgh-now" style="color:#e6d79a">…</small>',
-      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
-      '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
-        'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
       '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
+      '</div></details>',
+      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
+      '<pre class="kgh-log" style="margin:0;max-height:78px;white-space:pre-wrap;' +
+        'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
       "</div>",
     ].join("");
 
@@ -2201,6 +2214,7 @@
     };
     minBtn.addEventListener("click", () => applyMin(body.style.display !== "none"));
 
+    document.body.classList.add("kgh-helper-ready");
     document.body.appendChild(box);
     note.textContent = PROFILE_INFO[select.value].note;
     applyKSHidden(localStorage.getItem(KS_HIDE_KEY) !== "0", ksBtn); // default hidden = minimal
