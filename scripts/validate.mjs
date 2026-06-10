@@ -27,6 +27,19 @@ const required = [
   // The "build as soon as affordable" trigger fix must stay in place.
   "PURCHASE_SECTIONS",
   "setTriggersDeep",
+  // Cap-aware planning: blocked targets must redirect into storage builds.
+  "capBlocked",
+  "capReliefBoost",
+  // Overflow protection: capped resources get converted, never wasted.
+  "preventResourceOverruns",
+  "OVERFLOW_CONVERSIONS",
+  // Village care: leader election/promotion and the festival backup.
+  "manageLeader",
+  "maybeHoldFestival",
+  // KS's own jobs/hunt/leader automations must stay off (we manage them).
+  "disableKSManagedAutomations",
+  // Festivals must PAY before holdFestival (which itself charges nothing).
+  "payPrices",
 ];
 
 const missing = required.filter((token) => !source.includes(token));

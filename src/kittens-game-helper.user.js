@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.10.3
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.11.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, plans around storage caps (builds barns/libraries when a target exceeds a cap), converts about-to-overflow resources into beams/slabs/plates/steel/compendia, continuously rebalances kitten jobs (with wood-vs-catnip pathway math and a winter starvation guard), crafts workshop prerequisites like steel→gear with partial fills, elects + promotes the best leader, keeps cats happy via luxuries and festivals, sends hunters, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -22,7 +22,9 @@
  *   3. sets build/research triggers to "buy as soon as affordable" and tells KS
  *      to refine surplus catnip into wood (the usual early-game bottleneck),
  *   4. forces irreversible / permanent / resource-burning automations OFF,
- *   5. shows a panel: bottleneck, next science, and a live log of what it did.
+ *   5. takes over jobs, hunting, crafting, overflow control, leader election
+ *      and festivals with target-aware logic,
+ *   6. shows a panel: bottleneck, next science, mood/leader, and a live log.
  */
 
 (function kittensGameHelper() {
@@ -39,7 +41,7 @@
   const DENY_EXACT = new Set([
     "adore",
     "upgradeBuildings",
-    "promoteKittens",
+    "promoteKittens", // KS's version stays off — we promote ourselves, gated on overflowing gold
     "policies", // permanent, often exclusive choices — left to the player
     "filters", // KS log filters — keep off so the activity log stays visible
   ]);
@@ -52,11 +54,11 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, plans storage when a target exceeds a resource cap, converts about-to-overflow resources into crafted goods, continuously rebalances all non-engineer kitten jobs (with wood-vs-catnip pathway math and a starvation guard), crafts prerequisites like steel→gear, elects and promotes the best leader, keeps cats happy via hunts and festivals. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
-      note: "Only job rebalancing, luxury-aware hunting, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
+      note: "Job rebalancing, luxury-aware hunting, overflow-protective crafting, leader care, festivals and event-observing run. You decide what to build/research — the advisor tells you what's next.",
     },
   };
 
@@ -154,10 +156,11 @@
     }
   };
 
-  // We manage jobs + hunting ourselves (goal-aware, with pathway math), so turn
-  // OFF KS's own job/hunt automation to stop the two systems fighting. Festivals,
-  // leader, and the rest of the Village section stay on.
-  const disableKSJobsAndHunt = (settings) => {
+  // We manage jobs, hunting, leader election and promotions ourselves
+  // (goal-aware, with pathway math and gold-overflow gating), so turn OFF KS's
+  // own versions to stop the two systems fighting. Festivals and the rest of
+  // the Village section stay on.
+  const disableKSManagedAutomations = (settings) => {
     const village = settings && settings.village;
     if (!village) return;
     const jobs = village.jobs || village.job;
@@ -166,7 +169,9 @@
         if (job && typeof job === "object") job.enabled = false;
       }
     }
-    if (village.hunt && typeof village.hunt === "object") village.hunt.enabled = false;
+    for (const key of ["hunt", "electLeader", "promoteLeader"]) {
+      if (village[key] && typeof village[key] === "object") village[key].enabled = false;
+    }
   };
 
   // Tell KS to refine surplus catnip into wood. Catnip is the one resource that
@@ -209,7 +214,7 @@
       enableCatnipRefining(settings);
     }
 
-    disableKSJobsAndHunt(settings);
+    disableKSManagedAutomations(settings);
     return settings;
   };
 
@@ -288,26 +293,60 @@
   const isOpen = (meta) => meta && meta.unlocked !== false && meta.researched !== true;
   const labelOf = (meta) => meta.label || meta.title || meta.name || "?";
 
+  // Evaluate a candidate's costs. capBlocked lists costs that exceed a resource
+  // CAP — those can never be afforded by waiting, only by building storage; each
+  // entry carries how close the cap is (cap/cost) so urgency can be scaled.
   const evaluate = (kind, meta, resources) => {
     const costs = pricesFor(kind, meta).filter(
       (cost) => cost && cost.name && isFinite(cost.val) && cost.val > 0,
     );
-    if (!costs.length) return { affordable: false, progress: 0, missing: "" };
+    if (!costs.length) return { affordable: false, progress: 0, missing: "", capBlocked: [] };
     let affordable = true;
     let progress = 1;
     const missing = [];
+    const capBlocked = [];
     for (const cost of costs) {
       const res = getRes(resources, cost.name);
       const have = (res && res.value) || 0;
       const possible = have + craftablePotential(cost.name);
       progress = Math.min(progress, possible / cost.val);
+      if (res && res.maxValue > 0 && cost.val > res.maxValue) {
+        affordable = false;
+        capBlocked.push({ name: cost.name, ratio: res.maxValue / cost.val });
+        missing.push(`${(res && res.title) || cost.name} cap ${fmt(res.maxValue)} < ${fmt(cost.val)} — storage first`);
+        continue;
+      }
       if (have < cost.val) {
         affordable = false;
         const craftHint = craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
         missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${craftHint}`);
       }
     }
-    return { affordable, progress, missing: missing.slice(0, 3).join(", ") };
+    return { affordable, progress, missing: missing.slice(0, 3).join(", "), capBlocked };
+  };
+
+  /* ------------------------------ per-tick cache ----------------------------- */
+
+  // Candidate gathering walks every building/tech/upgrade and stringifies their
+  // effects, and chooseWorkTarget manages the target lock. Compute both once per
+  // tick and share the result with jobs, crafting, overflow control and every
+  // panel line so they all agree on the same plan.
+  let tickCache = { candidates: null, target: undefined, capNeeds: null };
+  let effectTextCache = new WeakMap();
+
+  const resetTickCache = () => {
+    tickCache = { candidates: null, target: undefined, capNeeds: null };
+    effectTextCache = new WeakMap();
+  };
+
+  const getCandidatesCached = (resources, goalKey) => {
+    if (!tickCache.candidates) tickCache.candidates = gatherCandidates(resources, goalKey);
+    return tickCache.candidates;
+  };
+
+  const getTargetCached = (resources, goalKey) => {
+    if (tickCache.target === undefined) tickCache.target = chooseWorkTarget(resources, goalKey);
+    return tickCache.target;
   };
 
   /* ------------------------- economy balancing action ------------------------ */
@@ -388,7 +427,7 @@
     if (["minerals", "iron", "titanium", "uranium"].includes(name)) return "minerals";
     if (["coal", "gold"].includes(name)) return "coal";
     if (["furs", "ivory", "unicorns"].includes(name)) return "manpower";
-    if (["science", "blueprint", "compendium"].includes(name)) return "science";
+    if (["science", "blueprint", "compedium", "compendium"].includes(name)) return "science";
     if (name === "faith") return "faith";
     return name;
   };
@@ -454,6 +493,9 @@
     return false;
   };
 
+  // Craft toward `targetAmount` of a resource, recursively crafting missing
+  // inputs first. Partial fills are fine: if inputs only cover a third of the
+  // deficit, craft that third now instead of stalling until everything fits.
   const tryCraftResource = (name, targetAmount, depth = 0) => {
     if (depth > 5 || !isFinite(targetAmount) || targetAmount <= 0) return false;
     const resources = resourceMap();
@@ -467,52 +509,176 @@
     if (!prices.length) return false;
 
     const deficit = targetAmount - have;
-    const baseUnits = Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name))));
+    const wantUnits = Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name))));
     for (const price of prices) {
-      const neededInput = price.val * baseUnits;
+      const neededInput = price.val * wantUnits;
       const input = getRes(resourceMap(), price.name);
-      if (((input && input.value) || 0) < neededInput && !tryCraftResource(price.name, neededInput, depth + 1)) {
-        return false;
+      if (((input && input.value) || 0) < neededInput) {
+        tryCraftResource(price.name, neededInput, depth + 1); // best effort, then clamp below
       }
     }
 
     const fresh = resourceMap();
+    let units = wantUnits;
     for (const price of prices) {
       const input = getRes(fresh, price.name);
-      const value = (input && input.value) || 0;
-      if (value - price.val * baseUnits < craftReserveFor(fresh, price.name)) return false;
+      const available = Math.max(0, ((input && input.value) || 0) - craftingFloorFor(fresh, price.name));
+      units = Math.min(units, Math.floor(available / price.val));
     }
+    if (units <= 0) return false;
 
-    if (craftUnits(name, baseUnits)) {
-      craftPlanText = `Craft: made ${fmt(baseUnits * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
+    if (craftUnits(name, units)) {
+      craftPlanText = `Craft: made ${fmt(units * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
       if (Date.now() - lastCraftLog > 15000) {
         pushLog(`🧰 ${craftPlanText}`);
         lastCraftLog = Date.now();
       }
-      return true;
+      return units >= wantUnits;
     }
     return false;
   };
 
   const craftTowardTarget = (resources, goalKey) => {
     try {
-      const target = chooseWorkTarget(resources, goalKey);
+      const target = getTargetCached(resources, goalKey);
       if (!target || target.affordable) {
         craftPlanText = "Craft: no intermediate needed";
         return;
       }
+      let planned = "";
       for (const cost of pricesFor(target.kind, target.meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         const have = (getRes(resourceMap(), cost.name) || { value: 0 }).value || 0;
         if (have < cost.val && craftByName(cost.name)) {
-          craftPlanText = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
-          tryCraftResource(cost.name, cost.val);
-          return;
+          if (!planned) {
+            planned = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
+            craftPlanText = planned;
+          }
+          tryCraftResource(cost.name, cost.val); // may overwrite plan text with "made N …"
         }
       }
-      craftPlanText = "Craft: gathering raw inputs";
+      if (!planned) craftPlanText = "Craft: gathering raw inputs";
     } catch (error) {
       /* ignore */
+    }
+  };
+
+  /* ------------------------- overflow protection ----------------------------- */
+
+  // When a capped resource is about to overflow, its production is pure waste.
+  // Convert the excess into durable crafted goods (which have no cap and feed
+  // future builds) instead of letting it evaporate. Reserves protect what the
+  // active target needs; compendia/manuscripts even RAISE the science/culture
+  // caps, turning waste into permanent storage.
+  const OVERFLOW_CONVERSIONS = [
+    { from: "wood", to: "beam" },
+    { from: "minerals", to: "slab" },
+    { from: "iron", to: "plate" },
+    { from: "coal", to: "steel" },
+    { from: "titanium", to: "alloy" },
+    { from: "oil", to: "kerosene" },
+    { from: "uranium", to: "thorium" },
+    { from: "unobtainium", to: "eludium" },
+    { from: "culture", to: "manuscript" },
+    { from: "science", to: "compedium" }, // the game really spells it "compedium"
+    { from: "furs", to: "parchment" },
+  ];
+  const OVERFLOW_TRIGGER = 0.93; // start converting at 93% of cap
+  const OVERFLOW_FLOOR = 0.85; // convert down to 85%, keep the rest liquid
+  let lastOverflowLog = 0;
+
+  // Total amount of `name` the active target still charges — kept liquid so
+  // overflow conversion never eats what the plan is saving up for.
+  const targetCostFor = (resources, goalKey, name) => {
+    const target = getTargetCached(resources, goalKey);
+    if (!target || !target.meta) return 0;
+    let total = 0;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (cost && cost.name === name && isFinite(cost.val) && cost.val > 0) total += cost.val;
+    }
+    return total;
+  };
+
+  // Festivals are a recurring spend on culture/parchment/catpower — once drama
+  // is researched, keep their price out of crafting so a festival is always
+  // affordable the moment one can start. Skipped while the resource's cap is
+  // too small to ever hold the price (early game — festivals can't happen yet).
+  const festivalReserveFor = (resources, name) => {
+    try {
+      const drama = window.gamePage.science && window.gamePage.science.get && window.gamePage.science.get("drama");
+      if (!drama || !drama.researched) return 0;
+      const price = FESTIVAL_PRICES.find((p) => p.name === name || (name === "catpower" && p.name === "manpower"));
+      if (!price) return 0;
+      const res = getRes(resources, name);
+      if (res && res.maxValue > 0 && res.maxValue < price.val * 1.1) return 0;
+      return price.val * 1.1;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  // Liquid floor EVERY crafting path must respect: food/catpower reserves, the
+  // festival budget, and a luxury cushion — furs/ivory/spice above zero are a
+  // happiness bonus, so crafting must never wipe them out.
+  const craftingFloorFor = (resources, name) => {
+    let floor = Math.max(craftReserveFor(resources, name), festivalReserveFor(resources, name));
+    if (LUXURY_RESOURCES.includes(name)) floor = Math.max(floor, luxuryStockTarget(resources, name) * 3);
+    return floor;
+  };
+
+  const overflowReserve = (resources, goalKey, name) => {
+    let reserve = craftingFloorFor(resources, name);
+    const res = getRes(resources, name);
+    const targetCost = targetCostFor(resources, goalKey, name);
+    // Hold what the active target needs — unless that exceeds the cap, where
+    // hoarding can never reach it anyway (and converting may raise the cap).
+    if (!(res && res.maxValue > 0 && targetCost > res.maxValue)) reserve += targetCost * 1.05;
+    return reserve;
+  };
+
+  const preventResourceOverruns = (resources, goalKey) => {
+    for (const conversion of OVERFLOW_CONVERSIONS) {
+      try {
+        const res = getRes(resources, conversion.from);
+        if (!res || res.unlocked === false) continue;
+        const craft = craftByName(conversion.to);
+        if (!craft) continue;
+        const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+        const fromPrice = prices.find((p) => p.name === conversion.from);
+        if (!fromPrice) continue;
+
+        const reserve = overflowReserve(resources, goalKey, conversion.from);
+        let spendable;
+        if (res.maxValue > 0) {
+          if (res.value < res.maxValue * OVERFLOW_TRIGGER) continue;
+          spendable = res.value - Math.max(res.maxValue * OVERFLOW_FLOOR, reserve);
+        } else {
+          // Uncapped sources (furs): only skim well above the luxury reserve.
+          spendable = res.value - Math.max(reserve * 2, 400);
+        }
+        if (spendable < fromPrice.val) continue;
+
+        let units = Math.floor(spendable / fromPrice.val);
+        for (const price of prices) {
+          if (price === fromPrice) continue;
+          const input = getRes(resources, price.name);
+          const inputValue = (input && input.value) || 0;
+          let keep = overflowReserve(resources, goalKey, price.name);
+          // Secondary inputs aren't overflowing — don't starve them: capped ones
+          // stay above 40% of cap, crafted stockpiles lose at most half a pass.
+          if (input && input.maxValue > 0) keep = Math.max(keep, input.maxValue * 0.4);
+          else keep = Math.max(keep, inputValue * 0.5);
+          units = Math.min(units, Math.floor(Math.max(0, inputValue - keep) / price.val));
+        }
+        if (units < 1) continue;
+
+        if (craftUnits(conversion.to, units) && Date.now() - lastOverflowLog > 20000) {
+          pushLog(`♻ ${fmt(units * (1 + craftRatioFor(conversion.to)))} ${craftLabel(conversion.to)} (${conversion.from} was capping)`);
+          lastOverflowLog = Date.now();
+        }
+      } catch (error) {
+        /* try the next conversion */
+      }
     }
   };
 
@@ -556,15 +722,6 @@
     }
   };
 
-  const RES_JOB = {
-    minerals: "miner",
-    science: "scholar",
-    catnip: "farmer",
-    coal: "geologist",
-    faith: "priest",
-    manpower: "hunter",
-    catpower: "hunter",
-  };
   const MANAGED_JOBS = ["woodcutter", "farmer", "miner", "scholar", "hunter", "priest", "geologist"];
   const JOB_RESOURCE = {
     woodcutter: "wood",
@@ -604,12 +761,14 @@
     }
   };
 
+  // village.happiness is a RATIO (1.4 = 140%, floor 0.25) and can legitimately
+  // exceed 2.0 late game. Only treat it as a percent if it's clearly one.
   const currentHappinessRatio = () => {
     try {
       const village = window.gamePage.village;
       const raw = typeof village.getHappiness === "function" ? village.getHappiness() : village.happiness;
       if (!isFinite(raw) || raw <= 0) return 1;
-      return raw > 2 ? raw / 100 : raw;
+      return raw > 10 ? raw / 100 : raw;
     } catch (error) {
       return 1;
     }
@@ -668,6 +827,8 @@
   };
 
   const effectText = (meta) => {
+    const cached = meta && typeof meta === "object" ? effectTextCache.get(meta) : null;
+    if (cached != null) return cached;
     const parts = [metaText(meta)];
     for (const key of ["effects", "calculateEffects", "unlocks", "upgrades", "stages"]) {
       const value = meta && meta[key];
@@ -678,7 +839,77 @@
         parts.push(Object.keys(value).join(" "));
       }
     }
-    return parts.join(" ").toLowerCase();
+    const text = parts.join(" ").toLowerCase();
+    if (meta && typeof meta === "object") {
+      try {
+        effectTextCache.set(meta, text);
+      } catch (error) {
+        /* non-cacheable meta */
+      }
+    }
+    return text;
+  };
+
+  // Merged effects object for a meta: top-level effects plus the active stage's
+  // effects (staged buildings like Library → Data Center swap their effects).
+  const effectsOf = (meta) => {
+    const out = {};
+    if (meta && meta.effects && typeof meta.effects === "object") Object.assign(out, meta.effects);
+    try {
+      const stage = meta && Array.isArray(meta.stages) && meta.stages[meta.stage || 0];
+      if (stage && stage.effects && typeof stage.effects === "object") Object.assign(out, stage.effects);
+    } catch (error) {
+      /* ignore */
+    }
+    return out;
+  };
+
+  const effectName = (name) => (name === "catpower" ? "manpower" : name);
+
+  // Does this candidate's effect table actually produce/boost `resourceName`?
+  // Matches real game effect keys: catnipPerTickBase, mineralsRatio,
+  // coalRatioGlobal, catnipDemandRatio (demand reduction helps too), etc.
+  const producesResource = (meta, resourceName) => {
+    const eff = effectsOf(meta);
+    const wanted = effectName(resourceName).toLowerCase();
+    for (const key of Object.keys(eff)) {
+      if (!isFinite(eff[key]) || eff[key] === 0) continue;
+      const lower = key.toLowerCase();
+      if (!lower.startsWith(wanted)) continue;
+      const tail = lower.slice(wanted.length);
+      if (
+        tail.startsWith("pertick") ||
+        tail.startsWith("ratio") ||
+        tail.startsWith("global") ||
+        tail.startsWith("autoprod") ||
+        tail.startsWith("demandratio")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Which resources each storage-ratio upgrade key expands (workshop upgrades
+  // like "Expanded Barns" carry barnRatio etc. instead of direct ...Max keys).
+  const STORAGE_RATIO_KEYS = {
+    barnratio: ["catnip", "wood", "minerals", "iron"],
+    warehouseratio: ["wood", "minerals", "iron", "coal", "titanium"],
+    harborratio: ["catnip", "wood", "minerals", "coal", "iron", "titanium", "gold"],
+    acceleratorratio: ["catnip", "wood", "minerals", "iron", "coal", "gold", "titanium", "oil", "uranium"],
+  };
+
+  const raisesCapFor = (meta, resourceName) => {
+    const eff = effectsOf(meta);
+    const wanted = effectName(resourceName).toLowerCase();
+    for (const key of Object.keys(eff)) {
+      if (!isFinite(eff[key]) || eff[key] === 0) continue;
+      const lower = key.toLowerCase();
+      if (lower.startsWith(`${wanted}max`)) return true;
+      const expanded = STORAGE_RATIO_KEYS[lower];
+      if (expanded && expanded.includes(wanted)) return true;
+    }
+    return false;
   };
 
   const helpsShortage = (meta, resourceName) => {
@@ -691,6 +922,17 @@
     try {
       const prod = window.gamePage.village.getResProduction ? window.gamePage.village.getResProduction() : {};
       const value = prod[name === "catpower" ? "manpower" : name];
+      return isFinite(value) ? value : 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  // Net per-tick rate including consumption — the game's own number, so it sees
+  // buildings, kitten demand, seasons and weather, not just village jobs.
+  const perTickRate = (name) => {
+    try {
+      const value = window.gamePage.getResourcePerTick(effectName(name), true);
       return isFinite(value) ? value : 0;
     } catch (error) {
       return 0;
@@ -745,6 +987,8 @@
       const prod = productionFor(name);
       const prodBoost = prod <= 0 && ratio < 0.8 ? 0.25 : 0;
       if (stockBoost <= 0 && prodBoost <= 0) continue;
+      // Real effect keys beat name keywords — check those first and strongest.
+      if (producesResource(meta, name)) boost += (stockBoost + prodBoost) * 34;
       if (helpsShortage(meta, name)) boost += (stockBoost + prodBoost) * (name === "coal" ? 42 : 26);
       if (name === "coal" && keywords.some((word) => metaText(meta).includes(word))) boost += (stockBoost + prodBoost) * 22;
     }
@@ -756,6 +1000,36 @@
       boost += Math.max(0, ironRatio - coalRatio) * 30;
     }
     return boost;
+  };
+
+  // How many things (techs, buildings, upgrades, jobs…) does this meta unlock?
+  // Unlock-rich steps open whole branches and deserve priority.
+  const unlockCount = (meta) => {
+    const unlocks = meta && meta.unlocks;
+    if (!unlocks || typeof unlocks !== "object") return 0;
+    let count = 0;
+    for (const value of Object.values(unlocks)) {
+      if (Array.isArray(value)) count += value.length;
+    }
+    return count;
+  };
+
+  // Small bonus for targets we could afford SOON at current net rates: a build
+  // 30 seconds away beats an equally-scored one 2 hours away.
+  const timeToAffordBonus = (kind, meta, resources) => {
+    let worstTicks = 0;
+    for (const cost of pricesFor(kind, meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const res = getRes(resources, cost.name);
+      const have = (res && res.value) || 0;
+      if (have >= cost.val) continue;
+      const rate = perTickRate(cost.name);
+      if (rate <= 0) return 0; // not currently producible — no bonus
+      worstTicks = Math.max(worstTicks, (cost.val - have) / rate);
+    }
+    if (worstTicks <= 0) return 0;
+    const minutes = worstTicks / 300; // game runs ~5 ticks/sec
+    return Math.max(0, 4 - Math.log10(1 + minutes) * 3);
   };
 
   const strategicBoost = (kind, meta, resources, goal) => {
@@ -770,7 +1044,25 @@
     }
     if (/hut|house|mansion|population|kitten/.test(text)) boost += 4;
     if (kind === "upgrade" && /furnace|coal|pyrolysis|combustion|smelter/.test(text)) boost += 5;
+    boost += Math.min(6, unlockCount(meta) * 1.2);
+    // Unhappy village? Amphitheatres, broadcast towers, sun altars and other
+    // happiness effects recover the global production multiplier.
+    const moodGap = Math.max(0, 1 - currentHappinessRatio());
+    if (moodGap > 0.01 && ("happiness" in effectsOf(meta) || /happiness|amphitheatre|broadcast|sun altar/.test(text))) {
+      boost += Math.min(9, 3 + moodGap * 20);
+    }
     if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) boost += 10;
+    return boost;
+  };
+
+  // Boost candidates that raise the caps blocking promising targets. Urgency is
+  // appeal × closeness, so a target at 80% of the needed cap pushes storage hard
+  // while a far-future tech barely registers.
+  const capReliefBoost = (meta, capNeeds) => {
+    let boost = 0;
+    for (const [name, urgency] of Object.entries(capNeeds || {})) {
+      if (urgency > 0 && raisesCapFor(meta, name)) boost += Math.min(24, urgency * 4);
+    }
     return boost;
   };
 
@@ -798,11 +1090,35 @@
     } catch (error) {
       /* ignore */
     }
-    return candidates
+
+    const evaluated = candidates.map((c) => ({ ...c, ...evaluate(c.kind, c.meta, resources) }));
+
+    // Storage planning: when a promising candidate can never be afforded because
+    // a cost exceeds a resource cap, raise demand for whatever lifts that cap.
+    const capNeeds = {};
+    for (const c of evaluated) {
+      if (!c.capBlocked.length) continue;
+      const appeal =
+        c.weight + c.progress + (goal && goal.keywords.length && matchesKeywords(c.meta, goal.keywords) ? 2 : 0);
+      for (const blocked of c.capBlocked) {
+        const urgency = appeal * Math.min(1, Math.max(0, blocked.ratio));
+        capNeeds[blocked.name] = Math.max(capNeeds[blocked.name] || 0, urgency);
+      }
+    }
+    tickCache.capNeeds = capNeeds;
+
+    return evaluated
       .map((c) => {
-        const evaluation = evaluate(c.kind, c.meta, resources);
-        const score = c.weight + evaluation.progress + shortageBoost(c.meta, resources) + strategicBoost(c.kind, c.meta, resources, goal);
-        return { ...c, ...evaluation, score };
+        const blockedPenalty = c.capBlocked.length ? 8 + 2 * c.capBlocked.length : 0;
+        const score =
+          c.weight +
+          c.progress +
+          shortageBoost(c.meta, resources) +
+          strategicBoost(c.kind, c.meta, resources, goal) +
+          capReliefBoost(c.meta, capNeeds) +
+          timeToAffordBonus(c.kind, c.meta, resources) -
+          blockedPenalty;
+        return { ...c, score };
       })
       .sort((a, b) => b.score - a.score);
   };
@@ -826,8 +1142,14 @@
   };
 
   const chooseWorkTarget = (resources, goalKey) => {
-    const candidates = gatherCandidates(resources, goalKey);
-    const preferred = candidates.find((c) => !c.affordable && c.missing) || candidates.find((c) => c.affordable) || null;
+    const candidates = getCandidatesCached(resources, goalKey);
+    // Prefer reachable plans: cap-blocked candidates need storage first, so they
+    // only become the target when nothing reachable exists.
+    const preferred =
+      candidates.find((c) => !c.affordable && c.missing && !c.capBlocked.length) ||
+      candidates.find((c) => !c.affordable && c.missing) ||
+      candidates.find((c) => c.affordable) ||
+      null;
     const now = Date.now();
 
     if (activeTarget) {
@@ -854,7 +1176,7 @@
 
   const resourceNeeds = (goalKey, resources) => {
     const needs = {};
-    const target = chooseWorkTarget(resources, goalKey);
+    const target = getTargetCached(resources, goalKey);
     if (target && !target.affordable) {
       const rawRequirements = {};
       for (const cost of pricesFor(target.kind, target.meta)) {
@@ -868,6 +1190,14 @@
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
+    }
+
+    // Storage pressure: when the plan is blocked by a cap, the jobs that build
+    // storage materials (wood/minerals for barns and warehouses) matter most.
+    const capNeeds = tickCache.capNeeds || {};
+    if (Object.keys(capNeeds).length) {
+      scoreNeed(needs, "wood", 2);
+      scoreNeed(needs, "minerals", 2);
     }
 
     // Safety and anti-waste: do not keep producing capped spendables; push low raw
@@ -894,15 +1224,6 @@
       scoreNeed(needs, "science", resRatio(resources, "science") < 0.9 ? 1 : 0);
     }
     return { needs, target };
-  };
-
-  // Decide which single job should receive a free/extra kitten as a fallback.
-  const chooseJob = (goalKey, resources) => {
-    const { needs } = resourceNeeds(goalKey, resources);
-    const best = Object.entries(needs).sort((a, b) => b[1] - a[1])[0];
-    const target = best && best[1] > 0 ? best[0] : "wood";
-    if (target === "wood") return bestWoodJob() || jobByName("woodcutter");
-    return jobByName(RES_JOB[target]) || jobByName("woodcutter") || jobByName("farmer");
   };
 
   const managedJobs = () => MANAGED_JOBS.map(jobByName).filter(Boolean);
@@ -949,6 +1270,12 @@
       weights[job.name] = Math.max(0, weight);
     }
 
+    // Starvation guard: if catnip is NET NEGATIVE (winter, big population) and
+    // the pantry is draining, force farmers before kittens start dying.
+    const netCatnip = perTickRate("catnip");
+    if (jobByName("farmer") && netCatnip < 0 && resRatio(resources, "catnip") < 0.6) {
+      weights.farmer = Math.max(weights.farmer || 0, 10 + Math.min(25, -netCatnip * 2));
+    }
     if (resRatio(resources, "catnip") < 0.2 && jobByName("farmer")) weights.farmer = Math.max(weights.farmer || 0, 20);
     if (!Object.values(weights).some((w) => w > 0)) {
       const fallback = bestWoodJob() || jobByName("woodcutter") || jobByName("farmer") || jobs[0];
@@ -1045,7 +1372,14 @@
       const discount = typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0;
       const huntCost = Math.max(1, 100 - discount);
       const economyNeed = huntingEconomyNeed(resources);
-      const threshold = economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
+      let threshold = economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
+      // huntAll drains ALL catpower — if a festival is one catpower-fill away
+      // (other costs ready, no festival running), hold hunts until it fires.
+      // Skipped while luxuries are short: refilling furs comes first.
+      if (economyNeed <= 0.5) {
+        const reserve = festivalCatpowerReserve(resources);
+        if (reserve > 0) threshold = Math.max(threshold, reserve + huntCost);
+      }
       if (cp.value >= threshold) {
         village.huntAll();
         if (Date.now() - lastHuntLog > 30000) {
@@ -1059,12 +1393,207 @@
     }
   };
 
+  /* --------------------- leader, promotions & festivals ---------------------- */
+
+  // Leader trait bonuses (from the game's getEffectLeader): engineer +5% craft,
+  // metallurgist +10% metal crafts, chemist +7.5% chemical crafts, merchant +3%
+  // trade, manager +50% hunting, scientist −5% science prices, wise −10%
+  // faith/gold prices on religion. Scientist compounds while research is the
+  // main spend; engineer takes over once steel-era crafting dominates.
+  const TRAIT_BASE_SCORE = { scientist: 6, engineer: 6, merchant: 4, manager: 4, metallurgist: 4, chemist: 3, wise: 3, none: 0 };
+
+  const buildingCount = (name) => {
+    try {
+      const meta = buildingMetas().find((b) => b && b.name === name);
+      return (meta && meta.val) || 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const researchedTechCount = () => {
+    try {
+      return (window.gamePage.science.techs || []).filter((t) => t && t.researched).length;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const traitScore = (traitName, resources) => {
+    let score = TRAIT_BASE_SCORE[traitName] != null ? TRAIT_BASE_SCORE[traitName] : 2;
+    if (traitName === "scientist") score += researchedTechCount() < 45 ? 4 : 1;
+    if (traitName === "engineer") score += craftByName("steel") ? 5 : 0;
+    if (traitName === "metallurgist") score += buildingCount("smelter") >= 4 ? 4 : 0;
+    if (traitName === "chemist") score += craftByName("kerosene") || craftByName("concrate") ? 4 : 0;
+    if (traitName === "merchant") score += buildingCount("tradepost") >= 1 ? 3 : 0;
+    if (traitName === "manager") score += huntingEconomyNeed(resources) > 0.5 ? 3 : 0;
+    if (traitName === "wise") score += buildingCount("temple") >= 1 ? 2 : 0;
+    return score;
+  };
+
+  const kittenTraitName = (kitten) => (kitten && kitten.trait && kitten.trait.name) || "none";
+
+  let lastLeaderCheck = 0;
+  let nextPromoteAttempt = 0;
+
+  // Elect the best-trait kitten as leader (with hysteresis so we don't churn),
+  // and spend NEAR-CAP gold on promotions — gold sitting at the cap is wasted,
+  // promotions turn it into permanent production.
+  const manageLeader = (resources) => {
+    try {
+      const game = window.gamePage;
+      const village = game.village;
+      const sim = village && village.sim;
+      if (!village || !sim || !Array.isArray(sim.kittens) || sim.kittens.length === 0) return;
+      try {
+        if (game.challenges && typeof game.challenges.isActive === "function" && game.challenges.isActive("anarchy")) return;
+      } catch (error) {
+        /* no challenges API — proceed */
+      }
+
+      const now = Date.now();
+      if (now - lastLeaderCheck >= 45000 && typeof village.makeLeader === "function") {
+        lastLeaderCheck = now;
+        let best = null;
+        let bestScore = -1;
+        for (const kitten of sim.kittens) {
+          const trait = kittenTraitName(kitten);
+          if (trait === "none") continue;
+          const score = traitScore(trait, resources) + Math.min(3, (kitten.rank || 0) * 0.5);
+          if (score > bestScore) {
+            bestScore = score;
+            best = kitten;
+          }
+        }
+        const leader = village.leader;
+        const leaderScore = leader
+          ? traitScore(kittenTraitName(leader), resources) + Math.min(3, (leader.rank || 0) * 0.5)
+          : -1;
+        if (best && (!leader || bestScore > leaderScore + 1.5)) {
+          village.makeLeader(best);
+          const traitTitle = (best.trait && (best.trait.title || best.trait.name)) || "?";
+          pushLog(`👑 elected ${best.name || "kitten"} (${traitTitle})`);
+        }
+      }
+
+      const gold = getRes(resources, "gold");
+      if (gold && gold.maxValue > 0 && gold.value >= gold.maxValue * 0.92 && now >= nextPromoteAttempt) {
+        const before = gold.value;
+        try {
+          if (typeof village.promoteKittens === "function") {
+            village.promoteKittens();
+          } else if (village.leader && typeof sim.promote === "function") {
+            sim.promote(village.leader, (village.leader.rank || 0) + 1);
+          }
+        } catch (error) {
+          /* promotion API mismatch — skip */
+        }
+        if (gold.value < before - 1) {
+          nextPromoteAttempt = now + 30000;
+          pushLog("🎖 promoted kittens (gold was capping)");
+        } else {
+          nextPromoteAttempt = now + 300000; // nobody promotable (exp/gold) — back off
+        }
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  // Festival backup behind KS's own automation. village.holdFestival() does NOT
+  // charge resources, so pay the real button price first — never start one we
+  // didn't pay for.
+  const FESTIVAL_PRICES = [
+    { name: "manpower", val: 1500 },
+    { name: "culture", val: 5000 },
+    { name: "parchment", val: 2500 },
+  ];
+  let lastFestivalTry = 0;
+
+  // Catpower worth holding back from hunts because a festival could start as
+  // soon as it accumulates (no festival running, drama researched, the other
+  // costs already covered, and the cap can actually hold the price).
+  const festivalCatpowerReserve = (resources) => {
+    try {
+      const game = window.gamePage;
+      if ((game.calendar.festivalDays || 0) > 0) return 0;
+      const drama = game.science && game.science.get && game.science.get("drama");
+      if (!drama || !drama.researched) return 0;
+      const manpowerPrice = FESTIVAL_PRICES.find((p) => p.name === "manpower");
+      const cp = getRes(resources, "manpower");
+      if (!manpowerPrice || !cp || !(cp.maxValue > manpowerPrice.val * 1.15)) return 0;
+      for (const price of FESTIVAL_PRICES) {
+        if (price.name === "manpower") continue;
+        const res = getRes(resources, price.name);
+        if (!res || (res.value || 0) < price.val * 1.1) return 0;
+      }
+      return manpowerPrice.val * 1.1;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const maybeHoldFestival = (resources) => {
+    try {
+      const game = window.gamePage;
+      const village = game.village;
+      const calendar = game.calendar;
+      if (!village || !calendar || typeof village.holdFestival !== "function") return;
+      if ((calendar.festivalDays || 0) > 0) return; // already celebrating
+      const drama = game.science && game.science.get && game.science.get("drama");
+      if (!drama || !drama.researched) return;
+      const now = Date.now();
+      if (now - lastFestivalTry < 30000) return;
+      for (const price of FESTIVAL_PRICES) {
+        const res = getRes(resources, price.name);
+        if (!res || (res.value || 0) < price.val * 1.1) return; // afford with headroom
+      }
+      if (!game.resPool || typeof game.resPool.payPrices !== "function") return;
+      lastFestivalTry = now;
+      game.resPool.payPrices(FESTIVAL_PRICES);
+      village.holdFestival(1);
+      pushLog("🎪 festival started (+happiness)");
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  const villageStatusLine = () => {
+    try {
+      const village = window.gamePage.village;
+      const mood = Math.round(currentHappinessRatio() * 100);
+      const leader = village && village.leader;
+      const leaderText = leader
+        ? `${(leader.trait && (leader.trait.title || leader.trait.name)) || "?"}${leader.rank ? ` r${leader.rank}` : ""}`
+        : "none yet";
+      const festival = (() => {
+        try {
+          return (window.gamePage.calendar.festivalDays || 0) > 0 ? " · 🎪 festival" : "";
+        } catch (error) {
+          return "";
+        }
+      })();
+      return `😊 Mood ${mood}% · 👑 Leader: ${leaderText}${festival}`;
+    } catch (error) {
+      return "";
+    }
+  };
+
   /* ------------------------------ the advisor ------------------------------- */
 
   const SPENDABLE = ["science", "culture", "faith", "manpower"];
   const RAW = ["wood", "minerals", "iron", "coal"];
 
   const getBottleneck = (resources) => {
+    // Cap-blocked plans come first: they name the storage that unblocks progress.
+    const capNeeds = tickCache.capNeeds || {};
+    const blocked = Object.entries(capNeeds).sort((a, b) => b[1] - a[1])[0];
+    if (blocked && blocked[1] >= 2) {
+      const res = getRes(resources, blocked[0]);
+      if (res && res.maxValue > 0) {
+        return `${res.title || blocked[0]} cap ${fmt(res.maxValue)} blocks the plan — building storage`;
+      }
+    }
     for (const name of SPENDABLE) {
       const r = resources.get(name);
       if (r && r.maxValue > 0 && r.value >= r.maxValue * 0.99) {
@@ -1142,7 +1671,7 @@
 
   const getPlanLine = (resources, goalKey) => {
     try {
-      const target = chooseWorkTarget(resources, goalKey);
+      const target = getTargetCached(resources, goalKey);
       if (!target) return "🧭 Plan: scanning unlocked buildings/research";
       const reqs = formatRequirements(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : `missing ${target.missing || "prerequisites"}`;
@@ -1153,7 +1682,7 @@
   };
 
   const getNowAction = (resources, goalKey) => {
-    const ready = gatherCandidates(resources, goalKey).find((c) => c.affordable);
+    const ready = getCandidatesCached(resources, goalKey).find((c) => c.affordable);
     return ready ? `${ready.kind} ${labelOf(ready.meta)}` : "gathering…";
   };
 
@@ -1227,6 +1756,7 @@
   let scienceEl;
   let planEl;
   let jobsEl;
+  let villageEl;
   let nowEl;
 
   const engineRunning = () => {
@@ -1239,11 +1769,15 @@
 
   const tick = () => {
     try {
+      resetTickCache();
       const resources = resourceMap();
       const goal = getGoal();
       refineSurplusCatnip();
+      preventResourceOverruns(resources, goal);
       craftTowardTarget(resources, goal);
       balanceJobs(goal, resources);
+      manageLeader(resources);
+      maybeHoldFestival(resources); // festivals claim catpower before hunts do
       autoHunt(resources);
       trackActions();
       if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
@@ -1256,6 +1790,7 @@
       if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
       if (planEl) planEl.textContent = getPlanLine(resources, goal);
       if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
+      if (villageEl) villageEl.textContent = villageStatusLine();
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
       /* ignore */
@@ -1315,6 +1850,7 @@
       '<small class="kgh-science" style="color:#bfe6a0">…</small>',
       '<small class="kgh-plan" style="color:#a7e8e0">…</small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
+      '<small class="kgh-village" style="color:#ffd9e8">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
       '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
@@ -1336,6 +1872,7 @@
     scienceEl = box.querySelector(".kgh-science");
     planEl = box.querySelector(".kgh-plan");
     jobsEl = box.querySelector(".kgh-jobs");
+    villageEl = box.querySelector(".kgh-village");
     nowEl = box.querySelector(".kgh-now");
     logBox = box.querySelector(".kgh-log");
 
@@ -1366,7 +1903,7 @@
     applyMin(localStorage.getItem(MIN_KEY) === "1");
     renderLog();
     tick();
-    setInterval(tick, 4000);
+    setInterval(tick, 3000);
   };
 
   /* ------------------------------- bootstrap -------------------------------- */

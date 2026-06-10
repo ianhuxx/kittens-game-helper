@@ -35,8 +35,8 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
-| **Assist: jobs + advice** | Only rebalances jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
+| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable), **plans storage when a target exceeds a resource cap**, **converts about-to-overflow resources into crafted goods**, **elects and promotes the best leader**, and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
+| **Assist: jobs + advice** | Rebalances jobs, hunts, protects capped resources from overflowing, takes care of the leader and festivals, and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
 actions (transcend, sacrifice unicorns/alicorns, time-skip, shatter time crystals).
@@ -54,6 +54,8 @@ The bottom-right box is a live dashboard:
 - **🧭 Plan:** the concrete building/research/upgrade target, what is missing, and a compact
   have/need resource sheet.
 - **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
+- **😊 Mood / 👑 Leader:** current village happiness (the global production multiplier), who
+  leads with which trait/rank, and whether a festival is running.
 - **🎯 Now:** what it can build/buy right this second.
 - **Recent actions:** a running log of what it actually built / researched / upgraded,
   kept across the session so you can see it working.
@@ -87,20 +89,70 @@ and population growth. That means it can choose to scale first when growth is be
 that unlocks the next important branch, or prioritize an upgrade like **Coal Furnace**
 when coal production is the thing blocking progress.
 
-Resource-starvation upgrades are part of that scoring too: if coal is depleted, upgrades
-whose names/effects/unlocks help coal or smelters get a large boost, so **Coal Furnace**
-can beat a random affordable build and become the active plan. Similar hints exist for
-wood, minerals/iron, catnip, science, manpower/hunting, and faith.
+Scoring reads the **actual effect tables** of buildings and upgrades (production per tick,
+ratio bonuses, storage maxes, happiness), not just their names, and prefers steps that
+**unlock more of the tech tree** and that are **affordable soonest** at current production
+rates. Resource-starvation upgrades are part of that scoring too: if coal is depleted,
+upgrades whose names/effects/unlocks help coal or smelters get a large boost, so
+**Coal Furnace** can beat a random affordable build and become the active plan. Similar
+hints exist for wood, minerals/iron, catnip, science, manpower/hunting, and faith.
+
+## Storage-aware planning (no more impossible targets)
+
+A target that costs **more than a resource cap** (say, a tech needing 9,000 science when
+your cap is 6,000) can *never* be afforded by waiting — only by building storage. The
+helper now detects exactly this: cap-blocked candidates step aside as the active plan,
+and everything that **raises the blocking cap** (barns, warehouses, harbors, libraries,
+Expanded Barns-style upgrades — found via their real `…Max`/ratio effects) gets a large
+scoring boost scaled by how close the cap is to the requirement. The ⚖ bottleneck line
+tells you when this happens: `science cap 6.00K blocks the plan — building storage`.
+Jobs feel it too: a cap-blocked plan adds weight to wood/minerals so the storage
+buildings actually get built.
+
+## Overflow protection (capped production is never wasted)
+
+Production into a full storage bin evaporates. Before that happens (at ~93% of cap), the
+helper converts the excess into **uncapped crafted goods** that future builds need
+anyway: wood→beams, minerals→slabs, iron→plates, coal→steel, titanium→alloy,
+oil→kerosene, uranium→thorium, unobtainium→eludium, culture→manuscripts,
+science→compendia and surplus furs→parchment. Reserves keep it safe: it never converts
+what the **active target** is saving up for, never drags a secondary ingredient below
+40% of its cap, keeps festival parchment and a luxury cushion (furs/ivory/spice are
+happiness!), and stops at 85% so there is always liquid stock. Converting capped science
+into compendia even **raises the science cap**, turning waste into permanent storage.
 
 ## Workshop crafting prerequisites
 
 When the active target needs a crafted resource, the helper now follows the recipe chain
 and crafts the missing intermediate instead of waiting forever. For example, if a target
 needs **gear**, and you have enough ingredients to make **steel**, it will craft steel
-from iron + coal, then craft the higher-level item when possible. The same recipe-chain
+from iron + coal, then craft the higher-level item when possible. Crafting is
+**partial-fill**: if inputs only cover a third of the deficit right now, it crafts that
+third instead of stalling until everything fits at once. The same recipe-chain
 logic feeds job balancing, so missing steel pushes work toward the raw inputs behind it
 (coal/geologists and minerals/iron support) instead of treating steel as an impossible
 resource.
+
+## Mood & leaders (managed for you)
+
+Happiness is a **global production multiplier**, so the helper works it actively:
+
+- **Luxury-aware hunting** keeps furs/ivory stocked (each unique luxury is +10%
+  happiness), and overflow crafting never drains the luxury cushion.
+- **Festivals**: Kitten Scientists holds them, and the helper carries a backup that
+  pays the real cost (1,500 catpower, 5,000 culture, 2,500 parchment) and starts one
+  whenever none is running and the resources are comfortably there.
+- **Happiness buildings** (amphitheatres, broadcast towers, sun-altar style effects) get
+  a scoring boost whenever village mood is below 100%.
+- **Leader election**: it scans every kitten's trait and elects the best one for the
+  current phase — *scientist* while research dominates, *engineer* once steel-era
+  crafting takes over, with *merchant/manager/metallurgist/chemist/wise* scored by how
+  much you trade, hunt, smelt, refine oil, or push faith. Re-elections only happen for a
+  clearly better kitten (no churn), and it respects the Anarchy challenge.
+- **Promotions on overflowing gold**: when gold sits above ~92% of its cap (where income
+  is about to be wasted), the helper promotes kittens — converting dead gold into
+  permanently better workers. Kitten Scientists' own elect/promote automations are kept
+  off so the two systems never fight.
 
 ## Jobs & hunting (managed for you)
 
@@ -111,6 +163,10 @@ turned off so they don't fight it):
   is capped, scholars are moved away; if faith is capped, priests are moved away; if the
   current target mostly needs wood, workers move toward the best wood route. You'll see
   `👷 rebalanced` lines in the log.
+- **Starvation guard:** the helper watches the *net* catnip rate (the game's own number,
+  which includes kitten demand, seasons and weather). The moment catnip goes net-negative
+  with the pantry draining — hello, winter — farmers are reinforced before anyone starves,
+  instead of reacting only after stocks are nearly empty.
 - **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs
   *farmer* (catnip, which it refines into wood) using live production rates, and picks
   whichever gives more wood per kitten.
@@ -149,7 +205,11 @@ the thresholds.
 ```
 src/kittens-game-helper.user.js   The userscript (the whole thing)
 scripts/validate.mjs              Sanity check: script parses + reset-safety intact
-package.json                      npm run validate
+scripts/smoke.mjs                 Behavioral test: runs the script against a mocked
+                                  game and asserts overflow crafting, festivals,
+                                  leader election, promotions, cap-aware planning,
+                                  job balancing and the starvation guard all fire
+package.json                      npm test (validate + smoke)
 LICENSE                           MIT (this wrapper). Kitten Scientists is MIT too.
 ```
 
