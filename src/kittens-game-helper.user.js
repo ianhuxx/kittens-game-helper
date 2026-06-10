@@ -819,20 +819,74 @@
     return boost;
   };
 
+  const hasPrice = (kind, meta, resourceName) =>
+    pricesFor(kind, meta).some((cost) => cost && cost.name === resourceName && cost.val > 0);
+
+  const isStorageMeta = (meta) => /storage|barn|warehouse|harbor|container|tank/.test(effectText(meta));
+
   const strategicBoost = (kind, meta, resources, goal) => {
     const text = effectText(meta);
     let boost = 0;
     if (/automation|factory|engineer|steam|magneto|reactor|accelerator|calciner/.test(text)) boost += 8;
-    if (/storage|barn|warehouse|harbor|container|tank|library|academy/.test(text)) {
+    if (isStorageMeta(meta)) {
       const capped = ["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some(
         (name) => resRatio(resources, name, 0) > 0.9,
       );
-      boost += capped ? 7 : 2;
+      boost += capped ? 10 : -3;
     }
+    if (/library|academy|observatory|biolab|data center/.test(text)) boost += resRatio(resources, "science", 0) > 0.75 ? 6 : 2;
     if (/hut|house|mansion|population|kitten/.test(text)) boost += 4;
     if (kind === "upgrade" && /furnace|coal|pyrolysis|combustion|smelter/.test(text)) boost += 5;
-    if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) boost += 10;
+    if (kind === "research" && hasPrice(kind, meta, "science") && resRatio(resources, "science", 0) > 0.7) boost += 10;
+    if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) boost += 12;
     return boost;
+  };
+
+  const rawProductionForNeed = (name) => {
+    const direct = productionFor(name);
+    if (name !== "wood") return direct;
+    const catnipToWood = productionFor("catnip") / woodCatnipCost();
+    return Math.max(direct, direct + Math.max(0, catnipToWood));
+  };
+
+  const waitSecondsForCandidate = (candidate, resources) => {
+    if (candidate.affordable) return 0;
+    let worst = 0;
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources, cost.name) || {}).value) || 0;
+      const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
+      if (deficit <= 0) continue;
+      const raw = {};
+      rawPathRequirements(cost.name, deficit, raw);
+      const rawEntries = Object.entries(raw);
+      if (!rawEntries.length) {
+        worst = Math.max(worst, Number.POSITIVE_INFINITY);
+        continue;
+      }
+      for (const [name, amount] of rawEntries) {
+        const res = getRes(resources, name);
+        const rawHave = Math.max(0, (res && res.value) || 0);
+        const missing = Math.max(0, amount - rawHave);
+        const prod = rawProductionForNeed(name);
+        if (missing <= 0) continue;
+        if (prod <= 0) return Number.POSITIVE_INFINITY;
+        worst = Math.max(worst, missing / prod);
+      }
+    }
+    return worst;
+  };
+
+  const candidateScore = (candidate, resources, goal) => {
+    const readiness = candidate.affordable ? 35 : Math.min(1, Math.max(0, candidate.progress || 0)) * 14;
+    const wait = waitSecondsForCandidate(candidate, resources);
+    const waitPenalty = isFinite(wait) ? Math.min(26, Math.log10(wait + 1) * 6) : 32;
+    const storagePenalty = isStorageMeta(candidate.meta) && !candidate.affordable &&
+      !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9)
+      ? 10
+      : 0;
+    const kindWeight = candidate.kind === "research" ? 8 : candidate.kind === "upgrade" ? 6 : 3;
+    return kindWeight + readiness + shortageBoost(candidate.meta, resources) + strategicBoost(candidate.kind, candidate.meta, resources, goal) - waitPenalty - storagePenalty;
   };
 
   const gatherCandidates = (resources, goalKey) => {
@@ -862,8 +916,8 @@
     return candidates
       .map((c) => {
         const evaluation = evaluate(c.kind, c.meta, resources);
-        const score = c.weight + evaluation.progress + shortageBoost(c.meta, resources) + strategicBoost(c.kind, c.meta, resources, goal);
-        return { ...c, ...evaluation, score };
+        const withEvaluation = { ...c, ...evaluation };
+        return { ...withEvaluation, score: candidateScore(withEvaluation, resources, goal) };
       })
       .sort((a, b) => b.score - a.score);
   };
@@ -888,15 +942,19 @@
 
   const chooseWorkTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
-    const preferred = candidates.find((c) => !c.affordable && c.missing) || candidates.find((c) => c.affordable) || null;
+    const preferred = candidates[0] || null;
     const now = Date.now();
 
     if (activeTarget) {
       const locked = findCandidateById(candidates, activeTarget.id);
       const age = now - activeTarget.startedAt;
-      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
+      const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
+      const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
+        !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9);
+      const muchBetter = preferred && locked && preferred.score > locked.score + 10;
+      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
         activeTarget = null;
-      } else if (age < TARGET_LOCK_MIN_MS || !preferred || locked.score >= preferred.score * 0.7) {
+      } else if (!muchBetter && (age < TARGET_LOCK_MIN_MS || !preferred || locked.score >= preferred.score * 0.85)) {
         return locked;
       } else {
         activeTarget = null;
