@@ -82,12 +82,41 @@ Both choices are remembered between sessions.
 
 ## Smarter target choice
 
+### Current decision chain (before the time-path update)
+
+1. Score every unlocked research, workshop upgrade, and building together.
+2. Boost obvious strategic items: automation, production unlocks, storage relief,
+   population, and goal keywords.
+3. If the top item is missing crafted resources, craft those prerequisites recursively
+   (for example iron + coal → steel → gear).
+4. Point jobs at the raw inputs behind the active target.
+5. Keep the chosen target briefly locked so close candidates do not flip every tick.
+
+That worked well for obvious bottlenecks, but the top target could still change too often
+because it did not explicitly ask: “Is waiting for this direct target slower than buying a
+quick prerequisite or efficiency step first?”
+
+### Updated decision chain (time-optimized pathing)
+
+1. Pick the best direct end-goal candidate from the selected goal and current economy.
+2. If that candidate is affordable, buy it immediately.
+3. If it is not affordable but its missing resource is craftable, recursively craft the
+   cheapest available recipe path first.
+4. If it is not craftable yet, expand the missing resource chain into raw inputs and
+   storage blockers, estimate the wait, and compare that wait against quick/affordable
+   pathway candidates that improve those exact blockers.
+5. Choose the pathway candidate only when it plausibly shortens time-to-goal; otherwise
+   continue gathering directly for the target.
+6. Lock the selected step long enough to push through, unless it completes, becomes
+   storage-blocked, or a much better pathway appears.
+
 The helper no longer blindly chases the next visible button. It scores research, workshop
 upgrades, and buildings together, with extra priority for automation/unlock steps,
 production scale, resource-fixing workshop upgrades, storage when resources are capping,
-and population growth. That means it can choose to scale first when growth is better long-term, rush science/automation when
-that unlocks the next important branch, or prioritize an upgrade like **Coal Furnace**
-when coal production is the thing blocking progress.
+and population growth. Then it applies the time-optimized pathway check above, so it can
+choose to scale first when growth is faster, rush science/automation when that unlocks the
+next important branch, or prioritize an upgrade like **Coal Furnace** when coal production
+is the thing blocking progress.
 
 Resource-starvation upgrades are part of that scoring too: if coal is depleted, upgrades
 whose names/effects/unlocks help coal or smelters get a large boost, so **Coal Furnace**
@@ -150,7 +179,8 @@ turned off so they don't fight it):
 - **All non-engineer kittens are rebalanced continuously**, not just idle kittens. If science
   is capped, scholars are moved away; if faith is capped, priests are moved away; if the
   current target mostly needs wood, workers move toward the best wood route. You'll see
-  `👷 rebalanced` lines in the log.
+  `👷 rebalanced` lines in the log with the full managed-job distribution, not just the
+  three largest job buckets.
 - **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs
   *farmer* (catnip, which it refines into wood) using live production rates, and picks
   whichever gives more wood per kitten.
