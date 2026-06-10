@@ -48,7 +48,9 @@
   // Setting these to 0 means "buy as soon as it's affordable". Bonfire, science
   // and workshop upgrades are NOT here: the helper buys those itself so the plan
   // can reserve resources — KS would otherwise spend the savings on cheap items.
-  const PURCHASE_SECTIONS = ["religion", "space", "time", "trade"];
+  // Religion is tuned separately: "Praise the Sun" converts banked faith, so it
+  // should wait for near-cap faith instead of firing as soon as any faith exists.
+  const PURCHASE_SECTIONS = ["space", "time", "trade"];
 
   const PROFILE_INFO = {
     autopilot: {
@@ -183,6 +185,54 @@
     }
   };
 
+  const RELIGION_GENERAL_TRIGGER = 0.5;
+  const RELIGION_UPGRADE_TRIGGER = 0.25;
+  const RELIGION_PRAISE_TRIGGER = 0.95;
+
+  const religionNodeType = (key) => {
+    const lower = String(key || "").toLowerCase();
+    if (lower.includes("praise") || lower === "faith" || lower.includes("faith")) return "praise";
+    if (lower.includes("upgrade") || lower.includes("build") || lower.includes("solar") || lower.includes("apocrypha")) {
+      return "upgrade";
+    }
+    return "general";
+  };
+
+  const tuneReligionNode = (node, key) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) tuneReligionNode(child, key);
+      return;
+    }
+    if (isDeniedKey(key)) {
+      if ("enabled" in node) node.enabled = false;
+      return;
+    }
+    if ("enabled" in node) node.enabled = true;
+    if (typeof node.trigger === "number") {
+      const type = religionNodeType(key);
+      node.trigger = type === "praise"
+        ? RELIGION_PRAISE_TRIGGER
+        : type === "upgrade"
+          ? RELIGION_UPGRADE_TRIGGER
+          : RELIGION_GENERAL_TRIGGER;
+    }
+    for (const [childKey, childVal] of Object.entries(node)) {
+      if (childKey === "enabled" || childKey === "trigger") continue;
+      if (childVal && typeof childVal === "object") tuneReligionNode(childVal, childKey);
+    }
+  };
+
+  // Religion needs different pacing than trade/space/time.  Most religion
+  // upgrades are progress, but "Praise the Sun" converts the faith bank into
+  // worship; doing that at trigger 0 starves near-term upgrade choices.  Keep
+  // upgrade buyers willing to act, force irreversible actions off via the deny
+  // list, and only praise when faith is close to storage cap.
+  const configureReligionProgression = (settings) => {
+    if (!settings || !settings.religion) return;
+    tuneReligionNode(settings.religion, "religion");
+  };
+
   // The helper owns ALL building/research/workshop-upgrade purchasing so the
   // active plan can reserve resources. KS keeps crafting, trade, religion,
   // space, time and village automations — but its competing buyers go dark.
@@ -232,6 +282,7 @@
       for (const section of ["space", "time"]) {
         if (settings[section]) raiseZeroMaxes(settings[section]);
       }
+      configureReligionProgression(settings);
       takeOverPurchasing(settings);
       enableCatnipRefining(settings);
     }
@@ -314,6 +365,7 @@
         if (typeof workshop.getPrices === "function") return workshop.getPrices(meta) || meta.prices || [];
         if (typeof workshop.getPrice === "function") return workshop.getPrice(meta) || meta.prices || [];
       }
+      if (kind === "religion") return religionUpgradePrices(meta);
     } catch (error) {
       /* ignore */
     }
@@ -346,6 +398,109 @@
       }
     }
     return { affordable, progress, missing: missing.slice(0, 3).join(", ") };
+  };
+
+  const religionUpgrades = () => {
+    try {
+      const religion = window.gamePage && window.gamePage.religion;
+      return Array.isArray(religion && religion.religionUpgrades) ? religion.religionUpgrades : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const religionWorship = () => {
+    try {
+      return (window.gamePage && window.gamePage.religion && window.gamePage.religion.faith) || 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const religionUpgradePurchased = (meta) => !!(meta && ((meta.noStackable && (meta.on || meta.val || 0) > 0) || meta.researched));
+
+  const religionUpgradeVisible = (meta) => {
+    if (!meta || meta.unlocked === false || religionUpgradePurchased(meta)) return false;
+    return !isFinite(meta.faith) || religionWorship() >= meta.faith || (meta.on || 0) > 0;
+  };
+
+  const religionUpgradePrices = (meta) => {
+    try {
+      const game = window.gamePage;
+      const Controller = getGlobalPath(["com", "nuclearunicorn", "game", "ui", "ReligionBtnController"]);
+      if (game && typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ id: meta.name, controller });
+        if (model && typeof controller.getPrices === "function") return controller.getPrices(model) || meta.prices || [];
+      }
+    } catch (error) {
+      /* fall through to raw metadata prices */
+    }
+    return (meta && (meta.prices || meta.price)) || [];
+  };
+
+  const nextFaithReligionUpgrade = (resources) => {
+    const faith = getRes(resources, "faith");
+    if (!faith) return null;
+    const candidates = [];
+    for (const meta of religionUpgrades()) {
+      if (!religionUpgradeVisible(meta)) continue;
+      const prices = religionUpgradePrices(meta);
+      const faithPrice = prices.find((price) => price && price.name === "faith" && price.val > 0);
+      if (!faithPrice) continue;
+      if (faith.maxValue > 0 && faithPrice.val > faith.maxValue) continue;
+      const evaluation = evaluate("religion", { ...meta, prices }, resources);
+      candidates.push({ meta, faithPrice: faithPrice.val, ...evaluation });
+    }
+    return candidates
+      .filter((candidate) => faith.value < candidate.faithPrice || candidate.affordable)
+      .sort((a, b) => {
+        if (a.affordable !== b.affordable) return a.affordable ? -1 : 1;
+        if (b.progress !== a.progress) return b.progress - a.progress;
+        return a.faithPrice - b.faithPrice;
+      })[0] || null;
+  };
+
+  const setReligionPraiseState = (settings, enabled, trigger = RELIGION_PRAISE_TRIGGER) => {
+    const visit = (node, key) => {
+      if (!node || typeof node !== "object") return;
+      if (Array.isArray(node)) {
+        for (const child of node) visit(child, key);
+        return;
+      }
+      if (religionNodeType(key) === "praise") {
+        if ("enabled" in node) node.enabled = enabled;
+        if (typeof node.trigger === "number") node.trigger = trigger;
+        return;
+      }
+      for (const [childKey, childVal] of Object.entries(node)) {
+        if (childVal && typeof childVal === "object") visit(childVal, childKey);
+      }
+    };
+    if (settings && settings.religion) visit(settings.religion, "religion");
+  };
+
+  let religionPlanText = "Religion: watching faith";
+
+  const reserveFaithForReligionProgression = (resources) => {
+    try {
+      const settings = window.kittenScientists && window.kittenScientists.getSettings && window.kittenScientists.getSettings();
+      if (!settings || !settings.religion) return;
+      configureReligionProgression(settings);
+      const next = nextFaithReligionUpgrade(resources);
+      if (next) {
+        setReligionPraiseState(settings, false);
+        religionPlanText = next.affordable
+          ? `Religion: ${labelOf(next.meta)} ready; holding praise until it is bought`
+          : `Religion: saving faith for ${labelOf(next.meta)} (${next.missing || "faith needed"})`;
+      } else {
+        setReligionPraiseState(settings, true, RELIGION_PRAISE_TRIGGER);
+        religionPlanText = "Religion: praise waits near cap; no faith upgrade pending";
+      }
+      if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
+    } catch (error) {
+      /* ignore religion pacing failures */
+    }
   };
 
   /* ------------------------------ per-tick cache ----------------------------- */
@@ -811,6 +966,7 @@
     catnip: ["catnip", "field", "pasture", "aqueduct", "unicorn pasture", "hydroponics"],
     science: ["science", "library", "academy", "observatory", "biolab", "data center"],
     manpower: ["manpower", "catpower", "hunter", "archery", "composite bow", "crossbow", "bolas"],
+    culture: ["culture", "amphitheat", "chapel", "temple", "tradepost", "brewery", "mint", "unicorn"],
     faith: ["faith", "temple", "chapel", "solar", "religion"],
   };
 
@@ -930,9 +1086,10 @@
       const ratio = resRatio(resources, name, 1);
       const stockBoost = Math.max(0, 0.45 - ratio);
       const prod = productionFor(name);
-      const prodBoost = prod <= 0 && ratio < 0.8 ? 0.25 : 0;
+      const prodBoost = prod <= 0 && ratio < (name === "culture" ? 0.95 : 0.8) ? (name === "culture" ? 0.5 : 0.25) : 0;
       if (stockBoost <= 0 && prodBoost <= 0) continue;
-      if (helpsShortage(meta, name)) boost += (stockBoost + prodBoost) * (name === "coal" ? 42 : 26);
+      const multiplier = name === "coal" ? 42 : name === "culture" ? 34 : 26;
+      if (helpsShortage(meta, name)) boost += (stockBoost + prodBoost) * multiplier;
       if (name === "coal" && keywords.some((word) => metaText(meta).includes(word))) boost += (stockBoost + prodBoost) * 22;
     }
     const iron = getRes(resources, "iron");
@@ -1023,6 +1180,13 @@
     }
     try {
       for (const u of window.gamePage.workshop.upgrades || []) visit("upgrade", u);
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const u of religionUpgrades()) {
+        if (religionUpgradeVisible(u)) visit("religion", u);
+      }
     } catch (error) {
       /* ignore */
     }
@@ -1352,7 +1516,7 @@
       !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9)
       ? 10
       : 0;
-    const kindWeight = candidate.kind === "research" ? 12 : candidate.kind === "upgrade" ? 12 : 3;
+    const kindWeight = candidate.kind === "research" ? 12 : candidate.kind === "upgrade" ? 12 : candidate.kind === "religion" ? 11 : 3;
     const affordBonus = candidate.affordable ? 6 : Math.min(1, Math.max(0, candidate.progress || 0)) * 5;
     let recursiveBoost = 0;
     if (candidate.kind === "research") {
@@ -1378,6 +1542,13 @@
     try {
       for (const u of window.gamePage.workshop.upgrades || []) {
         if (isOpen(u)) candidates.push({ kind: "upgrade", weight: 3, meta: u });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const u of religionUpgrades()) {
+        if (religionUpgradeVisible(u)) candidates.push({ kind: "religion", weight: 3, meta: u });
       }
     } catch (error) {
       /* ignore */
@@ -1410,6 +1581,7 @@
   const targetComplete = (candidate) => {
     if (!candidate || !candidate.meta) return true;
     if (candidate.kind === "research" || candidate.kind === "upgrade" || candidate.kind === "policy") return !!candidate.meta.researched;
+    if (candidate.kind === "religion") return religionUpgradePurchased(candidate.meta);
     if (candidate.kind === "build" && activeTarget && activeTarget.id === targetId(candidate)) {
       return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
     }
@@ -1472,6 +1644,15 @@
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
+    }
+
+    const religionTarget = nextFaithReligionUpgrade(resources);
+    if (religionTarget && !religionTarget.affordable) {
+      for (const cost of pricesFor("religion", religionTarget.meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        const have = ((getRes(resources, cost.name) || {}).value) || 0;
+        if (have < cost.val) scoreNeed(needs, cost.name, cost.name === "faith" ? 10 : 4);
+      }
     }
 
     for (const [name, amount] of Object.entries(getStoragePressureCached(resources, GOALS[goalKey]))) {
@@ -1645,6 +1826,25 @@
     .map((job) => `${job.title || job.name} ${Math.max(0, Math.floor(counts[job.name] || 0))}`)
     .join(", ");
 
+  const refreshJobManagementUI = (village) => {
+    try {
+      const game = window.gamePage;
+      if (village && typeof village.updateResourceProduction === "function") village.updateResourceProduction();
+      if (game && game.villageTab && typeof game.villageTab.updateTab === "function") game.villageTab.updateTab();
+      if (game && game.tabs) {
+        for (const tab of game.tabs) {
+          if (/village|management/i.test(`${tab && (tab.name || tab.tabName || tab.id || "")}`) && typeof tab.updateTab === "function") {
+            tab.updateTab();
+          }
+        }
+      }
+      if (game && typeof game.updateResources === "function") game.updateResources();
+      if (game && typeof game.render === "function") game.render();
+    } catch (error) {
+      /* ignore UI refresh failures */
+    }
+  };
+
   const balanceJobs = (goalKey, resources) => {
     try {
       const village = window.gamePage.village;
@@ -1672,13 +1872,7 @@
           moved += need;
         }
       }
-      try {
-        if (typeof village.updateResourceProduction === "function") village.updateResourceProduction();
-        if (window.gamePage.villageTab && typeof window.gamePage.villageTab.updateTab === "function") window.gamePage.villageTab.updateTab();
-        if (typeof window.gamePage.updateResources === "function") window.gamePage.updateResources();
-      } catch (error) {
-        /* ignore UI refresh failures */
-      }
+      refreshJobManagementUI(village);
       lastJobSignature = signature;
       if (moved > 0 && now - lastJobLog > 15000) {
         const after = {};
@@ -1861,6 +2055,7 @@
   const purchaseComplete = (candidate, initialVal) => {
     if (!candidate || !candidate.meta) return false;
     if (candidate.kind === "build") return ((candidate.meta.val || 0) > (initialVal || 0));
+    if (candidate.kind === "religion") return religionUpgradePurchased(candidate.meta);
     return !!candidate.meta.researched;
   };
 
@@ -1888,6 +2083,12 @@
     if (kind === "policy") {
       return {
         path: ["com", "nuclearunicorn", "game", "ui", "PolicyButtonController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
+    if (kind === "religion") {
+      return {
+        path: ["com", "nuclearunicorn", "game", "ui", "ReligionBtnController"],
         opts: (name) => ({ id: name }),
       };
     }
@@ -1947,7 +2148,7 @@
   const applyRawPurchaseEffects = (candidate) => {
     const game = window.gamePage;
     const meta = candidate.meta;
-    if (candidate.kind === "build") {
+    if (candidate.kind === "build" || candidate.kind === "religion") {
       meta.val = (meta.val || 0) + 1;
       meta.on = (meta.on || 0) + 1;
     } else {
@@ -1988,6 +2189,12 @@
       attempts.push(
         () => game.workshop && typeof game.workshop.research === "function" && game.workshop.research(name),
         () => game.workshop && typeof game.workshop.research === "function" && game.workshop.research(meta),
+      );
+    }
+    if (candidate.kind === "religion") {
+      attempts.push(
+        () => game.religion && typeof game.religion.build === "function" && game.religion.build(name),
+        () => game.religion && typeof game.religion.build === "function" && game.religion.build(candidate.meta),
       );
     }
     if (candidate.kind === "build") {
@@ -2415,6 +2622,7 @@
   let leaderEl;
   let craftEl;
   let processingEl;
+  let religionEl;
   let policyEl;
   let policySelectEl;
   let policyApplyEl;
@@ -2465,6 +2673,7 @@
       craftTowardTarget(resources, goal);
       craftOverflowResources(resources, goal);
       optimizeProcessing(resources, goal);
+      reserveFaithForReligionProgression(resources);
       executePlan(resources, goal);
       balanceJobs(goal, resources);
       maybeSelectLeader(goal, resources);
@@ -2485,6 +2694,7 @@
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
+      if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
       renderPolicyControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
@@ -2570,6 +2780,7 @@
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
+      '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
       '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
@@ -2598,6 +2809,7 @@
     leaderEl = box.querySelector(".kgh-leader");
     craftEl = box.querySelector(".kgh-craft");
     processingEl = box.querySelector(".kgh-processing");
+    religionEl = box.querySelector(".kgh-religion");
     policyEl = box.querySelector(".kgh-policy");
     policySelectEl = box.querySelector(".kgh-policy-select");
     policyApplyEl = box.querySelector(".kgh-policy-apply");

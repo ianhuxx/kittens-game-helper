@@ -144,6 +144,31 @@ const policies = [
   { name: "openFairs", label: "Open Fairs", unlocked: true, researched: false, blocked: false, blocks: [], prices: [{ name: "culture", val: 1500 }], effects: {} },
 ];
 
+const religionUpgrades = [
+  {
+    name: "solarchant",
+    label: "Solar Chant",
+    unlocked: true,
+    noStackable: true,
+    on: 0,
+    val: 0,
+    faith: 150,
+    prices: [{ name: "faith", val: 100 }],
+    effects: { faithRatioReligion: 0.1 },
+  },
+  {
+    name: "solarRevolution",
+    label: "Solar Revolution",
+    unlocked: true,
+    noStackable: true,
+    on: 0,
+    val: 0,
+    faith: 1000,
+    prices: [{ name: "gold", val: 500 }, { name: "faith", val: 750 }],
+    effects: { solarRevolutionRatio: 0 },
+  },
+];
+
 const J = (name, title, value) => ({ name, title, unlocked: true, value });
 const jobs = [
   J("woodcutter", "Woodcutter", 2),
@@ -223,6 +248,10 @@ const gamePage = {
     get: (name) => techs.find((t) => t.name === name),
     getPrices: (meta) => (meta && meta.prices) || [],
   },
+  religion: {
+    faith: 200,
+    religionUpgrades,
+  },
   workshop: {
     upgrades: [],
     crafts,
@@ -265,7 +294,13 @@ const ksSettings = {
     techs: { theology: S(), machinery: S(), trivia: S() },
     policies: { liberty: S(), openFairs: S() },
   }),
-  religion: S({ trigger: 0.2, adore: S(), sacrificeUnicorns: S() }),
+  religion: S({
+    trigger: 0.2,
+    faith: S({ trigger: 0.2 }),
+    solarRevolution: S({ trigger: 0.2 }),
+    adore: S(),
+    sacrificeUnicorns: S(),
+  }),
   space: S({ trigger: 1 }),
   time: S({ reset: S() }),
   trade: S({ trigger: 0.8 }),
@@ -357,6 +392,14 @@ check("KS tech buying disabled, star observation kept", appliedSettings.science.
 check("KS workshop upgrades disabled, crafts kept (catnip→wood at 50%)", appliedSettings.workshop.upgrades.printingPress.enabled === false && appliedSettings.workshop.crafts.wood.enabled === true && appliedSettings.workshop.crafts.wood.trigger === 0.5);
 check("KS jobs/hunt/leader automations disabled (ours run)", appliedSettings.village.jobs.woodcutter.enabled === false && appliedSettings.village.hunt.enabled === false && appliedSettings.village.electLeader.enabled === false && appliedSettings.village.promoteLeader.enabled === false);
 check("KS festivals stay on; resets/adore/sacrifice/policies stay off", appliedSettings.village.holdFestivals.enabled === true && appliedSettings.time.reset.enabled === false && appliedSettings.religion.adore.enabled === false && appliedSettings.religion.sacrificeUnicorns.enabled === false && appliedSettings.science.policies.liberty.enabled === false);
+check(
+  "religion progression waits to praise but still considers upgrades",
+  appliedSettings.religion.trigger === 0.5
+    && appliedSettings.religion.faith.trigger === 0.95
+    && appliedSettings.religion.faith.enabled === false
+    && appliedSettings.religion.solarRevolution.trigger === 0.25
+    && /Solar Chant/.test(panelText(".kgh-religion")),
+);
 
 check("plan: Library chosen over storage-blocked Theology and cheap Mine", /Library/.test(panelText(".kgh-plan")));
 check("plan: reservation visible in the panel", /reserving/i.test(panelText(".kgh-plan")) || /saving for/i.test(panelText(".kgh-buy")));
@@ -388,6 +431,7 @@ check("reservation: Mine never bought during the whole run", buildings[1].val ==
 check("leader elected from traits", village.leader != null && village.leader.trait.name !== "none");
 check("promotion: overflowing gold spent on kittens", promoteCalls > 0 && res("gold").value < 95);
 check("jobs: starvation guard reinforced farmers (net catnip < 0)", job("farmer").value >= 3);
+check("jobs: religion faith reserve directs priests", job("priest").value > 0);
 check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
 
 if (failures.length) {

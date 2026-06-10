@@ -53,6 +53,16 @@ const required = [
   "reservedNeedsFor",
   "respectsReservations",
   "kgh-buy",
+  // Religion: praise waits for a high faith bank so upgrades get a chance.
+  "configureReligionProgression",
+  "RELIGION_PRAISE_TRIGGER",
+  "reserveFaithForReligionProgression",
+  "nextFaithReligionUpgrade",
+  "kgh-religion",
+  "ReligionBtnController",
+  "refreshJobManagementUI",
+  "candidate.kind === \"religion\"",
+  "culture",
   // Recursive prerequisite planning: gateway techs and goal frontiers.
   "gatewayValue",
   "frontierFor",
