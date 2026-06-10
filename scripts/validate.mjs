@@ -4,7 +4,8 @@
 //   1. the userscript body parses (no syntax errors),
 //   2. the Kitten Scientists @require pin is present,
 //   3. the reset-safety denylist is intact (so we never auto-reset a save),
-//   4. both profiles still exist.
+//   4. both profiles still exist,
+//   5. the extra smart-play layers remain wired into the panel.
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,13 @@ const required = [
   // The "build as soon as affordable" trigger fix must stay in place.
   "PURCHASE_SECTIONS",
   "setTriggersDeep",
+  // Smart-play layers added on top of KS should stay wired in.
+  "OVERFLOW_CRAFTS",
+  "maybeSelectLeader",
+  "kgh-leader",
+  "kgh-craft",
+  // Kittens Game intentionally spells this resource ID as compedium.
+  "compedium",
 ];
 
 const missing = required.filter((token) => !source.includes(token));
