@@ -1160,14 +1160,24 @@
   const storageBlockPressure = (resources, goal, goalKey) => {
     const pressure = {};
     const goalFrontier = goalFrontierNames(goalKey);
+    const focusedMode = goalKey !== "balanced" && goal && goal.keywords.length;
     const storageBlockerIsFocused = (kind, meta) => {
       const text = metaText(meta);
       if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) return true;
       if (kind === "research") {
         if (goalFrontier.has(meta.name)) return true;
         // Balanced mode may still chase true gateway techs, but focused modes
-        // should not convert every capped science bank into more Libraries.
+        // should not convert every capped bank into generic storage for side
+        // upgrades that do not advance the selected goal.
         return goalKey === "balanced" && (gatewayValue(meta) >= 1 || /theology|philosophy|machinery|rocketry/.test(text));
+      }
+      if (focusedMode) {
+        // In a focused goal (especially Rush Space), a random side upgrade that
+        // barely exceeds catpower/material caps must not create enough storage
+        // pressure to make the helper build warehouses forever while the real
+        // blocker is craftable manuscripts/blueprints. Only let focused-mode
+        // storage pressure come from items that clearly advance that focus.
+        return /rocket|space|satellite|orbital|moon|oil|steamworks|factory|magneto|reactor|accelerator|mansion|amphitheat|temple/.test(text);
       }
       if (kind === "upgrade" || kind === "religion") return true;
       return /steamworks|factory|magneto|reactor|accelerator|harbor|warehouse|tank|container|mansion|amphitheat|temple/.test(text);

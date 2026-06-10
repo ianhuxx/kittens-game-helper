@@ -101,6 +101,15 @@ const buildings = [
   { name: "mine", label: "Mine", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 300 }], effects: { mineralsRatio: 0.2 } },
   { name: "barn", label: "Barn", unlocked: true, val: 1, on: 1, prices: [{ name: "wood", val: 1000 }], effects: { catnipMax: 5000, woodMax: 200 } },
   { name: "hut", label: "Hut", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 5000 }], effects: { manpowerMax: 75 } },
+  {
+    name: "warehouse",
+    label: "Warehouse",
+    unlocked: false,
+    val: 0,
+    on: 0,
+    prices: [{ name: "beam", val: 200 }, { name: "slab", val: 350 }],
+    effects: { manpowerMax: 500, woodMax: 1000, mineralsMax: 1000, ironMax: 250, coalMax: 250 },
+  },
 ];
 
 const techs = [
@@ -438,23 +447,61 @@ const mineBeforeProductionFocus = buildings[1].val;
 tickFn();
 check("focus: production goal spends on Mine instead of science storage", buildings[1].val === mineBeforeProductionFocus + 1 && buildings[0].val === libraryBeforeProductionFocus);
 
-/* Stage 5 — crafted intermediates must be bought in the same tick, even while throttled */
+/* Stage 5 — Rush Space must not detour into side-effect warehouses */
+storage.set("kgh.goal", "space");
+fakeNow += 370000;
+techs.push({
+  name: "rocketry",
+  label: "Rocketry",
+  unlocked: false,
+  researched: false,
+  prices: [{ name: "science", val: 100000 }],
+  unlocks: {},
+});
+const astronomy = techs.find((tech) => tech.name === "astronomy");
+astronomy.unlocked = true;
+astronomy.researched = false;
+astronomy.prices = [{ name: "science", val: 30000 }, { name: "manuscript", val: 65 }];
+astronomy.unlocks = { tech: ["rocketry"] };
+buildings.find((building) => building.name === "warehouse").unlocked = true;
+gamePage.workshop.upgrades.push({
+  name: "crossbow",
+  label: "Crossbow",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "manpower", val: 2500 }],
+  effects: { hunterRatio: 0.25 },
+});
+res("science").value = 29800;
+res("science").maxValue = 30050;
+res("manpower").value = 2200;
+res("manpower").maxValue = 2225;
+res("manuscript").value = 16;
+res("parchment").value = 2;
+res("beam").value = 55;
+res("slab").value = 342;
+tickFn();
+check("space focus: manuscript-gated Astronomy stays ahead of side catpower Warehouse", /Astronomy/.test(panelText(".kgh-plan")) && !/warehouse/i.test(panelText(".kgh-plan")));
+
+/* Stage 6 — crafted intermediates must be bought in the same tick, even while throttled */
 techs.forEach((tech) => { tech.researched = true; });
 policies.forEach((policy) => { policy.researched = true; });
 religionUpgrades.forEach((upgrade) => { upgrade.researched = true; upgrade.on = 1; upgrade.val = 1; });
 buildings.forEach((building) => { building.unlocked = false; });
-gamePage.workshop.upgrades.push({
+for (const upgrade of gamePage.workshop.upgrades) upgrade.researched = true;
+const sawblades = {
   name: "sawblades",
   label: "Sawblades",
   unlocked: true,
   researched: false,
   prices: [{ name: "beam", val: 11 }],
   effects: { woodRatio: 0.25 },
-});
+};
+gamePage.workshop.upgrades.push(sawblades);
 res("beam").value = 10;
 res("wood").value = 175;
 tickFn();
-check("crafted intermediate: upgrade bought in the same throttled tick", gamePage.workshop.upgrades[0].researched === true && res("beam").value >= 0 && res("beam").value < 10);
+check("crafted intermediate: upgrade bought in the same throttled tick", sawblades.researched === true && res("beam").value >= 0 && res("beam").value < 10);
 check("focus panel names upgrade priority clearly", logText().includes("plan upgrade Sawblades") || /FOCUS: .*WORKSHOP UPGRADE/i.test(panelText(".kgh-plan")));
 
 /* Cross-cutting village behaviors */
