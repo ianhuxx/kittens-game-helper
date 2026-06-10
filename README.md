@@ -96,6 +96,24 @@ wood, minerals/iron, catnip, science, manpower/hunting, and faith. The active pl
 kept stable for a short lock window so the helper does not thrash between projects every
 tick when several candidates are close.
 
+The advisor also detects when an important research target is impossible because a direct
+resource cost is above current storage. For example, if **Theology** needs more science
+than your science cap, it marks the plan as storage-blocked, stops treating Theology as a
+normal gather-wait target, and boosts the buildings or upgrades that add the missing
+storage (such as Libraries, Academies, Observatories, or other matching storage unlocks)
+before drifting into unrelated side projects. When multiple things are already affordable,
+autopilot spends ready research and workshop upgrades before ordinary buildings so unlocked
+science like Theology does not sit untouched while lower-impact construction continues.
+
+Workshop upgrades and Steamworks-style unlocks receive extra priority because they often
+open the next real layer of automation or production. The helper also explicitly enables
+Kitten Scientists' workshop-upgrade buying triggers while keeping bulk craft triggers
+conservative, and its own backstop buyer now reads workshop upgrade prices directly.
+
+Policies remain manual because they can be permanent, mutually exclusive, or strategy
+defining. The helper shows a recommended policy with pros, cons, and affordability, then
+provides a **Policy** button so you choose the exact policy before it is applied.
+
 ## Workshop crafting prerequisites and overflow control
 
 When the active target needs a crafted resource, the helper follows the recipe chain

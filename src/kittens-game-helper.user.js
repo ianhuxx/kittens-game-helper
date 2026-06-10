@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.11.2
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.11.4
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and detects storage-blocked research like Theology, pushes stuck Steamworks/workshop upgrades ahead of routine construction, keeps policy choices manual with pros/cons, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -52,7 +52,7 @@
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, selects productive leaders, converts near-capped resources into useful crafts, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
+      note: "Builds the instant things are affordable, continuously rebalances all non-engineer kitten jobs toward the best work (with wood-vs-catnip pathway math), prioritizes resource-fixing workshop upgrades like Coal Furnace, fixes storage-blocked research like Theology before drifting to side projects, pushes Steamworks and workshop upgrades when they unlock progress, crafts prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, selects productive leaders, converts near-capped resources into useful crafts, sends hunters, and refines surplus catnip into wood. Prestige resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
@@ -179,6 +179,18 @@
     }
   };
 
+  const enableWorkshopUpgradeBuying = (settings) => {
+    const workshop = settings && settings.workshop;
+    if (!workshop) return;
+    workshop.enabled = true;
+    for (const key of ["upgrades", "upgrade", "research", "technologies"]) {
+      if (workshop[key] && typeof workshop[key] === "object") {
+        setEnabledDeep(workshop[key], true, key);
+        setTriggersDeep(workshop[key], 0);
+      }
+    }
+  };
+
   const buildSettings = (profileName) => {
     const settings = window.kittenScientists.getSettings();
 
@@ -206,6 +218,7 @@
       for (const section of ["bonfire", "space", "time"]) {
         if (settings[section]) raiseZeroMaxes(settings[section]);
       }
+      enableWorkshopUpgradeBuying(settings);
       enableCatnipRefining(settings);
     }
 
@@ -279,8 +292,13 @@
       if (kind === "build" && window.gamePage.bld.getPrices) {
         return window.gamePage.bld.getPrices(meta.name) || meta.prices || [];
       }
-      if (kind === "research" && window.gamePage.science.getPrices) {
+      if ((kind === "research" || kind === "policy") && window.gamePage.science.getPrices) {
         return window.gamePage.science.getPrices(meta) || meta.prices || [];
+      }
+      if (kind === "upgrade" && window.gamePage.workshop) {
+        const workshop = window.gamePage.workshop;
+        if (typeof workshop.getPrices === "function") return workshop.getPrices(meta) || meta.prices || [];
+        if (typeof workshop.getPrice === "function") return workshop.getPrice(meta) || meta.prices || [];
       }
     } catch (error) {
       /* ignore */
@@ -306,8 +324,11 @@
       progress = Math.min(progress, possible / cost.val);
       if (have < cost.val) {
         affordable = false;
-        const craftHint = craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
-        missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${craftHint}`);
+        const storageHint = res && res.maxValue > 0 && cost.val > res.maxValue && !craftByName(cost.name)
+          ? ` (storage cap ${fmt(res.maxValue)})`
+          : "";
+        const craftHint = !storageHint && craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
+        missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${storageHint || craftHint}`);
       }
     }
     return { affordable, progress, missing: missing.slice(0, 3).join(", ") };
@@ -856,15 +877,111 @@
 
   const isStorageMeta = (meta) => /storage|barn|warehouse|harbor|container|tank/.test(effectText(meta));
 
+  const storageResourceFromEffectKey = (key) => {
+    const match = String(key || "").match(/^([a-z][a-z0-9]*)(?:Max|MaxRatio)$/i);
+    return match ? match[1] : null;
+  };
+
+  const directStorageBlockers = (kind, meta, resources) => {
+    const blockers = [];
+    for (const cost of pricesFor(kind, meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (craftByName(cost.name)) continue;
+      const res = getRes(resources, cost.name);
+      if (!res || !res.maxValue || res.maxValue <= 0 || cost.val <= res.maxValue) continue;
+      blockers.push({ name: cost.name, need: cost.val, max: res.maxValue });
+    }
+    return blockers;
+  };
+
+  const storageBlockerText = (kind, meta, resources) =>
+    directStorageBlockers(kind, meta, resources)
+      .slice(0, 2)
+      .map((blocker) => `${resTitle(resources, blocker.name)} storage ${fmt(blocker.max)}/${fmt(blocker.need)}`)
+      .join(", ");
+
+  const storageReliefResources = (meta) => {
+    const resources = new Set();
+    const effects = (meta && meta.effects) || {};
+    for (const [key, value] of Object.entries(effects)) {
+      if (!isFinite(value) || value <= 0) continue;
+      const name = storageResourceFromEffectKey(key);
+      if (name) resources.add(name);
+    }
+
+    // Some Kittens Game metadata exposes storage indirectly through stages,
+    // calculateEffects functions, or unlock text, so keep a conservative name
+    // fallback for the common research blockers. This is what makes a science
+    // cap below Theology prefer Libraries/Academies/Observatories instead of
+    // wandering into unrelated builds forever.
+    const text = effectText(meta);
+    if (/science|maxscience|library|academy|observatory|biolab|data center/.test(text)) resources.add("science");
+    if (/culture|maxculture|amphitheat|chapel|temple|tradepost|mint|unicorn/.test(text)) resources.add("culture");
+    if (/faith|maxfaith|chapel|temple|ziggurat|solar/.test(text)) resources.add("faith");
+    if (/catpower|maxmanpower|maxcatpower|harbor|warehouse|archery|composite bow|crossbow|bolas/.test(text)) resources.add("manpower");
+    if (/barn|warehouse|harbor|container|tank|storage/.test(text)) {
+      for (const name of ["wood", "minerals", "iron", "coal", "oil", "uranium"]) resources.add(name);
+    }
+    return resources;
+  };
+
+  const storageBlockPressure = (resources, goal) => {
+    const pressure = {};
+    const visit = (kind, meta) => {
+      if (!isOpen(meta)) return;
+      const blockers = directStorageBlockers(kind, meta, resources);
+      if (!blockers.length) return;
+      let weight = kind === "research" ? 34 : kind === "upgrade" ? 24 : 14;
+      if (/theology|philosophy|cryptotheology|scholasticism|rocketry/.test(metaText(meta))) weight += 26;
+      if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) weight += 18;
+      for (const blocker of blockers) {
+        const severity = Math.max(0.15, (blocker.need - blocker.max) / Math.max(1, blocker.need));
+        pressure[blocker.name] = (pressure[blocker.name] || 0) + weight * severity;
+      }
+    };
+
+    try {
+      for (const t of window.gamePage.science.techs || []) visit("research", t);
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const u of window.gamePage.workshop.upgrades || []) visit("upgrade", u);
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const b of buildingMetas()) visit("build", b);
+    } catch (error) {
+      /* ignore */
+    }
+    return pressure;
+  };
+
+  const storageReliefBoost = (meta, resources, goal) => {
+    const pressure = storageBlockPressure(resources, goal);
+    const relieves = storageReliefResources(meta);
+    let boost = 0;
+    for (const [name, amount] of Object.entries(pressure)) {
+      if (relieves.has(name)) boost += Math.min(55, amount);
+    }
+    return boost;
+  };
+
   const strategicBoost = (kind, meta, resources, goal) => {
     const text = effectText(meta);
     let boost = 0;
-    if (/automation|factory|engineer|steam|magneto|reactor|accelerator|calciner/.test(text)) boost += 8;
+    if (/automation|factory|engineer|steam|steamworks|magneto|reactor|accelerator|calciner/.test(text)) boost += 12;
+    if (kind === "upgrade") boost += 10;
+    if (/machinery|steel|workshop automation|printing press|factory automation|coal furnace|geodesy|astrophysicists/.test(text)) boost += 14;
+    if (kind === "build" && /steamworks/.test(metaText(meta))) boost += 28;
+    const storageRelief = storageReliefBoost(meta, resources, goal);
+    if (storageRelief > 0) boost += storageRelief;
     if (isStorageMeta(meta)) {
       const capped = ["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some(
         (name) => resRatio(resources, name, 0) > 0.9,
       );
-      boost += capped ? 10 : -3;
+      boost += capped || storageRelief > 0 ? 10 : -3;
     }
     if (/library|academy|observatory|biolab|data center/.test(text)) boost += resRatio(resources, "science", 0) > 0.75 ? 6 : 2;
     if (/hut|house|mansion|population|kitten/.test(text)) boost += 4;
@@ -1014,6 +1131,7 @@
 
   const waitSecondsForCandidate = (candidate, resources) => {
     if (candidate.affordable) return 0;
+    if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) return Number.POSITIVE_INFINITY;
     let worst = 0;
     for (const cost of pricesFor(candidate.kind, candidate.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
@@ -1042,12 +1160,14 @@
     const readiness = candidate.affordable ? 35 : Math.min(1, Math.max(0, candidate.progress || 0)) * 14;
     const wait = waitSecondsForCandidate(candidate, resources);
     const waitPenalty = isFinite(wait) ? Math.min(26, Math.log10(wait + 1) * 6) : 32;
+    const storageBlocked = directStorageBlockers(candidate.kind, candidate.meta, resources).length > 0;
+    const storageBlockPenalty = storageBlocked ? 48 : 0;
     const storagePenalty = isStorageMeta(candidate.meta) && !candidate.affordable &&
       !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9)
       ? 10
       : 0;
-    const kindWeight = candidate.kind === "research" ? 8 : candidate.kind === "upgrade" ? 6 : 3;
-    return kindWeight + readiness + shortageBoost(candidate.meta, resources) + strategicBoost(candidate.kind, candidate.meta, resources, goal) - waitPenalty - storagePenalty;
+    const kindWeight = candidate.kind === "research" ? 12 : candidate.kind === "upgrade" ? 14 : 3;
+    return kindWeight + readiness + shortageBoost(candidate.meta, resources) + strategicBoost(candidate.kind, candidate.meta, resources, goal) - waitPenalty - storagePenalty - storageBlockPenalty;
   };
 
   const gatherCandidates = (resources, goalKey) => {
@@ -1094,7 +1214,7 @@
 
   const targetComplete = (candidate) => {
     if (!candidate || !candidate.meta) return true;
-    if (candidate.kind === "research" || candidate.kind === "upgrade") return !!candidate.meta.researched;
+    if (candidate.kind === "research" || candidate.kind === "upgrade" || candidate.kind === "policy") return !!candidate.meta.researched;
     if (candidate.kind === "build" && activeTarget && activeTarget.id === targetId(candidate)) {
       return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
     }
@@ -1112,8 +1232,9 @@
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9);
+      const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
       const muchBetter = preferred && locked && preferred.score > locked.score + 10;
-      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
+      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
         activeTarget = null;
       } else if (!muchBetter && (age < TARGET_LOCK_MIN_MS || !preferred || locked.score >= preferred.score * 0.85)) {
         return locked;
@@ -1136,6 +1257,9 @@
     const needs = {};
     const target = chooseWorkTarget(resources, goalKey);
     if (target && !target.affordable) {
+      for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) {
+        scoreNeed(needs, blocker.name, 18 + Math.min(12, (blocker.need - blocker.max) / Math.max(1, blocker.need) * 24));
+      }
       const rawRequirements = {};
       for (const cost of pricesFor(target.kind, target.meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
@@ -1148,6 +1272,10 @@
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
+    }
+
+    for (const [name, amount] of Object.entries(storageBlockPressure(resources, GOALS[goalKey]))) {
+      scoreNeed(needs, name, Math.min(18, amount / 3));
     }
 
     // Safety and anti-waste: do not keep producing capped spendables; push low raw
@@ -1374,6 +1502,8 @@
       }
       const ready = scored.find((s) => s.affordable);
       if (ready) return `${labelOf(ready.t)} (ready now)`;
+      const blocked = scored.find((s) => storageBlockerText("research", s.t, resources));
+      if (blocked) return `${labelOf(blocked.t)} — blocked by ${storageBlockerText("research", blocked.t, resources)}`;
       const near = scored.filter((s) => s.progress > 0).sort((a, b) => b.progress - a.progress)[0];
       return near ? `${labelOf(near.t)} — need ${near.missing}` : "gathering prerequisites";
     } catch (error) {
@@ -1439,7 +1569,8 @@
       const target = chooseWorkTarget(resources, goalKey);
       if (!target) return "🧭 Plan: scanning unlocked buildings/research";
       const reqs = formatRequirements(target.kind, target.meta, resources);
-      const state = target.affordable ? "ready now" : `missing ${target.missing || "prerequisites"}`;
+      const storageBlock = storageBlockerText(target.kind, target.meta, resources);
+      const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
       const eta = formatEta(waitSecondsForCandidate(target, resources));
       return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
@@ -1448,7 +1579,10 @@
   };
 
   const getNowAction = (resources, goalKey) => {
-    const ready = gatherCandidates(resources, goalKey).find((c) => c.affordable);
+    const affordable = gatherCandidates(resources, goalKey).filter((c) => c.affordable);
+    const ready = affordable.find((candidate) => candidate.kind === "research") ||
+      affordable.find((candidate) => candidate.kind === "upgrade") ||
+      affordable[0];
     return ready ? `${ready.kind} ${labelOf(ready.meta)}` : "gathering…";
   };
 
@@ -1480,6 +1614,12 @@
     if (kind === "upgrade") {
       return {
         path: ["com", "nuclearunicorn", "game", "ui", "UpgradeButtonController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
+    if (kind === "policy") {
+      return {
+        path: ["com", "nuclearunicorn", "game", "ui", "PolicyButtonController"],
         opts: (name) => ({ id: name }),
       };
     }
@@ -1568,8 +1708,10 @@
       () => buyViaGameController(candidate),
       () => buyViaRawMetadata(candidate),
     ];
-    if (candidate.kind === "research") {
+    if (candidate.kind === "research" || candidate.kind === "policy") {
       attempts.push(
+        () => candidate.kind === "policy" && game.science && typeof game.science.researchPolicy === "function" && game.science.researchPolicy(name),
+        () => candidate.kind === "policy" && game.science && typeof game.science.researchPolicy === "function" && game.science.researchPolicy(meta),
         () => game.science && typeof game.science.research === "function" && game.science.research(name),
         () => game.science && typeof game.science.research === "function" && game.science.research(meta),
       );
@@ -1601,7 +1743,12 @@
       if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
       const candidates = gatherCandidates(resources, goalKey);
       const locked = activeTarget && findCandidateById(candidates, activeTarget.id);
-      const ready = (locked && locked.affordable ? locked : null) || candidates.find((candidate) => candidate.affordable);
+      const affordable = candidates.filter((candidate) => candidate.affordable);
+      const ready = (locked && locked.affordable && locked.kind !== "build" ? locked : null) ||
+        affordable.find((candidate) => candidate.kind === "research") ||
+        affordable.find((candidate) => candidate.kind === "upgrade") ||
+        (locked && locked.affordable ? locked : null) ||
+        affordable[0];
       if (!ready) return;
       lastAutoBuy = now;
 
@@ -1725,6 +1872,93 @@
     return score;
   };
 
+  const policyMetas = () => {
+    try {
+      const science = window.gamePage && window.gamePage.science;
+      const pools = [science && science.policies, science && science.policy, science && science.policiesData];
+      for (const pool of pools) {
+        if (Array.isArray(pool)) return pool;
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return [];
+  };
+
+  const policyOpen = (meta) => isOpen(meta) && meta.blocked !== true && meta.disabled !== true;
+
+  const summarizeEffects = (meta) => {
+    const effects = (meta && meta.effects) || {};
+    const pros = [];
+    const cons = [];
+    for (const [key, raw] of Object.entries(effects)) {
+      if (!isFinite(raw) || raw === 0) continue;
+      const label = key
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .replace(/PerTick/g, "/tick")
+        .replace(/Ratio/g, " ratio")
+        .replace(/Max/g, " storage")
+        .toLowerCase();
+      const item = `${raw > 0 ? "+" : ""}${fmt(raw)} ${label}`;
+      (raw > 0 ? pros : cons).push(item);
+    }
+    const text = effectText(meta);
+    if (!pros.length && /science|scholar|library|academy|observatory/.test(text)) pros.push("helps science progress");
+    if (!pros.length && /production|worker|mineral|wood|coal|craft|engineer/.test(text)) pros.push("helps production/crafting");
+    if (!cons.length && /unhappiness|happiness.*-|-.*happiness/.test(text)) cons.push("may reduce happiness");
+    return {
+      pros: pros.slice(0, 3),
+      cons: cons.slice(0, 3),
+    };
+  };
+
+  const policyScore = (meta, resources, goalKey) => {
+    const goal = GOALS[goalKey];
+    const text = effectText(meta);
+    const { cons } = summarizeEffects(meta);
+    let score = strategicBoost("policy", meta, resources, goal) + shortageBoost(meta, resources);
+    if (/liberty|tradition|monarchy|republic|technocracy|liberalism|communism|fascism/.test(text)) score += 8;
+    if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) score += 18;
+    if (goalKey === "production" && /production|worker|mineral|wood|coal|craft|engineer|communism/.test(text)) score += 18;
+    if (goalKey === "space" && /science|blueprint|starchart|oil|reactor|technocracy/.test(text)) score += 16;
+    if (goalKey === "population" && /happiness|catnip|kitten|housing|liberty/.test(text)) score += 14;
+    score -= cons.length * 4;
+    return score;
+  };
+
+  const availablePolicyChoices = (resources, goalKey) => policyMetas()
+    .filter(policyOpen)
+    .map((meta) => ({ kind: "policy", meta, ...evaluate("policy", meta, resources), score: policyScore(meta, resources, goalKey) }))
+    .sort((a, b) => b.score - a.score);
+
+  const policyAdviceLine = (resources, goalKey) => {
+    const choices = availablePolicyChoices(resources, goalKey);
+    if (!choices.length) return "Policies: none available/manual";
+    const best = choices[0];
+    const { pros, cons } = summarizeEffects(best.meta);
+    const state = best.affordable ? "ready" : `need ${best.missing || "resources"}`;
+    return `Policies: rec ${labelOf(best.meta)} (${state}) · pros: ${(pros.length ? pros : ["unlocks future choices"]).join("; ")} · cons: ${(cons.length ? cons : ["none obvious"]).join("; ")}`;
+  };
+
+  const buyPolicyChoice = (name) => {
+    const meta = policyMetas().find((policy) => policy && policy.name === name);
+    if (!meta) return false;
+    const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resourceMap()) };
+    if (!candidate.affordable) return false;
+    for (const attempt of purchaseAttemptsFor(candidate)) {
+      try {
+        attempt();
+      } catch (error) {
+        /* try next API shape */
+      }
+      if (purchaseComplete(candidate, 0)) {
+        pushLog(`📜 policy ${labelOf(meta)}`);
+        return true;
+      }
+    }
+    return false;
+  };
+
   const maybeSelectLeader = (goalKey, resources) => {
     try {
       const now = Date.now();
@@ -1771,7 +2005,38 @@
   let leaderEl;
   let craftEl;
   let processingEl;
+  let policyEl;
+  let policySelectEl;
+  let policyApplyEl;
   let nowEl;
+
+  const renderPolicyControl = (resources, goalKey) => {
+    if (!policyEl) return;
+    const choices = availablePolicyChoices(resources, goalKey);
+    policyEl.textContent = `📜 ${policyAdviceLine(resources, goalKey)}`;
+    if (!policySelectEl || !policyApplyEl) return;
+    const current = policySelectEl.value;
+    policySelectEl.innerHTML = "";
+    if (!choices.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "No policy choices available";
+      policySelectEl.appendChild(option);
+      policySelectEl.disabled = true;
+      policyApplyEl.disabled = true;
+      return;
+    }
+    for (const choice of choices.slice(0, 6)) {
+      const option = document.createElement("option");
+      option.value = choice.meta.name;
+      option.textContent = `${choice === choices[0] ? "★ " : ""}${labelOf(choice.meta)} — ${choice.affordable ? "ready" : `need ${choice.missing || "resources"}`}`;
+      policySelectEl.appendChild(option);
+    }
+    policySelectEl.disabled = false;
+    policySelectEl.value = choices.some((choice) => choice.meta.name === current) ? current : choices[0].meta.name;
+    const selected = choices.find((choice) => choice.meta.name === policySelectEl.value);
+    policyApplyEl.disabled = !selected || !selected.affordable;
+  };
 
   const engineRunning = () => {
     try {
@@ -1807,6 +2072,7 @@
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
+      renderPolicyControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
       /* ignore */
@@ -1869,6 +2135,9 @@
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
+      '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
+      '<div style="display:flex;gap:4px"><select class="kgh-policy-select" aria-label="policy" style="flex:1;min-width:0"></select>',
+      '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
       '<pre class="kgh-log" style="margin:0;max-height:92px;overflow:auto;white-space:pre-wrap;' +
@@ -1893,6 +2162,9 @@
     leaderEl = box.querySelector(".kgh-leader");
     craftEl = box.querySelector(".kgh-craft");
     processingEl = box.querySelector(".kgh-processing");
+    policyEl = box.querySelector(".kgh-policy");
+    policySelectEl = box.querySelector(".kgh-policy-select");
+    policyApplyEl = box.querySelector(".kgh-policy-apply");
     nowEl = box.querySelector(".kgh-now");
     logBox = box.querySelector(".kgh-log");
 
@@ -1906,6 +2178,10 @@
       tick();
     });
     button.addEventListener("click", () => applyProfile(select.value));
+    policyApplyEl.addEventListener("click", () => {
+      if (policySelectEl.value && buyPolicyChoice(policySelectEl.value)) tick();
+    });
+    policySelectEl.addEventListener("change", () => renderPolicyControl(resourceMap(), getGoal()));
 
     ksBtn.addEventListener("click", () => {
       applyKSHidden(!document.body.classList.contains("kgh-hide-ks"), ksBtn);
