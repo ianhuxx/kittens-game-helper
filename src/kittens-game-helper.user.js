@@ -2100,22 +2100,30 @@
     style.id = "kgh-style";
     style.textContent =
       "body.kgh-hide-ks #ksColumn,body.kgh-hide-ks .kitten-scientists{display:none!important}" +
+      ".kgh-panel{box-sizing:border-box;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);" +
+      "overflow:auto;overflow-x:hidden;user-select:text;-webkit-user-select:text}" +
+      ".kgh-panel *{box-sizing:border-box;min-width:0;max-width:100%}" +
+      ".kgh-panel small,.kgh-panel pre,.kgh-panel div{overflow-wrap:anywhere;word-break:normal}" +
+      ".kgh-panel select{width:100%;min-width:0;user-select:auto;-webkit-user-select:auto}" +
+      ".kgh-row{display:flex;gap:6px;min-width:0}" +
+      ".kgh-grow{flex:1 1 auto;min-width:0}" +
       ".kgh-hbtn{cursor:pointer;background:transparent;color:#f7ead0;border:1px solid #9b7a4d;" +
-      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px}";
+      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px;flex:0 0 auto}";
     document.head.appendChild(style);
 
     const box = document.createElement("div");
+    box.className = "kgh-panel";
     box.style.cssText =
-      "position:fixed;right:12px;bottom:12px;z-index:99999;width:300px;padding:9px 10px;" +
+      "position:fixed;right:12px;bottom:12px;z-index:99999;width:min(360px,calc(100vw - 24px));padding:9px 10px;" +
       "background:#2b2118;color:#f7ead0;border:1px solid #9b7a4d;border-radius:5px;" +
       "font:12px/1.4 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
     box.innerHTML = [
-      '<div style="display:flex;justify-content:space-between;align-items:center">',
+      '<div class="kgh-row" style="justify-content:space-between;align-items:center">',
       '<strong style="font-size:13px">🐱 Kittens Helper</strong>',
       '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-ks">Show KS</button>',
       '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
       '<div class="kgh-body" style="display:grid;gap:5px">',
-      '<div style="display:flex;gap:6px"><select style="flex:1" aria-label="profile">',
+      '<div class="kgh-row"><select class="kgh-grow" aria-label="profile">',
       '<option value="autopilot">Autopilot: play forward</option>',
       '<option value="assist">Assist: jobs + advice</option>',
       "</select><button type=\"button\" class=\"kgh-apply\" style=\"cursor:pointer\">Apply</button></div>",
@@ -2136,7 +2144,7 @@
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
-      '<div style="display:flex;gap:4px"><select class="kgh-policy-select" aria-label="policy" style="flex:1;min-width:0"></select>',
+      '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
