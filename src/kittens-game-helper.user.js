@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.12.0
+// @version      0.12.1
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. Recursive prerequisite planning chases gateway techs (Theology, Machinery→Steamworks) by what they unlock; non-exclusive policies are auto-bought while mutually-exclusive ones stay your choice (with pros/cons). Continuous job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, smelter/calciner pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -718,7 +718,10 @@
     geologist: "coal",
   };
   const LUXURY_RESOURCES = ["furs", "ivory", "spice"];
-  const JOB_REBALANCE_MIN_MS = 3500;
+  const JOB_REBALANCE_MIN_MS = 20000;
+  const JOB_WEIGHT_SMOOTHING = 0.35;
+  const JOB_COUNT_DEADBAND_RATIO = 0.08;
+  let smoothedJobWeights = {};
   let lastJobRun = 0;
   let lastJobLog = 0;
   let lastJobSignature = "";
@@ -884,8 +887,19 @@
       out[raw] = (out[raw] || 0) + amount;
       return out;
     }
+    const resources = resourceMap();
     const baseUnits = Math.max(1, Math.ceil(amount / Math.max(1, 1 + craftRatioFor(name))));
-    for (const price of prices) rawPathRequirements(price.name, price.val * baseUnits, out, depth + 1);
+    for (const price of prices) {
+      const inputNeed = price.val * baseUnits;
+      // Intermediate craft stock already on hand counts toward this chain.  For
+      // example, a Manuscript plan should consume existing Parchment before
+      // expanding the whole chain into Furs pressure; raw resource stock is still
+      // handled by scoreRawDeficits so it is not subtracted twice.
+      const inputStock = craftByName(price.name)
+        ? Math.max(0, (((getRes(resources, price.name) || {}).value) || 0) - craftFloorFor(resources, price.name))
+        : 0;
+      rawPathRequirements(price.name, Math.max(0, inputNeed - inputStock), out, depth + 1);
+    }
     return out;
   };
 
@@ -994,8 +1008,11 @@
       if (/theology|philosophy|cryptotheology|scholasticism|rocketry/.test(metaText(meta))) weight += 26;
       if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) weight += 18;
       for (const blocker of blockers) {
-        const severity = Math.max(0.15, (blocker.need - blocker.max) / Math.max(1, blocker.need));
-        pressure[blocker.name] = (pressure[blocker.name] || 0) + weight * severity;
+        // Prefer storage that makes near-term goals reachable.  A tech that is
+        // wildly beyond the current cap (e.g. 617K science vs 29K cap) should not
+        // drown out a plan that is only waiting on gatherable resources.
+        const closeness = Math.max(0.05, Math.min(1, blocker.max / Math.max(1, blocker.need)));
+        pressure[blocker.name] = (pressure[blocker.name] || 0) + weight * closeness;
       }
     };
 
@@ -1440,7 +1457,8 @@
     const target = getTargetCached(resources, goalKey);
     if (target && !target.affordable) {
       for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) {
-        scoreNeed(needs, blocker.name, 18 + Math.min(12, (blocker.need - blocker.max) / Math.max(1, blocker.need) * 24));
+        const closeness = Math.max(0.05, Math.min(1, blocker.max / Math.max(1, blocker.need)));
+        scoreNeed(needs, blocker.name, 12 + Math.min(18, closeness * 18));
       }
       const rawRequirements = {};
       for (const cost of pricesFor(target.kind, target.meta)) {
@@ -1542,6 +1560,19 @@
       if (fallback) weights[fallback.name] = 1;
     }
 
+    // Smooth noisy per-tick weights so tiny ratio changes do not whip kittens
+    // back and forth between jobs.  Safety overrides (starving catnip) still
+    // win because they push the raw weight far above the smoothed baseline.
+    const nextSmoothed = {};
+    for (const job of jobs) {
+      const raw = weights[job.name] || 0;
+      const previous = smoothedJobWeights[job.name];
+      nextSmoothed[job.name] = previous == null ? raw : previous * (1 - JOB_WEIGHT_SMOOTHING) + raw * JOB_WEIGHT_SMOOTHING;
+      if (raw === 0 && nextSmoothed[job.name] < 0.2) nextSmoothed[job.name] = 0;
+      weights[job.name] = nextSmoothed[job.name];
+    }
+    smoothedJobWeights = nextSmoothed;
+
     const desired = {};
     for (const job of jobs) desired[job.name] = 0;
     const sum = Object.values(weights).reduce((a, b) => a + b, 0) || 1;
@@ -1561,6 +1592,43 @@
         assigned += 1;
       }
       if (i > total + jobs.length) break;
+    }
+
+    // Deadband around the current assignment.  If the smoothed plan only wants
+    // to move a couple of kittens, keep the existing jobs and let future ticks
+    // accumulate into a real signal instead of churn.
+    const current = {};
+    let currentAssigned = 0;
+    for (const job of jobs) {
+      current[job.name] = Math.max(0, Math.floor(job.value || 0));
+      currentAssigned += current[job.name];
+    }
+    const free = Math.max(0, Math.floor(village.getFreeKittens ? village.getFreeKittens() : 0));
+    const perJobDeadband = Math.max(1, Math.floor(total * JOB_COUNT_DEADBAND_RATIO));
+    const totalMoveWanted = jobs.reduce((sumMoves, job) => sumMoves + Math.max(0, current[job.name] - (desired[job.name] || 0)), 0);
+    if (free <= 0 && currentAssigned === total && totalMoveWanted < Math.max(3, perJobDeadband * 2)) {
+      for (const job of jobs) desired[job.name] = current[job.name];
+    } else {
+      for (const job of jobs) {
+        if (Math.abs((desired[job.name] || 0) - current[job.name]) <= perJobDeadband) desired[job.name] = current[job.name];
+      }
+      assigned = Object.values(desired).reduce((a, b) => a + b, 0);
+      for (let i = 0; assigned < total && ranked.length; i += 1) {
+        const job = ranked[i % ranked.length];
+        if ((weights[job.name] || 0) <= 0) break;
+        const limit = village.getJobLimit ? village.getJobLimit(job.name) : 100000;
+        if (desired[job.name] < limit) {
+          desired[job.name] += 1;
+          assigned += 1;
+        }
+        if (i > total + jobs.length) break;
+      }
+      for (const job of ranked.slice().reverse()) {
+        while (assigned > total && desired[job.name] > 0) {
+          desired[job.name] -= 1;
+          assigned -= 1;
+        }
+      }
     }
 
     const needLine = Object.entries(needs)
@@ -1676,6 +1744,18 @@
     try {
       const techs = (window.gamePage.science.techs || []).filter(isOpen);
       if (!techs.length) return "all researched / none unlocked";
+
+      // The panel should explain the active plan first.  A distant storage-blocked
+      // tech can be useful as background pressure, but it should not replace the
+      // near-term science the autopilot is actually saving/crafting for.
+      const target = getTargetCached(resources, goalKey);
+      if (target && target.kind === "research" && isOpen(target.meta)) {
+        const block = storageBlockerText("research", target.meta, resources);
+        if (target.affordable) return `${labelOf(target.meta)} (ready now)`;
+        if (block) return `${labelOf(target.meta)} — blocked by ${block}`;
+        return `${labelOf(target.meta)} — need ${target.missing || "prerequisites"}`;
+      }
+
       let scored = techs.map((t) => ({ t, ...evaluate("research", t, resources) }));
       const goal = GOALS[goalKey];
       if (goal && goal.keywords.length) {
@@ -1684,10 +1764,11 @@
       }
       const ready = scored.find((s) => s.affordable);
       if (ready) return `${labelOf(ready.t)} (ready now)`;
+      const near = scored.filter((s) => s.progress > 0).sort((a, b) => b.progress - a.progress)[0];
+      if (near) return `${labelOf(near.t)} — need ${near.missing}`;
       const blocked = scored.find((s) => storageBlockerText("research", s.t, resources));
       if (blocked) return `${labelOf(blocked.t)} — blocked by ${storageBlockerText("research", blocked.t, resources)}`;
-      const near = scored.filter((s) => s.progress > 0).sort((a, b) => b.progress - a.progress)[0];
-      return near ? `${labelOf(near.t)} — need ${near.missing}` : "gathering prerequisites";
+      return "gathering prerequisites";
     } catch (error) {
       return "—";
     }
