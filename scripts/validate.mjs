@@ -46,6 +46,23 @@ const required = [
   "kgh-processing",
   // Kittens Game intentionally spells this resource ID as compedium.
   "compedium",
+  // The helper owns bonfire/science/workshop-upgrade purchasing (KS's buyers
+  // are disabled) so the plan can RESERVE resources and push through.
+  "takeOverPurchasing",
+  "executePlan",
+  "reservedNeedsFor",
+  "respectsReservations",
+  "kgh-buy",
+  // Recursive prerequisite planning: gateway techs and goal frontiers.
+  "gatewayValue",
+  "frontierFor",
+  "goalFrontierNames",
+  // Policies: non-exclusive auto-buy; exclusive (blocks-list) stays manual.
+  "policyIsExclusive",
+  "autoPolicyChoice",
+  // Village care that must stay wired in.
+  "maybePromoteKittens",
+  "resetTickCache",
 ];
 
 const missing = required.filter((token) => !source.includes(token));
