@@ -1,11 +1,13 @@
 {
   "name": "kittens-game-helper",
-  "version": "0.11.6",
-  "description": "One-click Kittens Game autopilot built on Kitten Scientists, with smart leader selection, overflow crafting, and a next-action advisor. Continues your existing browser save; prestige resets stay off.",
+  "version": "0.12.0",
+  "description": "One-click Kittens Game autopilot built on Kitten Scientists, with reservation-backed plan execution, recursive prerequisite planning, policy automation, leader/mood care and a next-action advisor. Continues your existing browser save; prestige resets stay off.",
   "private": true,
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "validate": "node scripts/validate.mjs"
+    "validate": "node scripts/validate.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "npm run validate && npm run smoke"
   }
 }

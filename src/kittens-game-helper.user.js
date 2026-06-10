@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.11.6
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists, turns on every SAFE automation, continuously rebalances kitten jobs (with wood-vs-catnip pathway math), prioritizes recursive time-to-goal pathways and resource-fixing upgrades like Coal Furnace, crafts workshop prerequisites like steel→gear, assigns hunters when luxury/mood gains beat raw gathering, picks the best leader trait for the active bottleneck, converts near-capped resources into useful crafts, sends hunters, refines surplus catnip into wood, and detects storage-blocked research like Theology, pushes stuck Steamworks/workshop upgrades ahead of routine construction, keeps policy choices manual with pros/cons, and shows the bottleneck + next science + goal + a live action log. Prestige resets stay OFF.
+// @version      0.12.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. Recursive prerequisite planning chases gateway techs (Theology, Machinery→Steamworks) by what they unlock; non-exclusive policies are auto-bought while mutually-exclusive ones stay your choice (with pros/cons). Continuous job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, smelter/calciner pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -44,15 +44,16 @@
     "filters", // KS log filters — keep off so the activity log stays visible
   ]);
 
-  // Build/research/buy sections gated by a storage-percent "trigger". Setting
-  // these to 0 means "buy as soon as it's affordable". "workshop" is excluded so
-  // crafting doesn't convert every raw resource and starve building/research.
-  const PURCHASE_SECTIONS = ["bonfire", "science", "religion", "space", "time", "trade"];
+  // KS sections we still let buy things, gated by a storage-percent "trigger".
+  // Setting these to 0 means "buy as soon as it's affordable". Bonfire, science
+  // and workshop upgrades are NOT here: the helper buys those itself so the plan
+  // can reserve resources — KS would otherwise spend the savings on cheap items.
+  const PURCHASE_SECTIONS = ["religion", "space", "time", "trade"];
 
   const PROFILE_INFO = {
     autopilot: {
       label: "Autopilot: play forward",
-      note: "Safe autopilot is on: progress targets, jobs, crafting, hunting, and storage fixes. Resets stay OFF.",
+      note: "Safe autopilot is on: the plan reserves what it needs and buys itself; jobs, crafting, hunting, leader and storage fixes run too. Resets stay OFF.",
     },
     assist: {
       label: "Assist: jobs + advice",
@@ -154,9 +155,10 @@
     }
   };
 
-  // We manage jobs + hunting ourselves (goal-aware, with pathway math), so turn
-  // OFF KS's own job/hunt automation to stop the two systems fighting. Festivals,
-  // leader, and the rest of the Village section stay on.
+  // We manage jobs, hunting, leader election and promotions ourselves
+  // (goal-aware, with pathway math and gold-overflow gating), so turn OFF KS's
+  // own versions to stop the two systems fighting. Festivals and the rest of
+  // the Village section stay on.
   const disableKSJobsAndHunt = (settings) => {
     const village = settings && settings.village;
     if (!village) return;
@@ -166,7 +168,9 @@
         if (job && typeof job === "object") job.enabled = false;
       }
     }
-    if (village.hunt && typeof village.hunt === "object") village.hunt.enabled = false;
+    for (const key of ["hunt", "electLeader", "promoteLeader"]) {
+      if (village[key] && typeof village[key] === "object") village[key].enabled = false;
+    }
   };
 
   // Tell KS to refine surplus catnip into wood. Catnip is the one resource that
@@ -179,14 +183,24 @@
     }
   };
 
-  const enableWorkshopUpgradeBuying = (settings) => {
-    const workshop = settings && settings.workshop;
-    if (!workshop) return;
-    workshop.enabled = true;
-    for (const key of ["upgrades", "upgrade", "research", "technologies"]) {
-      if (workshop[key] && typeof workshop[key] === "object") {
-        setEnabledDeep(workshop[key], true, key);
-        setTriggersDeep(workshop[key], 0);
+  // The helper owns ALL building/research/workshop-upgrade purchasing so the
+  // active plan can reserve resources. KS keeps crafting, trade, religion,
+  // space, time and village automations — but its competing buyers go dark.
+  const takeOverPurchasing = (settings) => {
+    if (settings.bonfire) setEnabledDeep(settings.bonfire, false, "bonfire");
+    const science = settings.science;
+    if (science) {
+      science.enabled = true; // the section stays on for observe (star events)
+      for (const key of ["techs", "tech", "technologies"]) {
+        if (science[key] && typeof science[key] === "object") setEnabledDeep(science[key], false, key);
+      }
+      if (science.observe) setEnabledDeep(science.observe, true, "observe");
+    }
+    const workshop = settings.workshop;
+    if (workshop) {
+      workshop.enabled = true; // crafts stay on
+      for (const key of ["upgrades", "upgrade", "research", "technologies"]) {
+        if (workshop[key] && typeof workshop[key] === "object") setEnabledDeep(workshop[key], false, key);
       }
     }
   };
@@ -215,10 +229,10 @@
       for (const section of PURCHASE_SECTIONS) {
         if (settings[section]) setTriggersDeep(settings[section], 0);
       }
-      for (const section of ["bonfire", "space", "time"]) {
+      for (const section of ["space", "time"]) {
         if (settings[section]) raiseZeroMaxes(settings[section]);
       }
-      enableWorkshopUpgradeBuying(settings);
+      takeOverPurchasing(settings);
       enableCatnipRefining(settings);
     }
 
@@ -332,6 +346,32 @@
       }
     }
     return { affordable, progress, missing: missing.slice(0, 3).join(", ") };
+  };
+
+  /* ------------------------------ per-tick cache ----------------------------- */
+
+  // Candidate gathering, target choice and storage-pressure scans are expensive
+  // (storage pressure alone walks every meta) and were being recomputed by every
+  // consumer each tick — sometimes disagreeing mid-tick. Compute once, share.
+  let tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null };
+
+  const resetTickCache = () => {
+    tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null };
+  };
+
+  const getCandidatesCached = (resources, goalKey) => {
+    if (!tickCache.candidates) tickCache.candidates = gatherCandidates(resources, goalKey);
+    return tickCache.candidates;
+  };
+
+  const getTargetCached = (resources, goalKey) => {
+    if (tickCache.target === undefined) tickCache.target = chooseWorkTarget(resources, goalKey);
+    return tickCache.target;
+  };
+
+  const getStoragePressureCached = (resources, goal) => {
+    if (!tickCache.pressure) tickCache.pressure = storageBlockPressure(resources, goal);
+    return tickCache.pressure;
   };
 
   /* ------------------------- economy balancing action ------------------------ */
@@ -478,6 +518,18 @@
     return false;
   };
 
+  // Liquid floor crafting must respect: food/catpower reserves plus a luxury
+  // cushion — furs/ivory/spice above zero are a happiness bonus, so crafting
+  // (e.g. furs→parchment for a manuscript chain) must never wipe them out.
+  const craftFloorFor = (resources, name) => {
+    let floor = craftReserveFor(resources, name);
+    if (LUXURY_RESOURCES.includes(name)) floor = Math.max(floor, luxuryStockTarget(resources, name) * 3);
+    return floor;
+  };
+
+  // Craft toward `targetAmount` of a resource, recursively crafting missing
+  // inputs first. Partial fills are fine: if inputs only cover a third of the
+  // deficit, craft that third now instead of stalling until everything fits.
   const tryCraftResource = (name, targetAmount, depth = 0) => {
     if (depth > 5 || !isFinite(targetAmount) || targetAmount <= 0) return false;
     const resources = resourceMap();
@@ -491,29 +543,31 @@
     if (!prices.length) return false;
 
     const deficit = targetAmount - have;
-    const baseUnits = Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name))));
+    const wantUnits = Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name))));
     for (const price of prices) {
-      const neededInput = price.val * baseUnits;
+      const neededInput = price.val * wantUnits;
       const input = getRes(resourceMap(), price.name);
-      if (((input && input.value) || 0) < neededInput && !tryCraftResource(price.name, neededInput, depth + 1)) {
-        return false;
+      if (((input && input.value) || 0) < neededInput) {
+        tryCraftResource(price.name, neededInput, depth + 1); // best effort, clamp below
       }
     }
 
     const fresh = resourceMap();
+    let units = wantUnits;
     for (const price of prices) {
       const input = getRes(fresh, price.name);
-      const value = (input && input.value) || 0;
-      if (value - price.val * baseUnits < craftReserveFor(fresh, price.name)) return false;
+      const available = Math.max(0, ((input && input.value) || 0) - craftFloorFor(fresh, price.name));
+      units = Math.min(units, Math.floor(available / price.val));
     }
+    if (units <= 0) return false;
 
-    if (craftUnits(name, baseUnits)) {
-      craftPlanText = `Craft: made ${fmt(baseUnits * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
+    if (craftUnits(name, units)) {
+      craftPlanText = `Craft: made ${fmt(units * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
       if (Date.now() - lastCraftLog > 15000) {
         pushLog(`🧰 ${craftPlanText}`);
         lastCraftLog = Date.now();
       }
-      return true;
+      return units >= wantUnits;
     }
     return false;
   };
@@ -538,7 +592,7 @@
 
   const craftOverflowResources = (resources, goalKey) => {
     try {
-      const target = chooseWorkTarget(resources, goalKey);
+      const target = getTargetCached(resources, goalKey);
       const scored = [];
       for (const name of OVERFLOW_CRAFTS) {
         const craft = craftByName(name);
@@ -581,21 +635,24 @@
 
   const craftTowardTarget = (resources, goalKey) => {
     try {
-      const target = chooseWorkTarget(resources, goalKey);
+      const target = getTargetCached(resources, goalKey);
       if (!target || target.affordable) {
         craftPlanText = "Craft: no intermediate needed";
         return;
       }
+      let planned = "";
       for (const cost of pricesFor(target.kind, target.meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         const have = (getRes(resourceMap(), cost.name) || { value: 0 }).value || 0;
         if (have < cost.val && craftByName(cost.name)) {
-          craftPlanText = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
-          tryCraftResource(cost.name, cost.val);
-          return;
+          if (!planned) {
+            planned = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
+            craftPlanText = planned;
+          }
+          tryCraftResource(cost.name, cost.val); // may overwrite plan text with "made N …"
         }
       }
-      craftPlanText = "Craft: gathering raw inputs";
+      if (!planned) craftPlanText = "Craft: gathering raw inputs";
     } catch (error) {
       /* ignore */
     }
@@ -689,12 +746,14 @@
     }
   };
 
+  // village.happiness is a RATIO (1.4 = 140%, floor 0.25) and can legitimately
+  // exceed 2.0 late game. Only treat it as a percent if it's clearly one.
   const currentHappinessRatio = () => {
     try {
       const village = window.gamePage.village;
       const raw = typeof village.getHappiness === "function" ? village.getHappiness() : village.happiness;
       if (!isFinite(raw) || raw <= 0) return 1;
-      return raw > 2 ? raw / 100 : raw;
+      return raw > 10 ? raw / 100 : raw;
     } catch (error) {
       return 1;
     }
@@ -959,13 +1018,111 @@
   };
 
   const storageReliefBoost = (meta, resources, goal) => {
-    const pressure = storageBlockPressure(resources, goal);
+    const pressure = getStoragePressureCached(resources, goal);
     const relieves = storageReliefResources(meta);
     let boost = 0;
     for (const [name, amount] of Object.entries(pressure)) {
       if (relieves.has(name)) boost += Math.min(55, amount);
     }
     return boost;
+  };
+
+  /* -------------------- recursive prerequisite planning ---------------------- */
+
+  // The tech tree is a DAG: tech.unlocks.tech lists children. Walking it both
+  // ways gives the two things the old scorer lacked:
+  //  - gatewayValue: how much a tech opens up RECURSIVELY (Theology opens the
+  //    whole religion branch, Machinery opens Steamworks + key upgrades), so
+  //    gateway techs outrank cheap filler;
+  //  - frontier: for a LOCKED milestone (like a goal target), the unlocked,
+  //    unresearched ancestor techs that actually advance toward it right now.
+  let unlockGraphCache = { stamp: "", parents: null, values: null };
+
+  const techList = () => {
+    try {
+      return window.gamePage.science.techs || [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const unlockListsOf = (meta) => {
+    const lists = [];
+    for (const key of ["unlocks", "upgrades"]) {
+      const node = meta && meta[key];
+      if (!node || typeof node !== "object") continue;
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) lists.push(value);
+      }
+    }
+    return lists;
+  };
+
+  const unlockGraph = () => {
+    const techs = techList();
+    const stamp = `${techs.length}:${techs.filter((t) => t && t.researched).length}`;
+    if (unlockGraphCache.parents && unlockGraphCache.stamp === stamp) return unlockGraphCache;
+    const parents = {};
+    for (const tech of techs) {
+      if (!tech || !tech.name) continue;
+      const children = (tech.unlocks && tech.unlocks.tech) || [];
+      for (const child of children) {
+        (parents[child] = parents[child] || []).push(tech);
+      }
+    }
+    unlockGraphCache = { stamp, parents, values: {} };
+    return unlockGraphCache;
+  };
+
+  const techByName = (name) => techList().find((t) => t && t.name === name) || null;
+
+  // Direct unlock count plus a dampened share of unresearched child techs'
+  // value: a tech that opens branches keeps scoring after its children appear.
+  const gatewayValue = (tech, depth = 0, seen = new Set()) => {
+    if (!tech || !tech.name || depth > 3 || seen.has(tech.name)) return 0;
+    seen.add(tech.name);
+    const graph = unlockGraph();
+    if (depth === 0 && isFinite(graph.values[tech.name])) return graph.values[tech.name];
+    let value = unlockListsOf(tech).reduce((sum, list) => sum + list.length, 0);
+    for (const childName of (tech.unlocks && tech.unlocks.tech) || []) {
+      const child = techByName(childName);
+      if (child && !child.researched) value += 0.45 * gatewayValue(child, depth + 1, seen);
+    }
+    if (depth === 0) graph.values[tech.name] = value;
+    return value;
+  };
+
+  // Unlocked, unresearched ancestors of a locked tech — the researchable steps
+  // that move toward it. Empty when the tech is already open or researched.
+  const frontierFor = (techName, depth = 0, seen = new Set()) => {
+    if (!techName || depth > 10 || seen.has(techName)) return [];
+    seen.add(techName);
+    const meta = techByName(techName);
+    if (!meta || meta.researched) return [];
+    if (meta.unlocked !== false) return [meta];
+    const out = [];
+    for (const parent of unlockGraph().parents[techName] || []) {
+      if (!parent || parent.researched) continue;
+      out.push(...frontierFor(parent.name, depth + 1, seen));
+    }
+    return out;
+  };
+
+  // Tech names worth pulling toward for the chosen goal: if the goal's
+  // milestone tech is locked, its frontier ancestors get a strong boost.
+  const goalFrontierNames = (goalKey) => {
+    if (tickCache.goalFrontier) return tickCache.goalFrontier;
+    const names = new Set();
+    const goal = GOALS[goalKey];
+    if (goal && goal.target) {
+      const milestone = techList().find((t) => t && metaText(t).includes(goal.target));
+      if (milestone && !milestone.researched) {
+        if (milestone.unlocked !== false) names.add(milestone.name);
+        else for (const tech of frontierFor(milestone.name)) names.add(tech.name);
+      }
+    }
+    tickCache.goalFrontier = names;
+    return names;
   };
 
   const strategicBoost = (kind, meta, resources, goal) => {
@@ -1084,7 +1241,7 @@
 
   const optimizeProcessing = (resources, goalKey) => {
     try {
-      const target = chooseWorkTarget(resources, goalKey);
+      const target = getTargetCached(resources, goalKey);
       if (!target) {
         processingPlanText = "Processing: watching converters";
         return;
@@ -1138,6 +1295,14 @@
       const have = ((getRes(resources, cost.name) || {}).value) || 0;
       const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
       if (deficit <= 0) continue;
+      // Resources with their own positive net production (wood, minerals…)
+      // arrive directly — don't expand them into a craft chain, or a negative
+      // catnip rate would mark a 25-second wood wait as "never".
+      const directProd = rawProductionForNeed(cost.name);
+      if (directProd > 0) {
+        worst = Math.max(worst, deficit / directProd);
+        continue;
+      }
       const raw = {};
       rawPathRequirements(cost.name, deficit, raw);
       const rawEntries = Object.entries(raw);
@@ -1156,79 +1321,31 @@
     return worst;
   };
 
-  const missingPathResourcesFor = (target, resources) => {
-    const needed = new Set();
-    if (!target) return needed;
-    for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) needed.add(blocker.name);
-    for (const cost of pricesFor(target.kind, target.meta)) {
-      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-      const have = ((getRes(resources, cost.name) || {}).value) || 0;
-      const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
-      if (deficit <= 0) continue;
-      needed.add(rawWorkNeedName(cost.name));
-      const raw = {};
-      rawPathRequirements(cost.name, deficit, raw);
-      for (const name of Object.keys(raw)) needed.add(name);
-    }
-    return needed;
-  };
-
-  const candidateHelpsPathResource = (candidate, resourceName) => {
-    if (!candidate || !resourceName) return false;
-    const relievesStorage = storageReliefResources(candidate.meta).has(resourceName);
-    return relievesStorage || helpsShortage(candidate.meta, resourceName) || resourceNamesFromPrices(candidate.kind, candidate.meta).some((name) => rawWorkNeedName(name) === resourceName);
-  };
-
-  const pathwayCandidateScore = (candidate, target, resources) => {
-    if (!candidate || !target || targetId(candidate) === targetId(target) || targetComplete(candidate)) return null;
-    if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) return null;
-    const targetWait = waitSecondsForCandidate(target, resources);
-    if (!isFinite(targetWait) || targetWait < 90) return null;
+  // VALUE-based scoring. Deliberately NOT dominated by "affordable right now":
+  // the executor opportunistically buys cheap ready items from surplus anyway,
+  // so the PLAN should be the most valuable reachable step (a gateway tech like
+  // Theology or Machinery, a storage fix, a shortage fix) — and the reservation
+  // system makes saving for it actually work.
+  const candidateScore = (candidate, resources, goal, goalKey) => {
     const wait = waitSecondsForCandidate(candidate, resources);
-    if (!candidate.affordable && (!isFinite(wait) || wait > Math.max(300, targetWait * 0.45))) return null;
-    const pathResources = missingPathResourcesFor(target, resources);
-    const helped = [...pathResources].filter((name) => candidateHelpsPathResource(candidate, name));
-    if (!helped.length) return null;
-    const readiness = candidate.affordable ? 28 : Math.max(0, 16 - Math.log10(wait + 1) * 5);
-    const kindBoost = candidate.kind === "upgrade" || candidate.kind === "research" ? 10 : 4;
-    const storageBoost = helped.some((name) => storageReliefResources(candidate.meta).has(name)) ? 12 : 0;
-    return {
-      score: candidate.score + readiness + kindBoost + storageBoost + helped.length * 6,
-      reason: `faster path to ${labelOf(target.meta)} via ${helped.map((name) => resTitle(resources, name)).slice(0, 3).join("+")}`,
-    };
-  };
-
-  // Time-optimized decision chain:
-  // 1) if the chosen target is ready, buy it;
-  // 2) if a required resource is craftable, the crafting loop recursively makes it;
-  // 3) otherwise compare waiting for the target against quick/affordable pathway
-  //    candidates that improve the missing raw resource or storage;
-  // 4) lock the selected step long enough to push through instead of thrashing.
-  const chooseTimeOptimizedTarget = (candidates, resources) => {
-    const direct = candidates[0] || null;
-    if (!direct || direct.affordable) return direct;
-    const directWait = waitSecondsForCandidate(direct, resources);
-    if (!isFinite(directWait) || directWait < 90) return direct;
-    const pathway = candidates
-      .map((candidate) => ({ candidate, plan: pathwayCandidateScore(candidate, direct, resources) }))
-      .filter((item) => item.plan)
-      .sort((a, b) => b.plan.score - a.plan.score)[0];
-    if (!pathway || pathway.plan.score < direct.score + 8) return direct;
-    return { ...pathway.candidate, pathwayReason: pathway.plan.reason, pathwayTarget: direct };
-  };
-
-  const candidateScore = (candidate, resources, goal) => {
-    const readiness = candidate.affordable ? 35 : Math.min(1, Math.max(0, candidate.progress || 0)) * 14;
-    const wait = waitSecondsForCandidate(candidate, resources);
-    const waitPenalty = isFinite(wait) ? Math.min(26, Math.log10(wait + 1) * 6) : 32;
+    const waitPenalty = isFinite(wait) ? Math.min(14, Math.log10(wait + 1) * 4) : 22;
     const storageBlocked = directStorageBlockers(candidate.kind, candidate.meta, resources).length > 0;
     const storageBlockPenalty = storageBlocked ? 48 : 0;
     const storagePenalty = isStorageMeta(candidate.meta) && !candidate.affordable &&
       !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9)
       ? 10
       : 0;
-    const kindWeight = candidate.kind === "research" ? 12 : candidate.kind === "upgrade" ? 14 : 3;
-    return kindWeight + readiness + shortageBoost(candidate.meta, resources) + strategicBoost(candidate.kind, candidate.meta, resources, goal) - waitPenalty - storagePenalty - storageBlockPenalty;
+    const kindWeight = candidate.kind === "research" ? 12 : candidate.kind === "upgrade" ? 12 : 3;
+    const affordBonus = candidate.affordable ? 6 : Math.min(1, Math.max(0, candidate.progress || 0)) * 5;
+    let recursiveBoost = 0;
+    if (candidate.kind === "research") {
+      recursiveBoost += Math.min(18, gatewayValue(candidate.meta) * 1.6);
+      if (goalFrontierNames(goalKey).has(candidate.meta.name)) recursiveBoost += 20;
+    }
+    return kindWeight + affordBonus + recursiveBoost +
+      shortageBoost(candidate.meta, resources) +
+      strategicBoost(candidate.kind, candidate.meta, resources, goal) -
+      waitPenalty - storagePenalty - storageBlockPenalty;
   };
 
   const gatherCandidates = (resources, goalKey) => {
@@ -1259,7 +1376,7 @@
       .map((c) => {
         const evaluation = evaluate(c.kind, c.meta, resources);
         const withEvaluation = { ...c, ...evaluation };
-        return { ...withEvaluation, score: candidateScore(withEvaluation, resources, goal) };
+        return { ...withEvaluation, score: candidateScore(withEvaluation, resources, goal, goalKey) };
       })
       .sort((a, b) => b.score - a.score);
   };
@@ -1284,9 +1401,13 @@
 
   const chooseWorkTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
-    const preferred = chooseTimeOptimizedTarget(candidates, resources);
+    const preferred = candidates[0] || null;
     const now = Date.now();
 
+    // The lock is what makes plans PUSH THROUGH. The executor reserves the
+    // locked target's resources and buys it the moment it's ready, so the lock
+    // only breaks on completion, a storage block, a long timeout, or a rival
+    // that is MUCH better — never on ordinary score wobble.
     if (activeTarget) {
       const locked = findCandidateById(candidates, activeTarget.id);
       const age = now - activeTarget.startedAt;
@@ -1294,11 +1415,11 @@
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9);
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
-      const muchBetter = preferred && locked && preferred.score > locked.score + (preferred.pathwayReason ? 18 : 12);
-      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked || (locked.affordable && age > TARGET_READY_GRACE_MS)) {
+      const muchBetter = preferred && locked && age >= TARGET_LOCK_MIN_MS && preferred.score > locked.score * 1.3 + 8;
+      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked) {
         activeTarget = null;
-      } else if (!muchBetter && (age < TARGET_LOCK_MIN_MS || !preferred || locked.score >= preferred.score * 0.85)) {
-        return activeTarget.reason ? { ...locked, pathwayReason: activeTarget.reason } : locked;
+      } else if (!muchBetter) {
+        return locked;
       } else {
         activeTarget = null;
       }
@@ -1307,7 +1428,6 @@
     if (preferred) {
       activeTarget = {
         id: targetId(preferred),
-        reason: preferred.pathwayReason || "",
         startedAt: now,
         initialVal: preferred.kind === "build" ? preferred.meta.val || 0 : 0,
       };
@@ -1317,7 +1437,7 @@
 
   const resourceNeeds = (goalKey, resources) => {
     const needs = {};
-    const target = chooseWorkTarget(resources, goalKey);
+    const target = getTargetCached(resources, goalKey);
     if (target && !target.affordable) {
       for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) {
         scoreNeed(needs, blocker.name, 18 + Math.min(12, (blocker.need - blocker.max) / Math.max(1, blocker.need) * 24));
@@ -1336,7 +1456,7 @@
       scoreRawDeficits(needs, resources, rawRequirements, 14);
     }
 
-    for (const [name, amount] of Object.entries(storageBlockPressure(resources, GOALS[goalKey]))) {
+    for (const [name, amount] of Object.entries(getStoragePressureCached(resources, GOALS[goalKey]))) {
       scoreNeed(needs, name, Math.min(18, amount / 3));
     }
 
@@ -1364,15 +1484,6 @@
       scoreNeed(needs, "science", resRatio(resources, "science") < 0.9 ? 1 : 0);
     }
     return { needs, target };
-  };
-
-  // Decide which single job should receive a free/extra kitten as a fallback.
-  const chooseJob = (goalKey, resources) => {
-    const { needs } = resourceNeeds(goalKey, resources);
-    const best = Object.entries(needs).sort((a, b) => b[1] - a[1])[0];
-    const target = best && best[1] > 0 ? best[0] : "wood";
-    if (target === "wood") return bestWoodJob() || jobByName("woodcutter");
-    return jobByName(RES_JOB[target]) || jobByName("woodcutter") || jobByName("farmer");
   };
 
   const managedJobs = () => MANAGED_JOBS.map(jobByName).filter(Boolean);
@@ -1419,6 +1530,12 @@
       weights[job.name] = Math.max(0, weight);
     }
 
+    // Starvation guard: if catnip is NET NEGATIVE (winter, big population) and
+    // the pantry is draining, force farmers before kittens start dying.
+    const netCatnipPerSecond = productionFor("catnip");
+    if (jobByName("farmer") && netCatnipPerSecond < 0 && resRatio(resources, "catnip") < 0.6) {
+      weights.farmer = Math.max(weights.farmer || 0, 10 + Math.min(25, -netCatnipPerSecond * 2));
+    }
     if (resRatio(resources, "catnip") < 0.2 && jobByName("farmer")) weights.farmer = Math.max(weights.farmer || 0, 20);
     if (!Object.values(weights).some((w) => w > 0)) {
       const fallback = bestWoodJob() || jobByName("woodcutter") || jobByName("farmer") || jobs[0];
@@ -1631,26 +1748,29 @@
 
   const getPlanLine = (resources, goalKey) => {
     try {
-      const target = chooseWorkTarget(resources, goalKey);
+      const target = getTargetCached(resources, goalKey);
       if (!target) return "🧭 Plan: scanning unlocked buildings/research";
       const reqs = formatRequirements(target.kind, target.meta, resources);
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
       const eta = formatEta(waitSecondsForCandidate(target, resources));
-      const reason = target.pathwayReason ? ` · ${target.pathwayReason}` : "";
-      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reason}${reqs ? ` (${reqs})` : ""}`;
+      const reserved = target.affordable ? [] : Object.keys(reservedNeedsFor(target, resources));
+      const reserveNote = reserved.length
+        ? ` · reserving ${reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+")}`
+        : "";
+      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reserveNote}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
       return "🧭 Plan: —";
     }
   };
 
   const getNowAction = (resources, goalKey) => {
-    const target = chooseWorkTarget(resources, goalKey);
+    const target = getTargetCached(resources, goalKey);
     if (!target) return "scanning…";
-    if (target.affordable) return `${target.kind} ${labelOf(target.meta)}`;
+    if (target.affordable) return `buying ${target.kind} ${labelOf(target.meta)}`;
     const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
     if (craftable) return `craft ${craftLabel(craftable.name)} for ${labelOf(target.meta)}`;
-    return target.pathwayReason ? target.pathwayReason : `gather ${target.missing || "prerequisites"}`;
+    return `gather ${target.missing || "prerequisites"} (reserved)`;
   };
 
 
@@ -1799,38 +1919,131 @@
     return attempts;
   };
 
-  // KS sometimes leaves Workshop automation disabled because that same section also
-  // controls bulk crafting. Backstop it here: if our advisor sees a genuinely
-  // affordable item, click the same game API the button would have used instead
-  // of waiting for KS to notice. Assist mode stays advisory-only.
-  const autoBuyReady = (resources, goalKey) => {
+  const buyCandidate = (candidate) => {
+    const initialVal = candidate.kind === "build" ? candidate.meta.val || 0 : 0;
+    for (const attempt of purchaseAttemptsFor(candidate)) {
+      try {
+        attempt();
+      } catch (error) {
+        /* try the next API shape */
+      }
+      if (purchaseComplete(candidate, initialVal)) return true;
+    }
+    return false;
+  };
+
+  // What the active plan still needs, by resource — held back from every other
+  // purchase so the plan actually completes instead of being eaten by cheaper
+  // buys (the classic "plan says Library, a Mine gets built" failure).
+  // Costs above a storage cap are NOT reserved: saving can never reach those,
+  // the storage planner handles them instead.
+  const reservedNeedsFor = (target, resources) => {
+    const reserved = {};
+    if (!target || target.affordable) return reserved;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const res = getRes(resources, cost.name);
+      if (res && res.maxValue > 0 && cost.val > res.maxValue) continue;
+      reserved[cost.name] = Math.max(reserved[cost.name] || 0, cost.val);
+      const have = (res && res.value) || 0;
+      // Costs the crafting loop must assemble (no direct production) also hold
+      // their raw chain, or competitors drain the wood meant for beams. Costs
+      // that produce on their own (wood, minerals…) reserve only themselves.
+      if (have < cost.val && craftByName(cost.name) && rawProductionForNeed(cost.name) <= 0) {
+        const raw = rawPathRequirements(cost.name, cost.val - have);
+        for (const [name, amount] of Object.entries(raw)) {
+          const rawRes = getRes(resources, name);
+          if (rawRes && rawRes.maxValue > 0 && amount > rawRes.maxValue) continue;
+          reserved[name] = (reserved[name] || 0) + amount;
+        }
+      }
+    }
+    return reserved;
+  };
+
+  const respectsReservations = (candidate, reserved, resources) => {
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const hold = reserved[cost.name] || (cost.name === "catpower" ? reserved.manpower || 0 : 0);
+      if (hold <= 0) continue;
+      const stock = ((getRes(resources, cost.name) || {}).value) || 0;
+      if (stock - cost.val < hold) return false;
+    }
+    return true;
+  };
+
+  // Purchases that keep silently failing (controller/API mismatch for that one
+  // item) get benched so the plan and the surplus buyer can move on.
+  const failedBuys = {};
+  const buyBenched = (id) => {
+    const entry = failedBuys[id];
+    return !!entry && entry.until > Date.now();
+  };
+  const noteBuyFailure = (id) => {
+    const entry = failedBuys[id] || { count: 0, until: 0 };
+    entry.count += 1;
+    entry.until = Date.now() + (entry.count >= 3 ? 300000 : 12000);
+    failedBuys[id] = entry;
+    return entry.count >= 3;
+  };
+
+  let buyPlanText = "Buy: waiting…";
+
+  // The purchase loop, replacing KS's bonfire/science/workshop-upgrade buyers:
+  //  1. buy the PLAN the moment it is affordable;
+  //  2. auto-buy policies that block no alternatives (exclusive ones stay manual);
+  //  3. spend only unreserved surplus on anything else, best-scored first.
+  // Assist mode stays advisory-only.
+  const executePlan = (resources, goalKey) => {
     try {
       if (getProfileName() !== "autopilot") return;
       const now = Date.now();
       if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
-      const candidates = gatherCandidates(resources, goalKey);
-      const locked = activeTarget && findCandidateById(candidates, activeTarget.id);
-      const affordable = candidates.filter((candidate) => candidate.affordable);
-      const ready = (locked && locked.affordable && locked.kind !== "build" ? locked : null) ||
-        affordable.find((candidate) => candidate.kind === "research") ||
-        affordable.find((candidate) => candidate.kind === "upgrade") ||
-        (locked && locked.affordable ? locked : null) ||
-        affordable[0];
-      if (!ready) return;
-      lastAutoBuy = now;
+      const target = getTargetCached(resources, goalKey);
 
-      const initialVal = ready.kind === "build" ? ready.meta.val || 0 : 0;
-      for (const attempt of purchaseAttemptsFor(ready)) {
-        try {
-          attempt();
-        } catch (error) {
-          /* try the next API shape */
+      if (target && target.affordable && !buyBenched(targetId(target))) {
+        lastAutoBuy = now;
+        if (buyCandidate(target)) {
+          pushLog(`🎯 plan ${target.kind} ${labelOf(target.meta)}`);
+          buyPlanText = `Buy: plan completed — ${labelOf(target.meta)}`;
+          activeTarget = null;
+        } else if (noteBuyFailure(targetId(target))) {
+          activeTarget = null; // benched — let the plan move on
         }
-        if (purchaseComplete(ready, initialVal)) {
-          if (activeTarget && activeTarget.id === targetId(ready)) activeTarget = null;
-          pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} auto ${ready.kind} ${labelOf(ready.meta)}`);
-          return;
+        return;
+      }
+
+      const policy = autoPolicyChoice(resources, goalKey);
+      if (policy && !buyBenched(targetId(policy))) {
+        lastAutoBuy = now;
+        if (buyCandidate(policy)) {
+          pushLog(`📜 policy ${labelOf(policy.meta)} (blocks nothing)`);
+        } else {
+          noteBuyFailure(targetId(policy));
         }
+        return;
+      }
+
+      const reserved = reservedNeedsFor(target, resources);
+      const candidates = getCandidatesCached(resources, goalKey);
+      const ready = candidates.find((candidate) =>
+        candidate.affordable &&
+        (!target || targetId(candidate) !== targetId(target)) &&
+        !buyBenched(targetId(candidate)) &&
+        respectsReservations(candidate, reserved, resources));
+      if (!ready) {
+        const held = Object.keys(reserved);
+        buyPlanText = target && !target.affordable && held.length
+          ? `Buy: saving for ${labelOf(target.meta)} (reserving ${held.slice(0, 3).map((name) => resTitle(resources, name)).join(", ")})`
+          : "Buy: nothing affordable";
+        return;
+      }
+      lastAutoBuy = now;
+      if (buyCandidate(ready)) {
+        pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} surplus ${ready.kind} ${labelOf(ready.meta)}`);
+        buyPlanText = `Buy: ${labelOf(ready.meta)} from surplus`;
+      } else {
+        noteBuyFailure(targetId(ready));
       }
     } catch (error) {
       /* ignore */
@@ -1907,7 +2120,7 @@
   let leaderPlanText = "Leader: waiting…";
 
   const desiredLeaderTraits = (goalKey, resources) => {
-    const target = chooseWorkTarget(resources, goalKey);
+    const target = getTargetCached(resources, goalKey);
     const traits = [];
     const text = target ? `${target.kind} ${effectText(target.meta)}` : "";
     const costs = target ? pricesFor(target.kind, target.meta).map((cost) => cost && cost.name).filter(Boolean) : [];
@@ -1954,6 +2167,20 @@
 
   const policyOpen = (meta) => isOpen(meta) && meta.blocked !== true && meta.disabled !== true;
 
+  // A policy with an empty `blocks` list forecloses nothing — buying it can
+  // never lock you out of another choice, so it's safe to automate. Exclusive
+  // policies (liberty vs tradition, monarchy vs republic …) stay manual.
+  const policyIsExclusive = (meta) => Array.isArray(meta && meta.blocks) && meta.blocks.length > 0;
+
+  const autoPolicyChoice = (resources, goalKey) => {
+    for (const meta of policyMetas()) {
+      if (!policyOpen(meta) || policyIsExclusive(meta)) continue;
+      const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resources) };
+      if (candidate.affordable) return candidate;
+    }
+    return null;
+  };
+
   const summarizeEffects = (meta) => {
     const effects = (meta && meta.effects) || {};
     const pros = [];
@@ -1993,18 +2220,19 @@
     return score;
   };
 
+  // Only EXCLUSIVE policies appear here — the executor auto-buys the rest.
   const availablePolicyChoices = (resources, goalKey) => policyMetas()
-    .filter(policyOpen)
+    .filter((meta) => policyOpen(meta) && policyIsExclusive(meta))
     .map((meta) => ({ kind: "policy", meta, ...evaluate("policy", meta, resources), score: policyScore(meta, resources, goalKey) }))
     .sort((a, b) => b.score - a.score);
 
   const policyAdviceLine = (resources, goalKey) => {
     const choices = availablePolicyChoices(resources, goalKey);
-    if (!choices.length) return "Policies: none available/manual";
+    if (!choices.length) return "Policies: non-exclusive auto-buy; no exclusive choice pending";
     const best = choices[0];
     const { pros, cons } = summarizeEffects(best.meta);
     const state = best.affordable ? "ready" : `need ${best.missing || "resources"}`;
-    return `Policies: rec ${labelOf(best.meta)} (${state}) · pros: ${(pros.length ? pros : ["unlocks future choices"]).join("; ")} · cons: ${(cons.length ? cons : ["none obvious"]).join("; ")}`;
+    return `Policies: exclusive choice! rec ${labelOf(best.meta)} (blocks ${(best.meta.blocks || []).join(", ")}) (${state}) · pros: ${(pros.length ? pros : ["unlocks future choices"]).join("; ")} · cons: ${(cons.length ? cons : ["none obvious"]).join("; ")}`;
   };
 
   const buyPolicyChoice = (name) => {
@@ -2061,6 +2289,39 @@
     }
   };
 
+  // Promotions are a pure win when gold would otherwise overflow at the cap:
+  // they turn wasted income into permanently better workers. Gold below the
+  // overflow band is left alone for trade and gold-priced builds.
+  let nextPromoteAttempt = 0;
+
+  const maybePromoteKittens = (resources) => {
+    try {
+      const village = window.gamePage.village;
+      const gold = getRes(resources, "gold");
+      if (!village || !gold || !(gold.maxValue > 0)) return;
+      const now = Date.now();
+      if (gold.value < gold.maxValue * 0.92 || now < nextPromoteAttempt) return;
+      const before = gold.value;
+      try {
+        if (typeof village.promoteKittens === "function") {
+          village.promoteKittens();
+        } else if (village.leader && village.sim && typeof village.sim.promote === "function") {
+          village.sim.promote(village.leader, (village.leader.rank || 0) + 1);
+        }
+      } catch (error) {
+        /* promotion API mismatch — skip */
+      }
+      if (gold.value < before - 1) {
+        nextPromoteAttempt = now + 30000;
+        pushLog("🎖 promoted kittens (gold was capping)");
+      } else {
+        nextPromoteAttempt = now + 300000; // nobody promotable (exp/gold) — back off
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
   /* ------------------------------- main loop -------------------------------- */
 
   let statusEl;
@@ -2069,6 +2330,7 @@
   let scienceEl;
   let planEl;
   let jobsEl;
+  let buyEl;
   let leaderEl;
   let craftEl;
   let processingEl;
@@ -2087,7 +2349,7 @@
     if (!choices.length) {
       const option = document.createElement("option");
       option.value = "";
-      option.textContent = "No policy choices available";
+      option.textContent = "No exclusive policy pending (others auto-buy)";
       policySelectEl.appendChild(option);
       policySelectEl.disabled = true;
       policyApplyEl.disabled = true;
@@ -2115,15 +2377,17 @@
 
   const tick = () => {
     try {
+      resetTickCache();
       const resources = resourceMap();
       const goal = getGoal();
       refineSurplusCatnip();
       craftTowardTarget(resources, goal);
       craftOverflowResources(resources, goal);
-      optimizeProcessing(resourceMap(), goal);
-      autoBuyReady(resourceMap(), goal);
+      optimizeProcessing(resources, goal);
+      executePlan(resources, goal);
       balanceJobs(goal, resources);
       maybeSelectLeader(goal, resources);
+      maybePromoteKittens(resources);
       autoHunt(resources);
       trackActions();
       if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
@@ -2136,6 +2400,7 @@
       if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
       if (planEl) planEl.textContent = getPlanLine(resources, goal);
       if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
+      if (buyEl) buyEl.textContent = `🛒 ${buyPlanText}`;
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
@@ -2220,6 +2485,7 @@
       '<details class="kgh-details"><summary>More automation details</summary><div class="kgh-details-body">',
       '<small class="kgh-note"></small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
+      '<small class="kgh-buy" style="color:#b8e2ff">…</small>',
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
@@ -2247,6 +2513,7 @@
     scienceEl = box.querySelector(".kgh-science");
     planEl = box.querySelector(".kgh-plan");
     jobsEl = box.querySelector(".kgh-jobs");
+    buyEl = box.querySelector(".kgh-buy");
     leaderEl = box.querySelector(".kgh-leader");
     craftEl = box.querySelector(".kgh-craft");
     processingEl = box.querySelector(".kgh-processing");

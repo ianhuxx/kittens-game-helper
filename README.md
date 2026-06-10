@@ -35,7 +35,7 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | Turns **on every safe automation**: continuous job rebalancing, building, research, crafting, trade, faith, space, hunting, festivals, and time acceleration. It **auto-tunes every build threshold** (buys the moment something is affordable) and **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. It plays the game for you. |
+| **Autopilot: play forward** *(default)* | The helper picks a plan, **reserves the resources the plan needs**, buys the plan the moment it's affordable, and spends only true surplus on everything else. Kitten Scientists keeps running crafting, trade, faith, space, festivals and time acceleration; the helper runs jobs, hunting, leader/promotions, policies (non-exclusive only) and all building/research/upgrade purchases. It also **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. |
 | **Assist: jobs + advice** | Only rebalances jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
@@ -54,6 +54,8 @@ The bottom-right box is a live dashboard:
 - **🧭 Plan:** the concrete building/research/upgrade target, what is missing, a rough ETA
   until it should be affordable, and a compact have/need resource sheet.
 - **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
+- **🛒 Buy:** what the purchase loop is doing — `saving for Library (reserving Wood)` while
+  the plan accumulates, or the last surplus purchase it allowed.
 - **👑 Leader:** the currently selected leader trait/kitten chosen for the active bottleneck.
 - **🧰 Craft:** prerequisite crafting plus overflow conversions that prevent near-capped inputs from being wasted.
 - **🎯 Now:** what it can build/buy right this second.
@@ -80,68 +82,52 @@ The helper bar has two buttons in its header:
 
 Both choices are remembered between sessions.
 
-## Smarter target choice
+## Plans that push through (reservation-backed execution)
 
-### Current decision chain (before the time-path update)
+The old failure mode: the panel says *“Plan: build Library”*, wood accumulates… and a
+Mine gets built instead, because every automated buyer purchased whatever became
+affordable first. That cannot happen anymore:
 
-1. Score every unlocked research, workshop upgrade, and building together.
-2. Boost obvious strategic items: automation, production unlocks, storage relief,
-   population, and goal keywords.
-3. If the top item is missing crafted resources, craft those prerequisites recursively
-   (for example iron + coal → steel → gear).
-4. Point jobs at the raw inputs behind the active target.
-5. Keep the chosen target briefly locked so close candidates do not flip every tick.
+1. Kitten Scientists' bonfire/science/workshop-upgrade buyers are **switched off** —
+   the helper is the only thing buying buildings, research and workshop upgrades.
+   (KS keeps crafting, trade, religion, space, time and festivals.)
+2. The helper picks the most **valuable** reachable step as the plan — not the
+   cheapest ready one — scoring real effects: production fixes, storage relief,
+   shortage fixes, goal keywords, and what a tech recursively unlocks.
+3. While the plan is unaffordable, its costs (and the raw chain behind crafted
+   costs) are **reserved**. Other purchases are allowed only from surplus that
+   doesn't dip into the reservation. The 🛒 line shows `saving for … (reserving …)`.
+4. The moment the plan is affordable, the helper buys it itself (🎯 in the log) and
+   moves on. Purchases that keep failing get benched for a while so the plan never
+   wedges on a broken button.
+5. The plan stays locked until it completes, becomes storage-blocked, or a rival is
+   *much* better — ordinary score wobble no longer flips it.
 
-That worked well for obvious bottlenecks, but the top target could still change too often
-because it did not explicitly ask: “Is waiting for this direct target slower than buying a
-quick prerequisite or efficiency step first?”
+Storage-blocked targets still redirect into storage: if **Theology** needs more science
+than your science cap, Libraries/Academies/Observatories get boosted until the cap can
+actually hold the price, and the ⚖/🧭 lines say so.
 
-### Updated decision chain (time-optimized pathing)
+## Recursive prerequisite planning
 
-1. Pick the best direct end-goal candidate from the selected goal and current economy.
-2. If that candidate is affordable, buy it immediately.
-3. If it is not affordable but its missing resource is craftable, recursively craft the
-   cheapest available recipe path first.
-4. If it is not craftable yet, expand the missing resource chain into raw inputs and
-   storage blockers, estimate the wait, and compare that wait against quick/affordable
-   pathway candidates that improve those exact blockers.
-5. Choose the pathway candidate only when it plausibly shortens time-to-goal; otherwise
-   continue gathering directly for the target.
-6. Lock the selected step long enough to push through, unless it completes, becomes
-   storage-blocked, or a much better pathway appears.
+The tech tree is walked in both directions every tick:
 
-The helper no longer blindly chases the next visible button. It scores research, workshop
-upgrades, and buildings together, with extra priority for automation/unlock steps,
-production scale, resource-fixing workshop upgrades, storage when resources are capping,
-and population growth. Then it applies the time-optimized pathway check above, so it can
-choose to scale first when growth is faster, rush science/automation when that unlocks the
-next important branch, or prioritize an upgrade like **Coal Furnace** when coal production
-is the thing blocking progress.
+- **Gateway value:** a tech is scored by everything it unlocks, recursively — so
+  **Theology** (the whole religion branch) and **Machinery** (Steamworks + key workshop
+  upgrades) outrank filler research of the same price, instead of never becoming the
+  focus.
+- **Goal frontier:** if your chosen goal's milestone (say **Rocketry**) is still locked,
+  the helper walks the unlock graph backwards to the unlocked ancestor techs that lead
+  to it and boosts exactly those.
+- Crafted prerequisites recurse the same way (iron + coal → steel → gear), and jobs are
+  pointed at the raw inputs behind the active plan.
 
-Resource-starvation upgrades are part of that scoring too: if coal is depleted, upgrades
-whose names/effects/unlocks help coal or smelters get a large boost, so **Coal Furnace**
-can beat a random affordable build and become the active plan. Similar hints exist for
-wood, minerals/iron, catnip, science, manpower/hunting, and faith. The active plan is
-kept stable for a short lock window so the helper does not thrash between projects every
-tick when several candidates are close.
+## Policies: automatic where safe, yours where permanent
 
-The advisor also detects when an important research target is impossible because a direct
-resource cost is above current storage. For example, if **Theology** needs more science
-than your science cap, it marks the plan as storage-blocked, stops treating Theology as a
-normal gather-wait target, and boosts the buildings or upgrades that add the missing
-storage (such as Libraries, Academies, Observatories, or other matching storage unlocks)
-before drifting into unrelated side projects. When multiple things are already affordable,
-autopilot spends ready research and workshop upgrades before ordinary buildings so unlocked
-science like Theology does not sit untouched while lower-impact construction continues.
-
-Workshop upgrades and Steamworks-style unlocks receive extra priority because they often
-open the next real layer of automation or production. The helper also explicitly enables
-Kitten Scientists' workshop-upgrade buying triggers while keeping bulk craft triggers
-conservative, and its own backstop buyer now reads workshop upgrade prices directly.
-
-Policies remain manual because they can be permanent, mutually exclusive, or strategy
-defining. The helper shows a recommended policy with pros, cons, and affordability, then
-provides a **Policy** button so you choose the exact policy before it is applied.
+Policies with an empty `blocks` list can never lock anything out — the helper buys those
+automatically (📜 in the log). **Mutually exclusive** policies (Liberty vs Tradition,
+Monarchy vs Republic vs Autocracy…) are permanent strategy choices, so they stay manual:
+the panel lists the pending exclusive choices with pros/cons and a **Policy** button, and
+nothing is applied until you pick.
 
 ## Workshop crafting prerequisites and overflow control
 
@@ -161,15 +147,18 @@ hunting) and prefers the craft that helps the current plan, so overflow becomes 
 instead of waste.
 
 
-## Leader selection
+## Leader selection & promotions
 
 The helper now elects a leader when the village has eligible kittens. It picks the trait
 that best matches the current bottleneck: scientists for science-heavy research,
 metallurgists for steel/gear/plate paths, chemists for concrete/kerosene/thorium paths,
 engineers for general crafting, managers when hunting and happiness are lagging, merchants
-for trade-heavy work, and wise kittens for faith/religion pressure. It does **not** promote
-kittens with gold; it only chooses the best existing leader so the run gets the free trait
-bonus without spending rare resources.
+for trade-heavy work, and wise kittens for faith/religion pressure.
+
+Promotions cost gold, so they are gated on **overflowing gold only**: when gold sits above
+~92% of its cap (where income is about to be wasted at the cap), the helper promotes
+kittens — converting dead gold into permanently better workers (🎖 in the log). Gold below
+that band is left alone for trade and gold-priced buildings.
 
 ## Jobs & hunting (managed for you)
 
@@ -184,6 +173,10 @@ turned off so they don't fight it):
 - **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs
   *farmer* (catnip, which it refines into wood) using live production rates, and picks
   whichever gives more wood per kitten.
+- **Starvation guard:** the helper watches the *net* catnip rate (the game's own number,
+  which includes kitten demand, seasons and weather). The moment catnip goes net-negative
+  with the pantry draining — hello, winter — farmers are reinforced before anyone starves,
+  instead of reacting only after stocks are nearly empty.
 - **Luxury-aware hunting:** the helper now values hunters as an economic production boost,
   not just a capped-resource dump. If furs/ivory/spice are low or village happiness is
   below normal, it assigns settlement kittens to hunters so they generate catpower for
@@ -219,7 +212,11 @@ the thresholds.
 ```
 src/kittens-game-helper.user.js   The userscript (the whole thing)
 scripts/validate.mjs              Sanity check: script parses + reset-safety intact
-package.json                      npm run validate
+scripts/smoke.mjs                 Behavioral test: runs the script against a mocked
+                                  game and proves the plan reserves resources and
+                                  pushes through, gateway techs win, policies split
+                                  auto/manual, leader/promotions/jobs fire
+package.json                      npm test (validate + smoke)
 LICENSE                           MIT (this wrapper). Kitten Scientists is MIT too.
 ```
 
