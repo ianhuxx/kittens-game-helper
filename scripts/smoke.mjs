@@ -427,6 +427,25 @@ check("gateway: Machinery (unlocks Steamworks) researched first", techs[1].resea
 check("gateway: filler tech with no unlocks left waiting", techs[2].researched === false);
 check("reservation: Mine never bought during the whole run", buildings[1].val === 2);
 
+/* Stage 4 — crafted intermediates must be bought in the same tick, even while throttled */
+techs.forEach((tech) => { tech.researched = true; });
+policies.forEach((policy) => { policy.researched = true; });
+religionUpgrades.forEach((upgrade) => { upgrade.researched = true; upgrade.on = 1; upgrade.val = 1; });
+buildings.forEach((building) => { building.unlocked = false; });
+gamePage.workshop.upgrades.push({
+  name: "sawblades",
+  label: "Sawblades",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "beam", val: 11 }],
+  effects: { woodRatio: 0.25 },
+});
+res("beam").value = 10;
+res("wood").value = 175;
+tickFn();
+check("crafted intermediate: upgrade bought in the same throttled tick", gamePage.workshop.upgrades[0].researched === true && res("beam").value >= 0 && res("beam").value < 10);
+check("focus panel names upgrade priority clearly", logText().includes("plan upgrade Sawblades") || /FOCUS: .*WORKSHOP UPGRADE/i.test(panelText(".kgh-plan")));
+
 /* Cross-cutting village behaviors */
 check("leader elected from traits", village.leader != null && village.leader.trait.name !== "none");
 check("promotion: overflowing gold spent on kittens", promoteCalls > 0 && res("gold").value < 95);

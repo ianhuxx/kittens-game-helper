@@ -2021,10 +2021,22 @@
     return `≈${days}d${remHours ? ` ${remHours}h` : ""}`;
   };
 
+  const KIND_LABELS = {
+    build: "BUILDING",
+    research: "SCIENCE",
+    upgrade: "WORKSHOP UPGRADE",
+    religion: "RELIGION UPGRADE",
+    policy: "POLICY",
+  };
+
+  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜" };
+
+  const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase()}`;
+
   const getPlanLine = (resources, goalKey) => {
     try {
       const target = getTargetCached(resources, goalKey);
-      if (!target) return "🧭 Plan: scanning unlocked buildings/research";
+      if (!target) return "🎯 FOCUS: scanning unlocked buildings/research/upgrades";
       const reqs = formatRequirements(target.kind, target.meta, resources);
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
@@ -2033,16 +2045,16 @@
       const reserveNote = reserved.length
         ? ` · reserving ${reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+")}`
         : "";
-      return `🧭 Plan: ${target.kind} ${labelOf(target.meta)} — ${state} · ETA ${eta}${reserveNote}${reqs ? ` (${reqs})` : ""}`;
+      return `🎯 FOCUS: ${focusLabel(target)} — ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
-      return "🧭 Plan: —";
+      return "🎯 FOCUS: —";
     }
   };
 
   const getNowAction = (resources, goalKey) => {
     const target = getTargetCached(resources, goalKey);
     if (!target) return "scanning…";
-    if (target.affordable) return `buying ${target.kind} ${labelOf(target.meta)}`;
+    if (target.affordable) return `buying ${focusLabel(target).toLowerCase()} ${labelOf(target.meta)}`;
     const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
     if (craftable) return `craft ${craftLabel(craftable.name)} for ${labelOf(target.meta)}`;
     return `gather ${target.missing || "prerequisites"} (reserved)`;
@@ -2286,9 +2298,13 @@
     try {
       if (getProfileName() !== "autopilot") return;
       const now = Date.now();
-      if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
       const target = getTargetCached(resources, goalKey);
 
+      // Plan purchases are latency-sensitive: if we just crafted the exact
+      // beams/slabs/etc. for a building, raw inputs may still be draining in the
+      // background.  Do not let the generic buy throttle insert another tick of
+      // delay between "ready" and the actual click.  Surplus/policy buys below
+      // remain throttled so the helper does not spam incidental purchases.
       if (target && target.affordable && !buyBenched(targetId(target))) {
         lastAutoBuy = now;
         if (buyCandidate(target)) {
@@ -2300,6 +2316,8 @@
         }
         return;
       }
+
+      if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
 
       const policy = autoPolicyChoice(resources, goalKey);
       if (policy && !buyBenched(targetId(policy))) {
@@ -2667,12 +2685,19 @@
   const tick = () => {
     try {
       resetTickCache();
-      const resources = resourceMap();
+      let resources = resourceMap();
       const goal = getGoal();
       refineSurplusCatnip();
-      craftTowardTarget(resources, goal);
-      craftOverflowResources(resources, goal);
       optimizeProcessing(resources, goal);
+      craftTowardTarget(resources, goal);
+      // Crafting can turn a plan affordable immediately.  Re-read resources and
+      // rebuild the per-tick target cache before buying, otherwise the next tick
+      // (and ongoing raw-resource drain) can steal the just-crafted window.
+      resetTickCache();
+      resources = resourceMap();
+      craftOverflowResources(resources, goal);
+      resetTickCache();
+      resources = resourceMap();
       reserveFaithForReligionProgression(resources);
       executePlan(resources, goal);
       balanceJobs(goal, resources);
@@ -2771,7 +2796,7 @@
       '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
       '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
       '<small class="kgh-science" style="color:#bfe6a0">…</small>',
-      '<small class="kgh-plan" style="color:#a7e8e0">…</small>',
+      '<small class="kgh-plan" style="color:#a7e8e0;font-weight:700">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
       '<details class="kgh-details"><summary>More automation details</summary><div class="kgh-details-body">',
       '<small class="kgh-note"></small>',
