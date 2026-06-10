@@ -41,6 +41,9 @@ const required = [
   // The plan should include a rough completion estimate.
   "formatEta",
   "ETA",
+  "ticksPerSecond",
+  "optimizeProcessing",
+  "kgh-processing",
   // Kittens Game intentionally spells this resource ID as compedium.
   "compedium",
 ];
