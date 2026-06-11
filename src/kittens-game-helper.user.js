@@ -751,6 +751,35 @@
     return pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === name && cost.val > ((getRes(resourceMap(), name) || { value: 0 }).value || 0));
   };
 
+  // Overflow crafting is allowed to convert a hot input only when that input is
+  // genuinely surplus to the active plan.  The floor is computed from the plan's
+  // direct prices plus raw craft-chain requirements for every missing target
+  // resource EXCEPT the output currently being crafted.  That exception lets
+  // overflow crafting still help by making a needed intermediate (minerals →
+  // slab when the focus needs slabs), while preventing contradictions such as
+  // minerals → slab when the focus itself is still reserving minerals.
+  const overflowInputFloor = (target, resources, inputName, outputName) => {
+    let floor = craftFloorFor(resources, inputName);
+    if (!target) return floor;
+
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const res = getRes(resources, cost.name);
+      if (res && res.maxValue > 0 && cost.val > res.maxValue && !craftByName(cost.name)) continue;
+
+      if (cost.name === inputName) floor = Math.max(floor, cost.val);
+      if (cost.name === outputName) continue;
+
+      const have = ((getRes(resources, cost.name) || {}).value) || 0;
+      const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
+      if (deficit <= 0 || !craftByName(cost.name)) continue;
+      const raw = rawPathRequirements(cost.name, deficit);
+      if (raw[inputName] > 0) floor = Math.max(floor, raw[inputName]);
+    }
+
+    return floor;
+  };
+
   const craftOverflowResources = (resources, goalKey) => {
     try {
       const target = getTargetCached(resources, goalKey);
@@ -768,7 +797,7 @@
         for (const price of prices) {
           const input = getRes(resources, price.name);
           const value = (input && input.value) || 0;
-          const reserve = craftReserveFor(resources, price.name);
+          const reserve = overflowInputFloor(target, resources, price.name, name);
           maxUnits = Math.min(maxUnits, Math.floor(Math.max(0, value - reserve) / price.val));
         }
         if (!isFinite(maxUnits) || maxUnits < 1) continue;
@@ -1061,6 +1090,20 @@
 
   const emptyEffectProfile = () => ({ perTick: {}, max: {}, ratio: {}, demand: {}, housing: 0, happiness: 0, craft: 0 });
 
+  const addEffectProfile = (target, source, scale = 1) => {
+    if (!source || !isFinite(scale) || scale <= 0) return target;
+    for (const group of ["perTick", "max", "ratio", "demand"]) {
+      for (const [name, amount] of Object.entries(source[group] || {})) {
+        if (!isFinite(amount) || amount === 0) continue;
+        target[group][name] = (target[group][name] || 0) + amount * scale;
+      }
+    }
+    target.housing += (source.housing || 0) * scale;
+    target.happiness += (source.happiness || 0) * scale;
+    target.craft += (source.craft || 0) * scale;
+    return target;
+  };
+
   const parseEffectEntry = (profile, key, value) => {
     if (!isFinite(value) || value === 0) return;
     if (key === "maxKittens") {
@@ -1116,6 +1159,74 @@
     }
     for (const effects of sources) {
       for (const [key, value] of Object.entries(effects)) parseEffectEntry(profile, key, value);
+    }
+    return profile;
+  };
+
+  const scaledEffectProfileFromEntries = (entries) => {
+    const profile = emptyEffectProfile();
+    for (const [key, value, scale] of entries) parseEffectEntry(profile, key, value * scale);
+    return profile;
+  };
+
+  // Some upgrades do not expose their own direct `effects`; instead, buying
+  // them changes the calculated effects of existing buildings listed in
+  // `upgrades.buildings` (for example an automation upgrade can make a
+  // powered building produce a crafted resource).  Score that as a normal
+  // effect delta: temporarily evaluate the affected building as if this
+  // candidate were researched, diff its numeric effects, then restore the live
+  // game metadata.  This keeps hidden building-upgrade synergies generic and
+  // expandable instead of hard-coding individual upgrade names.
+  const affectedBuildingDeltaProfile = (meta) => {
+    const profile = emptyEffectProfile();
+    const names = meta && meta.upgrades && Array.isArray(meta.upgrades.buildings) ? meta.upgrades.buildings : [];
+    if (!names.length) return profile;
+    const game = window.gamePage;
+    for (const name of names) {
+      const building = buildingByName(name);
+      if (!building || typeof building.calculateEffects !== "function") continue;
+      const activeCount = Math.max(0, building.on || building.val || 0);
+      const ownedCount = Math.max(0, building.val || activeCount);
+      if (activeCount <= 0 && ownedCount <= 0) continue;
+
+      const beforeEffects = { ...(building.effects || {}) };
+      const beforeDescription = building.description;
+      const wasResearched = !!meta.researched;
+      try {
+        meta.researched = true;
+        building.effects = { ...beforeEffects };
+        building.calculateEffects(building, game);
+        const deltaEntries = [];
+        for (const key of new Set([...Object.keys(beforeEffects), ...Object.keys(building.effects || {})])) {
+          const before = beforeEffects[key] || 0;
+          const after = (building.effects && building.effects[key]) || 0;
+          const delta = after - before;
+          if (!isFinite(delta) || delta === 0) continue;
+          const perTickLike = /PerTick|Autoprod|Prod|Con/i.test(key);
+          deltaEntries.push([key, delta, perTickLike ? activeCount : ownedCount]);
+        }
+        addEffectProfile(profile, scaledEffectProfileFromEntries(deltaEntries));
+      } catch (error) {
+        /* ignore metadata shapes we cannot safely evaluate */
+      } finally {
+        meta.researched = wasResearched;
+        building.effects = beforeEffects;
+        building.description = beforeDescription;
+      }
+    }
+    return profile;
+  };
+
+  const candidateEffectProfile = (kind, meta) => {
+    const profile = metaEffectProfile(meta);
+    if (kind === "upgrade") addEffectProfile(profile, affectedBuildingDeltaProfile(meta));
+    return profile;
+  };
+
+  const effectiveMetaProfile = (meta) => {
+    const profile = metaEffectProfile(meta);
+    if (meta && meta.upgrades && Array.isArray(meta.upgrades.buildings)) {
+      addEffectProfile(profile, affectedBuildingDeltaProfile(meta));
     }
     return profile;
   };
@@ -1521,7 +1632,7 @@
 
   const profileMatchesEmphasis = (meta, goal) => {
     const emphasis = (goal && goal.emphasis) || {};
-    const profile = metaEffectProfile(meta);
+    const profile = effectiveMetaProfile(meta);
     return Object.entries(emphasis).some(([category, mult]) => mult > 1 && profileMatchesCategory(profile, category));
   };
 
@@ -1558,7 +1669,7 @@
     if (!goal) return 0;
     let boost = 0;
     if (kind === "research" && goalClosureNames(goalKey).has(meta.name)) boost += TUNING.goalClosureBoost;
-    const profile = metaEffectProfile(meta);
+    const profile = candidateEffectProfile(kind, meta);
     for (const [category, mult] of Object.entries(goal.emphasis || {})) {
       if (mult > 1 && profileMatchesCategory(profile, category)) boost += (mult - 1) * TUNING.emphasisScale;
     }
@@ -1596,8 +1707,8 @@
   // effects and price its worth against the CURRENT economy — relative
   // production gains scaled by scarcity, storage scaled by live pressure,
   // housing/happiness by their global multipliers. No per-item keyword boosts.
-  const economicValue = (meta, resources, goal, goalKey) => {
-    const profile = metaEffectProfile(meta);
+  const economicValue = (kind, meta, resources, goal, goalKey) => {
+    const profile = candidateEffectProfile(kind, meta);
     const pressure = getStoragePressureCached(resources, goal, goalKey);
     const tps = ticksPerSecond();
     let value = 0;
@@ -1826,7 +1937,7 @@
       ? TUNING.affordBonus
       : Math.min(1, Math.max(0, candidate.progress || 0)) * TUNING.progressScale;
     let score = (TUNING.kindPrior[kind] || 3) + affordBonus +
-      economicValue(meta, resources, goal, goalKey) +
+      economicValue(kind, meta, resources, goal, goalKey) +
       goalAlignmentBoost(kind, meta, goalKey) +
       spendBonusFor(kind, meta, resources);
     if (kind === "research") {
@@ -2872,7 +2983,7 @@
   const policyScore = (meta, resources, goalKey) => {
     const goal = GOALS[goalKey];
     const { cons } = summarizeEffects(meta);
-    let score = economicValue(meta, resources, goal, goalKey) + goalAlignmentBoost("policy", meta, goalKey);
+    let score = economicValue("policy", meta, resources, goal, goalKey) + goalAlignmentBoost("policy", meta, goalKey);
     score -= cons.length * 4;
     return score;
   };

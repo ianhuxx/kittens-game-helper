@@ -85,12 +85,14 @@ const resources = [
   R("slab", 0, 0),
   R("plate", 0, 0),
   R("steel", 0, 0),
+  R("gear", 45, 0),
 ];
 const res = (name) => resources.find((r) => r.name === name);
 
 const crafts = [
   { name: "wood", label: "Refine Catnip", unlocked: true, prices: [{ name: "catnip", val: 100 }] },
   { name: "beam", label: "Beam", unlocked: true, prices: [{ name: "wood", val: 175 }] },
+  { name: "slab", label: "Slab", unlocked: true, prices: [{ name: "minerals", val: 250 }] },
   { name: "parchment", label: "Parchment", unlocked: true, prices: [{ name: "furs", val: 175 }] },
   { name: "manuscript", label: "Manuscript", unlocked: true, prices: [{ name: "culture", val: 400 }, { name: "parchment", val: 25 }] },
 ];
@@ -101,6 +103,18 @@ const buildings = [
   { name: "mine", label: "Mine", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 300 }], effects: { mineralsRatio: 0.2 } },
   { name: "barn", label: "Barn", unlocked: true, val: 1, on: 1, prices: [{ name: "wood", val: 1000 }], effects: { catnipMax: 5000, woodMax: 200 } },
   { name: "hut", label: "Hut", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 5000 }], effects: { manpowerMax: 75 } },
+  {
+    name: "steamworks",
+    label: "Steamworks",
+    unlocked: false,
+    val: 4,
+    on: 4,
+    prices: [{ name: "steel", val: 65 }, { name: "gear", val: 20 }, { name: "blueprint", val: 1 }],
+    effects: { manuscriptPerTickProd: 0 },
+    calculateEffects(self, game) {
+      self.effects.manuscriptPerTickProd = game.workshop.get("printingPress").researched ? 0.0005 : 0;
+    },
+  },
   {
     name: "warehouse",
     label: "Warehouse",
@@ -151,6 +165,18 @@ const policies = [
   { name: "liberty", label: "Liberty", unlocked: true, researched: false, blocked: false, blocks: ["tradition"], prices: [{ name: "culture", val: 1500 }], effects: {} },
   { name: "tradition", label: "Tradition", unlocked: true, researched: false, blocked: false, blocks: ["liberty"], prices: [{ name: "culture", val: 1500 }], effects: {} },
   { name: "openFairs", label: "Open Fairs", unlocked: true, researched: false, blocked: false, blocks: [], prices: [{ name: "culture", val: 1500 }], effects: {} },
+];
+
+const workshopUpgrades = [
+  {
+    name: "printingPress",
+    label: "Printing Press",
+    unlocked: false,
+    researched: false,
+    prices: [{ name: "science", val: 7500 }, { name: "gear", val: 45 }],
+    effects: {},
+    upgrades: { buildings: ["steamworks"] },
+  },
 ];
 
 const religionUpgrades = [
@@ -262,8 +288,9 @@ const gamePage = {
     religionUpgrades,
   },
   workshop: {
-    upgrades: [],
+    upgrades: workshopUpgrades,
     crafts,
+    get: (name) => workshopUpgrades.find((upgrade) => upgrade.name === name),
     getCraft: (name) => craft(name),
     getCraftPrice: (c) => (c && c.prices) || [],
     getPrices: (meta) => (meta && meta.prices) || [],
@@ -465,6 +492,19 @@ astronomy.researched = false;
 astronomy.prices = [{ name: "science", val: 30000 }, { name: "manuscript", val: 65 }];
 astronomy.unlocks = { tech: ["rocketry"] };
 buildings.find((building) => building.name === "warehouse").unlocked = true;
+const steamworks = buildings.find((building) => building.name === "steamworks");
+steamworks.unlocked = true;
+const printingPress = gamePage.workshop.get("printingPress");
+printingPress.unlocked = true;
+printingPress.researched = false;
+res("culture").value = 0;
+perTick.culture = 0;
+res("science").value = 8000;
+res("science").maxValue = 30050;
+res("gear").value = 45;
+res("manuscript").value = 16;
+tickFn();
+check("space focus: hidden building-upgrade production is valued (Printing Press for manuscripts)", printingPress.researched === true && /Printing Press/.test(logText()));
 gamePage.workshop.upgrades.push({
   name: "crossbow",
   label: "Crossbow",
@@ -485,11 +525,29 @@ tickFn();
 check("space focus: manuscript-gated Astronomy stays ahead of side catpower Warehouse", /Astronomy/.test(panelText(".kgh-plan")) && !/warehouse/i.test(panelText(".kgh-plan")));
 check("goal line: milestone progress counted from the tech tree (0/3 toward Rocketry)", /0\/3 techs/.test(panelText(".kgh-goal-line")) && /Astronomy/.test(panelText(".kgh-goal-line")));
 
-/* Stage 6 — crafted intermediates must be bought in the same tick, even while throttled */
+/* Stage 6 — overflow crafting must not steal resources the focus still reserves */
 techs.forEach((tech) => { tech.researched = true; });
 policies.forEach((policy) => { policy.researched = true; });
 religionUpgrades.forEach((upgrade) => { upgrade.researched = true; upgrade.on = 1; upgrade.val = 1; });
 buildings.forEach((building) => { building.unlocked = false; });
+for (const upgrade of gamePage.workshop.upgrades) upgrade.researched = true;
+fakeNow += 370000;
+const mineralDrills = {
+  name: "mineralDrills",
+  label: "Mineral Drills",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "minerals", val: 900 }],
+  effects: { mineralsRatio: 0.5 },
+};
+gamePage.workshop.upgrades.push(mineralDrills);
+res("minerals").value = 950;
+res("minerals").maxValue = 1000;
+const slabsBeforeOverflowGuard = res("slab").value;
+tickFn();
+check("overflow: hot minerals are reserved for the focused project instead of converted to slabs", mineralDrills.researched === true && res("slab").value === slabsBeforeOverflowGuard);
+
+/* Stage 7 — crafted intermediates must be bought in the same tick, even while throttled */
 for (const upgrade of gamePage.workshop.upgrades) upgrade.researched = true;
 const sawblades = {
   name: "sawblades",
