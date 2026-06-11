@@ -83,6 +83,7 @@ const resources = [
   R("compedium", 0, 0, "Compendium"),
   R("beam", 10, 0),
   R("slab", 0, 0),
+  R("scaffold", 0, 0),
   R("plate", 0, 0),
   R("steel", 0, 0),
   R("gear", 45, 0),
@@ -265,6 +266,12 @@ const village = {
 
 const perTick = { catnip: -0.4, wood: 0.4, minerals: 0.3, science: 0.2, culture: 0.2, manpower: 0.2, iron: 0.05, coal: 0.01, gold: 0.01 };
 
+const diplomacy = {
+  races: [
+    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [] },
+  ],
+};
+
 const gamePage = {
   resPool: {
     resources,
@@ -297,6 +304,7 @@ const gamePage = {
   },
   village,
   calendar,
+  diplomacy,
   villageTab: { updateTab() {} },
   updateResources() {},
   unlock() {},
@@ -440,6 +448,7 @@ check(
 check("plan: Library chosen over storage-blocked Theology and cheap Mine", /Library/.test(panelText(".kgh-plan")));
 check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
 check("plan: reservation visible in the panel", /reserving/i.test(panelText(".kgh-plan")) || /saving for/i.test(panelText(".kgh-buy")));
+check("reservation: KS external spenders paused while focused plan saves", appliedSettings.trade.enabled === false && appliedSettings.space.enabled === false && appliedSettings.time.enabled === false && /paused Space\/Time\/Trade/.test(panelText(".kgh-external-spenders")));
 check("reservation: affordable Mine NOT bought while Library saves up", buildings[1].val === 2);
 check("policy: non-exclusive auto-bought", policies[2].researched === true);
 check("policy: exclusive choices left for the player", policies[0].researched === false && policies[1].researched === false);
@@ -600,6 +609,19 @@ res("wood").value = 0;
 fakeNow += 25000;
 tickFn();
 check("overflow: capped catnip is converted into wood by the generic craft scanner", res("wood").value > 0 && res("catnip").value < 4900);
+
+/* Recent actions — KS-owned diplomacy/trade changes are discovered by state diffs */
+fakeNow += 25000;
+diplomacy.races[0].embassyLevel += 1;
+diplomacy.races[0].tradeTotal += 1;
+res("gold").value -= 15;
+res("manpower").value -= 50;
+res("spice").unlocked = true;
+res("spice").value += 70;
+res("scaffold").value += 1;
+tickFn();
+check("recent actions: embassy level changes are logged", /embassy with Lizards/.test(logText()));
+check("recent actions: external trade resource swings are logged", /trade: .*Spice/.test(logText()) && /Gold/.test(logText()));
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

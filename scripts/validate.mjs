@@ -52,6 +52,8 @@ const required = [
   "executePlan",
   "reservedNeedsFor",
   "respectsReservations",
+  "protectPlanFromExternalSpenders",
+  "kgh-external-spenders",
   "kgh-buy",
   // Religion: praise waits for a high faith bank so upgrades get a chance.
   "configureReligionProgression",
@@ -66,6 +68,8 @@ const required = [
   // Diplomacy: KS usually owns trade, but the helper keeps a direct fallback for
   // explorers and embassies so catpower/culture caps become progress.
   "manageDiplomacy",
+  "trackDiplomacyActionDeltas",
+  "trackTradeResourceDeltas",
   "maybeSendExplorers",
   "maybeBuildEmbassy",
   "EmbassyButtonController",
