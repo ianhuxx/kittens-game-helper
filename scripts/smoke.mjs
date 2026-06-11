@@ -446,6 +446,7 @@ const libraryBeforeProductionFocus = buildings[0].val;
 const mineBeforeProductionFocus = buildings[1].val;
 tickFn();
 check("focus: production goal spends on Mine instead of science storage", buildings[1].val === mineBeforeProductionFocus + 1 && buildings[0].val === libraryBeforeProductionFocus);
+check("goal line: emphasis goal explains what it favors", /favoring production/.test(panelText(".kgh-goal-line")));
 
 /* Stage 5 — Rush Space must not detour into side-effect warehouses */
 storage.set("kgh.goal", "space");
@@ -482,6 +483,7 @@ res("beam").value = 55;
 res("slab").value = 342;
 tickFn();
 check("space focus: manuscript-gated Astronomy stays ahead of side catpower Warehouse", /Astronomy/.test(panelText(".kgh-plan")) && !/warehouse/i.test(panelText(".kgh-plan")));
+check("goal line: milestone progress counted from the tech tree (0/3 toward Rocketry)", /0\/3 techs/.test(panelText(".kgh-goal-line")) && /Astronomy/.test(panelText(".kgh-goal-line")));
 
 /* Stage 6 — crafted intermediates must be bought in the same tick, even while throttled */
 techs.forEach((tech) => { tech.researched = true; });

@@ -64,12 +64,22 @@ The bottom-right box is a live dashboard:
 
 ## Pick a goal
 
-The second dropdown steers the advisor toward a target you choose — **Balanced**,
-**Rush Space**, **Max production**, or **Max population**. It adds a **🏁 goal line**
-showing progress to that milestone (e.g. *Rush Space → Rocketry locked, researching
-toward it*), prioritises goal-relevant research in **🔬 Next science**, and highlights
-goal buildings in **🎯 Now**. Autopilot still grows the whole economy so you never stall
-waiting on a single branch.
+The second dropdown steers the planner toward a destination you choose. A goal is one
+of two shapes — and neither relies on keyword lists; relevance is computed from live
+game data:
+
+- **Milestone goals** (e.g. **Reach Space — race to Rocketry**) name a target tech. The
+  planner walks the tech tree, treats every unresearched prerequisite as goal-relevant,
+  and the **🏁 goal line** shows honest progress: `4/9 techs (44%) · next: Astronomy
+  (need 12.00K science)`. Anything that produces or stores a resource the next goal
+  techs still need also gets pulled forward.
+- **Emphasis goals** (**Industry — max resource production**, **Population — more
+  kittens, happier kittens**) multiply effect *categories*. Each candidate's parsed
+  effects are matched against the emphasis — a building with production effects counts
+  for Industry whatever it's called — and the goal line says what's being favored.
+
+**Balanced** (the default) grows everything and still chases gateway techs. Whatever the
+goal, autopilot keeps the whole economy alive so you never stall on a single branch.
 
 ## Minimal UI
 
@@ -92,8 +102,12 @@ affordable first. That cannot happen anymore:
    the helper is the only thing buying buildings, research and workshop upgrades.
    (KS keeps crafting, trade, religion, space, time and festivals.)
 2. The helper picks the most **valuable** reachable step as the plan — not the
-   cheapest ready one — scoring real effects: production fixes, storage relief,
-   shortage fixes, goal keywords, and what a tech recursively unlocks.
+   cheapest ready one — using one universal scoring framework: each candidate's
+   *parsed metadata effects* (`woodPerTick`, `scienceMax`, `maxKittens`, …) are priced
+   against the current economy (production weighted by scarcity, storage by live
+   pressure, plus unlocks, goal alignment, and a spend-before-store bonus for research
+   that drains an almost-full science bank), minus how long it would take to afford.
+   There are no per-item keyword lists; every weight lives in one `TUNING` table.
 3. While the plan is unaffordable, its costs (and the raw chain behind crafted
    costs) are **reserved**. Other purchases are allowed only from surplus that
    doesn't dip into the reservation. The 🛒 line shows `saving for … (reserving …)`.
@@ -165,11 +179,15 @@ that band is left alone for trade and gold-priced buildings.
 The helper takes over **job rebalancing** and **hunting** directly (KS's own versions are
 turned off so they don't fight it):
 
-- **All non-engineer kittens are rebalanced continuously**, not just idle kittens. If science
-  is capped, scholars are moved away; if faith is capped, priests are moved away; if the
-  current target mostly needs wood, workers move toward the best wood route. You'll see
-  `👷 rebalanced` lines in the log with the full managed-job distribution, not just the
-  three largest job buckets.
+- **All non-engineer kittens are rebalanced continuously**, not just idle kittens. Which
+  resource each job produces is discovered from the game's own job metadata, so new jobs
+  are managed automatically. If a job's output bank is essentially full its workers move
+  away; if the current target mostly needs wood, workers move toward the best wood route.
+  You'll see `👷 rebalanced` lines in the log with the full managed-job distribution.
+- **Lookahead demand:** jobs don't serve only the single locked plan. The next few
+  runner-up candidates contribute a smaller share of demand, so science keeps flowing
+  for the next tech while wood gathers for the current build — instead of the whole
+  village whiplashing between "all scholars" and "all woodcutters".
 - **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs
   *farmer* (catnip, which it refines into wood) using live production rates, and picks
   whichever gives more wood per kitten.
