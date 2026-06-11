@@ -342,6 +342,7 @@
   };
 
   const resourceMap = () => {
+    if (tickCache.resources) return tickCache.resources;
     const map = new Map();
     try {
       for (const res of window.gamePage.resPool.resources) {
@@ -351,6 +352,7 @@
     } catch (error) {
       /* ignore */
     }
+    tickCache.resources = map;
     return map;
   };
 
@@ -528,10 +530,28 @@
   // Candidate gathering, target choice and storage-pressure scans are expensive
   // (storage pressure alone walks every meta) and were being recomputed by every
   // consumer each tick — sometimes disagreeing mid-tick. Compute once, share.
-  let tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null, goalClosure: null, goalSupport: null };
+  let tickCache = {
+    resources: null,
+    production: Object.create(null),
+    candidates: null,
+    target: undefined,
+    pressure: null,
+    goalFrontier: null,
+    goalClosure: null,
+    goalSupport: null,
+  };
 
   const resetTickCache = () => {
-    tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null, goalClosure: null, goalSupport: null };
+    tickCache = {
+      resources: null,
+      production: Object.create(null),
+      candidates: null,
+      target: undefined,
+      pressure: null,
+      goalFrontier: null,
+      goalClosure: null,
+      goalSupport: null,
+    };
   };
 
   const getCandidatesCached = (resources, goalKey) => {
@@ -553,31 +573,23 @@
 
   /* ------------------------- economy balancing action ------------------------ */
 
-  // Backup to the KS craft setting above: directly refine the catnip surplus
-  // into wood when catnip is piling up and wood is low, keeping a food reserve.
+  // Backup to the KS craft setting above: directly refine catnip surplus into
+  // wood when catnip is piling up, keeping the same food reserve used by the
+  // universal crafting rules below. Use the resilient craftUnits wrapper (not a
+  // single game API shape), because Kittens Game has changed craft entrypoints.
   const refineSurplusCatnip = () => {
     try {
-      const game = window.gamePage;
-      if (typeof game.craft !== "function") return;
       const res = resourceMap();
       const catnip = res.get("catnip");
-      const wood = res.get("wood");
-      if (!catnip || !wood || !catnip.maxValue) return;
+      if (!catnip || !catnip.maxValue || !craftByName("wood")) return;
       const catnipRatio = catnip.value / catnip.maxValue;
-      const woodRatio = wood.maxValue ? wood.value / wood.maxValue : 0;
-      if (catnipRatio < 0.6 || woodRatio > 0.4) return; // catnip piling AND wood low
-      const spendable = catnip.value - catnip.maxValue * 0.5; // keep half for food
+      if (catnipRatio < 0.86) return;
+      const spendable = catnip.value - craftFloorFor(res, "catnip");
       if (spendable <= 0) return;
-      let costPer = 100;
-      try {
-        const craft = game.workshop.getCraft && game.workshop.getCraft("wood");
-        const price = craft && craft.prices && craft.prices.find((p) => p.name === "catnip");
-        if (price && price.val > 0) costPer = price.val;
-      } catch (error) {
-        /* use default ratio */
-      }
+      const price = craftPricesFor(craftByName("wood")).find((p) => p && p.name === "catnip" && p.val > 0);
+      const costPer = price && price.val > 0 ? price.val : woodCatnipCost();
       const woodToMake = Math.floor(spendable / costPer);
-      if (woodToMake >= 1) game.craft("wood", woodToMake);
+      if (woodToMake >= 1) craftUnits("wood", Math.max(1, Math.ceil(woodToMake * 0.35)));
     } catch (error) {
       /* ignore */
     }
@@ -750,9 +762,23 @@
   };
 
 
-  const OVERFLOW_CRAFTS = ["beam", "slab", "plate", "steel", "gear", "concrate", "alloy", "eludium", "scaffold", "ship", "parchment", "manuscript", "compedium", "blueprint"];
+  const OVERFLOW_CRAFTS = ["wood", "beam", "slab", "plate", "steel", "gear", "concrate", "alloy", "eludium", "scaffold", "ship", "parchment", "manuscript", "compedium", "blueprint"];
   let overflowPlanText = "Overflow: watching storage";
   let lastOverflowLog = 0;
+
+  const craftableResourceNames = () => {
+    const names = new Set(OVERFLOW_CRAFTS);
+    try {
+      const crafts = window.gamePage && window.gamePage.workshop && window.gamePage.workshop.crafts;
+      const list = Array.isArray(crafts) ? crafts : Object.values(crafts || {});
+      for (const craft of list) {
+        if (craft && craft.name && craft.unlocked !== false) names.add(craft.name);
+      }
+    } catch (error) {
+      /* keep the curated fallback list */
+    }
+    return [...names];
+  };
 
   const wouldWasteResource = (resources, name) => {
     const res = getRes(resources, name);
@@ -800,7 +826,7 @@
     try {
       const target = getTargetCached(resources, goalKey);
       const scored = [];
-      for (const name of OVERFLOW_CRAFTS) {
+      for (const name of craftableResourceNames()) {
         const craft = craftByName(name);
         if (!craft) continue;
         const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
@@ -1282,21 +1308,31 @@
   // resource column shows per-second rates. ETAs must use the same unit players
   // see, and they must include buildings/processors, not only village jobs.
   const productionFor = (name) => {
+    const resourceName = name === "catpower" ? "manpower" : name;
+    if (Object.prototype.hasOwnProperty.call(tickCache.production, resourceName)) return tickCache.production[resourceName];
+    let result = 0;
     try {
       const game = window.gamePage;
-      const resourceName = name === "catpower" ? "manpower" : name;
       if (game && typeof game.getResourcePerTick === "function") {
         const perTick = game.getResourcePerTick(resourceName, true);
-        if (isFinite(perTick)) return perTick * ticksPerSecond();
+        if (isFinite(perTick)) result = perTick * ticksPerSecond();
+        tickCache.production[resourceName] = result;
+        return result;
       }
       const res = getRes(resourceMap(), resourceName);
-      if (res && isFinite(res.perTickCached)) return res.perTickCached * ticksPerSecond();
+      if (res && isFinite(res.perTickCached)) {
+        result = res.perTickCached * ticksPerSecond();
+        tickCache.production[resourceName] = result;
+        return result;
+      }
       const prod = game && game.village && game.village.getResProduction ? game.village.getResProduction() : {};
       const value = prod[resourceName];
-      return isFinite(value) ? value * ticksPerSecond() : 0;
+      result = isFinite(value) ? value * ticksPerSecond() : 0;
     } catch (error) {
-      return 0;
+      result = 0;
     }
+    tickCache.production[resourceName] = result;
+    return result;
   };
 
   const rawPathRequirements = (name, amount, out = {}, depth = 0) => {
@@ -2905,6 +2941,150 @@
     }
   };
 
+  /* ------------------------ diplomacy safety net (ours) ----------------------- */
+
+  // KS normally owns trade, but exploration/embassy clicks are important enough
+  // to keep a direct, reservation-aware fallback here. This is generic over the
+  // game's live race metadata: it reads each race's current embassy prices and
+  // lets the diplomacy manager decide which civilization an explorer discovers.
+  let diplomacyPlanText = "Diplomacy: watching trade";
+  let lastDiplomacyAction = 0;
+
+  const unlockedRaces = () => {
+    try {
+      const races = window.gamePage && window.gamePage.diplomacy && window.gamePage.diplomacy.races;
+      return (Array.isArray(races) ? races : []).filter((race) => race && race.unlocked);
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const hasLockedDiscoverableRace = () => {
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      const races = (diplomacy && diplomacy.races) || [];
+      return races.some((race) => race && !race.unlocked && !race.hidden);
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const pricesRespectReservations = (prices, reserved, resources) => prices.every((price) => {
+    if (!price || !price.name || !isFinite(price.val) || price.val <= 0) return true;
+    const hold = reserved[price.name] || (price.name === "catpower" ? reserved.manpower || 0 : 0);
+    if (hold <= 0) return true;
+    const stock = ((getRes(resources, price.name) || {}).value) || 0;
+    return stock - price.val >= hold;
+  });
+
+  const writingResearched = () => {
+    try {
+      const writing = window.gamePage.science && window.gamePage.science.get && window.gamePage.science.get("writing");
+      return !writing || writing.researched;
+    } catch (error) {
+      return true;
+    }
+  };
+
+  const embassyPricesForRace = (race) => {
+    try {
+      const game = window.gamePage;
+      const Controller = getGlobalPath(["classes", "diplomacy", "ui", "EmbassyButtonController"]);
+      if (game && typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ prices: race.embassyPrices, race, controller });
+        if (model && typeof controller.getPrices === "function") return controller.getPrices(model) || race.embassyPrices || [];
+      }
+    } catch (error) {
+      /* fall through to metadata pricing */
+    }
+    const reduction = (() => {
+      try { return 1 - (window.gamePage.getEffect("embassyCostReduction") || 0); } catch (error) { return 1; }
+    })();
+    const fakeBought = (() => {
+      try { return window.gamePage.getEffect("embassyFakeBought") || 0; } catch (error) { return 0; }
+    })();
+    return (race.embassyPrices || []).map((price) => ({ ...price, val: price.val * reduction * Math.pow(1.15, (race.embassyLevel || 0) + fakeBought) }));
+  };
+
+  const buyEmbassyForRace = (race) => {
+    const game = window.gamePage;
+    const before = race.embassyLevel || 0;
+    try {
+      const Controller = getGlobalPath(["classes", "diplomacy", "ui", "EmbassyButtonController"]);
+      if (game && typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ prices: race.embassyPrices, race, controller });
+        if (model && typeof controller.buyItem === "function") controller.buyItem(model, { boughtByQueue: true });
+        if ((race.embassyLevel || 0) > before) return true;
+      }
+    } catch (error) {
+      /* try raw metadata below */
+    }
+    const prices = embassyPricesForRace(race).filter((price) => price && price.name && price.val > 0);
+    if (!prices.length || !canPayPrices(prices) || !rawPayPrices(prices)) return false;
+    race.embassyLevel = before + 1;
+    if (game && game.diplomacy && typeof game.diplomacy.triggerOnEmbassyCountChanged === "function") game.diplomacy.triggerOnEmbassyCountChanged();
+    if (game && typeof game.render === "function") game.render();
+    return (race.embassyLevel || 0) > before;
+  };
+
+  const maybeSendExplorers = (resources, reserved) => {
+    const game = window.gamePage;
+    const diplomacy = game && game.diplomacy;
+    if (!diplomacy || typeof diplomacy.unlockRandomRace !== "function") return false;
+    const price = [{ name: "manpower", val: 1000 }];
+    if (!hasLockedDiscoverableRace() || !canPayPrices(price) || !pricesRespectReservations(price, reserved, resources)) return false;
+    if (unlockedRaces().length > 0 && resRatio(resources, "manpower", 0) < 0.92) return false;
+    const before = unlockedRaces().length;
+    if (!rawPayPrices(price)) return false;
+    const race = diplomacy.unlockRandomRace();
+    if (!race && game.resPool && typeof game.resPool.addResEvent === "function") game.resPool.addResEvent("manpower", 950);
+    if (game && typeof game.render === "function") game.render();
+    const after = unlockedRaces().length;
+    if (after > before || race) {
+      diplomacyPlanText = `Diplomacy: sent explorers; met ${(race && (race.title || race.name)) || "a civilization"}`;
+      pushLog(`🧭 ${diplomacyPlanText}`);
+      return true;
+    }
+    diplomacyPlanText = "Diplomacy: explorers need later unlock conditions";
+    return false;
+  };
+
+  const maybeBuildEmbassy = (resources, reserved) => {
+    if (!writingResearched()) return false;
+    const races = unlockedRaces()
+      .filter((race) => race.embassyPrices && race.embassyPrices.length)
+      .map((race) => ({ race, prices: embassyPricesForRace(race) }))
+      .filter((item) => item.prices.length && canPayPrices(item.prices) && pricesRespectReservations(item.prices, reserved, resources))
+      .sort((a, b) => (a.race.embassyLevel || 0) - (b.race.embassyLevel || 0));
+    const next = races[0];
+    if (!next) return false;
+    if (buyEmbassyForRace(next.race)) {
+      diplomacyPlanText = `Diplomacy: built embassy with ${next.race.title || next.race.name} (level ${next.race.embassyLevel || 1})`;
+      pushLog(`🤝 ${diplomacyPlanText}`);
+      return true;
+    }
+    return false;
+  };
+
+  const manageDiplomacy = (resources, goalKey) => {
+    try {
+      if (getProfileName() !== "autopilot") return;
+      if (Date.now() - lastDiplomacyAction < 10000) return;
+      const target = getTargetCached(resources, goalKey);
+      const reserved = reservedNeedsFor(target, resources);
+      if (maybeSendExplorers(resources, reserved) || maybeBuildEmbassy(resources, reserved)) {
+        lastDiplomacyAction = Date.now();
+        return;
+      }
+      const raceCount = unlockedRaces().length;
+      diplomacyPlanText = raceCount ? `Diplomacy: ${raceCount} trade partner${raceCount === 1 ? "" : "s"}; embassies watched` : "Diplomacy: saving catpower for explorers";
+    } catch (error) {
+      /* ignore diplomacy fallback failures */
+    }
+  };
+
   /* ------------------------------ action log -------------------------------- */
 
   let actionLog = [];
@@ -3188,6 +3368,7 @@
   let craftEl;
   let processingEl;
   let religionEl;
+  let diplomacyEl;
   let policyEl;
   let policySelectEl;
   let policyApplyEl;
@@ -3247,6 +3428,14 @@
       resources = resourceMap();
       reserveFaithForReligionProgression(resources);
       executePlan(resources, goal);
+      // Purchases can change resource stocks, caps, unlocks and per-tick effects;
+      // re-read before diplomacy/jobs so later decisions are based on the board
+      // after the buy, not on the planning snapshot from before it.
+      resetTickCache();
+      resources = resourceMap();
+      manageDiplomacy(resources, goal);
+      resetTickCache();
+      resources = resourceMap();
       balanceJobs(goal, resources);
       maybeSelectLeader(goal, resources);
       maybePromoteKittens(resources);
@@ -3267,6 +3456,7 @@
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
+      if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
     } catch (error) {
@@ -3358,6 +3548,7 @@
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
       '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
+      '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
       '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
@@ -3388,6 +3579,7 @@
     craftEl = box.querySelector(".kgh-craft");
     processingEl = box.querySelector(".kgh-processing");
     religionEl = box.querySelector(".kgh-religion");
+    diplomacyEl = box.querySelector(".kgh-diplomacy");
     policyEl = box.querySelector(".kgh-policy");
     policySelectEl = box.querySelector(".kgh-policy-select");
     policyApplyEl = box.querySelector(".kgh-policy-apply");
