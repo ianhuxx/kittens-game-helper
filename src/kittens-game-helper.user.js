@@ -48,6 +48,10 @@
   // Setting these to 0 means "buy as soon as it's affordable". Bonfire, science
   // and workshop upgrades are NOT here: the helper buys those itself so the plan
   // can reserve resources — KS would otherwise spend the savings on cheap items.
+  // These sections are also paused dynamically while the active plan is saving
+  // scarce resources.  That makes the reservation contract universal: KS trade,
+  // space and time automations cannot drain gold/culture/catpower/etc. out from
+  // under a focused build/research target.
   // Religion is tuned separately: "Praise the Sun" converts banked faith, so it
   // should wait for near-cap faith instead of firing as soon as any faith exists.
   const PURCHASE_SECTIONS = ["space", "time", "trade"];
@@ -500,6 +504,60 @@
       }
     };
     if (settings && settings.religion) visit(settings.religion, "religion");
+  };
+
+
+  const externalSectionHasPurchases = (section) => PURCHASE_SECTIONS.includes(section);
+
+  const externalSpenderLabel = (section) => section.charAt(0).toUpperCase() + section.slice(1);
+
+  // KS owns a few broad purchasing systems whose exact costs can vary by race,
+  // era and unlock state.  Because those buyers run outside this helper's
+  // purchase loop, they cannot call respectsReservations() before spending.
+  // When the focused plan is still saving, pause those external spenders instead
+  // of trying to mirror every possible KS trade/space/time price.  This is the
+  // universal guard that prevents e.g. lizard trades from repeatedly consuming
+  // the gold reserved for a Temple.
+  let externalSpendersPlanText = "External spenders: watching KS trade/space/time";
+  let externalSpendersPaused = false;
+  let lastExternalSpenderLog = 0;
+
+  const reservedResourceNames = (target, resources) => Object.keys(reservedNeedsFor(target, resources));
+
+  const setExternalSpendersEnabled = (settings, enabled) => {
+    if (!settings) return;
+    for (const section of PURCHASE_SECTIONS) {
+      if (!externalSectionHasPurchases(section) || !settings[section]) continue;
+      setEnabledDeep(settings[section], enabled, section);
+      if (enabled) setTriggersDeep(settings[section], 0);
+    }
+  };
+
+  const protectPlanFromExternalSpenders = (resources, goalKey) => {
+    try {
+      if (getProfileName() !== "autopilot") return;
+      const settings = window.kittenScientists && window.kittenScientists.getSettings && window.kittenScientists.getSettings();
+      if (!settings) return;
+      const target = getTargetCached(resources, goalKey);
+      const reserved = target && !target.affordable ? reservedResourceNames(target, resources) : [];
+      const shouldPause = reserved.length > 0;
+      setExternalSpendersEnabled(settings, !shouldPause);
+      if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
+
+      if (shouldPause) {
+        const shown = reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+");
+        externalSpendersPlanText = `External spenders: paused ${PURCHASE_SECTIONS.map(externalSpenderLabel).join("/")} while saving ${shown} for ${labelOf(target.meta)}`;
+        if (!externalSpendersPaused || Date.now() - lastExternalSpenderLog > 60000) {
+          pushLog(`🛡 ${externalSpendersPlanText}`);
+          lastExternalSpenderLog = Date.now();
+        }
+      } else {
+        externalSpendersPlanText = `External spenders: ${PURCHASE_SECTIONS.map(externalSpenderLabel).join("/")} allowed (no active resource reserve)`;
+      }
+      externalSpendersPaused = shouldPause;
+    } catch (error) {
+      /* ignore external-spender pacing failures */
+    }
   };
 
   let religionPlanText = "Religion: watching faith";
@@ -3094,7 +3152,7 @@
     actionLog = [];
   }
 
-  const prev = { build: {}, tech: {}, upgrade: {} };
+  const prev = { build: {}, tech: {}, upgrade: {}, resource: {}, race: {} };
   let seeded = false;
   let logBox;
 
@@ -3112,6 +3170,92 @@
       /* ignore */
     }
     renderLog();
+  };
+
+
+  const diplomacyRaces = (game) => {
+    try {
+      const races = game && game.diplomacy && game.diplomacy.races;
+      return Array.isArray(races) ? races : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const raceKey = (race) => String((race && (race.name || race.title)) || "unknown");
+
+  const raceTradeCount = (race) => {
+    for (const key of ["tradeTotal", "totalTrades", "tradeCount", "trades", "buys"]) {
+      const value = race && race[key];
+      if (isFinite(value)) return value;
+    }
+    return null;
+  };
+
+  const trackDiplomacyActionDeltas = (game) => {
+    for (const race of diplomacyRaces(game)) {
+      if (!race) continue;
+      const key = raceKey(race);
+      const before = prev.race[key] || {};
+      const now = {
+        unlocked: !!race.unlocked,
+        embassyLevel: race.embassyLevel || 0,
+        tradeCount: raceTradeCount(race),
+      };
+      if (seeded && before.unlocked === false && now.unlocked) {
+        pushLog(`🧭 met ${race.title || race.name || "a civilization"}`);
+      }
+      if (seeded && now.embassyLevel > (before.embassyLevel || 0)) {
+        pushLog(`🤝 embassy with ${race.title || race.name || "civilization"} → ${now.embassyLevel}`);
+      }
+      if (seeded && now.tradeCount != null && before.tradeCount != null && now.tradeCount > before.tradeCount) {
+        pushLog(`🤝 trade with ${race.title || race.name || "civilization"} (${now.tradeCount})`);
+      }
+      prev.race[key] = now;
+    }
+  };
+
+  const TRADE_LOOT_RESOURCES = new Set([
+    "wood", "minerals", "iron", "coal", "gold", "titanium", "uranium",
+    "furs", "ivory", "spice", "unicorns", "starchart", "blueprint",
+    "beam", "slab", "plate", "steel", "gear", "scaffold", "ship",
+  ]);
+
+  const TRADE_SPEND_RESOURCES = new Set(["gold", "manpower", "catpower", "culture"]);
+
+  const formatDelta = (resources, name, amount) => `${amount > 0 ? "+" : ""}${fmt(amount)} ${resTitle(resources, name)}`;
+
+  const resourceDeltaLooksLikeTradeLoot = (resources, name, amount) => {
+    if (amount <= 0 || !TRADE_LOOT_RESOURCES.has(name)) return false;
+    const produced = Math.max(0, productionFor(name));
+    return amount >= Math.max(1, produced * 3);
+  };
+
+  const trackTradeResourceDeltas = () => {
+    const resources = resourceMap();
+    const deltas = [];
+    for (const res of resources.values()) {
+      if (!res || !res.name || !isFinite(res.value)) continue;
+      const before = prev.resource[res.name];
+      if (seeded && isFinite(before)) {
+        const delta = res.value - before;
+        if (Math.abs(delta) > 0.0001) deltas.push({ name: res.name, delta });
+      }
+      prev.resource[res.name] = res.value;
+    }
+    if (!seeded || !deltas.length) return;
+
+    const spent = deltas
+      .filter(({ name, delta }) => delta < 0 && TRADE_SPEND_RESOURCES.has(name === "catpower" ? "manpower" : name))
+      .filter(({ name, delta }) => Math.abs(delta) >= (name === "manpower" || name === "catpower" ? 5 : 1));
+    const loot = deltas
+      .filter(({ name, delta }) => resourceDeltaLooksLikeTradeLoot(resources, name, delta))
+      .sort((a, b) => b.delta - a.delta);
+
+    if (!spent.length || !loot.length) return;
+    const lootText = loot.slice(0, 4).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
+    const spendText = spent.slice(0, 3).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
+    pushLog(`🤝 trade: ${lootText}${spendText ? ` (${spendText})` : ""}`);
   };
 
   // Detect what changed in game state and log it (no dependency on KS/game log
@@ -3141,6 +3285,8 @@
         }
         prev.upgrade[u.name] = !!u.researched;
       }
+      trackDiplomacyActionDeltas(game);
+      trackTradeResourceDeltas();
       seeded = true;
     } catch (error) {
       /* ignore */
@@ -3367,6 +3513,7 @@
   let leaderEl;
   let craftEl;
   let processingEl;
+  let externalSpendersEl;
   let religionEl;
   let diplomacyEl;
   let policyEl;
@@ -3427,6 +3574,7 @@
       resetTickCache();
       resources = resourceMap();
       reserveFaithForReligionProgression(resources);
+      protectPlanFromExternalSpenders(resources, goal);
       executePlan(resources, goal);
       // Purchases can change resource stocks, caps, unlocks and per-tick effects;
       // re-read before diplomacy/jobs so later decisions are based on the board
@@ -3455,6 +3603,7 @@
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
+      if (externalSpendersEl) externalSpendersEl.textContent = `🛡 ${externalSpendersPlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
@@ -3547,6 +3696,7 @@
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
+      '<small class="kgh-external-spenders" style="color:#9fd0ff">…</small>',
       '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
       '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
@@ -3578,6 +3728,7 @@
     leaderEl = box.querySelector(".kgh-leader");
     craftEl = box.querySelector(".kgh-craft");
     processingEl = box.querySelector(".kgh-processing");
+    externalSpendersEl = box.querySelector(".kgh-external-spenders");
     religionEl = box.querySelector(".kgh-religion");
     diplomacyEl = box.querySelector(".kgh-diplomacy");
     policyEl = box.querySelector(".kgh-policy");
