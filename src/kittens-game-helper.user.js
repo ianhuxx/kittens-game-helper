@@ -78,7 +78,9 @@
   //  - an EMPHASIS goal multiplies effect categories (production, housing,
   //    happiness, …) that are matched against each candidate's parsed effects.
   const GOAL_KEY = "kgh.goal";
+  const PRIORITY_KEY = "kgh.priority";
   const DEFAULT_GOAL = "balanced";
+  const DEFAULT_PRIORITY = "auto";
   const GOALS = {
     balanced: {
       label: "Balanced — steady all-round growth",
@@ -102,9 +104,23 @@
     },
   };
 
+  const PRIORITIES = {
+    auto: { label: "Auto priority — universal scoring" },
+    science: { label: "Manual: science first" },
+    workshop: { label: "Manual: workshop upgrades first" },
+    bonfire: { label: "Manual: bonfire buildings first" },
+    storage: { label: "Manual: storage/caps first" },
+    production: { label: "Manual: production first" },
+  };
+
   const getGoal = () => {
     const stored = localStorage.getItem(GOAL_KEY);
     return GOALS[stored] ? stored : DEFAULT_GOAL;
+  };
+
+  const getPriority = () => {
+    const stored = localStorage.getItem(PRIORITY_KEY);
+    return PRIORITIES[stored] ? stored : DEFAULT_PRIORITY;
   };
 
   const metaText = (meta) => `${meta.name || ""} ${meta.label || ""} ${meta.title || ""}`.toLowerCase();
@@ -1047,6 +1063,7 @@
     supportStorageBoost: 4, // stores a resource the goal frontier needs
     productionScale: 24, // relative production / ratio gains
     spendBonus: 10, // consumes an almost-full spendable bank (science…)
+    manualPriorityBoost: 22, // optional player override, still inside scoring
     storageReliefCap: 30, // max boost from relieving live storage pressure
     housingValue: 6,
     happinessScale: 8,
@@ -1697,11 +1714,28 @@
       if (!SPENDABLE.includes(cost.name)) continue;
       const res = getRes(resources, cost.name);
       if (!res || !(res.maxValue > 0) || cost.val > res.maxValue) continue;
-      if (res.value / res.maxValue <= 0.7) continue;
+      const ratio = res.value / res.maxValue;
+      if (ratio <= 0.7) continue;
       bonus = Math.max(bonus, TUNING.spendBonus * Math.min(1, res.value / cost.val));
     }
     return bonus;
   };
+
+  const priorityMatchesCandidate = (kind, meta, priority) => {
+    if (!priority || priority === "auto") return false;
+    const profile = candidateEffectProfile(kind, meta);
+    if (priority === "science") return kind === "research";
+    if (priority === "workshop") return kind === "upgrade";
+    if (priority === "bonfire") return kind === "build";
+    if (priority === "storage") return Object.keys(profile.max).length > 0;
+    if (priority === "production") {
+      return Object.values(profile.perTick).some((v) => v > 0) || Object.values(profile.ratio).some((v) => v > 0);
+    }
+    return false;
+  };
+
+  const manualPriorityBoostFor = (kind, meta) =>
+    priorityMatchesCandidate(kind, meta, getPriority()) ? TUNING.manualPriorityBoost : 0;
 
   // Universal value model: read what a candidate actually does from its parsed
   // effects and price its worth against the CURRENT economy — relative
@@ -1939,7 +1973,8 @@
     let score = (TUNING.kindPrior[kind] || 3) + affordBonus +
       economicValue(kind, meta, resources, goal, goalKey) +
       goalAlignmentBoost(kind, meta, goalKey) +
-      spendBonusFor(kind, meta, resources);
+      spendBonusFor(kind, meta, resources) +
+      manualPriorityBoostFor(kind, meta);
     if (kind === "research") {
       score += Math.min(TUNING.gatewayCap, gatewayValue(meta) * TUNING.gatewayScale);
       if (goalFrontierNames(goalKey).has(meta.name)) score += TUNING.frontierBoost;
@@ -1985,6 +2020,22 @@
         return { ...withEvaluation, score: candidateScore(withEvaluation, resources, goal, goalKey) };
       })
       .sort((a, b) => b.score - a.score);
+  };
+
+  const CAP_RELIEF_RATIO = 0.985;
+
+  // Catpower/manpower has its own relief valve (hunting), so urgent purchase
+  // relief is for banks whose income is otherwise wasted at the cap.
+  const CAPPED_PURCHASE_RESOURCES = ["science", "culture", "faith"];
+
+  const cappedSpendableResources = (resources) => CAPPED_PURCHASE_RESOURCES.filter((name) => {
+    const res = getRes(resources, name);
+    return res && res.maxValue > 0 && res.value / res.maxValue >= CAP_RELIEF_RATIO;
+  });
+
+  const candidateSpendsAny = (candidate, names) => {
+    if (!candidate || !names || !names.length) return false;
+    return pricesFor(candidate.kind, candidate.meta).some((cost) => cost && names.includes(cost.name));
   };
 
   const TARGET_LOCK_MIN_MS = 120000;
@@ -2457,10 +2508,13 @@
       const favored = Object.entries(goal.emphasis || {})
         .filter(([, mult]) => mult > 1)
         .map(([category]) => category);
-      if (!favored.length) return ""; // balanced — no extra line needed
+      if (!favored.length && getPriority() === "auto") return ""; // balanced — no extra line needed
+      if (!favored.length) return `🏁 ${goal.label}: override ${PRIORITIES[getPriority()].label.replace(/^Manual: /, "")}`;
       const target = getTargetCached(resources, goalKey);
       const targetText = target ? ` · focusing ${labelOf(target.meta)}` : "";
-      return `🏁 ${goal.label}: favoring ${favored.join(", ")}${targetText}`;
+      const priority = getPriority();
+      const priorityText = priority !== "auto" ? ` · override ${PRIORITIES[priority].label.replace(/^Manual: /, "")}` : "";
+      return `🏁 ${goal.label}: favoring ${favored.join(", ")}${priorityText}${targetText}`;
     } catch (error) {
       return `🏁 ${goal.label}`;
     }
@@ -2535,6 +2589,17 @@
 
   const AUTOBUY_MIN_MS = 2500;
   let lastAutoBuy = 0;
+
+  const findCapReliefPurchase = (resources, goalKey, target, reserved) => {
+    const capped = cappedSpendableResources(resources);
+    if (!capped.length) return null;
+    return getCandidatesCached(resources, goalKey).find((candidate) =>
+      candidate.affordable &&
+      (!target || targetId(candidate) !== targetId(target)) &&
+      !buyBenched(targetId(candidate)) &&
+      candidateSpendsAny(candidate, capped) &&
+      respectsReservations(candidate, reserved, resources));
+  };
 
   const purchaseComplete = (candidate, initialVal) => {
     if (!candidate || !candidate.meta) return false;
@@ -2789,6 +2854,19 @@
         return;
       }
 
+      const reserved = reservedNeedsFor(target, resources);
+      const capRelief = findCapReliefPurchase(resources, goalKey, target, reserved);
+      if (capRelief) {
+        lastAutoBuy = now;
+        if (buyCandidate(capRelief)) {
+          pushLog(`${capRelief.kind === "upgrade" ? "⚙" : capRelief.kind === "research" ? "🔬" : "🎯"} cap relief ${capRelief.kind} ${labelOf(capRelief.meta)}`);
+          buyPlanText = `Buy: spent capped resources on ${labelOf(capRelief.meta)}`;
+        } else {
+          noteBuyFailure(targetId(capRelief));
+        }
+        return;
+      }
+
       if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
 
       const policy = autoPolicyChoice(resources, goalKey);
@@ -2802,7 +2880,6 @@
         return;
       }
 
-      const reserved = reservedNeedsFor(target, resources);
       const candidates = getCandidatesCached(resources, goalKey);
       const ready = candidates.find((candidate) =>
         candidate.affordable &&
@@ -3264,6 +3341,9 @@
       // the progress line can never drift apart.
       ...Object.entries(GOALS).map(([key, goal]) => `<option value="${key}">🏁 ${goal.label}</option>`),
       "</select>",
+      '<select class="kgh-priority" aria-label="manual priority" style="width:100%">',
+      ...Object.entries(PRIORITIES).map(([key, priority]) => `<option value="${key}">🎚 ${priority.label}</option>`),
+      "</select>",
       '<small class="kgh-status" style="color:#9fd0ff">…</small>',
       '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
       '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
@@ -3292,6 +3372,7 @@
     const select = box.querySelector("select");
     const goalSelect = box.querySelector(".kgh-goal");
     const button = box.querySelector(".kgh-apply");
+    const prioritySelect = box.querySelector(".kgh-priority");
     const note = box.querySelector(".kgh-note");
     const ksBtn = box.querySelector(".kgh-ks");
     const minBtn = box.querySelector(".kgh-min");
@@ -3320,6 +3401,13 @@
     goalSelect.value = getGoal();
     goalSelect.addEventListener("change", () => {
       localStorage.setItem(GOAL_KEY, goalSelect.value);
+      activeTarget = null;
+      tick();
+    });
+    prioritySelect.value = getPriority();
+    prioritySelect.addEventListener("change", () => {
+      localStorage.setItem(PRIORITY_KEY, prioritySelect.value);
+      activeTarget = null;
       tick();
     });
     button.addEventListener("click", () => applyProfile(select.value));
