@@ -438,6 +438,7 @@ check(
 );
 
 check("plan: Library chosen over storage-blocked Theology and cheap Mine", /Library/.test(panelText(".kgh-plan")));
+check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
 check("plan: reservation visible in the panel", /reserving/i.test(panelText(".kgh-plan")) || /saving for/i.test(panelText(".kgh-buy")));
 check("reservation: affordable Mine NOT bought while Library saves up", buildings[1].val === 2);
 check("policy: non-exclusive auto-bought", policies[2].researched === true);
@@ -569,7 +570,6 @@ check("leader elected from traits", village.leader != null && village.leader.tra
 check("promotion: overflowing gold spent on kittens", promoteCalls > 0 && res("gold").value < 95);
 check("jobs: starvation guard reinforced farmers (net catnip < 0)", job("farmer").value >= 3);
 check("jobs: religion faith reserve directs priests", job("priest").value > 0);
-check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
 
 /* Calm hunting — happy village with stocked furs keeps hunters to a crew */
 village.happiness = 1.18; // >100% mood, like a real luxury-fed village
@@ -592,6 +592,14 @@ tickFn();
 const rebalancesAfter = (logText().match(/rebalanced/g) || []).length;
 check("stability: no job churn across idle ticks", jobs.map((j) => `${j.name}:${j.value}`).join("|") === jobSnapshot);
 check("stability: no rebalance log spam across idle ticks", rebalancesAfter === rebalancesBefore);
+
+/* Universal overflow crafting — hot craft inputs should be converted by metadata, including catnip→wood */
+res("catnip").value = 4900;
+res("catnip").maxValue = 5000;
+res("wood").value = 0;
+fakeNow += 25000;
+tickFn();
+check("overflow: capped catnip is converted into wood by the generic craft scanner", res("wood").value > 0 && res("catnip").value < 4900);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

@@ -63,6 +63,13 @@ const required = [
   "refreshJobManagementUI",
   "candidate.kind === \"religion\"",
   "culture",
+  // Diplomacy: KS usually owns trade, but the helper keeps a direct fallback for
+  // explorers and embassies so catpower/culture caps become progress.
+  "manageDiplomacy",
+  "maybeSendExplorers",
+  "maybeBuildEmbassy",
+  "EmbassyButtonController",
+  "kgh-diplomacy",
   // Recursive prerequisite planning: gateway techs and goal frontiers.
   "gatewayValue",
   "frontierFor",
