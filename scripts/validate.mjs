@@ -67,6 +67,28 @@ const required = [
   "gatewayValue",
   "frontierFor",
   "goalFrontierNames",
+  // Universal decision framework: candidates are scored from parsed game
+  // metadata (effects) against the current economy — no keyword tables —
+  // with every weight centralized in TUNING.
+  "TUNING",
+  "metaEffectProfile",
+  "parseEffectEntry",
+  "economicValue",
+  "goalAlignmentBoost",
+  "spendBonusFor",
+  "scarcityWeight",
+  // Goal system: tech-tree milestone closures with live progress, or
+  // effect-category emphases.
+  "goalClosureNames",
+  "goalProgress",
+  "goalSupportResources",
+  "profileMatchesCategory",
+  "emphasis",
+  // Jobs discover what each job produces from the game's own metadata.
+  "jobResourceFor",
+  // The Apply button must never wrap its label ("Appl\\ny") — panel buttons
+  // are pinned to content size.
+  ".kgh-panel button{white-space:nowrap;flex:0 0 auto}",
   // Policies: non-exclusive auto-buy; exclusive (blocks-list) stays manual.
   "policyIsExclusive",
   "autoPolicyChoice",

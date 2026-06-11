@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.12.1
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. Recursive prerequisite planning chases gateway techs (Theology, Machinery→Steamworks) by what they unlock; non-exclusive policies are auto-bought while mutually-exclusive ones stay your choice (with pros/cons). Continuous job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, smelter/calciner pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
+// @version      0.13.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, smelter/calciner pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -70,27 +70,35 @@
     return PROFILE_INFO[stored] ? stored : DEFAULT_PROFILE;
   };
 
-  // Goals steer the advisor toward a target you pick (autopilot still grows the
-  // whole economy so you never stall). Each goal has a named milestone "target"
-  // plus keywords used to prioritize matching research/buildings.
+  // Goals steer the advisor toward a destination you pick (autopilot still
+  // grows the whole economy so you never stall). A goal is one of two shapes,
+  // and NEITHER uses keyword lists — relevance is computed from game data:
+  //  - a MILESTONE goal names a target tech; the planner walks the live tech
+  //    tree, pushes every prerequisite, and reports progress as "n/m techs";
+  //  - an EMPHASIS goal multiplies effect categories (production, housing,
+  //    happiness, …) that are matched against each candidate's parsed effects.
   const GOAL_KEY = "kgh.goal";
   const DEFAULT_GOAL = "balanced";
   const GOALS = {
-    balanced: { label: "Balanced", target: null, keywords: [] },
+    balanced: {
+      label: "Balanced — steady all-round growth",
+      target: null,
+      emphasis: {},
+    },
     space: {
-      label: "Rush Space",
+      label: "Reach Space — race to Rocketry",
       target: "rocketry",
-      keywords: ["space", "rocket", "satellite", "orbital", "moon", "oil"],
+      emphasis: { science: 1.5 },
     },
     production: {
-      label: "Max production",
-      target: "factory",
-      keywords: ["mine", "lumber", "steam", "magneto", "factory", "accelerator", "calciner", "smelt", "reactor", "quarry", "mint"],
+      label: "Industry — max resource production",
+      target: null,
+      emphasis: { production: 1.8, storage: 1.2 },
     },
     population: {
-      label: "Max population",
-      target: "mansion",
-      keywords: ["hut", "house", "mansion", "aqueduct", "pasture", "amphitheat", "brewery"],
+      label: "Population — more kittens, happier kittens",
+      target: null,
+      emphasis: { housing: 2.2, happiness: 1.6, food: 1.5 },
     },
   };
 
@@ -100,10 +108,6 @@
   };
 
   const metaText = (meta) => `${meta.name || ""} ${meta.label || ""} ${meta.title || ""}`.toLowerCase();
-  const matchesKeywords = (meta, keywords) => {
-    const text = metaText(meta);
-    return keywords.some((k) => text.includes(k));
-  };
 
   /* --------------------------- settings management --------------------------- */
 
@@ -508,10 +512,10 @@
   // Candidate gathering, target choice and storage-pressure scans are expensive
   // (storage pressure alone walks every meta) and were being recomputed by every
   // consumer each tick — sometimes disagreeing mid-tick. Compute once, share.
-  let tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null };
+  let tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null, goalClosure: null, goalSupport: null };
 
   const resetTickCache = () => {
-    tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null };
+    tickCache = { candidates: null, target: undefined, pressure: null, goalFrontier: null, goalClosure: null, goalSupport: null };
   };
 
   const getCandidatesCached = (resources, goalKey) => {
@@ -864,7 +868,10 @@
     manpower: "hunter",
     catpower: "hunter",
   };
-  const MANAGED_JOBS = ["woodcutter", "farmer", "miner", "scholar", "hunter", "priest", "geologist"];
+  // Fallback job → produced-resource map. The live mapping is discovered from
+  // each job's own `modifiers` metadata (see jobResourceFor), so new jobs the
+  // game adds are managed automatically; this map only covers jobs that don't
+  // expose modifiers.
   const JOB_RESOURCE = {
     woodcutter: "wood",
     farmer: "catnip",
@@ -873,6 +880,21 @@
     hunter: "manpower",
     priest: "faith",
     geologist: "coal",
+  };
+
+  const jobResourceFor = (job) => {
+    if (!job) return null;
+    const modifiers = job.modifiers;
+    if (modifiers && typeof modifiers === "object") {
+      let best = null;
+      for (const [name, amount] of Object.entries(modifiers)) {
+        if (!isFinite(amount) || amount <= 0) continue;
+        if (!getRes(resourceMap(), name)) continue;
+        if (!best || amount > best.amount) best = { name, amount };
+      }
+      if (best) return best.name;
+    }
+    return JOB_RESOURCE[job.name] || null;
   };
   const LUXURY_RESOURCES = ["furs", "ivory", "spice"];
   const JOB_REBALANCE_MIN_MS = 20000;
@@ -961,17 +983,6 @@
     needs[key] = (needs[key] || 0) + weight;
   };
 
-  const SHORTAGE_KEYWORDS = {
-    coal: ["coal", "furnace", "steel", "pyrolysis", "combustion", "injector", "smelter", "calciner"],
-    wood: ["wood", "lumber", "sawmill", "forestry", "beam", "scaffold"],
-    minerals: ["minerals", "mine", "quarry", "iron", "smelter", "calciner"],
-    catnip: ["catnip", "field", "pasture", "aqueduct", "unicorn pasture", "hydroponics"],
-    science: ["science", "library", "academy", "observatory", "biolab", "data center"],
-    manpower: ["manpower", "catpower", "hunter", "archery", "composite bow", "crossbow", "bolas"],
-    culture: ["culture", "amphitheat", "chapel", "temple", "tradepost", "brewery", "mint", "unicorn"],
-    faith: ["faith", "temple", "chapel", "solar", "religion"],
-  };
-
   const effectText = (meta) => {
     const parts = [metaText(meta)];
     for (const key of ["effects", "calculateEffects", "unlocks", "upgrades", "stages"]) {
@@ -986,10 +997,139 @@
     return parts.join(" ").toLowerCase();
   };
 
-  const helpsShortage = (meta, resourceName) => {
-    const text = effectText(meta);
-    const keywords = SHORTAGE_KEYWORDS[resourceName] || [resourceName];
-    return keywords.some((word) => text.includes(word));
+  /* ---------------------- universal effect understanding --------------------- */
+
+  // Every scoring constant lives here. The decision framework is uniform:
+  // a candidate's score is its expected VALUE — production gains, storage
+  // relief, unlocks and goal alignment, all read from parsed game metadata —
+  // minus its COST (time to afford, storage blocks). Tune weights here instead
+  // of hunting per-item special cases through the code.
+  const TUNING = {
+    kindPrior: { research: 12, upgrade: 12, religion: 11, build: 4, policy: 6 },
+    affordBonus: 6, // fully affordable right now
+    progressScale: 5, // partial affordability, 0..1
+    gatewayScale: 3, // per item a tech unlocks (recursively dampened)
+    gatewayCap: 24,
+    frontierBoost: 20, // unlocked tech on the path to the goal milestone
+    goalClosureBoost: 14, // any tech on the path to the goal milestone
+    emphasisScale: 10, // per (multiplier - 1) of a matching goal emphasis
+    unlockAlignBoost: 8, // tech unlocking emphasis-matching content
+    supportProductionBoost: 6, // produces a resource the goal frontier needs
+    supportStorageBoost: 4, // stores a resource the goal frontier needs
+    productionScale: 24, // relative production / ratio gains
+    spendBonus: 10, // consumes an almost-full spendable bank (science…)
+    storageReliefCap: 30, // max boost from relieving live storage pressure
+    housingValue: 6,
+    happinessScale: 8,
+    idleStoragePenalty: 10, // pure-storage item nothing currently needs
+    waitPenaltyCap: 14, // log-scaled time-to-afford penalty
+    unreachablePenalty: 22, // no production path at all
+    storageBlockPenalty: 48, // a cost sits above a storage cap
+    pressureKind: { research: 34, upgrade: 24, religion: 14, build: 14 },
+    pressureGatewayScale: 8,
+    pressureGatewayCap: 26,
+    pressureClosureBoost: 20,
+  };
+
+  // Instead of keyword tables, read the game's own metadata: every building,
+  // tech, upgrade and religion item exposes an `effects` object whose keys
+  // follow regular naming conventions (`woodPerTick`, `scienceMax`,
+  // `mineralsRatio`, `maxKittens`, `catnipDemandRatio`, …). Parsing those keys
+  // yields what a candidate actually DOES — production, storage, multipliers,
+  // housing — so scoring adapts to any content the game adds instead of
+  // relying on hand-kept name lists.
+  let resourceNamesCache = { count: -1, names: [] };
+  const knownResourceNames = () => {
+    try {
+      const list = window.gamePage.resPool.resources;
+      if (list.length !== resourceNamesCache.count) {
+        resourceNamesCache = { count: list.length, names: list.map((r) => r.name).filter(Boolean) };
+      }
+    } catch (error) {
+      /* keep the previous cache */
+    }
+    return resourceNamesCache.names;
+  };
+
+  const matchResourcePrefix = (key) => {
+    let best = null;
+    for (const name of knownResourceNames()) {
+      if (key.startsWith(name) && (!best || name.length > best.length)) best = name;
+    }
+    return best;
+  };
+
+  const emptyEffectProfile = () => ({ perTick: {}, max: {}, ratio: {}, demand: {}, housing: 0, happiness: 0, craft: 0 });
+
+  const parseEffectEntry = (profile, key, value) => {
+    if (!isFinite(value) || value === 0) return;
+    if (key === "maxKittens") {
+      profile.housing += value;
+      return;
+    }
+    if (/happiness/i.test(key)) {
+      profile.happiness += value;
+      return;
+    }
+    if (key === "craftRatio") {
+      profile.craft += value;
+      return;
+    }
+    const resource = matchResourcePrefix(key);
+    if (resource) {
+      const rest = key.slice(resource.length);
+      if (/^PerTick/.test(rest)) {
+        profile.perTick[resource] = (profile.perTick[resource] || 0) + value;
+        return;
+      }
+      if (/^Max(Ratio)?$/.test(rest)) {
+        const cap = ((getRes(resourceMap(), resource) || {}).maxValue) || 0;
+        const amount = /Ratio$/.test(rest) ? value * cap : value;
+        profile.max[resource] = (profile.max[resource] || 0) + amount;
+        return;
+      }
+      if (/^(Global|Super)?Ratio/.test(rest)) {
+        profile.ratio[resource] = (profile.ratio[resource] || 0) + value;
+        return;
+      }
+      if (/^Demand/.test(rest)) {
+        profile.demand[resource] = (profile.demand[resource] || 0) + value;
+        return;
+      }
+    }
+    // `<job>Ratio` boosts a job's output (hunterRatio, geologistRatio…) — map
+    // it to the resource that job produces.
+    const jobMatch = key.match(/^([a-z]+?)Ratio$/);
+    if (jobMatch && JOB_RESOURCE[jobMatch[1]]) {
+      const produced = JOB_RESOURCE[jobMatch[1]];
+      profile.ratio[produced] = (profile.ratio[produced] || 0) + value;
+    }
+  };
+
+  const metaEffectProfile = (meta) => {
+    const profile = emptyEffectProfile();
+    if (!meta || typeof meta !== "object") return profile;
+    const sources = [];
+    if (meta.effects && typeof meta.effects === "object") sources.push(meta.effects);
+    if (Array.isArray(meta.stages) && isFinite(meta.stage) && meta.stages[meta.stage] && meta.stages[meta.stage].effects) {
+      sources.push(meta.stages[meta.stage].effects);
+    }
+    for (const effects of sources) {
+      for (const [key, value] of Object.entries(effects)) parseEffectEntry(profile, key, value);
+    }
+    return profile;
+  };
+
+  // 0..~1.2 — how starved the economy is for a resource: low stock and zero
+  // production both raise it. Used to weight production/ratio gains, so the
+  // same building is worth more when its output is the actual bottleneck.
+  const scarcityWeight = (resources, name) => {
+    const res = getRes(resources, name);
+    if (!res || res.unlocked === false) return 0;
+    const ratio = resRatio(resources, name, res.value > 0 ? 1 : 0);
+    let weight = Math.max(0, 0.5 - ratio) * 1.4;
+    if (productionFor(name) <= 0 && ratio < 0.8) weight += 0.5;
+    return weight;
   };
 
   const ticksPerSecond = () => {
@@ -1082,37 +1222,21 @@
     }
   };
 
-  const shortageBoost = (meta, resources) => {
-    let boost = 0;
-    for (const [name, keywords] of Object.entries(SHORTAGE_KEYWORDS)) {
-      const ratio = resRatio(resources, name, 1);
-      const stockBoost = Math.max(0, 0.45 - ratio);
-      const prod = productionFor(name);
-      const prodBoost = prod <= 0 && ratio < (name === "culture" ? 0.95 : 0.8) ? (name === "culture" ? 0.5 : 0.25) : 0;
-      if (stockBoost <= 0 && prodBoost <= 0) continue;
-      const multiplier = name === "coal" ? 42 : name === "culture" ? 34 : 26;
-      if (helpsShortage(meta, name)) boost += (stockBoost + prodBoost) * multiplier;
-      if (name === "coal" && keywords.some((word) => metaText(meta).includes(word))) boost += (stockBoost + prodBoost) * 22;
-    }
-    const iron = getRes(resources, "iron");
-    const coal = getRes(resources, "coal");
-    if (iron && coal && iron.unlocked !== false && coal.unlocked !== false && helpsShortage(meta, "coal")) {
-      const ironRatio = resRatio(resources, "iron", 0);
-      const coalRatio = resRatio(resources, "coal", 0);
-      boost += Math.max(0, ironRatio - coalRatio) * 30;
-    }
-    return boost;
+  // "Pure storage": parsed effects show capacity but no production or housing.
+  const isStorageMeta = (meta) => {
+    const profile = metaEffectProfile(meta);
+    return Object.keys(profile.max).length > 0 &&
+      !Object.keys(profile.perTick).length &&
+      !Object.keys(profile.ratio).length &&
+      !profile.housing;
   };
 
-  const hasPrice = (kind, meta, resourceName) =>
-    pricesFor(kind, meta).some((cost) => cost && cost.name === resourceName && cost.val > 0);
-
-  const isStorageMeta = (meta) => /storage|barn|warehouse|harbor|container|tank/.test(effectText(meta));
-
-  const storageResourceFromEffectKey = (key) => {
-    const match = String(key || "").match(/^([a-z][a-z0-9]*)(?:Max|MaxRatio)$/i);
-    return match ? match[1] : null;
-  };
+  // Storage is only worth chasing while something still wants it: live
+  // pressure from blocked candidates, or a capped bank wasting production.
+  const storageStillWanted = (meta, resources, pressure) =>
+    Object.keys(metaEffectProfile(meta).max).some(
+      (name) => (pressure[name] || 0) > 0 || resRatio(resources, name, 0) > 0.9,
+    );
 
   const directStorageBlockers = (kind, meta, resources) => {
     const blockers = [];
@@ -1132,63 +1256,46 @@
       .map((blocker) => `${resTitle(resources, blocker.name)} storage ${fmt(blocker.max)}/${fmt(blocker.need)}`)
       .join(", ");
 
-  const storageReliefResources = (meta) => {
-    const resources = new Set();
-    const effects = (meta && meta.effects) || {};
-    for (const [key, value] of Object.entries(effects)) {
-      if (!isFinite(value) || value <= 0) continue;
-      const name = storageResourceFromEffectKey(key);
-      if (name) resources.add(name);
+  // Which blocked items may create storage pressure. Balanced mode lets most
+  // real blockers count; focused goals only listen to items that demonstrably
+  // advance the goal — membership in the milestone's tech closure, alignment
+  // with the goal's emphasis categories (parsed effects, including what a tech
+  // UNLOCKS), or producing/storing a resource the goal frontier still needs.
+  // This is what stops a side upgrade just over a cap from turning a focused
+  // run into an endless warehouse detour.
+  const storageBlockerIsFocused = (kind, meta, goal, goalKey) => {
+    if (goalKey === "balanced") {
+      if (kind === "research") return gatewayValue(meta) >= 1;
+      if (kind === "upgrade" || kind === "religion") return true;
+      const profile = metaEffectProfile(meta);
+      return Object.keys(profile.perTick).length > 0 || Object.keys(profile.ratio).length > 0 || profile.housing > 0;
     }
-
-    // Some Kittens Game metadata exposes storage indirectly through stages,
-    // calculateEffects functions, or unlock text, so keep a conservative name
-    // fallback for the common research blockers. This is what makes a science
-    // cap below Theology prefer Libraries/Academies/Observatories instead of
-    // wandering into unrelated builds forever.
-    const text = effectText(meta);
-    if (/science|maxscience|library|academy|observatory|biolab|data center/.test(text)) resources.add("science");
-    if (/culture|maxculture|amphitheat|chapel|temple|tradepost|mint|unicorn/.test(text)) resources.add("culture");
-    if (/faith|maxfaith|chapel|temple|ziggurat|solar/.test(text)) resources.add("faith");
-    if (/catpower|maxmanpower|maxcatpower|harbor|warehouse|archery|composite bow|crossbow|bolas/.test(text)) resources.add("manpower");
-    if (/barn|warehouse|harbor|container|tank|storage/.test(text)) {
-      for (const name of ["wood", "minerals", "iron", "coal", "oil", "uranium"]) resources.add(name);
+    if (kind === "research" && goalClosureNames(goalKey).has(meta.name)) return true;
+    if (profileMatchesEmphasis(meta, goal)) return true;
+    if (kind === "research" && techUnlocksAligned(meta, goal)) return true;
+    if (goal && goal.target) {
+      const support = goalSupportResources(goalKey);
+      const profile = metaEffectProfile(meta);
+      for (const group of [profile.perTick, profile.ratio, profile.max]) {
+        for (const name of Object.keys(group)) {
+          if (support.has(name)) return true;
+        }
+      }
     }
-    return resources;
+    return false;
   };
 
   const storageBlockPressure = (resources, goal, goalKey) => {
     const pressure = {};
-    const goalFrontier = goalFrontierNames(goalKey);
-    const focusedMode = goalKey !== "balanced" && goal && goal.keywords.length;
-    const storageBlockerIsFocused = (kind, meta) => {
-      const text = metaText(meta);
-      if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) return true;
-      if (kind === "research") {
-        if (goalFrontier.has(meta.name)) return true;
-        // Balanced mode may still chase true gateway techs, but focused modes
-        // should not convert every capped bank into generic storage for side
-        // upgrades that do not advance the selected goal.
-        return goalKey === "balanced" && (gatewayValue(meta) >= 1 || /theology|philosophy|machinery|rocketry/.test(text));
-      }
-      if (focusedMode) {
-        // In a focused goal (especially Rush Space), a random side upgrade that
-        // barely exceeds catpower/material caps must not create enough storage
-        // pressure to make the helper build warehouses forever while the real
-        // blocker is craftable manuscripts/blueprints. Only let focused-mode
-        // storage pressure come from items that clearly advance that focus.
-        return /rocket|space|satellite|orbital|moon|oil|steamworks|factory|magneto|reactor|accelerator|mansion|amphitheat|temple/.test(text);
-      }
-      if (kind === "upgrade" || kind === "religion") return true;
-      return /steamworks|factory|magneto|reactor|accelerator|harbor|warehouse|tank|container|mansion|amphitheat|temple/.test(text);
-    };
     const visit = (kind, meta) => {
       if (!isOpen(meta)) return;
       const blockers = directStorageBlockers(kind, meta, resources);
-      if (!blockers.length || !storageBlockerIsFocused(kind, meta)) return;
-      let weight = kind === "research" ? 34 : kind === "upgrade" ? 24 : 14;
-      if (/theology|philosophy|cryptotheology|scholasticism|rocketry/.test(metaText(meta))) weight += 26;
-      if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) weight += 18;
+      if (!blockers.length || !storageBlockerIsFocused(kind, meta, goal, goalKey)) return;
+      let weight = TUNING.pressureKind[kind] || 14;
+      if (kind === "research") {
+        weight += Math.min(TUNING.pressureGatewayCap, gatewayValue(meta) * TUNING.pressureGatewayScale);
+        if (goalClosureNames(goalKey).has(meta.name)) weight += TUNING.pressureClosureBoost;
+      }
       for (const blocker of blockers) {
         // Prefer storage that makes the current focus reachable. A tech that is
         // wildly beyond the current cap (e.g. 617K science vs 29K cap) should not
@@ -1223,15 +1330,6 @@
     return pressure;
   };
 
-  const storageReliefBoost = (meta, resources, goal, goalKey) => {
-    const pressure = getStoragePressureCached(resources, goal, goalKey);
-    const relieves = storageReliefResources(meta);
-    let boost = 0;
-    for (const [name, amount] of Object.entries(pressure)) {
-      if (relieves.has(name)) boost += Math.min(55, amount);
-    }
-    return boost;
-  };
 
   /* -------------------- recursive prerequisite planning ---------------------- */
 
@@ -1314,45 +1412,224 @@
     return out;
   };
 
+  const goalMilestoneTech = (goalKey) => {
+    const goal = GOALS[goalKey];
+    if (!goal || !goal.target) return null;
+    return techByName(goal.target) || techList().find((t) => t && metaText(t).includes(goal.target)) || null;
+  };
+
   // Tech names worth pulling toward for the chosen goal: if the goal's
   // milestone tech is locked, its frontier ancestors get a strong boost.
   const goalFrontierNames = (goalKey) => {
     if (tickCache.goalFrontier) return tickCache.goalFrontier;
     const names = new Set();
-    const goal = GOALS[goalKey];
-    if (goal && goal.target) {
-      const milestone = techList().find((t) => t && metaText(t).includes(goal.target));
-      if (milestone && !milestone.researched) {
-        if (milestone.unlocked !== false) names.add(milestone.name);
-        else for (const tech of frontierFor(milestone.name)) names.add(tech.name);
-      }
+    const milestone = goalMilestoneTech(goalKey);
+    if (milestone && !milestone.researched) {
+      if (milestone.unlocked !== false) names.add(milestone.name);
+      else for (const tech of frontierFor(milestone.name)) names.add(tech.name);
     }
     tickCache.goalFrontier = names;
     return names;
   };
 
-  const strategicBoost = (kind, meta, resources, goal, goalKey) => {
-    const text = effectText(meta);
-    const pressure = getStoragePressureCached(resources, goal, goalKey);
-    let boost = 0;
-    if (/automation|factory|engineer|steam|steamworks|magneto|reactor|accelerator|calciner/.test(text)) boost += 12;
-    if (kind === "upgrade") boost += 10;
-    if (/machinery|steel|workshop automation|printing press|factory automation|coal furnace|geodesy|astrophysicists/.test(text)) boost += 14;
-    if (kind === "build" && /steamworks/.test(metaText(meta))) boost += 28;
-    const storageRelief = storageReliefBoost(meta, resources, goal, goalKey);
-    if (storageRelief > 0) boost += storageRelief;
-    if (isStorageMeta(meta)) {
-      const rawCapped = ["wood", "minerals", "iron", "coal", "oil", "uranium"].some(
-        (name) => resRatio(resources, name, 0) > 0.9,
-      );
-      boost += rawCapped || storageRelief > 0 ? 10 : -3;
+  // Every unresearched tech on the path to the goal milestone (the milestone's
+  // prerequisite closure). Frontier techs are the researchable subset; closure
+  // membership marks the rest as goal-relevant even while still locked.
+  const goalClosureNames = (goalKey) => {
+    if (tickCache.goalClosure) return tickCache.goalClosure;
+    const names = new Set();
+    const milestone = goalMilestoneTech(goalKey);
+    if (milestone && !milestone.researched) {
+      const stack = [milestone.name];
+      const seen = new Set();
+      while (stack.length) {
+        const name = stack.pop();
+        if (seen.has(name)) continue;
+        seen.add(name);
+        const meta = techByName(name);
+        if (!meta || meta.researched) continue;
+        names.add(name);
+        for (const parent of unlockGraph().parents[name] || []) {
+          if (parent && !parent.researched) stack.push(parent.name);
+        }
+      }
     }
-    if (/library|academy|observatory|biolab|data center/.test(text)) boost += pressure.science > 0 ? (resRatio(resources, "science", 0) > 0.75 ? 6 : 2) : -8;
-    if (/hut|house|mansion|population|kitten/.test(text)) boost += 4;
-    if (kind === "upgrade" && /furnace|coal|pyrolysis|combustion|smelter/.test(text)) boost += 5;
-    if (kind === "research" && hasPrice(kind, meta, "science") && resRatio(resources, "science", 0) > 0.7) boost += 10;
-    if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) boost += 12;
+    tickCache.goalClosure = names;
+    return names;
+  };
+
+  // Researched/total counts over the milestone's full ancestor chain — powers
+  // the "n/m techs" goal progress line.
+  const goalProgress = (goalKey) => {
+    const milestone = goalMilestoneTech(goalKey);
+    if (!milestone) return null;
+    const seen = new Set();
+    const stack = [milestone.name];
+    let total = 0;
+    let done = 0;
+    while (stack.length) {
+      const name = stack.pop();
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const meta = techByName(name);
+      if (!meta) continue;
+      total += 1;
+      if (meta.researched) done += 1;
+      for (const parent of unlockGraph().parents[name] || []) {
+        if (parent) stack.push(parent.name);
+      }
+    }
+    return { done, total, milestone };
+  };
+
+  // Raw resources the goal's frontier techs still need (their prices expanded
+  // through craft chains). Anything that produces or stores one of these is
+  // genuinely advancing the goal — computed, not keyword-matched.
+  const goalSupportResources = (goalKey) => {
+    if (tickCache.goalSupport) return tickCache.goalSupport;
+    const names = new Set();
+    for (const techName of goalFrontierNames(goalKey)) {
+      const meta = techByName(techName);
+      if (!meta) continue;
+      for (const cost of pricesFor("research", meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        names.add(cost.name);
+        const raw = rawPathRequirements(cost.name, cost.val);
+        for (const name of Object.keys(raw)) names.add(name);
+      }
+    }
+    tickCache.goalSupport = names;
+    return names;
+  };
+
+  // Does a parsed effect profile fall into a goal emphasis category?
+  const profileMatchesCategory = (profile, category) => {
+    if (category === "production") {
+      return Object.values(profile.perTick).some((v) => v > 0) || Object.values(profile.ratio).some((v) => v > 0);
+    }
+    if (category === "housing") return profile.housing > 0;
+    if (category === "happiness") return profile.happiness > 0;
+    if (category === "food") {
+      return (profile.perTick.catnip || 0) > 0 || (profile.ratio.catnip || 0) > 0 || (profile.demand.catnip || 0) < 0;
+    }
+    if (category === "science") {
+      return (profile.perTick.science || 0) > 0 || (profile.ratio.science || 0) > 0 || (profile.max.science || 0) > 0;
+    }
+    if (category === "storage") return Object.keys(profile.max).length > 0;
+    return false;
+  };
+
+  const profileMatchesEmphasis = (meta, goal) => {
+    const emphasis = (goal && goal.emphasis) || {};
+    const profile = metaEffectProfile(meta);
+    return Object.entries(emphasis).some(([category, mult]) => mult > 1 && profileMatchesCategory(profile, category));
+  };
+
+  const upgradeByName = (name) => {
+    try {
+      return (window.gamePage.workshop.upgrades || []).find((u) => u && u.name === name) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  // A tech with no aligned effects of its own can still advance an emphasis
+  // goal through what it UNLOCKS (Machinery → Steamworks for an industry
+  // focus): check the unlocked buildings/upgrades' parsed profiles.
+  const techUnlocksAligned = (meta, goal) => {
+    const unlocks = (meta && meta.unlocks) || {};
+    for (const key of ["buildings", "upgrades"]) {
+      const list = unlocks[key];
+      if (!Array.isArray(list)) continue;
+      for (const name of list) {
+        const child = buildingByName(name) || upgradeByName(name);
+        if (child && profileMatchesEmphasis(child, goal)) return true;
+      }
+    }
+    return false;
+  };
+
+  // Goal alignment without keyword lists: milestone goals score techs by tech-
+  // tree closure membership and anything by whether it produces/stores what
+  // the goal's frontier techs still need; emphasis goals scale matching effect
+  // categories.
+  const goalAlignmentBoost = (kind, meta, goalKey) => {
+    const goal = GOALS[goalKey];
+    if (!goal) return 0;
+    let boost = 0;
+    if (kind === "research" && goalClosureNames(goalKey).has(meta.name)) boost += TUNING.goalClosureBoost;
+    const profile = metaEffectProfile(meta);
+    for (const [category, mult] of Object.entries(goal.emphasis || {})) {
+      if (mult > 1 && profileMatchesCategory(profile, category)) boost += (mult - 1) * TUNING.emphasisScale;
+    }
+    if (kind === "research" && techUnlocksAligned(meta, goal)) boost += TUNING.unlockAlignBoost;
+    if (goal.target) {
+      const support = goalSupportResources(goalKey);
+      if (Object.entries(profile.perTick).some(([name, amount]) => amount > 0 && support.has(name)) ||
+          Object.entries(profile.ratio).some(([name, amount]) => amount > 0 && support.has(name))) {
+        boost += TUNING.supportProductionBoost;
+      }
+      if (Object.keys(profile.max).some((name) => support.has(name))) boost += TUNING.supportStorageBoost;
+    }
     return boost;
+  };
+
+  // Spend-before-store: research/upgrades that consume an almost-full
+  // spendable bank (science, faith, culture, catpower) convert otherwise-
+  // wasted income into progress and free the cap for the next item — prefer
+  // them over raising that cap.
+  const spendBonusFor = (kind, meta, resources) => {
+    if (kind === "build") return 0;
+    let bonus = 0;
+    for (const cost of pricesFor(kind, meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (!SPENDABLE.includes(cost.name)) continue;
+      const res = getRes(resources, cost.name);
+      if (!res || !(res.maxValue > 0) || cost.val > res.maxValue) continue;
+      if (res.value / res.maxValue <= 0.7) continue;
+      bonus = Math.max(bonus, TUNING.spendBonus * Math.min(1, res.value / cost.val));
+    }
+    return bonus;
+  };
+
+  // Universal value model: read what a candidate actually does from its parsed
+  // effects and price its worth against the CURRENT economy — relative
+  // production gains scaled by scarcity, storage scaled by live pressure,
+  // housing/happiness by their global multipliers. No per-item keyword boosts.
+  const economicValue = (meta, resources, goal, goalKey) => {
+    const profile = metaEffectProfile(meta);
+    const pressure = getStoragePressureCached(resources, goal, goalKey);
+    const tps = ticksPerSecond();
+    let value = 0;
+    for (const [name, amount] of Object.entries(profile.perTick)) {
+      const perSecond = amount * tps;
+      const current = productionFor(name);
+      if (perSecond > 0) {
+        const relative = perSecond / (Math.abs(current) + perSecond);
+        value += relative * (0.35 + scarcityWeight(resources, name)) * TUNING.productionScale;
+      } else if (perSecond < 0) {
+        const drain = -perSecond / (Math.max(0, current) - perSecond + 0.001);
+        value -= Math.min(8, drain * scarcityWeight(resources, name) * TUNING.productionScale * 0.5);
+      }
+    }
+    for (const [name, amount] of Object.entries(profile.ratio)) {
+      if (amount <= 0 || productionFor(name) <= 0) continue;
+      value += Math.min(1, amount) * (0.35 + scarcityWeight(resources, name)) * TUNING.productionScale * 0.8;
+    }
+    for (const [name, amount] of Object.entries(profile.max)) {
+      if (amount <= 0) continue;
+      const relief = pressure[name] || 0;
+      if (relief > 0) value += Math.min(TUNING.storageReliefCap, relief);
+      else if (!SPENDABLE.includes(name) && resRatio(resources, name, 0) > 0.93 && productionFor(name) > 0) value += 5;
+    }
+    for (const [name, amount] of Object.entries(profile.demand)) {
+      if (amount < 0) value += Math.min(6, -amount * 10 * (0.35 + scarcityWeight(resources, name)));
+    }
+    if (profile.housing > 0) value += TUNING.housingValue;
+    if (profile.happiness > 0) {
+      value += Math.min(TUNING.happinessScale, profile.happiness * (0.5 + Math.max(0, 1 - currentHappinessRatio()) * 4));
+    }
+    return value;
   };
 
   const rawProductionForNeed = (name) => {
@@ -1530,29 +1807,33 @@
 
   // VALUE-based scoring. Deliberately NOT dominated by "affordable right now":
   // the executor opportunistically buys cheap ready items from surplus anyway,
-  // so the PLAN should be the most valuable reachable step (a gateway tech like
-  // Theology or Machinery, a storage fix, a shortage fix) — and the reservation
-  // system makes saving for it actually work.
+  // so the PLAN should be the most valuable reachable step — and the
+  // reservation system makes saving for it actually work. One framework for
+  // every kind: score = value (parsed economic effects + unlocks + goal
+  // alignment + spend-before-store) − cost (time to afford, storage blocks).
   const candidateScore = (candidate, resources, goal, goalKey) => {
+    const { kind, meta } = candidate;
     const wait = waitSecondsForCandidate(candidate, resources);
-    const waitPenalty = isFinite(wait) ? Math.min(14, Math.log10(wait + 1) * 4) : 22;
-    const storageBlocked = directStorageBlockers(candidate.kind, candidate.meta, resources).length > 0;
-    const storageBlockPenalty = storageBlocked ? 48 : 0;
-    const storagePenalty = isStorageMeta(candidate.meta) && !candidate.affordable &&
-      !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9)
-      ? 10
+    const waitPenalty = isFinite(wait)
+      ? Math.min(TUNING.waitPenaltyCap, Math.log10(wait + 1) * 4)
+      : TUNING.unreachablePenalty;
+    const storageBlockPenalty = directStorageBlockers(kind, meta, resources).length > 0 ? TUNING.storageBlockPenalty : 0;
+    const pressure = getStoragePressureCached(resources, goal, goalKey);
+    const idleStoragePenalty = isStorageMeta(meta) && !candidate.affordable && !storageStillWanted(meta, resources, pressure)
+      ? TUNING.idleStoragePenalty
       : 0;
-    const kindWeight = candidate.kind === "research" ? 12 : candidate.kind === "upgrade" ? 12 : candidate.kind === "religion" ? 11 : 3;
-    const affordBonus = candidate.affordable ? 6 : Math.min(1, Math.max(0, candidate.progress || 0)) * 5;
-    let recursiveBoost = 0;
-    if (candidate.kind === "research") {
-      recursiveBoost += Math.min(18, gatewayValue(candidate.meta) * 1.6);
-      if (goalFrontierNames(goalKey).has(candidate.meta.name)) recursiveBoost += 20;
+    const affordBonus = candidate.affordable
+      ? TUNING.affordBonus
+      : Math.min(1, Math.max(0, candidate.progress || 0)) * TUNING.progressScale;
+    let score = (TUNING.kindPrior[kind] || 3) + affordBonus +
+      economicValue(meta, resources, goal, goalKey) +
+      goalAlignmentBoost(kind, meta, goalKey) +
+      spendBonusFor(kind, meta, resources);
+    if (kind === "research") {
+      score += Math.min(TUNING.gatewayCap, gatewayValue(meta) * TUNING.gatewayScale);
+      if (goalFrontierNames(goalKey).has(meta.name)) score += TUNING.frontierBoost;
     }
-    return kindWeight + affordBonus + recursiveBoost +
-      shortageBoost(candidate.meta, resources) +
-      strategicBoost(candidate.kind, candidate.meta, resources, goal, goalKey) -
-      waitPenalty - storagePenalty - storageBlockPenalty;
+    return score - waitPenalty - idleStoragePenalty - storageBlockPenalty;
   };
 
   const gatherCandidates = (resources, goalKey) => {
@@ -1628,7 +1909,7 @@
       const age = now - activeTarget.startedAt;
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
-        !["wood", "minerals", "iron", "coal", "science", "culture", "faith", "manpower"].some((name) => resRatio(resources, name, 0) > 0.9);
+        !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
       const muchBetter = preferred && locked && age >= TARGET_LOCK_MIN_MS && preferred.score > locked.score * 1.3 + 8;
       if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked) {
@@ -1672,6 +1953,29 @@
       scoreRawDeficits(needs, resources, rawRequirements, 14);
     }
 
+    // Lookahead: the next few runner-up candidates also pull a little weight,
+    // so jobs and crafting serve the steps right behind the plan instead of
+    // whiplashing to a single target — science keeps flowing for the next tech
+    // while wood gathers for the current build, and vice versa.
+    let lookaheads = 0;
+    for (const candidate of getCandidatesCached(resources, goalKey)) {
+      if (lookaheads >= 3) break;
+      if (candidate.affordable || candidate.score <= 0) continue;
+      if (target && targetId(candidate) === targetId(target)) continue;
+      const raw = {};
+      for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        const res = getRes(resources, cost.name);
+        if (res && res.maxValue > 0 && cost.val > res.maxValue) continue; // storage planner's job
+        const have = (res && res.value) || 0;
+        if (have < cost.val) rawPathRequirements(cost.name, cost.val - have, raw);
+      }
+      if (Object.keys(raw).length) {
+        scoreRawDeficits(needs, resources, raw, 4);
+        lookaheads += 1;
+      }
+    }
+
     const religionTarget = nextFaithReligionUpgrade(resources);
     if (religionTarget && !religionTarget.affordable) {
       for (const cost of pricesFor("religion", religionTarget.meta)) {
@@ -1690,10 +1994,11 @@
     if (resRatio(resources, "catnip") < 0.25) scoreNeed(needs, "catnip", 14);
     if (resRatio(resources, "wood") < 0.3) scoreNeed(needs, "wood", 7 * (0.3 - resRatio(resources, "wood")) / 0.3);
     if (resRatio(resources, "minerals") < 0.3) scoreNeed(needs, "minerals", 6 * (0.3 - resRatio(resources, "minerals")) / 0.3);
-    if (goalKey === "space" && resRatio(resources, "science") < 0.92) scoreNeed(needs, "science", 3);
+    const emphasis = (GOALS[goalKey] && GOALS[goalKey].emphasis) || {};
+    if ((emphasis.science || 1) > 1 && resRatio(resources, "science") < 0.92) scoreNeed(needs, "science", 3);
     scoreNeed(needs, "manpower", huntingEconomyNeed(resources));
-    if (goalKey === "production") scoreNeed(needs, resRatio(resources, "minerals") <= resRatio(resources, "wood") ? "minerals" : "wood", 3);
-    if (goalKey === "population") scoreNeed(needs, "catnip", 3);
+    if ((emphasis.production || 1) > 1) scoreNeed(needs, resRatio(resources, "minerals") <= resRatio(resources, "wood") ? "minerals" : "wood", 3);
+    if ((emphasis.food || 1) > 1 || (emphasis.housing || 1) > 1) scoreNeed(needs, "catnip", 3);
 
     for (const name of ["science", "faith", "culture", "manpower"]) {
       if (name === "manpower" && huntingEconomyNeed(resources) > 0.5) continue;
@@ -1711,7 +2016,17 @@
     return { needs, target };
   };
 
-  const managedJobs = () => MANAGED_JOBS.map(jobByName).filter(Boolean);
+  // Manage every unlocked resource-producing job. Engineers are left alone:
+  // they run KS's crafting queue and are reserved out of the worker pool.
+  const managedJobs = () => {
+    try {
+      return (window.gamePage.village.jobs || []).filter(
+        (job) => job && job.unlocked !== false && job.name !== "engineer" && jobResourceFor(job),
+      );
+    } catch (error) {
+      return [];
+    }
+  };
 
   const unassignJobByName = (village, name, amt) => {
     if (amt <= 0) return;
@@ -1739,8 +2054,9 @@
     const weights = {};
 
     for (const job of jobs) {
-      const res = JOB_RESOURCE[job.name];
-      let weight = needs[res] || 0;
+      const produced = jobResourceFor(job);
+      const needKey = produced === "catpower" ? "manpower" : produced;
+      let weight = needs[needKey] || 0;
       if (job.name === "woodcutter" && needs.wood > 0) weight = Math.max(weight, needs.wood);
       if (job.name === "farmer" && needs.wood > 0 && bestWoodJob() && bestWoodJob().name === "farmer") {
         weight = Math.max(weight, needs.wood + 1);
@@ -1748,10 +2064,11 @@
       if (job.name === "woodcutter" && bestWoodJob() && bestWoodJob().name === "farmer") {
         weight = Math.min(weight, 0.25);
       }
-      if (job.name === "scholar" && resRatio(resources, "science") > 0.94) weight = 0;
-      if (job.name === "priest" && resRatio(resources, "faith") > 0.94) weight = 0;
-      if (job.name === "hunter" && resRatio(resources, "manpower") > 0.94 && huntingEconomyNeed(resources) <= 0.5) weight = 0;
-      if (job.name === "geologist" && resRatio(resources, "coal") > 0.96) weight = 0;
+      // Universal anti-waste rule: stop staffing a job whose output bank is
+      // essentially full — unless the economy still wants it (hunting keeps
+      // luxuries/mood up even when catpower is high).
+      const keepForEconomy = needKey === "manpower" && huntingEconomyNeed(resources) > 0.5;
+      if (resRatio(resources, needKey, 0) > 0.94 && !keepForEconomy) weight = 0;
       weights[job.name] = Math.max(0, weight);
     }
 
@@ -1817,6 +2134,9 @@
       for (const job of jobs) desired[job.name] = current[job.name];
     } else {
       for (const job of jobs) {
+        // Assigning the FIRST kitten to a needed job is a real signal, not
+        // churn — only deadband jobs that are already staffed.
+        if (current[job.name] === 0 && (desired[job.name] || 0) > 0) continue;
         if (Math.abs((desired[job.name] || 0) - current[job.name]) <= perJobDeadband) desired[job.name] = current[job.name];
       }
       assigned = Object.values(desired).reduce((a, b) => a + b, 0);
@@ -1977,10 +2297,10 @@
       }
 
       let scored = techs.map((t) => ({ t, ...evaluate("research", t, resources) }));
-      const goal = GOALS[goalKey];
-      if (goal && goal.keywords.length) {
-        const matches = scored.filter((s) => matchesKeywords(s.t, goal.keywords));
-        if (matches.length) scored = matches; // prefer goal-relevant research
+      const closure = goalClosureNames(goalKey);
+      if (closure.size) {
+        const matches = scored.filter((s) => closure.has(s.t.name));
+        if (matches.length) scored = matches; // prefer research on the goal path
       }
       const ready = scored.find((s) => s.affordable);
       if (ready) return `${labelOf(ready.t)} (ready now)`;
@@ -1994,27 +2314,34 @@
     }
   };
 
-  // One line summarising progress toward the chosen goal's milestone.
+  // One line summarising the chosen goal. Milestone goals show real progress
+  // ("4/9 techs · next: Astronomy"); emphasis goals show what is being favored.
   const getGoalLine = (resources, goalKey) => {
     const goal = GOALS[goalKey];
-    if (!goal || !goal.target) return "";
+    if (!goal) return "";
     try {
-      for (const t of window.gamePage.science.techs || []) {
-        if (metaText(t).includes(goal.target)) {
-          if (t.researched) return `🏁 ${goal.label}: ${labelOf(t)} researched ✓`;
-          if (t.unlocked === false) return `🏁 ${goal.label}: ${labelOf(t)} locked — researching toward it`;
-          const e = evaluate("research", t, resources);
-          return `🏁 ${goal.label}: ${labelOf(t)} — ${e.affordable ? "ready!" : "need " + e.missing}`;
+      if (goal.target) {
+        const progress = goalProgress(goalKey);
+        if (!progress) return `🏁 ${goal.label}: milestone not visible yet — growing the economy toward it`;
+        const { done, total, milestone } = progress;
+        if (milestone.researched) return `🏁 ${goal.label}: ${labelOf(milestone)} researched ✓`;
+        const nextName = [...goalFrontierNames(goalKey)][0];
+        const next = nextName ? techByName(nextName) : null;
+        let stepText = "";
+        if (next) {
+          const e = evaluate("research", next, resources);
+          stepText = ` · next: ${labelOf(next)}${e.affordable ? " (ready!)" : e.missing ? ` (need ${e.missing})` : ""}`;
         }
+        const pct = total ? Math.round((done / total) * 100) : 0;
+        return `🏁 ${goal.label}: ${done}/${total} techs (${pct}%)${stepText}`;
       }
-      for (const b of buildingMetas()) {
-        if (metaText(b).includes(goal.target)) {
-          if (b.unlocked === false) return `🏁 ${goal.label}: ${labelOf(b)} locked`;
-          const e = evaluate("build", b, resources);
-          return `🏁 ${goal.label}: ${labelOf(b)} ×${b.val || 0} — ${e.affordable ? "can build now" : "need " + e.missing}`;
-        }
-      }
-      return `🏁 ${goal.label}: target not unlocked yet`;
+      const favored = Object.entries(goal.emphasis || {})
+        .filter(([, mult]) => mult > 1)
+        .map(([category]) => category);
+      if (!favored.length) return ""; // balanced — no extra line needed
+      const target = getTargetCached(resources, goalKey);
+      const targetText = target ? ` · focusing ${labelOf(target.meta)}` : "";
+      return `🏁 ${goal.label}: favoring ${favored.join(", ")}${targetText}`;
     } catch (error) {
       return `🏁 ${goal.label}`;
     }
@@ -2453,17 +2780,18 @@
 
   const desiredLeaderTraits = (goalKey, resources) => {
     const target = getTargetCached(resources, goalKey);
+    const emphasis = (GOALS[goalKey] && GOALS[goalKey].emphasis) || {};
     const traits = [];
     const text = target ? `${target.kind} ${effectText(target.meta)}` : "";
     const costs = target ? pricesFor(target.kind, target.meta).map((cost) => cost && cost.name).filter(Boolean) : [];
 
-    if ((target && target.kind === "research") || costs.includes("science") || goalKey === "space") traits.push("scientist");
+    if ((target && target.kind === "research") || costs.includes("science") || (emphasis.science || 1) > 1) traits.push("scientist");
     if (costs.some((name) => ["steel", "gear", "alloy", "plate"].includes(name)) || /steel|gear|alloy|plate|coal|smelter|furnace/.test(text)) traits.push("metallurgist");
     if (costs.some((name) => ["concrate", "kerosene", "thorium", "eludium"].includes(name)) || /concrete|concrate|kerosene|thorium|reactor|eludium/.test(text)) traits.push("chemist");
     if (costs.some((name) => ["beam", "slab", "parchment", "manuscript", "compedium", "blueprint"].includes(name)) || /workshop|craft|beam|slab|blueprint/.test(text)) traits.push("engineer");
     if (huntingEconomyNeed(resources) > 3 || resRatio(resources, "manpower", 0) < 0.35) traits.push("manager");
     if (target && target.kind === "trade") traits.push("merchant");
-    if (costs.includes("faith") || goalKey === "production" && resRatio(resources, "faith", 1) < 0.6) traits.push("wise");
+    if (costs.includes("faith") || ((emphasis.production || 1) > 1 && resRatio(resources, "faith", 1) < 0.6)) traits.push("wise");
     traits.push("engineer", "scientist", "manager", "metallurgist", "wise", "merchant", "chemist");
     return [...new Set(traits)];
   };
@@ -2538,16 +2866,13 @@
     };
   };
 
+  // Exclusive policies are ranked with the same universal framework as every
+  // other candidate: parsed economic effects plus goal alignment, minus the
+  // number of visible downsides.
   const policyScore = (meta, resources, goalKey) => {
     const goal = GOALS[goalKey];
-    const text = effectText(meta);
     const { cons } = summarizeEffects(meta);
-    let score = strategicBoost("policy", meta, resources, goal, goalKey) + shortageBoost(meta, resources);
-    if (/liberty|tradition|monarchy|republic|technocracy|liberalism|communism|fascism/.test(text)) score += 8;
-    if (goal && goal.keywords.length && matchesKeywords(meta, goal.keywords)) score += 18;
-    if (goalKey === "production" && /production|worker|mineral|wood|coal|craft|engineer|communism/.test(text)) score += 18;
-    if (goalKey === "space" && /science|blueprint|starchart|oil|reactor|technocracy/.test(text)) score += 16;
-    if (goalKey === "population" && /happiness|catnip|kitten|housing|liberty/.test(text)) score += 14;
+    let score = economicValue(meta, resources, goal, goalKey) + goalAlignmentBoost("policy", meta, goalKey);
     score -= cons.length * 4;
     return score;
   };
@@ -2785,6 +3110,9 @@
       ".kgh-panel select{width:100%;min-width:0;user-select:auto;-webkit-user-select:auto}" +
       ".kgh-row{display:flex;gap:6px;min-width:0}" +
       ".kgh-grow{flex:1 1 auto;min-width:0}" +
+      // Buttons must never shrink or wrap their label ("Appl\ny"): the panel's
+      // global min-width:0 lets flex squeeze them, so pin them to content size.
+      ".kgh-panel button{white-space:nowrap;flex:0 0 auto}" +
       ".kgh-note{display:block;color:#d9ccae;opacity:.78}" +
       ".kgh-details{border-top:1px solid #9b7a4d50;padding-top:3px}" +
       ".kgh-details>summary{cursor:pointer;opacity:.82;list-style:none}" +
@@ -2813,10 +3141,9 @@
       '<option value="assist">Assist: jobs + advice</option>',
       "</select><button type=\"button\" class=\"kgh-apply\" style=\"cursor:pointer\">Apply</button></div>",
       '<select class="kgh-goal" aria-label="goal" style="width:100%">',
-      '<option value="balanced">🏁 Goal: Balanced</option>',
-      '<option value="space">🏁 Goal: Rush Space</option>',
-      '<option value="production">🏁 Goal: Max production</option>',
-      '<option value="population">🏁 Goal: Max population</option>',
+      // Goal options come straight from GOALS so the dropdown, the planner and
+      // the progress line can never drift apart.
+      ...Object.entries(GOALS).map(([key, goal]) => `<option value="${key}">🏁 ${goal.label}</option>`),
       "</select>",
       '<small class="kgh-status" style="color:#9fd0ff">…</small>',
       '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
