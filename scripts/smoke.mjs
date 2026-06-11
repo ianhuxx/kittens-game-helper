@@ -571,6 +571,28 @@ check("jobs: starvation guard reinforced farmers (net catnip < 0)", job("farmer"
 check("jobs: religion faith reserve directs priests", job("priest").value > 0);
 check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
 
+/* Calm hunting — happy village with stocked furs keeps hunters to a crew */
+village.happiness = 1.18; // >100% mood, like a real luxury-fed village
+res("furs").value = 800; // far above the luxury target
+fakeNow += 25000;
+tickFn();
+fakeNow += 25000;
+tickFn();
+check("jobs: hunting stays minimal when furs and mood are healthy", job("hunter").value <= 2);
+
+/* Stability — with nothing changing, the village must NOT churn */
+fakeNow += 25000;
+tickFn(); // settle once more
+const jobSnapshot = jobs.map((j) => `${j.name}:${j.value}`).join("|");
+const rebalancesBefore = (logText().match(/rebalanced/g) || []).length;
+fakeNow += 25000;
+tickFn();
+fakeNow += 25000;
+tickFn();
+const rebalancesAfter = (logText().match(/rebalanced/g) || []).length;
+check("stability: no job churn across idle ticks", jobs.map((j) => `${j.name}:${j.value}`).join("|") === jobSnapshot);
+check("stability: no rebalance log spam across idle ticks", rebalancesAfter === rebalancesBefore);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

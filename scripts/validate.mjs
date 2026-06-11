@@ -95,6 +95,8 @@ const required = [
   // Village care that must stay wired in.
   "maybePromoteKittens",
   "resetTickCache",
+  // Calm hunting: chain pressure may not flood hunters at healthy furs/mood.
+  "fursHealthy",
 ];
 
 const missing = required.filter((token) => !source.includes(token));

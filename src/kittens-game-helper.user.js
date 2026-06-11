@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.13.0
+// @version      0.13.1
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, smelter/calciner pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -2180,6 +2180,14 @@
       // luxuries/mood up even when catpower is high).
       const keepForEconomy = needKey === "manpower" && huntingEconomyNeed(resources) > 0.5;
       if (resRatio(resources, needKey, 0) > 0.94 && !keepForEconomy) weight = 0;
+      // Hunting beyond the luxury/mood need is busywork: when furs are well
+      // stocked and the village is happy, crafting-chain pressure (parchment →
+      // furs → catpower) must not march half the settlement into the woods.
+      if (job.name === "hunter" && huntingEconomyNeed(resources) <= 0.5) {
+        const furs = getRes(resources, "furs");
+        const fursHealthy = furs && (furs.value || 0) > luxuryStockTarget(resources, "furs") * 2;
+        if (fursHealthy && currentHappinessRatio() >= 1) weight = Math.min(weight, 2.5);
+      }
       weights[job.name] = Math.max(0, weight);
     }
 
