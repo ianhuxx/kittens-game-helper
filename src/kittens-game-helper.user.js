@@ -311,13 +311,6 @@
     storage: { label: "Manual: storage/caps first" },
     production: { label: "Manual: production first" },
   };
-    auto: { label: "Auto priority — universal scoring" },
-    science: { label: "Manual: science first" },
-    workshop: { label: "Manual: workshop upgrades first" },
-    bonfire: { label: "Manual: bonfire buildings first" },
-    storage: { label: "Manual: storage/caps first" },
-    production: { label: "Manual: production first" },
-  };
 
   const getGoal = () => {
     const stored = localStorage.getItem(GOAL_KEY);
@@ -2472,8 +2465,6 @@
     return pricesFor(candidate.kind, candidate.meta).some((cost) => cost && names.includes(cost.name));
   };
 
-  const TARGET_LOCK_MIN_MS = 120000;
-  const TARGET_LOCK_MAX_MS = 360000;
   const TARGET_READY_GRACE_MS = 20000;
   let activeTarget = null;
 
@@ -3419,3 +3410,4 @@
     } catch (error) { /* ignore */ }
   };
 
+})();
