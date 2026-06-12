@@ -108,6 +108,23 @@ const required = [
   "resetTickCache",
   // Calm hunting: chain pressure may not flood hunters at healthy furs/mood.
   "fursHealthy",
+  // New-content awareness: fresh unlocks (Mint, Mansion, Observatory, …)
+  // break the target lock, get logged and get a short evaluation boost.
+  "watchNewUnlocks",
+  "noveltyBoostFor",
+  "🆕 unlocked",
+  // Live effects: calculateEffects-backed numbers (Observatory science) are
+  // refreshed before profiling so new unlocks are valued correctly.
+  "refreshMetaEffects",
+  // Converters are discovered from PerTickCon/Prod effects, not name lists.
+  "converterBuildings",
+  "PerTick(?:Base|Autoprod|Con|Prod)?",
+  // Exploration reads the game's own explorer fee and is never starved by
+  // auto-hunting (hunting holds the fee back while a race is discoverable).
+  "explorerPrices",
+  "hasLockedDiscoverableRace",
+  // Housing value scales with how full the village is (Mansion timing).
+  "housingSaturation",
 ];
 
 const missing = required.filter((token) => !source.includes(token));

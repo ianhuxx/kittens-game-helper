@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      0.13.1
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, smelter/calciner pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
+// @version      0.14.0
+// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -597,6 +597,7 @@
     goalFrontier: null,
     goalClosure: null,
     goalSupport: null,
+    fxRefreshed: new WeakSet(),
   };
 
   const resetTickCache = () => {
@@ -609,6 +610,7 @@
       goalFrontier: null,
       goalClosure: null,
       goalSupport: null,
+      fxRefreshed: new WeakSet(),
     };
   };
 
@@ -694,13 +696,31 @@
     return (craft && craft.label) || (res && res.title) || name;
   };
 
-  const rawWorkNeedName = (name) => {
+  const rawWorkNeedName = (name, depth = 0) => {
     if (["wood", "beam", "scaffold", "ship"].includes(name)) return "wood";
     if (["minerals", "iron", "titanium", "uranium"].includes(name)) return "minerals";
     if (["coal", "gold"].includes(name)) return "coal";
-    if (["furs", "ivory", "unicorns"].includes(name)) return "manpower";
+    if (["furs", "ivory", "spice", "unicorns"].includes(name)) return "manpower";
     if (["science", "blueprint", "compendium", "compedium"].includes(name)) return "science";
     if (name === "faith") return "faith";
+    // Resources the static shortcuts don't know (new game content): if a job
+    // produces it the jobs system can staff it directly; otherwise follow the
+    // converter building that outputs it back to that converter's raw input.
+    if (depth < 3) {
+      try {
+        for (const job of managedJobs()) {
+          if (jobResourceFor(job) === name) return name;
+        }
+        for (const meta of buildingMetas()) {
+          if (!meta || !(meta.val > 0)) continue;
+          const profile = processingProfileFor(meta);
+          if (!profile.outputs.includes(name) || !profile.inputs.length) continue;
+          return rawWorkNeedName(profile.inputs[0], depth + 1);
+        }
+      } catch (error) {
+        /* fall through to the name itself */
+      }
+    }
     return name;
   };
 
@@ -1057,6 +1077,20 @@
     }
   };
 
+  // 0..1 — how full the village is. Housing is worth little while beds are
+  // free and a lot when population growth is blocked by it, so Mansions/Huts
+  // surge in the scoring exactly when they matter.
+  const housingSaturation = () => {
+    try {
+      const village = window.gamePage.village;
+      const max = village.maxKittens || (village.sim && village.sim.maxKittens) || 0;
+      if (!(max > 0)) return 0;
+      return Math.min(1, villageKittens() / max);
+    } catch (error) {
+      return 0;
+    }
+  };
+
   // village.happiness is a RATIO (1.4 = 140%, floor 0.25) and can legitimately
   // exceed 2.0 late game. Only treat it as a percent if it's clearly one.
   const currentHappinessRatio = () => {
@@ -1148,6 +1182,7 @@
     productionScale: 24, // relative production / ratio gains
     spendBonus: 10, // consumes an almost-full spendable bank (science…)
     manualPriorityBoost: 22, // optional player override, still inside scoring
+    noveltyBoost: 9, // freshly unlocked content gets a short evaluation window
     storageReliefCap: 30, // max boost from relieving live storage pressure
     housingValue: 6,
     happinessScale: 8,
@@ -1250,9 +1285,24 @@
     }
   };
 
+  // Many buildings only get their real numbers when the game runs their
+  // calculateEffects (the Observatory's scienceRatio/scienceMax exist ONLY
+  // there; the metadata carries placeholders). Refresh once per tick before
+  // profiling, so freshly unlocked content is valued from live effects.
+  const refreshMetaEffects = (meta) => {
+    if (!meta || typeof meta.calculateEffects !== "function" || tickCache.fxRefreshed.has(meta)) return;
+    tickCache.fxRefreshed.add(meta);
+    try {
+      meta.calculateEffects(meta, window.gamePage);
+    } catch (error) {
+      /* keep the existing effect values */
+    }
+  };
+
   const metaEffectProfile = (meta) => {
     const profile = emptyEffectProfile();
     if (!meta || typeof meta !== "object") return profile;
+    refreshMetaEffects(meta);
     const sources = [];
     if (meta.effects && typeof meta.effects === "object") sources.push(meta.effects);
     if (Array.isArray(meta.stages) && isFinite(meta.stage) && meta.stages[meta.stage] && meta.stages[meta.stage].effects) {
@@ -1864,7 +1914,7 @@
     for (const [name, amount] of Object.entries(profile.demand)) {
       if (amount < 0) value += Math.min(6, -amount * 10 * (0.35 + scarcityWeight(resources, name)));
     }
-    if (profile.housing > 0) value += TUNING.housingValue;
+    if (profile.housing > 0) value += TUNING.housingValue * (0.6 + housingSaturation() * 1.8);
     if (profile.happiness > 0) {
       value += Math.min(TUNING.happinessScale, profile.happiness * (0.5 + Math.max(0, 1 - currentHappinessRatio()) * 4));
     }
@@ -1880,8 +1930,12 @@
 
   const buildingByName = (name) => buildingMetas().find((meta) => meta && meta.name === name) || null;
 
+  // Match every per-tick effect spelling the game uses — PerTick, PerTickBase,
+  // PerTickAutoprod, PerTickCon, PerTickProd — so converters like the Mint
+  // (goldPerTickCon/manpowerPerTickCon → fursPerTickProd/ivoryPerTickProd) are
+  // recognized from metadata alone, with no name list to maintain.
   const effectResourceName = (effectKey) => {
-    const match = String(effectKey || "").match(/^([a-z][a-z0-9]*)(?:PerTick|PerTickBase|PerTickAutoprod)$/i);
+    const match = String(effectKey || "").match(/^([a-z][a-z0-9]*?)PerTick(?:Base|Autoprod|Con|Prod)?$/i);
     return match ? match[1] : null;
   };
 
@@ -1891,6 +1945,7 @@
       .filter(Boolean);
 
   const processingProfileFor = (meta) => {
+    refreshMetaEffects(meta);
     const effects = (meta && meta.effects) || {};
     const inputs = [];
     const outputs = [];
@@ -1904,7 +1959,12 @@
     return { inputs: [...new Set(inputs)], outputs: [...new Set(outputs)] };
   };
 
-  const PROCESSOR_NAMES = ["smelter", "calciner"];
+  // Converters are DISCOVERED, not listed: any owned building whose live
+  // effects both consume (…PerTickCon) and produce (…PerTickProd/Autoprod)
+  // resources qualifies — smelter, calciner, mint, upgraded steamworks lines
+  // and whatever the game adds next. The static input/output maps below are
+  // only a fallback for metas whose effects are temporarily unreadable.
+  const KNOWN_CONVERTERS = ["smelter", "calciner"];
   const PROCESSOR_INPUTS = {
     smelter: ["wood", "minerals"],
     calciner: ["minerals", "oil"],
@@ -1912,6 +1972,20 @@
   const PROCESSOR_OUTPUTS = {
     smelter: ["iron", "coal", "gold", "titanium"],
     calciner: ["iron", "titanium", "coal"],
+  };
+
+  const converterBuildings = () => {
+    const out = [];
+    const seen = new Set();
+    for (const meta of buildingMetas()) {
+      if (!meta || !meta.name || !(meta.val > 0) || seen.has(meta.name)) continue;
+      const profile = processingProfileFor(meta);
+      if ((profile.inputs.length && profile.outputs.length) || KNOWN_CONVERTERS.includes(meta.name)) {
+        seen.add(meta.name);
+        out.push(meta);
+      }
+    }
+    return out;
   };
   const pausedProcessors = {};
   let processingPlanText = "Processing: watching converters";
@@ -1973,9 +2047,8 @@
       const needed = resourcesNeededForTarget(target, resources);
       const changed = [];
 
-      for (const name of PROCESSOR_NAMES) {
-        const meta = buildingByName(name);
-        if (!meta || !meta.val) continue;
+      for (const meta of converterBuildings()) {
+        const name = meta.name;
         const profile = processingProfileFor(meta);
         const inputs = profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || [];
         const outputs = profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || [];
@@ -2068,7 +2141,8 @@
       economicValue(kind, meta, resources, goal, goalKey) +
       goalAlignmentBoost(kind, meta, goalKey) +
       spendBonusFor(kind, meta, resources) +
-      manualPriorityBoostFor(kind, meta);
+      manualPriorityBoostFor(kind, meta) +
+      noveltyBoostFor(candidate);
     if (kind === "research") {
       score += Math.min(TUNING.gatewayCap, gatewayValue(meta) * TUNING.gatewayScale);
       if (goalFrontierNames(goalKey).has(meta.name)) score += TUNING.frontierBoost;
@@ -2149,6 +2223,55 @@
       return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
     }
     return false;
+  };
+
+  /* --------------------------- new-unlock watching --------------------------- */
+
+  // The game keeps opening new content as you play (Mint, Mansion, Observatory,
+  // new techs/upgrades/religion items, …). When something NEW becomes available
+  // the autopilot must notice on its own: log it, break the current target lock
+  // so the next plan choice weighs the newcomer, and give it a short evaluation
+  // boost so fresh options are folded into the progression instead of waiting
+  // behind an old lock. This is fully generic — anything gatherCandidates can
+  // see is watched, so future game content needs no code changes.
+  const NOVELTY_MS = 10 * 60 * 1000;
+  let knownUnlockIds = null; // null until the first tick seeds the baseline
+  const noveltyUntil = {};
+
+  const noveltyBoostFor = (candidate) => {
+    const until = noveltyUntil[targetId(candidate)];
+    return until && until > Date.now() ? TUNING.noveltyBoost : 0;
+  };
+
+  const watchNewUnlocks = () => {
+    try {
+      const ids = new Set();
+      const fresh = [];
+      const note = (kind, meta, open) => {
+        if (!open || !meta || !meta.name) return;
+        const id = `${kind}:${meta.name}`;
+        ids.add(id);
+        if (knownUnlockIds && !knownUnlockIds.has(id)) fresh.push({ id, meta });
+      };
+      for (const t of techList()) note("research", t, isOpen(t));
+      try {
+        for (const u of window.gamePage.workshop.upgrades || []) note("upgrade", u, isOpen(u));
+      } catch (error) {
+        /* ignore */
+      }
+      for (const u of religionUpgrades()) note("religion", u, religionUpgradeVisible(u));
+      for (const b of buildingMetas()) note("build", b, !!b && b.unlocked !== false);
+      if (knownUnlockIds && fresh.length) {
+        const now = Date.now();
+        for (const item of fresh) noveltyUntil[item.id] = now + NOVELTY_MS;
+        activeTarget = null; // replan with the newcomers in the running
+        const shown = fresh.slice(0, 3).map((item) => labelOf(item.meta)).join(", ");
+        pushLog(`🆕 unlocked: ${shown}${fresh.length > 3 ? ` +${fresh.length - 3} more` : ""} — replanning`);
+      }
+      knownUnlockIds = ids;
+    } catch (error) {
+      /* ignore unlock-watch failures */
+    }
   };
 
   const chooseWorkTarget = (resources, goalKey) => {
@@ -2507,7 +2630,15 @@
       const discount = typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0;
       const huntCost = Math.max(1, 100 - discount);
       const economyNeed = huntingEconomyNeed(resources);
-      const threshold = economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
+      let threshold = economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
+      // Exploration shares this bank. While an undiscovered trade partner is
+      // waiting and the cap can fit the explorer fee, hold hunting back far
+      // enough that it can never permanently starve "Send explorers"
+      // (diplomacy runs earlier in the tick, so explorers get first claim).
+      const exploreCost = hasLockedDiscoverableRace() ? explorerPrices()[0].val : 0;
+      if (exploreCost > 0 && cp.maxValue > exploreCost * 1.15) {
+        threshold = Math.max(threshold, Math.min(cp.maxValue * 0.95, exploreCost + huntCost));
+      }
       if (cp.value >= threshold) {
         village.huntAll();
         if (Date.now() - lastHuntLog > 30000) {
@@ -3087,17 +3218,34 @@
     return (race.embassyLevel || 0) > before;
   };
 
+  // The live "Send explorers" fee (1000 catpower stock) read from the game's
+  // own trade-tab button when present, so cost changes track the game itself.
+  const explorerPrices = () => {
+    try {
+      const btn = window.gamePage.tradeTab && window.gamePage.tradeTab.exploreBtn;
+      const prices = (btn && btn.model && btn.model.prices) || (btn && btn.opts && btn.opts.prices);
+      const manpower = Array.isArray(prices) && prices.find((price) => price && price.name === "manpower" && price.val > 0);
+      if (manpower) return [{ name: "manpower", val: manpower.val }];
+    } catch (error) {
+      /* fall through to the stock fee */
+    }
+    return [{ name: "manpower", val: 1000 }];
+  };
+
+  // Discovering a trade partner beats hoarding catpower: explore as soon as
+  // the fee fits and the plan's reservations allow it. (The old near-cap gate
+  // could deadlock against auto-hunting, which fires below it — explorers
+  // would then never be sent for the rest of the run.)
   const maybeSendExplorers = (resources, reserved) => {
     const game = window.gamePage;
     const diplomacy = game && game.diplomacy;
     if (!diplomacy || typeof diplomacy.unlockRandomRace !== "function") return false;
-    const price = [{ name: "manpower", val: 1000 }];
+    const price = explorerPrices();
     if (!hasLockedDiscoverableRace() || !canPayPrices(price) || !pricesRespectReservations(price, reserved, resources)) return false;
-    if (unlockedRaces().length > 0 && resRatio(resources, "manpower", 0) < 0.92) return false;
     const before = unlockedRaces().length;
     if (!rawPayPrices(price)) return false;
     const race = diplomacy.unlockRandomRace();
-    if (!race && game.resPool && typeof game.resPool.addResEvent === "function") game.resPool.addResEvent("manpower", 950);
+    if (!race && game.resPool && typeof game.resPool.addResEvent === "function") game.resPool.addResEvent("manpower", price[0].val * 0.95);
     if (game && typeof game.render === "function") game.render();
     const after = unlockedRaces().length;
     if (after > before || race) {
@@ -3562,6 +3710,7 @@
       resetTickCache();
       let resources = resourceMap();
       const goal = getGoal();
+      watchNewUnlocks();
       refineSurplusCatnip();
       optimizeProcessing(resources, goal);
       craftTowardTarget(resources, goal);

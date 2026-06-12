@@ -623,6 +623,52 @@ tickFn();
 check("recent actions: embassy level changes are logged", /embassy with Lizards/.test(logText()));
 check("recent actions: external trade resource swings are logged", /trade: .*Spice/.test(logText()) && /Gold/.test(logText()));
 
+/* New content awareness — fresh unlocks must be noticed, logged and replanned */
+fakeNow += 25000;
+buildings.push({
+  name: "mint",
+  label: "Mint",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "minerals", val: 5000 }],
+  effects: { goldPerTickCon: -0.005, manpowerPerTickCon: -0.75, fursPerTickProd: 0.00875, ivoryPerTickProd: 0.0021, goldMax: 100 },
+});
+tickFn();
+check("new unlocks: freshly opened building noticed and logged for replanning", /🆕 unlocked: .*Mint/.test(logText()));
+
+/* Converter discovery — in/out buildings are found from PerTickCon/Prod effects
+   alone (this one is NOT in any hard-coded converter list) and paused when they
+   drain an input the focused plan is still missing. */
+const testforge = {
+  name: "testforge",
+  label: "Testforge",
+  unlocked: true,
+  val: 1,
+  on: 1,
+  prices: [{ name: "minerals", val: 900 }],
+  effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.1 },
+};
+buildings.push(testforge);
+res("minerals").value = 100; // plan (next Testforge) is missing minerals → converter must yield
+fakeNow += 25000;
+tickFn();
+check("converters: metadata-discovered converter paused while plan misses its input", testforge.on === 0 && /paused Testforge/.test(logText()));
+
+/* Exploration — explorers go out as soon as the fee fits (no near-cap gate) */
+fakeNow += 25000;
+diplomacy.races.push({ name: "griffins", title: "Griffins", unlocked: false, hidden: false, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 1000 }] });
+diplomacy.unlockRandomRace = () => {
+  const race = diplomacy.races.find((r) => !r.unlocked && !r.hidden);
+  if (race) race.unlocked = true;
+  return race;
+};
+res("manpower").value = 1100;
+res("manpower").maxValue = 1200;
+tickFn();
+check("explorers: sent the moment the catpower fee fits (old 92%-cap gate removed)", diplomacy.races[1].unlocked === true && /🧭/.test(logText()));
+check("explorers: catpower fee actually paid", res("manpower").value < 1100);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);
