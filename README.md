@@ -144,7 +144,10 @@ Nothing in the planner is a name list, so new game content never needs a code ch
 - **Exploration runs itself.** The explorer fee is read from the game's own trade tab,
   explorers go out as soon as the fee fits the plan's reservations, and auto-hunting
   holds enough catpower back that it can never starve "Send explorers" (a deadlock in
-  older versions). Embassies keep being built from each race's live prices.
+  older versions). If titanium is the bottleneck, the helper follows the live game flow:
+  craft the first ship, reveal hidden Zebras with explorers, then run a reserved direct
+  Zebra trade fallback for titanium before spending on slower side goals. Embassies keep
+  being built from each race's live prices.
 
 ## Recursive prerequisite planning
 

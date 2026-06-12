@@ -519,6 +519,7 @@
   // universal guard that prevents e.g. lizard trades from repeatedly consuming
   // the gold reserved for a Temple.
   let externalSpendersPlanText = "External spenders: watching KS trade/space/time";
+  let diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
   let externalSpendersPaused = false;
   let lastExternalSpenderLog = 0;
 
@@ -540,13 +541,16 @@
       if (!settings) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = target && !target.affordable ? reservedResourceNames(target, resources) : [];
-      const shouldPause = reserved.length > 0;
+      const explorerSave = shouldSaveForExplorers(resources);
+      const shouldPause = reserved.length > 0 || explorerSave;
       setExternalSpendersEnabled(settings, !shouldPause);
       if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
 
       if (shouldPause) {
         const shown = reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+");
-        externalSpendersPlanText = `External spenders: paused ${PURCHASE_SECTIONS.map(externalSpenderLabel).join("/")} while saving ${shown} for ${labelOf(target.meta)}`;
+        externalSpendersPlanText = explorerSave && !reserved.length
+          ? "External spenders: paused Trade/Space/Time while saving Catpower for explorers"
+          : `External spenders: paused ${PURCHASE_SECTIONS.map(externalSpenderLabel).join("/")} while saving ${shown} for ${labelOf(target.meta)}`;
         if (!externalSpendersPaused || Date.now() - lastExternalSpenderLog > 60000) {
           pushLog(`🛡 ${externalSpendersPlanText}`);
           lastExternalSpenderLog = Date.now();
@@ -3148,13 +3152,124 @@
     }
   };
 
-  const hasLockedDiscoverableRace = () => {
+  const hasLockedDiscoverableRace = () => hasDiscoverableRaceNow(resourceMap());
+
+  const raceByName = (name) => {
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      if (diplomacy && typeof diplomacy.get === "function") return diplomacy.get(name);
+      const races = (diplomacy && diplomacy.races) || [];
+      return (Array.isArray(races) ? races : []).find((race) => race && race.name === name) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const resourceValue = (resources, name) => ((getRes(resources, name) || {}).value) || 0;
+
+  const hiddenRaceDiscoverableNow = (race, resources) => {
+    if (!race || race.unlocked || !race.hidden) return false;
+    if (race.name === "nagas") return resourceValue(resources, "culture") >= 1500;
+    if (race.name === "zebras") return resourceValue(resources, "ship") >= 1;
+    if (race.name === "spiders") return resourceValue(resources, "ship") >= 100 && ((getRes(resources, "science") || {}).maxValue || 0) > 125000;
+    if (race.name === "dragons") {
+      try {
+        const tech = window.gamePage.science && window.gamePage.science.get && window.gamePage.science.get("nuclearFission");
+        return !!(tech && tech.researched);
+      } catch (error) {
+        return false;
+      }
+    }
+    return false;
+  };
+
+  const hasDiscoverableRaceNow = (resources) => {
     try {
       const diplomacy = window.gamePage && window.gamePage.diplomacy;
       const races = (diplomacy && diplomacy.races) || [];
-      return races.some((race) => race && !race.unlocked && !race.hidden);
+      return (Array.isArray(races) ? races : []).some((race) => race && !race.unlocked && (!race.hidden || hiddenRaceDiscoverableNow(race, resources)));
     } catch (error) {
       return false;
+    }
+  };
+
+  const explorerFeeCanFit = (resources) => explorerPrices().every((price) => {
+    const res = getRes(resources, price.name);
+    return !res || !res.maxValue || res.maxValue >= price.val;
+  });
+
+  const shouldSaveForExplorers = (resources) => {
+    if (getProfileName() !== "autopilot" || !hasDiscoverableRaceNow(resources) || !explorerFeeCanFit(resources)) return false;
+    return explorerPrices().some((price) => resourceValue(resources, price.name) < price.val);
+  };
+
+  const targetMissingResource = (target, resources, name) => {
+    if (!target || target.affordable) return false;
+    return pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === name && resourceValue(resources, name) < cost.val);
+  };
+
+  const titaniumNeededSoon = (resources, goalKey) => {
+    const titanium = getRes(resources, "titanium");
+    if (titanium && titanium.unlocked !== false && titanium.maxValue > 0 && titanium.value < Math.min(titanium.maxValue * 0.5, 50)) {
+      return true;
+    }
+    const target = getTargetCached(resources, goalKey);
+    if (targetMissingResource(target, resources, "titanium")) return true;
+    return getCandidatesCached(resources, goalKey).slice(0, 12).some((candidate) =>
+      !candidate.affordable && pricesFor(candidate.kind, candidate.meta).some((cost) => cost && cost.name === "titanium" && resourceValue(resources, "titanium") < cost.val),
+    );
+  };
+
+  const tradePricesForRace = (race) => {
+    const prices = [];
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      const manpowerCost = diplomacy && typeof diplomacy.getManpowerCost === "function" ? diplomacy.getManpowerCost() : (diplomacy && diplomacy.baseManpowerCost) || 50;
+      const goldCost = diplomacy && typeof diplomacy.getGoldCost === "function" ? diplomacy.getGoldCost() : (diplomacy && diplomacy.baseGoldCost) || 15;
+      if (manpowerCost > 0) prices.push({ name: "manpower", val: manpowerCost });
+      if (goldCost > 0) prices.push({ name: "gold", val: goldCost });
+    } catch (error) {
+      prices.push({ name: "manpower", val: 50 }, { name: "gold", val: 15 });
+    }
+    const buy = race && race.buys && race.buys[0];
+    if (buy && buy.name && buy.val > 0) prices.push({ name: buy.name, val: buy.val });
+    return prices;
+  };
+
+  const tradeWithRace = (race) => {
+    const diplomacy = window.gamePage && window.gamePage.diplomacy;
+    const beforeTitanium = resourceValue(resourceMap(), "titanium");
+    const costsBefore = tradePricesForRace(race).map((price) => ({ name: price.name, value: resourceValue(resourceMap(), price.name) }));
+    if (!diplomacy || !race) return false;
+    try {
+      if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, 1);
+      else if (typeof diplomacy.trade === "function") diplomacy.trade(race);
+    } catch (error) {
+      return false;
+    }
+    if (resourceValue(resourceMap(), "titanium") > beforeTitanium) return true;
+    return costsBefore.some(({ name, value }) => resourceValue(resourceMap(), name) < value);
+  };
+
+  const craftDiplomacyPrerequisites = (resources, goalKey) => {
+    try {
+      if (getProfileName() !== "autopilot" || !titaniumNeededSoon(resources, goalKey)) {
+        diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
+        return;
+      }
+      const zebras = raceByName("zebras");
+      if (zebras && zebras.unlocked) {
+        diplomacyPrepText = "Diplomacy prep: zebras unlocked for titanium";
+        return;
+      }
+      if (resourceValue(resources, "ship") < 1 && craftByName("ship")) {
+        diplomacyPrepText = "Diplomacy prep: crafting first ship to reveal Zebras";
+        tryCraftResource("ship", 1);
+      } else if (resourceValue(resources, "ship") >= 1) {
+        diplomacyPrepText = "Diplomacy prep: saving Catpower to send explorers for Zebras";
+      }
+    } catch (error) {
+      /* ignore diplomacy prerequisite crafting failures */
     }
   };
 
@@ -3257,6 +3372,34 @@
     return false;
   };
 
+  const maybeTradeForTitanium = (resources, reserved, goalKey) => {
+    const titanium = getRes(resources, "titanium");
+    const targetNeedsTitanium = titaniumNeededSoon(resources, goalKey);
+    if (!targetNeedsTitanium) return false;
+    if (titanium && titanium.maxValue > 0 && titanium.value >= titanium.maxValue * 0.995) {
+      diplomacyPlanText = "Diplomacy: titanium capped; waiting for storage before more Zebra trades";
+      return false;
+    }
+    const zebras = raceByName("zebras");
+    if (!zebras || !zebras.unlocked) return false;
+    const prices = tradePricesForRace(zebras);
+    if (!prices.length || !canPayPrices(prices) || !pricesRespectReservations(prices, reserved, resources)) {
+      const missing = prices
+        .filter((price) => price && price.name && resourceValue(resources, price.name) < price.val)
+        .map((price) => `${fmt(price.val - resourceValue(resources, price.name))} ${resTitle(resources, price.name)}`)
+        .slice(0, 3)
+        .join(", ");
+      diplomacyPlanText = missing ? `Diplomacy: Zebra titanium trade needs ${missing}` : "Diplomacy: holding Zebra trade for plan reservations";
+      return false;
+    }
+    if (tradeWithRace(zebras)) {
+      diplomacyPlanText = "Diplomacy: traded with Zebras for titanium path";
+      pushLog(`🦓 ${diplomacyPlanText}`);
+      return true;
+    }
+    return false;
+  };
+
   const maybeBuildEmbassy = (resources, reserved) => {
     if (!writingResearched()) return false;
     const races = unlockedRaces()
@@ -3280,12 +3423,13 @@
       if (Date.now() - lastDiplomacyAction < 10000) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = reservedNeedsFor(target, resources);
-      if (maybeSendExplorers(resources, reserved) || maybeBuildEmbassy(resources, reserved)) {
+      if (maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeBuildEmbassy(resources, reserved)) {
         lastDiplomacyAction = Date.now();
         return;
       }
       const raceCount = unlockedRaces().length;
-      diplomacyPlanText = raceCount ? `Diplomacy: ${raceCount} trade partner${raceCount === 1 ? "" : "s"}; embassies watched` : "Diplomacy: saving catpower for explorers";
+      const prep = diplomacyPrepText && !/watching/.test(diplomacyPrepText) ? ` · ${diplomacyPrepText.replace(/^Diplomacy prep: /, "")}` : "";
+      diplomacyPlanText = raceCount ? `Diplomacy: ${raceCount} trade partner${raceCount === 1 ? "" : "s"}; embassies watched${prep}` : `Diplomacy: saving catpower for explorers${prep}`;
     } catch (error) {
       /* ignore diplomacy fallback failures */
     }
@@ -3714,6 +3858,7 @@
       refineSurplusCatnip();
       optimizeProcessing(resources, goal);
       craftTowardTarget(resources, goal);
+      craftDiplomacyPrerequisites(resources, goal);
       // Crafting can turn a plan affordable immediately.  Re-read resources and
       // rebuild the per-tick target cache before buying, otherwise the next tick
       // (and ongoing raw-resource drain) can steal the just-crafted window.
