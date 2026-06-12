@@ -121,6 +121,31 @@ Storage-blocked targets still redirect into storage: if **Theology** needs more 
 than your science cap, Libraries/Academies/Observatories get boosted until the cap can
 actually hold the price, and the ⚖/🧭 lines say so.
 
+## New content is handled automatically
+
+Nothing in the planner is a name list, so new game content never needs a code change:
+
+- **New unlocks break the lock.** Every tick the helper diffs the set of available
+  buildings, techs, workshop upgrades and religion items. When something new opens up
+  (Mint, Mansion, Observatory, a fresh tech branch…) it logs `🆕 unlocked: … — replanning`,
+  drops the current target lock so the newcomer competes immediately, and gives the new
+  item a short scoring boost so it gets a fair evaluation instead of waiting behind an
+  old plan.
+- **Live effects, not metadata placeholders.** Buildings whose real numbers only exist
+  in their `calculateEffects` (the Observatory's science bonus, the Mint's output) are
+  refreshed before scoring, so they are valued for what they actually do.
+- **Converters are discovered, not listed.** Any owned building that both consumes and
+  produces per-tick resources (smelter, calciner, mint, upgraded steamworks, and
+  whatever the game adds next) is found from its effects and paused/resumed around the
+  plan's reservations.
+- **Housing scales with need.** Huts/Log Houses/Mansions are worth little while beds are
+  free and surge when population growth is blocked, so housing is built exactly when it
+  matters.
+- **Exploration runs itself.** The explorer fee is read from the game's own trade tab,
+  explorers go out as soon as the fee fits the plan's reservations, and auto-hunting
+  holds enough catpower back that it can never starve "Send explorers" (a deadlock in
+  older versions). Embassies keep being built from each race's live prices.
+
 ## Recursive prerequisite planning
 
 The tech tree is walked in both directions every tick:
