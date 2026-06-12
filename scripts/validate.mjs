@@ -123,6 +123,10 @@ const required = [
   // auto-hunting (hunting holds the fee back while a race is discoverable).
   "explorerPrices",
   "hasLockedDiscoverableRace",
+  "zebraTitaniumStats",
+  "desiredZebraShipCount",
+  "zebraTitaniumOddsText",
+  "shipCraftWouldStealFromActivePlan",
   // Housing value scales with how full the village is (Mansion timing).
   "housingSaturation",
 ];
