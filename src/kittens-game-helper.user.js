@@ -3326,6 +3326,68 @@
   let diplomacyPlanText = "Diplomacy: watching trade";
   let lastDiplomacyAction = 0;
 
+  // Zebra titanium is special: ships improve both the chance and the payout.
+  // Kittens Game's live formula is 15% + 0.35 percentage points per ship
+  // (capped at certainty), and 1.5 titanium + 0.03 per ship when it hits.
+  // Use that expected value to decide when to build the fleet before burning
+  // slabs/gold/catpower on lots of low-odds trades.
+  const ZEBRA_TITANIUM_BASE_CHANCE = 0.15;
+  const ZEBRA_TITANIUM_CHANCE_PER_SHIP = 0.0035;
+  const ZEBRA_TITANIUM_BASE_AMOUNT = 1.5;
+  const ZEBRA_TITANIUM_AMOUNT_PER_SHIP = 0.03;
+  const ZEBRA_TITANIUM_GUARANTEE_SHIPS = Math.ceil((1 - ZEBRA_TITANIUM_BASE_CHANCE) / ZEBRA_TITANIUM_CHANCE_PER_SHIP);
+
+  const zebraTitaniumStats = (resources) => {
+    const ships = resourceValue(resources, "ship");
+    const chance = Math.min(1, ZEBRA_TITANIUM_BASE_CHANCE + ships * ZEBRA_TITANIUM_CHANCE_PER_SHIP);
+    const amount = ZEBRA_TITANIUM_BASE_AMOUNT + ships * ZEBRA_TITANIUM_AMOUNT_PER_SHIP;
+    return {
+      ships,
+      chance,
+      amount,
+      expected: chance * amount,
+      shipsToGuarantee: Math.max(0, ZEBRA_TITANIUM_GUARANTEE_SHIPS - Math.floor(ships)),
+    };
+  };
+
+  const titaniumDemandAmount = (resources, goalKey) => {
+    const have = resourceValue(resources, "titanium");
+    let demand = 0;
+    const inspect = (candidate) => {
+      if (!candidate || candidate.affordable) return;
+      for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+        if (cost && cost.name === "titanium" && cost.val > have) demand = Math.max(demand, cost.val - have);
+      }
+    };
+    inspect(getTargetCached(resources, goalKey));
+    for (const candidate of getCandidatesCached(resources, goalKey).slice(0, 12)) inspect(candidate);
+    return demand;
+  };
+
+  const desiredZebraShipCount = (resources, goalKey) => {
+    const demand = titaniumDemandAmount(resources, goalKey);
+    if (demand <= 0) return 0;
+    if (demand <= 10) return 25;
+    if (demand <= 50) return 50;
+    if (demand <= 150) return 100;
+    return ZEBRA_TITANIUM_GUARANTEE_SHIPS;
+  };
+
+  const zebraTitaniumOddsText = (resources, goalKey) => {
+    const stats = zebraTitaniumStats(resources);
+    const goalShips = desiredZebraShipCount(resources, goalKey);
+    const goalText = goalShips > Math.floor(stats.ships) ? `; build toward ${goalShips} ships before spam-trading` : "; trade now";
+    const guaranteeText = stats.shipsToGuarantee > 0 ? `; +${stats.shipsToGuarantee} ships to 100%` : "; 100% hit chance";
+    return `${fmt(stats.ships)} ships → ${(stats.chance * 100).toFixed(1)}% × ${fmt(stats.amount)} Ti = ${fmt(stats.expected)} Ti/trade avg${goalText}${guaranteeText}`;
+  };
+
+  const shipCraftWouldStealFromActivePlan = (resources, goalKey) => {
+    const target = getTargetCached(resources, goalKey);
+    if (!target || target.affordable || targetMissingResource(target, resources, "titanium")) return false;
+    const reserved = reservedNeedsFor(target, resources);
+    return ["scaffold", "plate", "starchart", "slab", "beam", "wood", "minerals", "iron", "coal"].some((name) => (reserved[name] || 0) > 0);
+  };
+
   const unlockedRaces = () => {
     try {
       const races = window.gamePage && window.gamePage.diplomacy && window.gamePage.diplomacy.races;
@@ -3450,15 +3512,24 @@
         return;
       }
       const zebras = raceByName("zebras");
-      if (zebras && zebras.unlocked) {
-        diplomacyPrepText = "Diplomacy prep: zebras unlocked for titanium";
-        return;
-      }
-      if (resourceValue(resources, "ship") < 1 && craftByName("ship")) {
+      const ships = resourceValue(resources, "ship");
+      const shipCraftBlocked = shipCraftWouldStealFromActivePlan(resources, goalKey);
+      if (shipCraftBlocked) {
+        const target = getTargetCached(resources, goalKey);
+        diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}; finishing ${labelOf(target.meta)} first`;
+      } else if (ships < 1 && craftByName("ship")) {
         diplomacyPrepText = "Diplomacy prep: crafting first ship to reveal Zebras";
         tryCraftResource("ship", 1);
-      } else if (resourceValue(resources, "ship") >= 1) {
+      } else if (ships >= 1 && zebras && !zebras.unlocked) {
         diplomacyPrepText = "Diplomacy prep: saving Catpower to send explorers for Zebras";
+      } else if (zebras && zebras.unlocked && craftByName("ship")) {
+        const targetShips = desiredZebraShipCount(resources, goalKey);
+        if (targetShips > Math.floor(ships)) {
+          diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}`;
+          tryCraftResource("ship", Math.floor(ships) + 1);
+        } else {
+          diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}`;
+        }
       }
     } catch (error) {
       /* ignore diplomacy prerequisite crafting failures */
@@ -3579,17 +3650,18 @@
     const zebras = raceByName("zebras");
     if (!zebras || !zebras.unlocked) return false;
     const prices = tradePricesForRace(zebras);
+    const odds = zebraTitaniumOddsText(resources, goalKey);
     if (!prices.length || !canPayPrices(prices) || !pricesRespectReservations(prices, reserved, resources)) {
       const missing = prices
         .filter((price) => price && price.name && resourceValue(resources, price.name) < price.val)
         .map((price) => `${fmt(price.val - resourceValue(resources, price.name))} ${resTitle(resources, price.name)}`)
         .slice(0, 3)
         .join(", ");
-      diplomacyPlanText = missing ? `Diplomacy: Zebra titanium trade needs ${missing}` : "Diplomacy: holding Zebra trade for plan reservations";
+      diplomacyPlanText = missing ? `Diplomacy: Zebra titanium trade needs ${missing} · ${odds}` : `Diplomacy: holding Zebra trade for plan reservations · ${odds}`;
       return false;
     }
     if (tradeWithRace(zebras)) {
-      diplomacyPlanText = "Diplomacy: traded with Zebras for titanium path";
+      diplomacyPlanText = `Diplomacy: traded with Zebras for titanium path · ${odds}`;
       pushLog(`🦓 ${diplomacyPlanText}`);
       return true;
     }
@@ -3625,7 +3697,8 @@
       }
       const raceCount = unlockedRaces().length;
       const prep = diplomacyPrepText && !/watching/.test(diplomacyPrepText) ? ` · ${diplomacyPrepText.replace(/^Diplomacy prep: /, "")}` : "";
-      diplomacyPlanText = raceCount ? `Diplomacy: ${raceCount} trade partner${raceCount === 1 ? "" : "s"}; embassies watched${prep}` : `Diplomacy: saving catpower for explorers${prep}`;
+      const zebraOdds = raceByName("zebras") && raceByName("zebras").unlocked && titaniumNeededSoon(resources, goalKey) ? ` · ${zebraTitaniumOddsText(resources, goalKey)}` : "";
+      diplomacyPlanText = raceCount ? `Diplomacy: ${raceCount} trade partner${raceCount === 1 ? "" : "s"}; embassies watched${prep || zebraOdds}` : `Diplomacy: saving catpower for explorers${prep}`;
     } catch (error) {
       /* ignore diplomacy fallback failures */
     }

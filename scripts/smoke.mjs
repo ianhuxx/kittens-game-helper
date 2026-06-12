@@ -729,6 +729,7 @@ check("titanium path: hidden Zebras discovered via explorers after first ship", 
 fakeNow += 25000;
 tickFn();
 check("titanium path: direct Zebra trade fallback obtains titanium for blocked upgrades", res("titanium").value > 0 && zebras.tradeTotal > 0);
+check("titanium path: Zebra odds and ship/trade balance are shown", /ships.*%.*Ti\/trade avg.*build toward/i.test(panelText(".kgh-diplomacy")));
 
 
 if (failures.length) {
