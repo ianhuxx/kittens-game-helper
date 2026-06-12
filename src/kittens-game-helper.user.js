@@ -3410,4 +3410,14 @@
     } catch (error) { /* ignore */ }
   };
 
+  // ================================ STARTUP ==================================
+  const startWhenReady = () => {
+    if (window.gamePage && window.kittenScientists) {
+      applyProfile(DEFAULT_PROFILE);
+    } else {
+      setTimeout(startWhenReady, 500);
+    }
+  };
+  startWhenReady();
+
 })();
