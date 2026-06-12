@@ -75,6 +75,8 @@ const resources = [
   R("faith", 10, 100),
   R("manpower", 200, 1000, "Catpower"),
   R("gold", 95, 100), // overflowing → promotions
+  R("ship", 0, 0, "Ship"),
+  R("titanium", 0, 100, "Titanium"),
   R("furs", 600, 0),
   R("ivory", 100, 0),
   R("spice", 0, 0, "Spice", { unlocked: false }),
@@ -94,6 +96,7 @@ const crafts = [
   { name: "wood", label: "Refine Catnip", unlocked: true, prices: [{ name: "catnip", val: 100 }] },
   { name: "beam", label: "Beam", unlocked: true, prices: [{ name: "wood", val: 175 }] },
   { name: "slab", label: "Slab", unlocked: true, prices: [{ name: "minerals", val: 250 }] },
+  { name: "ship", label: "Ship", unlocked: true, prices: [{ name: "scaffold", val: 1 }] },
   { name: "parchment", label: "Parchment", unlocked: true, prices: [{ name: "furs", val: 175 }] },
   { name: "manuscript", label: "Manuscript", unlocked: true, prices: [{ name: "culture", val: 400 }, { name: "parchment", val: 25 }] },
 ];
@@ -270,6 +273,9 @@ const diplomacy = {
   races: [
     { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [] },
   ],
+  get: (name) => diplomacy.races.find((race) => race.name === name),
+  getManpowerCost: () => 50,
+  getGoldCost: () => 15,
 };
 
 const gamePage = {
@@ -668,6 +674,54 @@ res("manpower").maxValue = 1200;
 tickFn();
 check("explorers: sent the moment the catpower fee fits (old 92%-cap gate removed)", diplomacy.races[1].unlocked === true && /🧭/.test(logText()));
 check("explorers: catpower fee actually paid", res("manpower").value < 1100);
+
+
+/* Titanium path — real game best practice is: craft a ship, explore to reveal hidden Zebras, then trade Zebras. */
+for (const upgrade of gamePage.workshop.upgrades) upgrade.researched = true;
+const titaniumSaw = {
+  name: "titaniumSaw",
+  label: "Titanium Saw",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "titanium", val: 10 }],
+  effects: { woodRatio: 5 },
+};
+gamePage.workshop.upgrades.push(titaniumSaw);
+const zebras = { name: "zebras", title: "Zebras", hidden: true, unlocked: false, embassyLevel: 0, tradeTotal: 0, embassyPrices: [{ name: "culture", val: 25000 }], buys: [{ name: "slab", val: 50 }], sells: [] };
+diplomacy.races.push(zebras);
+diplomacy.unlockRandomRace = () => {
+  if (!zebras.unlocked && res("ship").value >= 1) {
+    zebras.unlocked = true;
+    return zebras;
+  }
+  const race = diplomacy.races.find((r) => !r.unlocked && !r.hidden);
+  if (race) race.unlocked = true;
+  return race || null;
+};
+diplomacy.tradeMultiple = (race, amt) => {
+  if (race.name !== "zebras") return;
+  if (res("gold").value < 15 * amt || res("manpower").value < 50 * amt || res("slab").value < 50 * amt) return;
+  res("gold").value -= 15 * amt;
+  res("manpower").value -= 50 * amt;
+  res("slab").value -= 50 * amt;
+  res("titanium").value += 12 * amt;
+  race.tradeTotal = (race.tradeTotal || 0) + amt;
+};
+res("ship").value = 0;
+res("scaffold").value = 1;
+res("titanium").value = 0;
+res("manpower").value = 1100;
+res("manpower").maxValue = 1200;
+res("gold").value = 100;
+res("slab").value = 100;
+fakeNow += 25000;
+tickFn();
+check("titanium path: first ship crafted when titanium is blocking progression", res("ship").value >= 1);
+check("titanium path: hidden Zebras discovered via explorers after first ship", zebras.unlocked === true && /Zebras|civilization/.test(logText()));
+fakeNow += 25000;
+tickFn();
+check("titanium path: direct Zebra trade fallback obtains titanium for blocked upgrades", res("titanium").value > 0 && zebras.tradeTotal > 0);
+
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
