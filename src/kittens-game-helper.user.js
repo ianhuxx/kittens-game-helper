@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.0.0
+// @version      1.1.0
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -875,6 +875,30 @@
       if (!catnip || !catnip.maxValue || !craftByName("wood")) return;
       const catnipRatio = catnip.value / catnip.maxValue;
       if (catnipRatio < 0.86) return;
+      // Don't feed the catnip→wood→beam chain when wood is already abundant.
+      // If wood storage is near cap AND the active plan doesn't need raw wood
+      // (e.g. Observatory is waiting on iron, not wood), skip refining so
+      // catnip stays available for food/housing instead of getting beamed.
+      const wood = res.get("wood");
+      if (wood && wood.maxValue && wood.value / wood.maxValue > 0.88) {
+        const goalKey = getGoal();
+        const target = getTargetCached(res, goalKey);
+        // Check if the active target still needs raw wood directly
+        let needsWood = false;
+        if (target && !target.affordable) {
+          for (const cost of pricesFor(target.kind, target.meta)) {
+            if (cost && cost.name && cost.val > 0) {
+              if (cost.name === "wood") { needsWood = true; break; }
+              // If a craftable cost needs wood in its raw chain, count it
+              if (craftByName(cost.name)) {
+                const raw = rawPathRequirements(cost.name, Math.max(1, cost.val));
+                if (raw.wood > 0) { needsWood = true; break; }
+              }
+            }
+          }
+        }
+        if (!needsWood) return;
+      }
       const spendable = catnip.value - craftFloorFor(res, "catnip");
       if (spendable <= 0) return;
       const price = craftPricesFor(craftByName("wood")).find((p) => p && p.name === "catnip" && p.val > 0);
@@ -2634,6 +2658,13 @@
     for (const name of ["wood", "minerals", "catnip", "coal"]) {
       if (resRatio(resources, name) > 0.96) needs[name] = Math.min(needs[name] || 0, 0.25);
     }
+    // Iron/titanium/uranium need lives inside "minerals" but the mineral cap
+    // zeroing above should NOT starve them. Restore sub-resource needs so
+    // miners keep running when the plan demands iron (e.g. Observatory).
+    for (const sub of ["iron", "titanium", "uranium"]) {
+      const sval = needs[sub];
+      if (sval > 0 && (needs.minerals || 0) < 0.5) needs.minerals = Math.max(needs.minerals || 0, sval * 0.7);
+    }
 
     if (!Object.values(needs).some((v) => v > 0)) {
       scoreNeed(needs, "wood", resRatio(resources, "wood") < 0.95 ? 2 : 0);
@@ -2688,8 +2719,11 @@
       if (job.name === "farmer" && needs.wood > 0 && bestWoodJob() && bestWoodJob().name === "farmer") {
         weight = Math.max(weight, needs.wood + 1);
       }
+      // Woodcutters still matter even when farmers refine catnip more efficiently:
+      // farmers can hit job caps, and refineSurplusCatnip only fires at 86%+ catnip.
+      // The +1 farmer bonus already gives farmers preference; this is a backstop.
       if (job.name === "woodcutter" && bestWoodJob() && bestWoodJob().name === "farmer") {
-        weight = Math.min(weight, 0.25);
+        weight = Math.max(weight, 0.8);
       }
       // Universal anti-waste rule: stop staffing a job whose output bank is
       // essentially full — unless the economy still wants it (hunting keeps
