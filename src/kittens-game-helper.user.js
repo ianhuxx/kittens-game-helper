@@ -656,7 +656,7 @@
       if (!settings) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = target && !target.affordable ? reservedResourceNames(target, resources) : [];
-      const explorerSave = shouldSaveForExplorers(resources);
+      const explorerSave = shouldSaveForExplorers(resources, goalKey);
       const shouldPause = reserved.length > 0 || explorerSave;
       setExternalSpendersEnabled(settings, !shouldPause);
       if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
@@ -2785,7 +2785,7 @@
       // waiting and the cap can fit the explorer fee, hold hunting back far
       // enough that it can never permanently starve "Send explorers"
       // (diplomacy runs earlier in the tick, so explorers get first claim).
-      const exploreCost = hasLockedDiscoverableRace() ? explorerPrices()[0].val : 0;
+      const exploreCost = (hasLockedDiscoverableRace() || titaniumDiscoveryPending(resources, getGoal())) ? explorerPrices()[0].val : 0;
       if (exploreCost > 0 && cp.maxValue > exploreCost * 1.15) {
         threshold = Math.max(threshold, Math.min(cp.maxValue * 0.95, exploreCost + huntCost));
       }
@@ -2896,6 +2896,27 @@
   };
 
 
+  const titaniumRouteHint = (resources, goalKey) => {
+    const target = getTargetCached(resources, goalKey);
+    if (!targetNeedsResource(target, "titanium") || !targetMissingResource(target, resources, "titanium")) return "";
+    const zebras = raceByName("zebras");
+    if (zebras && zebras.unlocked) {
+      const missing = tradePricesForRace(zebras)
+        .filter((price) => price && price.name && resourceValue(resources, price.name) < price.val)
+        .map((price) => `${fmt(price.val - resourceValue(resources, price.name))} ${resTitle(resources, price.name)}`)
+        .slice(0, 2)
+        .join(", ");
+      return missing ? `Zebra trade needs ${missing}` : "trade Zebras for titanium";
+    }
+    if (resourceValue(resources, "ship") < 1) return "craft first Ship to reveal Zebras";
+    const exploreMissing = explorerPrices()
+      .filter((price) => price && price.name && resourceValue(resources, price.name) < price.val)
+      .map((price) => `${fmt(price.val - resourceValue(resources, price.name))} ${resTitle(resources, price.name)}`)
+      .slice(0, 2)
+      .join(", ");
+    return exploreMissing ? `save ${exploreMissing} for explorers, then trade Zebras` : "send explorers to meet Zebras, then trade titanium";
+  };
+
   const formatRequirements = (kind, meta, resources) => {
     const parts = [];
     for (const cost of pricesFor(kind, meta)) {
@@ -2947,7 +2968,8 @@
         ? ` · reserving ${reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+")}`
         : "";
       const sprintTag = target._sprint ? " 🚀SPRINT" : "";
-      return `🎯 FOCUS: ${focusLabel(target)} — ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${sprintTag}${reqs ? ` (${reqs})` : ""}`;
+      const titaniumHint = titaniumRouteHint(resources, goalKey);
+      return `🎯 FOCUS: ${focusLabel(target)} — ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${sprintTag}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
       return "🎯 FOCUS: —";
     }
@@ -2957,6 +2979,8 @@
     const target = getTargetCached(resources, goalKey);
     if (!target) return "scanning…";
     if (target.affordable) return `buying ${focusLabel(target).toLowerCase()} ${labelOf(target.meta)}`;
+    const titaniumHint = titaniumRouteHint(resources, goalKey);
+    if (titaniumHint) return `titanium path: ${titaniumHint}`;
     const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
     if (craftable) return `craft ${craftLabel(craftable.name)} for ${labelOf(target.meta)}`;
     return `gather ${target.missing || "prerequisites"} (reserved)`;
@@ -3357,8 +3381,17 @@
     return !res || !res.maxValue || res.maxValue >= price.val;
   });
 
-  const shouldSaveForExplorers = (resources) => {
-    if (getProfileName() !== "autopilot" || !hasDiscoverableRaceNow(resources) || !explorerFeeCanFit(resources)) return false;
+  const titaniumDiscoveryPending = (resources, goalKey) => {
+    if (getProfileName() !== "autopilot" || !explorerFeeCanFit(resources)) return false;
+    const zebras = raceByName("zebras");
+    if (zebras && zebras.unlocked) return false;
+    if (!titaniumNeededSoon(resources, goalKey)) return false;
+    return resourceValue(resources, "ship") >= 1 || !!craftByName("ship");
+  };
+
+  const shouldSaveForExplorers = (resources, goalKey) => {
+    if (getProfileName() !== "autopilot" || !explorerFeeCanFit(resources)) return false;
+    if (!hasDiscoverableRaceNow(resources) && !titaniumDiscoveryPending(resources, goalKey)) return false;
     return explorerPrices().some((price) => resourceValue(resources, price.name) < price.val);
   };
 
@@ -3536,7 +3569,11 @@
     const targetNeedsTitanium = titaniumNeededSoon(resources, goalKey);
     if (!targetNeedsTitanium) return false;
     if (titanium && titanium.maxValue > 0 && titanium.value >= titanium.maxValue * 0.995) {
-      diplomacyPlanText = "Diplomacy: titanium capped; waiting for storage before more Zebra trades";
+      const target = getTargetCached(resources, goalKey);
+      const stillMissingTitanium = targetMissingResource(target, resources, "titanium");
+      diplomacyPlanText = stillMissingTitanium
+        ? "Diplomacy: titanium capped below the plan cost — build storage before more Zebra trades"
+        : "Diplomacy: titanium is full; saving the other plan costs before spending it";
       return false;
     }
     const zebras = raceByName("zebras");
