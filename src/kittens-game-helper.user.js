@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.2
+// @version      1.1.3
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,195 +31,30 @@
   const STORAGE_KEY = "kgh.profile";
   const LOG_KEY = "kgh.log";
   const DEFAULT_PROFILE = "autopilot";
-  
-  // =========================== SPEEDRUN STATE KEYS ============================
-  const STATE_PREFIX = "kgh.state.";
-  const STATE_RUN_START = STATE_PREFIX + "runStart";
-  const STATE_PEAK_KITTENS = STATE_PREFIX + "peakKittens";
-  const STATE_PEAK_PARAGON = STATE_PREFIX + "peakParagon";
-  const STATE_PEAK_KARMA = STATE_PREFIX + "peakKarma";
-  const STATE_TOTAL_RESETS = STATE_PREFIX + "totalResets";
-  const STATE_PARAGON_HISTORY = STATE_PREFIX + "paragonHistory";
-  const STATE_LAST_PARAGON_GAIN = STATE_PREFIX + "lastParagonGain";
-  const STATE_LAST_PARAGON_TIME = STATE_PREFIX + "lastParagonTime";
 
-  // ========================== SPEEDRUN CONSTANTS ==============================
-  const TARGET_LOCK_MIN_EARLY = 30000;
-  const TARGET_LOCK_MIN_MID = 60000;
-  const TARGET_LOCK_MIN_LATE = 120000;
-  const TARGET_LOCK_MAX_MS = 360000;
+  // Speedrun helpers are advisory and scoring nudges only: the helper still
+  // never clicks reset/transcend/sacrifice/time-skip actions.
+  const SPEEDRUN_STATE_PREFIX = "kgh.speedrun.";
+  const SPEEDRUN_RUN_START_KEY = SPEEDRUN_STATE_PREFIX + "runStart";
+  const SPEEDRUN_PEAK_KITTENS_KEY = SPEEDRUN_STATE_PREFIX + "peakKittens";
+  const SPEEDRUN_LAST_RESET_COUNT_KEY = SPEEDRUN_STATE_PREFIX + "lastResetCount";
+  const SPEEDRUN_PARAGON_HISTORY_KEY = SPEEDRUN_STATE_PREFIX + "paragonHistory";
+  const TARGET_LOCK_MIN_EARLY_MS = 30000;
+  const TARGET_LOCK_MIN_MID_MS = 60000;
+  const TARGET_LOCK_MIN_LATE_MS = 120000;
   const EARLY_GAME_KITTENS = 30;
   const EARLY_GAME_RESEARCH_COUNT = 8;
   const SPRINT_PROGRESS_THRESHOLD = 0.75;
-  const RESET_PARAGON_PER_DAY_MIN = 8;
-  const FAITH_INVEST_WORSHIP_MULTIPLIER = 1.08;
-
+  const RESET_ADVISOR_MIN_PARAGON_PER_DAY = 8;
   const METAPHYSICS_ORDER = [
-    { name: "engineering", cost: 5, label: "Engineering — price ratio -10%" },
-    { name: "goldenRatio", cost: 15, label: "Golden Ratio — price ratio → 1.618/1" },
-    { name: "divineProportion", cost: 50, label: "Divine Proportion — further price drop" },
-    { name: "vitruvianFeline", cost: 100, label: "Vitruvian Feline — near-linear prices" },
-    { name: "renaissance", cost: 750, label: "Renaissance — price ratio → 1.15/1" },
-    { name: "chronomancy", cost: 30, label: "Chronomancy — time crystal basics (5+25)" },
-    { name: "anachronomancy", cost: 375, label: "Anachronomancy — chronospheres (125+250)" },
+    { name: "engineering", cost: 5, label: "Engineering" },
+    { name: "goldenRatio", cost: 15, label: "Golden Ratio" },
+    { name: "divineProportion", cost: 50, label: "Divine Proportion" },
+    { name: "vitruvianFeline", cost: 100, label: "Vitruvian Feline" },
+    { name: "renaissance", cost: 750, label: "Renaissance" },
+    { name: "chronomancy", cost: 30, label: "Chronomancy chain" },
+    { name: "anachronomancy", cost: 375, label: "Anachronomancy chain" },
   ];
-
-  // ======================== CROSS-RUN STATE ==================================
-  const stateGet = (key, fallback) => {
-    try { const val = localStorage.getItem(key); return val != null ? JSON.parse(val) : fallback; }
-    catch (e) { return fallback; }
-  };
-  const stateSet = (key, value) => {
-    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
-  };
-
-  const speedrunState = {
-    runStart: stateGet(STATE_RUN_START, 0),
-    peakKittens: stateGet(STATE_PEAK_KITTENS, 0),
-    peakParagon: stateGet(STATE_PEAK_PARAGON, 0),
-    peakKarma: stateGet(STATE_PEAK_KARMA, 0),
-    totalResets: stateGet(STATE_TOTAL_RESETS, 0),
-    paragonHistory: stateGet(STATE_PARAGON_HISTORY, []),
-    lastParagonGain: stateGet(STATE_LAST_PARAGON_GAIN, 0),
-    lastParagonTime: stateGet(STATE_LAST_PARAGON_TIME, 0),
-  };
-
-  const saveSpeedrunState = () => {
-    stateSet(STATE_RUN_START, speedrunState.runStart);
-    stateSet(STATE_PEAK_KITTENS, speedrunState.peakKittens);
-    stateSet(STATE_PEAK_PARAGON, speedrunState.peakParagon);
-    stateSet(STATE_PEAK_KARMA, speedrunState.peakKarma);
-    stateSet(STATE_TOTAL_RESETS, speedrunState.totalResets);
-    stateSet(STATE_PARAGON_HISTORY, speedrunState.paragonHistory.slice(-20));
-    stateSet(STATE_LAST_PARAGON_GAIN, speedrunState.lastParagonGain);
-    stateSet(STATE_LAST_PARAGON_TIME, speedrunState.lastParagonTime);
-  };
-
-  const detectRunRestart = () => {
-    try {
-      const kittens = totalKittenCount();
-      const paragon = window.gamePage.paragonPoints || 0;
-      const karma = typeof window.gamePage.getEffect === "function"
-        ? window.gamePage.getEffect("karma") || 0 : 0;
-      const totalResets = window.gamePage.totalResets || 0;
-      if (totalResets > speedrunState.totalResets) {
-        const now = Date.now();
-        const lastGain = paragon - speedrunState.peakParagon;
-        if (lastGain > 0) {
-          speedrunState.paragonHistory.push({ time: now, gain: lastGain, kittens: speedrunState.peakKittens });
-          speedrunState.paragonHistory = speedrunState.paragonHistory.slice(-20);
-          speedrunState.lastParagonGain = lastGain;
-          speedrunState.lastParagonTime = now;
-        }
-        speedrunState.totalResets = totalResets;
-        speedrunState.runStart = now;
-        speedrunState.peakKittens = kittens;
-        speedrunState.peakParagon = paragon;
-        speedrunState.peakKarma = karma;
-        speedrunState.lastParagonGain = lastGain;
-        speedrunState.lastParagonTime = now;
-        saveSpeedrunState();
-        pushLog("\u{1F504} new run detected \u2014 welcome back");
-      }
-      if (speedrunState.runStart === 0) speedrunState.runStart = Date.now();
-      if (kittens > speedrunState.peakKittens) speedrunState.peakKittens = kittens;
-      if (paragon > speedrunState.peakParagon) speedrunState.peakParagon = paragon;
-      if (karma > speedrunState.peakKarma) speedrunState.peakKarma = karma;
-    } catch (e) { /* ignore */ }
-  };
-
-  // =========================== PARAGON / KARMA AWARENESS =====================
-  const getParagonProductionMultiplier = () => {
-    try {
-      const paragon = window.gamePage.paragonPoints || 0;
-      const burned = window.gamePage.burnedParagon || 0;
-      const burnedCap = (window.gamePage.calendar && window.gamePage.calendar.year > 40000) ? 400 : 100;
-      const burnedDim = (window.gamePage.calendar && window.gamePage.calendar.year > 40000) ? 300 : 75;
-      const pMult = Math.min(paragon * 0.01, 2.0);
-      const bMult = Math.min(burned, burnedCap) * 0.01;
-      const bDim = burned > burnedDim ? burnedDim * 0.01 + (burned - burnedDim) * 0.0005 : bMult;
-      return 1 + pMult + bDim;
-    } catch (e) { return 1; }
-  };
-
-  const getKarmaHappinessBonus = () => {
-    try { return (speedrunState.peakKarma || 0) / 100; } catch (e) { return 0; }
-  };
-
-  const isEarlyGame = () => {
-    const kittens = totalKittenCount();
-    const researchCount = researchDoneCount();
-    return kittens < EARLY_GAME_KITTENS && researchCount < EARLY_GAME_RESEARCH_COUNT;
-  };
-
-  const isMidGame = () => totalKittenCount() < 120;
-
-  // =========================== RESET ADVISOR =================================
-  let resetAdvisorText = "Reset advisor: tracking\u2026";
-
-  const totalKittenCount = () => {
-    try { return window.gamePage.village.sim.kittens.length; } catch (e) { return 0; }
-  };
-
-  const researchDoneCount = () => {
-    try { return (window.gamePage.science.techs || []).filter(t => t && t.researched).length; } catch (e) { return 0; }
-  };
-
-  const currentParagon = () => {
-    try { return window.gamePage.paragonPoints || 0; } catch (e) { return 0; }
-  };
-
-  const computeResetAdvisor = () => {
-    try {
-      detectRunRestart();
-      const now = Date.now();
-      const runDays = Math.max(0.001, (now - speedrunState.runStart) / 86400000);
-      const kittens = totalKittenCount();
-      const expectedParagon = Math.max(0, kittens - 70);
-      const paragonPerDay = expectedParagon / runDays;
-      let trend = "";
-      const hist = speedrunState.paragonHistory;
-      if (hist.length >= 2) {
-        const recent = hist.slice(-3);
-        const avgGain = recent.reduce((s, h) => s + h.gain, 0) / recent.length;
-        if (avgGain > 0) {
-          let totalDays = 0;
-          for (let i = 0; i < recent.length; i++) {
-            const h = recent[i];
-            const idx = hist.indexOf(h);
-            const prev = idx > 0 ? hist[idx - 1] : null;
-            totalDays += prev ? (h.time - prev.time) / 86400000 : runDays;
-          }
-          const histRate = totalDays > 0 ? avgGain / Math.max(1, totalDays) : 0;
-          trend = histRate > 0 ? " \u00b7 avg " + fmt(histRate) + "/day over last " + recent.length + " resets" : "";
-        }
-      }
-      let recommendation = "";
-      if (kittens < 35) {
-        recommendation = "growing (need 35+ kittens for karma, 70+ for paragon)";
-      } else if (kittens < 70) {
-        const karmaGain = kittens - 35;
-        recommendation = "push to 70+ kittens for paragon \u00b7 " + fmt(karmaGain) + " karma if reset now";
-      } else if (paragonPerDay < RESET_PARAGON_PER_DAY_MIN) {
-        recommendation = "DIMINISHING \u2014 consider reset now";
-      } else {
-        recommendation = "healthy growth \u00b7 push further";
-      }
-      const nextMeta = METAPHYSICS_ORDER.find(m => {
-        try {
-          const sci = window.gamePage.science;
-          return !(sci && sci.get && sci.get(m.name) && sci.get(m.name).researched);
-        } catch (e) { return true; }
-      });
-      const metaLine = nextMeta && currentParagon() >= nextMeta.cost
-        ? " \u00b7 next meta: " + nextMeta.label + " (" + nextMeta.cost + "P, you have " + fmt(currentParagon()) + ")"
-        : "";
-      resetAdvisorText = "\u267B Reset: " + totalKittenCount() + " kittens \u00b7 " + fmt(expectedParagon)
-        + " paragon now \u00b7 " + fmt(paragonPerDay) + "/day" + trend
-        + " \u00b7 " + recommendation + metaLine;
-      if (Math.random() < 0.1) saveSpeedrunState();
-    } catch (e) { resetAdvisorText = "Reset advisor: \u2014"; }
-  };
 
   const KS_FALLBACK_LOADER = "https://kitten-science.com/stable.js";
 
@@ -274,14 +109,15 @@
   const GOAL_KEY = "kgh.goal";
   const PRIORITY_KEY = "kgh.priority";
   const DEFAULT_GOAL = "balanced";
-  const DEFAULT_PRIORITY = "auto";const GOALS = {
+  const DEFAULT_PRIORITY = "auto";
+  const GOALS = {
     balanced: {
       label: "Balanced — steady all-round growth",
       target: null,
       emphasis: {},
     },
     speedrun: {
-      label: "Speedrun — rapid expansion for fastest reset",
+      label: "Speedrun — reset-aware expansion",
       target: null,
       emphasis: { housing: 2.5, production: 1.5, science: 1.4, storage: 1.2 },
     },
@@ -540,6 +376,90 @@
     return `${Math.round(value * 100) / 100}`;
   };
 
+  const readJson = (key, fallback) => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw == null ? fallback : JSON.parse(raw);
+    } catch (error) {
+      return fallback;
+    }
+  };
+
+  const writeJson = (key, value) => {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (error) { /* ignore */ }
+  };
+
+  const totalKittenCount = () => {
+    try { return (window.gamePage.village.sim.kittens || []).length; } catch (error) { return 0; }
+  };
+
+  const researchedTechCount = () => {
+    try { return (window.gamePage.science.techs || []).filter((tech) => tech && tech.researched).length; } catch (error) { return 0; }
+  };
+
+  const isEarlyGame = () => totalKittenCount() < EARLY_GAME_KITTENS && researchedTechCount() < EARLY_GAME_RESEARCH_COUNT;
+  const isMidGame = () => totalKittenCount() < 120;
+  const speedrunMode = () => getGoal() === "speedrun" || getPriority() === "speedrun";
+
+  const metaphysicsResearched = (name) => {
+    try {
+      const meta = window.gamePage.science.get(name);
+      return !!(meta && meta.researched);
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const currentParagon = () => {
+    try { return window.gamePage.paragonPoints || 0; } catch (error) { return 0; }
+  };
+
+  let resetAdvisorText = "♻ Reset advisor: tracking this run…";
+
+  const computeResetAdvisor = () => {
+    try {
+      const now = Date.now();
+      const resetCount = window.gamePage.totalResets || 0;
+      const kittens = totalKittenCount();
+      const paragon = currentParagon();
+      let runStart = readJson(SPEEDRUN_RUN_START_KEY, now);
+      let peakKittens = readJson(SPEEDRUN_PEAK_KITTENS_KEY, kittens);
+      let lastResetCount = readJson(SPEEDRUN_LAST_RESET_COUNT_KEY, resetCount);
+      const history = readJson(SPEEDRUN_PARAGON_HISTORY_KEY, []);
+
+      if (resetCount !== lastResetCount || kittens < Math.max(5, peakKittens * 0.35)) {
+        if (peakKittens >= 35) history.push({ time: now, kittens: peakKittens, paragon });
+        runStart = now;
+        peakKittens = kittens;
+        lastResetCount = resetCount;
+        writeJson(SPEEDRUN_PARAGON_HISTORY_KEY, history.slice(-10));
+        writeJson(SPEEDRUN_LAST_RESET_COUNT_KEY, lastResetCount);
+        pushLog("🔄 new run detected — reset advisor restarted tracking");
+      }
+
+      peakKittens = Math.max(peakKittens, kittens);
+      writeJson(SPEEDRUN_RUN_START_KEY, runStart);
+      writeJson(SPEEDRUN_PEAK_KITTENS_KEY, peakKittens);
+
+      const runDays = Math.max(0.01, (now - runStart) / 86400000);
+      const expectedParagon = Math.max(0, kittens - 70);
+      const expectedKarma = Math.max(0, kittens - 35);
+      const paragonPerDay = expectedParagon / runDays;
+      const nextMeta = METAPHYSICS_ORDER.find((item) => !metaphysicsResearched(item.name));
+      const metaText = nextMeta
+        ? ` · next meta: ${nextMeta.label} (${nextMeta.cost}P${paragon >= nextMeta.cost ? ", affordable" : ""})`
+        : " · core metaphysics plan complete";
+      const advice = kittens < 70
+        ? `push to 70+ kittens (${fmt(expectedKarma)} karma if reset now)`
+        : paragonPerDay < RESET_ADVISOR_MIN_PARAGON_PER_DAY
+          ? "slow paragon/day — consider a manual reset after checking your save"
+          : "healthy paragon/day — keep pushing";
+      resetAdvisorText = `♻ Reset: ${kittens} kittens · ${fmt(expectedParagon)}P now · ${fmt(paragonPerDay)}P/day · ${advice}${metaText}`;
+    } catch (error) {
+      resetAdvisorText = "♻ Reset advisor: unavailable";
+    }
+  };
+
   const resourceMap = () => {
     if (tickCache.resources) return tickCache.resources;
     const map = new Map();
@@ -761,38 +681,13 @@
 
   let religionPlanText = "Religion: watching faith";
 
-  const solarRevolutionLevel = () => {
-    try { return window.gamePage.religion && window.gamePage.religion.solarRevolution ? window.gamePage.religion.solarRevolution : 0; }
-    catch (e) { return 0; }
-  };
-
-  const faithWorshipForNextLevel = () => {
-    try {
-      const religion = window.gamePage && window.gamePage.religion;
-      if (!religion) return Infinity;
-      const current = religion.faith || 0;
-      const sr = solarRevolutionLevel();
-      const base = 500;
-      const cost = base * Math.pow(1.1, sr);
-      return Math.max(0, cost - current);
-    } catch (e) { return Infinity; }
-  };
-
   const reserveFaithForReligionProgression = (resources) => {
     try {
       const settings = window.kittenScientists && window.kittenScientists.getSettings && window.kittenScientists.getSettings();
       if (!settings || !settings.religion) return;
       configureReligionProgression(settings);
-      const faith = getRes(resources, "faith");
-      const faithVal = (faith && faith.value) || 0;
-      const faithMax = (faith && faith.maxValue) || 0;
       const next = nextFaithReligionUpgrade(resources);
-      const worshipNeeded = faithWorshipForNextLevel();
-      const faithForNextSR = Math.max(0, worshipNeeded - faithVal);
-      if (faithForNextSR > 0 && faithForNextSR < faithMax * 0.3 && faithVal > faithMax * 0.4) {
-        setReligionPraiseState(settings, false);
-        religionPlanText = `☀ Saving faith for Solar Revolution +1 (need ${fmt(faithForNextSR)} more)`;
-      } else if (next) {
+      if (next) {
         setReligionPraiseState(settings, false);
         religionPlanText = next.affordable
           ? `Religion: ${labelOf(next.meta)} ready; holding praise until it is bought`
@@ -868,25 +763,17 @@
       if (!catnip || !catnip.maxValue || !craftByName("wood")) return;
       const catnipRatio = catnip.value / catnip.maxValue;
       if (catnipRatio < 0.86) return;
-      // Don't feed the catnip→wood→beam chain when wood is already abundant.
-      // If wood storage is near cap AND the active plan doesn't need raw wood
-      // (e.g. Observatory is waiting on iron, not wood), skip refining so
-      // catnip stays available for food/housing instead of getting beamed.
       const wood = res.get("wood");
       if (wood && wood.maxValue && wood.value / wood.maxValue > 0.88) {
-        const goalKey = getGoal();
-        const target = getTargetCached(res, goalKey);
-        // Check if the active target still needs raw wood directly
+        const target = getTargetCached(res, getGoal());
         let needsWood = false;
         if (target && !target.affordable) {
           for (const cost of pricesFor(target.kind, target.meta)) {
-            if (cost && cost.name && cost.val > 0) {
-              if (cost.name === "wood") { needsWood = true; break; }
-              // If a craftable cost needs wood in its raw chain, count it
-              if (craftByName(cost.name)) {
-                const raw = rawPathRequirements(cost.name, Math.max(1, cost.val));
-                if (raw.wood > 0) { needsWood = true; break; }
-              }
+            if (!cost || !cost.name || cost.val <= 0) continue;
+            if (cost.name === "wood") { needsWood = true; break; }
+            if (craftByName(cost.name) && (rawPathRequirements(cost.name, Math.max(1, cost.val)).wood || 0) > 0) {
+              needsWood = true;
+              break;
             }
           }
         }
@@ -1415,13 +1302,6 @@
   // relief, unlocks and goal alignment, all read from parsed game metadata —
   // minus its COST (time to afford, storage blocks). Tune weights here instead
   // of hunting per-item special cases through the code.
-  const PARAGON_MULTIPLIER = () => {
-    try {
-      if (tickCache._paragonMult == null) tickCache._paragonMult = getParagonProductionMultiplier();
-      return tickCache._paragonMult;
-    } catch (e) { return 1; }
-  };
-
   const TUNING = {
     kindPrior: { research: 12, upgrade: 12, religion: 11, build: 4, policy: 6 },
     affordBonus: 6, // fully affordable right now
@@ -1438,6 +1318,8 @@
     spendBonus: 10, // consumes an almost-full spendable bank (science…)
     manualPriorityBoost: 22, // optional player override, still inside scoring
     noveltyBoost: 9, // freshly unlocked content gets a short evaluation window
+    earlyGameBonus: 4, // cold-start: favor first unlocks before economy data is rich
+    earlyGameUnlockMult: 2.2,
     storageReliefCap: 30, // max boost from relieving live storage pressure
     housingValue: 6,
     happinessScale: 8,
@@ -2398,9 +2280,10 @@
       spendBonusFor(kind, meta, resources) +
       manualPriorityBoostFor(kind, meta) +
       noveltyBoostFor(candidate);
-    if (isEarlyGame()) {
-      const unlockMult = meta.unlocks && meta.unlocks.length > 0 ? TUNING.earlyGameUnlockMult : 1;
-      score += TUNING.earlyGameBonus * unlockMult;
+    if (speedrunMode() && isEarlyGame()) {
+      const firstInstance = kind === "build" && (!meta.val || meta.val <= 0);
+      const unlocksContent = (meta.unlocks && meta.unlocks.length) || (profile.unlocks && profile.unlocks.length);
+      score += TUNING.earlyGameBonus * (firstInstance ? 1.4 : 1) * (unlocksContent ? TUNING.earlyGameUnlockMult : 1);
     }
     if (kind === "research") {
       score += Math.min(TUNING.gatewayCap, gatewayValue(meta) * TUNING.gatewayScale);
@@ -2465,6 +2348,12 @@
     return pricesFor(candidate.kind, candidate.meta).some((cost) => cost && names.includes(cost.name));
   };
 
+  const TARGET_LOCK_MAX_MS = 360000;
+  const getTargetLockMinMs = () => {
+    if (isEarlyGame()) return TARGET_LOCK_MIN_EARLY_MS;
+    if (isMidGame()) return TARGET_LOCK_MIN_MID_MS;
+    return TARGET_LOCK_MIN_LATE_MS;
+  };
   const TARGET_READY_GRACE_MS = 20000;
   let activeTarget = null;
 
@@ -2531,12 +2420,6 @@
     }
   };
 
-  const getTargetLockMs = () => {
-    if (isEarlyGame()) return TARGET_LOCK_MIN_EARLY;
-    if (isMidGame()) return TARGET_LOCK_MIN_MID;
-    return TARGET_LOCK_MIN_LATE;
-  };
-
   const chooseWorkTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
     const preferred = candidates[0] || null;
@@ -2553,7 +2436,7 @@
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
-      const muchBetter = preferred && locked && age >= getTargetLockMs() && preferred.score > locked.score * 1.3 + 8;
+      const muchBetter = preferred && locked && age >= getTargetLockMinMs() && preferred.score > locked.score * 1.3 + 8;
       if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked) {
         activeTarget = null;
       } else if (!muchBetter) {
@@ -2649,12 +2532,9 @@
     for (const name of ["wood", "minerals", "catnip", "coal"]) {
       if (resRatio(resources, name) > 0.96) needs[name] = Math.min(needs[name] || 0, 0.25);
     }
-    // Iron/titanium/uranium need lives inside "minerals" but the mineral cap
-    // zeroing above should NOT starve them. Restore sub-resource needs so
-    // miners keep running when the plan demands iron (e.g. Observatory).
-    for (const sub of ["iron", "titanium", "uranium"]) {
-      const sval = needs[sub];
-      if (sval > 0 && (needs.minerals || 0) < 0.5) needs.minerals = Math.max(needs.minerals || 0, sval * 0.7);
+    const mineralSubNeed = (needs.iron || 0) + (needs.titanium || 0) + (needs.uranium || 0);
+    if (mineralSubNeed > 0) {
+      needs.minerals = Math.max(needs.minerals || 0, mineralSubNeed * 0.7);
     }
 
     if (!Object.values(needs).some((v) => v > 0)) {
@@ -2710,11 +2590,8 @@
       if (job.name === "farmer" && needs.wood > 0 && bestWoodJob() && bestWoodJob().name === "farmer") {
         weight = Math.max(weight, needs.wood + 1);
       }
-      // Woodcutters still matter even when farmers refine catnip more efficiently:
-      // farmers can hit job caps, and refineSurplusCatnip only fires at 86%+ catnip.
-      // The +1 farmer bonus already gives farmers preference; this is a backstop.
       if (job.name === "woodcutter" && bestWoodJob() && bestWoodJob().name === "farmer") {
-        weight = Math.max(weight, 0.8);
+        weight = Math.max(Math.min(weight, 0.8), Math.min(needs.wood || 0, 0.8));
       }
       // Universal anti-waste rule: stop staffing a job whose output bank is
       // essentially full — unless the economy still wants it (hunting keeps
@@ -3328,23 +3205,27 @@
   // The purchase loop, replacing KS's bonfire/science/workshop-upgrade buyers:
   //  1. buy the PLAN the moment it is affordable;
   //  2. auto-buy policies that block no alternatives (exclusive ones stay manual);
-  //  3. spend only unreserved surplus on anything else, best-scored first.
+  //  3. spend only unreserved surplus on everything else, best-scored first.
   // Assist mode stays advisory-only.
   const isSprintCandidate = (target, resources) => {
-    if (!target || target.affordable) return false;
-    const p = evaluate(target.kind, target.meta, resources);
-    return p.progress >= SPRINT_PROGRESS_THRESHOLD;
+    if (!speedrunMode() || !target || target.affordable) return false;
+    return evaluate(target.kind, target.meta, resources).progress >= SPRINT_PROGRESS_THRESHOLD;
   };
 
   const executePlan = (resources, goalKey) => {
     try {
       if (getProfileName() !== "autopilot") return;
-      const now = Date.now();
       computeResetAdvisor();
+      const now = Date.now();
       const target = getTargetCached(resources, goalKey);
       const sprint = isSprintCandidate(target, resources);
-      if (sprint && target) target._sprint = true;
+      if (target) target._sprint = sprint;
 
+      // Plan purchases are latency-sensitive: if we just crafted the exact
+      // beams/slabs/etc. for a building, raw inputs may still be draining in the
+      // background.  Do not let the generic buy throttle insert another tick of
+      // delay between "ready" and the actual click.  Surplus/policy buys below
+      // remain throttled so the helper does not spam incidental purchases.
       if (target && target.affordable && !buyBenched(targetId(target))) {
         lastAutoBuy = now;
         if (buyCandidate(target)) {
@@ -3352,7 +3233,7 @@
           buyPlanText = `Buy: plan completed — ${labelOf(target.meta)}`;
           activeTarget = null;
         } else if (noteBuyFailure(targetId(target))) {
-          activeTarget = null;
+          activeTarget = null; // benched — let the plan move on
         }
         return;
       }
@@ -3386,38 +3267,1018 @@
       }
 
       const candidates = getCandidatesCached(resources, goalKey);
-      const readyFilter = sprint
-        ? (c) => c.affordable && (!target || targetId(c) === targetId(target)) && !buyBenched(targetId(c))
-        : (c) => c.affordable && (!target || targetId(c) !== targetId(target)) && !buyBenched(targetId(c)) && respectsReservations(c, reserved, resources);
-
-      const ready = candidates.find(readyFilter);
-
+      const ready = candidates.find((candidate) =>
+        !sprint &&
+        candidate.affordable &&
+        (!target || targetId(candidate) !== targetId(target)) &&
+        !buyBenched(targetId(candidate)) &&
+        respectsReservations(candidate, reserved, resources));
       if (!ready) {
         const held = Object.keys(reserved);
-        const sprintTag = sprint ? " 🚀SPRINT — holding all surplus for target" : "";
+        const sprintTag = sprint ? " · 🚀 sprint holding surplus" : "";
         buyPlanText = target && !target.affordable && held.length
           ? `Buy: saving for ${labelOf(target.meta)} (reserving ${held.slice(0, 3).map((name) => resTitle(resources, name)).join(", ")})${sprintTag}`
-          : sprint ? `Buy: sprint — everything reserved for ${labelOf(target.meta)}` : "Buy: nothing affordable";
+          : sprint && target ? `Buy: sprint — holding all surplus for ${labelOf(target.meta)}` : "Buy: nothing affordable";
         return;
       }
       lastAutoBuy = now;
       if (buyCandidate(ready)) {
-        pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} ${sprint ? "sprint" : "surplus"} ${ready.kind} ${labelOf(ready.meta)}`);
-        buyPlanText = sprint ? `Buy: SPRINT ${labelOf(ready.meta)}` : `Buy: ${labelOf(ready.meta)} from surplus`;
+        pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} surplus ${ready.kind} ${labelOf(ready.meta)}`);
+        buyPlanText = `Buy: ${labelOf(ready.meta)} from surplus`;
       } else {
         noteBuyFailure(targetId(ready));
       }
-    } catch (error) { /* ignore */ }
-  };
-
-  // ================================ STARTUP ==================================
-  const startWhenReady = () => {
-    if (window.gamePage && window.kittenScientists) {
-      applyProfile(DEFAULT_PROFILE);
-    } else {
-      setTimeout(startWhenReady, 500);
+    } catch (error) {
+      /* ignore */
     }
   };
-  startWhenReady();
 
+  /* ------------------------ diplomacy safety net (ours) ----------------------- */
+
+  // KS normally owns trade, but exploration/embassy clicks are important enough
+  // to keep a direct, reservation-aware fallback here. This is generic over the
+  // game's live race metadata: it reads each race's current embassy prices and
+  // lets the diplomacy manager decide which civilization an explorer discovers.
+  let diplomacyPlanText = "Diplomacy: watching trade";
+  let lastDiplomacyAction = 0;
+
+  const unlockedRaces = () => {
+    try {
+      const races = window.gamePage && window.gamePage.diplomacy && window.gamePage.diplomacy.races;
+      return (Array.isArray(races) ? races : []).filter((race) => race && race.unlocked);
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const hasLockedDiscoverableRace = () => hasDiscoverableRaceNow(resourceMap());
+
+  const raceByName = (name) => {
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      if (diplomacy && typeof diplomacy.get === "function") return diplomacy.get(name);
+      const races = (diplomacy && diplomacy.races) || [];
+      return (Array.isArray(races) ? races : []).find((race) => race && race.name === name) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const resourceValue = (resources, name) => ((getRes(resources, name) || {}).value) || 0;
+
+  const hiddenRaceDiscoverableNow = (race, resources) => {
+    if (!race || race.unlocked || !race.hidden) return false;
+    if (race.name === "nagas") return resourceValue(resources, "culture") >= 1500;
+    if (race.name === "zebras") return resourceValue(resources, "ship") >= 1;
+    if (race.name === "spiders") return resourceValue(resources, "ship") >= 100 && ((getRes(resources, "science") || {}).maxValue || 0) > 125000;
+    if (race.name === "dragons") {
+      try {
+        const tech = window.gamePage.science && window.gamePage.science.get && window.gamePage.science.get("nuclearFission");
+        return !!(tech && tech.researched);
+      } catch (error) {
+        return false;
+      }
+    }
+    return false;
+  };
+
+  const hasDiscoverableRaceNow = (resources) => {
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      const races = (diplomacy && diplomacy.races) || [];
+      return (Array.isArray(races) ? races : []).some((race) => race && !race.unlocked && (!race.hidden || hiddenRaceDiscoverableNow(race, resources)));
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const explorerFeeCanFit = (resources) => explorerPrices().every((price) => {
+    const res = getRes(resources, price.name);
+    return !res || !res.maxValue || res.maxValue >= price.val;
+  });
+
+  const shouldSaveForExplorers = (resources) => {
+    if (getProfileName() !== "autopilot" || !hasDiscoverableRaceNow(resources) || !explorerFeeCanFit(resources)) return false;
+    return explorerPrices().some((price) => resourceValue(resources, price.name) < price.val);
+  };
+
+  const targetMissingResource = (target, resources, name) => {
+    if (!target || target.affordable) return false;
+    return pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === name && resourceValue(resources, name) < cost.val);
+  };
+
+  const titaniumNeededSoon = (resources, goalKey) => {
+    const titanium = getRes(resources, "titanium");
+    if (titanium && titanium.unlocked !== false && titanium.maxValue > 0 && titanium.value < Math.min(titanium.maxValue * 0.5, 50)) {
+      return true;
+    }
+    const target = getTargetCached(resources, goalKey);
+    if (targetMissingResource(target, resources, "titanium")) return true;
+    return getCandidatesCached(resources, goalKey).slice(0, 12).some((candidate) =>
+      !candidate.affordable && pricesFor(candidate.kind, candidate.meta).some((cost) => cost && cost.name === "titanium" && resourceValue(resources, "titanium") < cost.val),
+    );
+  };
+
+  const tradePricesForRace = (race) => {
+    const prices = [];
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      const manpowerCost = diplomacy && typeof diplomacy.getManpowerCost === "function" ? diplomacy.getManpowerCost() : (diplomacy && diplomacy.baseManpowerCost) || 50;
+      const goldCost = diplomacy && typeof diplomacy.getGoldCost === "function" ? diplomacy.getGoldCost() : (diplomacy && diplomacy.baseGoldCost) || 15;
+      if (manpowerCost > 0) prices.push({ name: "manpower", val: manpowerCost });
+      if (goldCost > 0) prices.push({ name: "gold", val: goldCost });
+    } catch (error) {
+      prices.push({ name: "manpower", val: 50 }, { name: "gold", val: 15 });
+    }
+    const buy = race && race.buys && race.buys[0];
+    if (buy && buy.name && buy.val > 0) prices.push({ name: buy.name, val: buy.val });
+    return prices;
+  };
+
+  const tradeWithRace = (race) => {
+    const diplomacy = window.gamePage && window.gamePage.diplomacy;
+    const beforeTitanium = resourceValue(resourceMap(), "titanium");
+    const costsBefore = tradePricesForRace(race).map((price) => ({ name: price.name, value: resourceValue(resourceMap(), price.name) }));
+    if (!diplomacy || !race) return false;
+    try {
+      if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, 1);
+      else if (typeof diplomacy.trade === "function") diplomacy.trade(race);
+    } catch (error) {
+      return false;
+    }
+    if (resourceValue(resourceMap(), "titanium") > beforeTitanium) return true;
+    return costsBefore.some(({ name, value }) => resourceValue(resourceMap(), name) < value);
+  };
+
+  const craftDiplomacyPrerequisites = (resources, goalKey) => {
+    try {
+      if (getProfileName() !== "autopilot" || !titaniumNeededSoon(resources, goalKey)) {
+        diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
+        return;
+      }
+      const zebras = raceByName("zebras");
+      if (zebras && zebras.unlocked) {
+        diplomacyPrepText = "Diplomacy prep: zebras unlocked for titanium";
+        return;
+      }
+      if (resourceValue(resources, "ship") < 1 && craftByName("ship")) {
+        diplomacyPrepText = "Diplomacy prep: crafting first ship to reveal Zebras";
+        tryCraftResource("ship", 1);
+      } else if (resourceValue(resources, "ship") >= 1) {
+        diplomacyPrepText = "Diplomacy prep: saving Catpower to send explorers for Zebras";
+      }
+    } catch (error) {
+      /* ignore diplomacy prerequisite crafting failures */
+    }
+  };
+
+  const pricesRespectReservations = (prices, reserved, resources) => prices.every((price) => {
+    if (!price || !price.name || !isFinite(price.val) || price.val <= 0) return true;
+    const hold = reserved[price.name] || (price.name === "catpower" ? reserved.manpower || 0 : 0);
+    if (hold <= 0) return true;
+    const stock = ((getRes(resources, price.name) || {}).value) || 0;
+    return stock - price.val >= hold;
+  });
+
+  const writingResearched = () => {
+    try {
+      const writing = window.gamePage.science && window.gamePage.science.get && window.gamePage.science.get("writing");
+      return !writing || writing.researched;
+    } catch (error) {
+      return true;
+    }
+  };
+
+  const embassyPricesForRace = (race) => {
+    try {
+      const game = window.gamePage;
+      const Controller = getGlobalPath(["classes", "diplomacy", "ui", "EmbassyButtonController"]);
+      if (game && typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ prices: race.embassyPrices, race, controller });
+        if (model && typeof controller.getPrices === "function") return controller.getPrices(model) || race.embassyPrices || [];
+      }
+    } catch (error) {
+      /* fall through to metadata pricing */
+    }
+    const reduction = (() => {
+      try { return 1 - (window.gamePage.getEffect("embassyCostReduction") || 0); } catch (error) { return 1; }
+    })();
+    const fakeBought = (() => {
+      try { return window.gamePage.getEffect("embassyFakeBought") || 0; } catch (error) { return 0; }
+    })();
+    return (race.embassyPrices || []).map((price) => ({ ...price, val: price.val * reduction * Math.pow(1.15, (race.embassyLevel || 0) + fakeBought) }));
+  };
+
+  const buyEmbassyForRace = (race) => {
+    const game = window.gamePage;
+    const before = race.embassyLevel || 0;
+    try {
+      const Controller = getGlobalPath(["classes", "diplomacy", "ui", "EmbassyButtonController"]);
+      if (game && typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ prices: race.embassyPrices, race, controller });
+        if (model && typeof controller.buyItem === "function") controller.buyItem(model, { boughtByQueue: true });
+        if ((race.embassyLevel || 0) > before) return true;
+      }
+    } catch (error) {
+      /* try raw metadata below */
+    }
+    const prices = embassyPricesForRace(race).filter((price) => price && price.name && price.val > 0);
+    if (!prices.length || !canPayPrices(prices) || !rawPayPrices(prices)) return false;
+    race.embassyLevel = before + 1;
+    if (game && game.diplomacy && typeof game.diplomacy.triggerOnEmbassyCountChanged === "function") game.diplomacy.triggerOnEmbassyCountChanged();
+    if (game && typeof game.render === "function") game.render();
+    return (race.embassyLevel || 0) > before;
+  };
+
+  // The live "Send explorers" fee (1000 catpower stock) read from the game's
+  // own trade-tab button when present, so cost changes track the game itself.
+  const explorerPrices = () => {
+    try {
+      const btn = window.gamePage.tradeTab && window.gamePage.tradeTab.exploreBtn;
+      const prices = (btn && btn.model && btn.model.prices) || (btn && btn.opts && btn.opts.prices);
+      const manpower = Array.isArray(prices) && prices.find((price) => price && price.name === "manpower" && price.val > 0);
+      if (manpower) return [{ name: "manpower", val: manpower.val }];
+    } catch (error) {
+      /* fall through to the stock fee */
+    }
+    return [{ name: "manpower", val: 1000 }];
+  };
+
+  // Discovering a trade partner beats hoarding catpower: explore as soon as
+  // the fee fits and the plan's reservations allow it. (The old near-cap gate
+  // could deadlock against auto-hunting, which fires below it — explorers
+  // would then never be sent for the rest of the run.)
+  const maybeSendExplorers = (resources, reserved) => {
+    const game = window.gamePage;
+    const diplomacy = game && game.diplomacy;
+    if (!diplomacy || typeof diplomacy.unlockRandomRace !== "function") return false;
+    const price = explorerPrices();
+    if (!hasLockedDiscoverableRace() || !canPayPrices(price) || !pricesRespectReservations(price, reserved, resources)) return false;
+    const before = unlockedRaces().length;
+    if (!rawPayPrices(price)) return false;
+    const race = diplomacy.unlockRandomRace();
+    if (!race && game.resPool && typeof game.resPool.addResEvent === "function") game.resPool.addResEvent("manpower", price[0].val * 0.95);
+    if (game && typeof game.render === "function") game.render();
+    const after = unlockedRaces().length;
+    if (after > before || race) {
+      diplomacyPlanText = `Diplomacy: sent explorers; met ${(race && (race.title || race.name)) || "a civilization"}`;
+      pushLog(`🧭 ${diplomacyPlanText}`);
+      return true;
+    }
+    diplomacyPlanText = "Diplomacy: explorers need later unlock conditions";
+    return false;
+  };
+
+  const maybeTradeForTitanium = (resources, reserved, goalKey) => {
+    const titanium = getRes(resources, "titanium");
+    const targetNeedsTitanium = titaniumNeededSoon(resources, goalKey);
+    if (!targetNeedsTitanium) return false;
+    if (titanium && titanium.maxValue > 0 && titanium.value >= titanium.maxValue * 0.995) {
+      diplomacyPlanText = "Diplomacy: titanium capped; waiting for storage before more Zebra trades";
+      return false;
+    }
+    const zebras = raceByName("zebras");
+    if (!zebras || !zebras.unlocked) return false;
+    const prices = tradePricesForRace(zebras);
+    if (!prices.length || !canPayPrices(prices) || !pricesRespectReservations(prices, reserved, resources)) {
+      const missing = prices
+        .filter((price) => price && price.name && resourceValue(resources, price.name) < price.val)
+        .map((price) => `${fmt(price.val - resourceValue(resources, price.name))} ${resTitle(resources, price.name)}`)
+        .slice(0, 3)
+        .join(", ");
+      diplomacyPlanText = missing ? `Diplomacy: Zebra titanium trade needs ${missing}` : "Diplomacy: holding Zebra trade for plan reservations";
+      return false;
+    }
+    if (tradeWithRace(zebras)) {
+      diplomacyPlanText = "Diplomacy: traded with Zebras for titanium path";
+      pushLog(`🦓 ${diplomacyPlanText}`);
+      return true;
+    }
+    return false;
+  };
+
+  const maybeBuildEmbassy = (resources, reserved) => {
+    if (!writingResearched()) return false;
+    const races = unlockedRaces()
+      .filter((race) => race.embassyPrices && race.embassyPrices.length)
+      .map((race) => ({ race, prices: embassyPricesForRace(race) }))
+      .filter((item) => item.prices.length && canPayPrices(item.prices) && pricesRespectReservations(item.prices, reserved, resources))
+      .sort((a, b) => (a.race.embassyLevel || 0) - (b.race.embassyLevel || 0));
+    const next = races[0];
+    if (!next) return false;
+    if (buyEmbassyForRace(next.race)) {
+      diplomacyPlanText = `Diplomacy: built embassy with ${next.race.title || next.race.name} (level ${next.race.embassyLevel || 1})`;
+      pushLog(`🤝 ${diplomacyPlanText}`);
+      return true;
+    }
+    return false;
+  };
+
+  const manageDiplomacy = (resources, goalKey) => {
+    try {
+      if (getProfileName() !== "autopilot") return;
+      if (Date.now() - lastDiplomacyAction < 10000) return;
+      const target = getTargetCached(resources, goalKey);
+      const reserved = reservedNeedsFor(target, resources);
+      if (maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeBuildEmbassy(resources, reserved)) {
+        lastDiplomacyAction = Date.now();
+        return;
+      }
+      const raceCount = unlockedRaces().length;
+      const prep = diplomacyPrepText && !/watching/.test(diplomacyPrepText) ? ` · ${diplomacyPrepText.replace(/^Diplomacy prep: /, "")}` : "";
+      diplomacyPlanText = raceCount ? `Diplomacy: ${raceCount} trade partner${raceCount === 1 ? "" : "s"}; embassies watched${prep}` : `Diplomacy: saving catpower for explorers${prep}`;
+    } catch (error) {
+      /* ignore diplomacy fallback failures */
+    }
+  };
+
+  /* ------------------------------ action log -------------------------------- */
+
+  let actionLog = [];
+  try {
+    actionLog = JSON.parse(localStorage.getItem(LOG_KEY)) || [];
+  } catch (error) {
+    actionLog = [];
+  }
+
+  const prev = { build: {}, tech: {}, upgrade: {}, resource: {}, race: {} };
+  let seeded = false;
+  let logBox;
+
+  const renderLog = () => {
+    if (logBox) logBox.textContent = actionLog.slice(0, 12).join("\n") || "(waiting…)";
+  };
+
+  const pushLog = (text) => {
+    const time = new Date().toLocaleTimeString();
+    actionLog.unshift(`${time}  ${text}`);
+    actionLog = actionLog.slice(0, 50);
+    try {
+      localStorage.setItem(LOG_KEY, JSON.stringify(actionLog));
+    } catch (error) {
+      /* ignore */
+    }
+    renderLog();
+  };
+
+
+  const diplomacyRaces = (game) => {
+    try {
+      const races = game && game.diplomacy && game.diplomacy.races;
+      return Array.isArray(races) ? races : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const raceKey = (race) => String((race && (race.name || race.title)) || "unknown");
+
+  const raceTradeCount = (race) => {
+    for (const key of ["tradeTotal", "totalTrades", "tradeCount", "trades", "buys"]) {
+      const value = race && race[key];
+      if (isFinite(value)) return value;
+    }
+    return null;
+  };
+
+  const trackDiplomacyActionDeltas = (game) => {
+    for (const race of diplomacyRaces(game)) {
+      if (!race) continue;
+      const key = raceKey(race);
+      const before = prev.race[key] || {};
+      const now = {
+        unlocked: !!race.unlocked,
+        embassyLevel: race.embassyLevel || 0,
+        tradeCount: raceTradeCount(race),
+      };
+      if (seeded && before.unlocked === false && now.unlocked) {
+        pushLog(`🧭 met ${race.title || race.name || "a civilization"}`);
+      }
+      if (seeded && now.embassyLevel > (before.embassyLevel || 0)) {
+        pushLog(`🤝 embassy with ${race.title || race.name || "civilization"} → ${now.embassyLevel}`);
+      }
+      if (seeded && now.tradeCount != null && before.tradeCount != null && now.tradeCount > before.tradeCount) {
+        pushLog(`🤝 trade with ${race.title || race.name || "civilization"} (${now.tradeCount})`);
+      }
+      prev.race[key] = now;
+    }
+  };
+
+  const TRADE_LOOT_RESOURCES = new Set([
+    "wood", "minerals", "iron", "coal", "gold", "titanium", "uranium",
+    "furs", "ivory", "spice", "unicorns", "starchart", "blueprint",
+    "beam", "slab", "plate", "steel", "gear", "scaffold", "ship",
+  ]);
+
+  const TRADE_SPEND_RESOURCES = new Set(["gold", "manpower", "catpower", "culture"]);
+
+  const formatDelta = (resources, name, amount) => `${amount > 0 ? "+" : ""}${fmt(amount)} ${resTitle(resources, name)}`;
+
+  const resourceDeltaLooksLikeTradeLoot = (resources, name, amount) => {
+    if (amount <= 0 || !TRADE_LOOT_RESOURCES.has(name)) return false;
+    const produced = Math.max(0, productionFor(name));
+    return amount >= Math.max(1, produced * 3);
+  };
+
+  const trackTradeResourceDeltas = () => {
+    const resources = resourceMap();
+    const deltas = [];
+    for (const res of resources.values()) {
+      if (!res || !res.name || !isFinite(res.value)) continue;
+      const before = prev.resource[res.name];
+      if (seeded && isFinite(before)) {
+        const delta = res.value - before;
+        if (Math.abs(delta) > 0.0001) deltas.push({ name: res.name, delta });
+      }
+      prev.resource[res.name] = res.value;
+    }
+    if (!seeded || !deltas.length) return;
+
+    const spent = deltas
+      .filter(({ name, delta }) => delta < 0 && TRADE_SPEND_RESOURCES.has(name === "catpower" ? "manpower" : name))
+      .filter(({ name, delta }) => Math.abs(delta) >= (name === "manpower" || name === "catpower" ? 5 : 1));
+    const loot = deltas
+      .filter(({ name, delta }) => resourceDeltaLooksLikeTradeLoot(resources, name, delta))
+      .sort((a, b) => b.delta - a.delta);
+
+    if (!spent.length || !loot.length) return;
+    const lootText = loot.slice(0, 4).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
+    const spendText = spent.slice(0, 3).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
+    pushLog(`🤝 trade: ${lootText}${spendText ? ` (${spendText})` : ""}`);
+  };
+
+  // Detect what changed in game state and log it (no dependency on KS/game log
+  // message formats — we just diff building counts and researched flags).
+  const trackActions = () => {
+    try {
+      const game = window.gamePage;
+      for (const b of buildingMetas()) {
+        if (!b || !b.name) continue;
+        const now = b.val || 0;
+        if (seeded && prev.build[b.name] != null && now > prev.build[b.name]) {
+          pushLog(`🏗 ${labelOf(b)} → ${now}`);
+        }
+        prev.build[b.name] = now;
+      }
+      for (const t of game.science.techs || []) {
+        if (!t || !t.name) continue;
+        if (seeded && prev.tech[t.name] === false && t.researched) {
+          pushLog(`🔬 researched ${labelOf(t)}`);
+        }
+        prev.tech[t.name] = !!t.researched;
+      }
+      for (const u of game.workshop.upgrades || []) {
+        if (!u || !u.name) continue;
+        if (seeded && prev.upgrade[u.name] === false && u.researched) {
+          pushLog(`⚙ ${labelOf(u)}`);
+        }
+        prev.upgrade[u.name] = !!u.researched;
+      }
+      trackDiplomacyActionDeltas(game);
+      trackTradeResourceDeltas();
+      seeded = true;
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+
+  /* -------------------------- leader specialization -------------------------- */
+
+  const LEADER_RECHECK_MS = 90000;
+  let lastLeaderCheck = 0;
+  let leaderPlanText = "Leader: waiting…";
+
+  const desiredLeaderTraits = (goalKey, resources) => {
+    const target = getTargetCached(resources, goalKey);
+    const emphasis = (GOALS[goalKey] && GOALS[goalKey].emphasis) || {};
+    const traits = [];
+    const text = target ? `${target.kind} ${effectText(target.meta)}` : "";
+    const costs = target ? pricesFor(target.kind, target.meta).map((cost) => cost && cost.name).filter(Boolean) : [];
+
+    if ((target && target.kind === "research") || costs.includes("science") || (emphasis.science || 1) > 1) traits.push("scientist");
+    if (costs.some((name) => ["steel", "gear", "alloy", "plate"].includes(name)) || /steel|gear|alloy|plate|coal|smelter|furnace/.test(text)) traits.push("metallurgist");
+    if (costs.some((name) => ["concrate", "kerosene", "thorium", "eludium"].includes(name)) || /concrete|concrate|kerosene|thorium|reactor|eludium/.test(text)) traits.push("chemist");
+    if (costs.some((name) => ["beam", "slab", "parchment", "manuscript", "compedium", "blueprint"].includes(name)) || /workshop|craft|beam|slab|blueprint/.test(text)) traits.push("engineer");
+    if (huntingEconomyNeed(resources) > 3 || resRatio(resources, "manpower", 0) < 0.35) traits.push("manager");
+    if (target && target.kind === "trade") traits.push("merchant");
+    if (costs.includes("faith") || ((emphasis.production || 1) > 1 && resRatio(resources, "faith", 1) < 0.6)) traits.push("wise");
+    traits.push("engineer", "scientist", "manager", "metallurgist", "wise", "merchant", "chemist");
+    return [...new Set(traits)];
+  };
+
+  const kittenScore = (kitten, traitName, targetJob) => {
+    let score = 0;
+    if (kitten.trait && kitten.trait.name === traitName) score += 1000;
+    if (kitten.job && kitten.job === targetJob) score += 120;
+    if (kitten.isLeader) score += 25;
+    score += Math.min(500, (kitten.rank || 0) * 30 + ((kitten.exp || 0) / 500));
+    try {
+      const skills = kitten.skills || {};
+      const skill = skills[targetJob];
+      if (skill && isFinite(skill)) score += Math.min(150, skill / 10);
+    } catch (error) {
+      /* ignore */
+    }
+    return score;
+  };
+
+  const policyMetas = () => {
+    try {
+      const science = window.gamePage && window.gamePage.science;
+      const pools = [science && science.policies, science && science.policy, science && science.policiesData];
+      for (const pool of pools) {
+        if (Array.isArray(pool)) return pool;
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return [];
+  };
+
+  const policyOpen = (meta) => isOpen(meta) && meta.blocked !== true && meta.disabled !== true;
+
+  // A policy with an empty `blocks` list forecloses nothing — buying it can
+  // never lock you out of another choice, so it's safe to automate. Exclusive
+  // policies (liberty vs tradition, monarchy vs republic …) stay manual.
+  const policyIsExclusive = (meta) => Array.isArray(meta && meta.blocks) && meta.blocks.length > 0;
+
+  const autoPolicyChoice = (resources, goalKey) => {
+    for (const meta of policyMetas()) {
+      if (!policyOpen(meta) || policyIsExclusive(meta)) continue;
+      const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resources) };
+      if (candidate.affordable) return candidate;
+    }
+    return null;
+  };
+
+  const summarizeEffects = (meta) => {
+    const effects = (meta && meta.effects) || {};
+    const pros = [];
+    const cons = [];
+    for (const [key, raw] of Object.entries(effects)) {
+      if (!isFinite(raw) || raw === 0) continue;
+      const label = key
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .replace(/PerTick/g, "/tick")
+        .replace(/Ratio/g, " ratio")
+        .replace(/Max/g, " storage")
+        .toLowerCase();
+      const item = `${raw > 0 ? "+" : ""}${fmt(raw)} ${label}`;
+      (raw > 0 ? pros : cons).push(item);
+    }
+    const text = effectText(meta);
+    if (!pros.length && /science|scholar|library|academy|observatory/.test(text)) pros.push("helps science progress");
+    if (!pros.length && /production|worker|mineral|wood|coal|craft|engineer/.test(text)) pros.push("helps production/crafting");
+    if (!cons.length && /unhappiness|happiness.*-|-.*happiness/.test(text)) cons.push("may reduce happiness");
+    return {
+      pros: pros.slice(0, 3),
+      cons: cons.slice(0, 3),
+    };
+  };
+
+  // Exclusive policies are ranked with the same universal framework as every
+  // other candidate: parsed economic effects plus goal alignment, minus the
+  // number of visible downsides.
+  const policyScore = (meta, resources, goalKey) => {
+    const goal = GOALS[goalKey];
+    const { cons } = summarizeEffects(meta);
+    let score = economicValue("policy", meta, resources, goal, goalKey) + goalAlignmentBoost("policy", meta, goalKey);
+    score -= cons.length * 4;
+    return score;
+  };
+
+  // Only EXCLUSIVE policies appear here — the executor auto-buys the rest.
+  const availablePolicyChoices = (resources, goalKey) => policyMetas()
+    .filter((meta) => policyOpen(meta) && policyIsExclusive(meta))
+    .map((meta) => ({ kind: "policy", meta, ...evaluate("policy", meta, resources), score: policyScore(meta, resources, goalKey) }))
+    .sort((a, b) => b.score - a.score);
+
+  const policyAdviceLine = (resources, goalKey) => {
+    const choices = availablePolicyChoices(resources, goalKey);
+    if (!choices.length) return "Policies: non-exclusive auto-buy; no exclusive choice pending";
+    const best = choices[0];
+    const { pros, cons } = summarizeEffects(best.meta);
+    const state = best.affordable ? "ready" : `need ${best.missing || "resources"}`;
+    return `Policies: exclusive choice! rec ${labelOf(best.meta)} (blocks ${(best.meta.blocks || []).join(", ")}) (${state}) · pros: ${(pros.length ? pros : ["unlocks future choices"]).join("; ")} · cons: ${(cons.length ? cons : ["none obvious"]).join("; ")}`;
+  };
+
+  const buyPolicyChoice = (name) => {
+    const meta = policyMetas().find((policy) => policy && policy.name === name);
+    if (!meta) return false;
+    const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resourceMap()) };
+    if (!candidate.affordable) return false;
+    for (const attempt of purchaseAttemptsFor(candidate)) {
+      try {
+        attempt();
+      } catch (error) {
+        /* try next API shape */
+      }
+      if (purchaseComplete(candidate, 0)) {
+        pushLog(`📜 policy ${labelOf(meta)}`);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const maybeSelectLeader = (goalKey, resources) => {
+    try {
+      const now = Date.now();
+      if (now - lastLeaderCheck < LEADER_RECHECK_MS) return;
+      lastLeaderCheck = now;
+      const village = window.gamePage.village;
+      if (!village || typeof village.makeLeader !== "function" || !village.sim || !Array.isArray(village.sim.kittens)) return;
+      const kittens = village.sim.kittens.filter((kitten) => kitten && kitten.trait && kitten.trait.name && kitten.trait.name !== "none");
+      if (!kittens.length) return;
+      const traits = desiredLeaderTraits(goalKey, resources);
+      const { needs } = resourceNeeds(goalKey, resources);
+      const bestNeed = Object.entries(needs).sort((a, b) => b[1] - a[1])[0];
+      const targetJob = bestNeed ? (RES_JOB[bestNeed[0]] || bestNeed[0]) : "engineer";
+      let best = null;
+      for (const trait of traits) {
+        const candidate = kittens
+          .filter((kitten) => kitten.trait && kitten.trait.name === trait)
+          .sort((a, b) => kittenScore(b, trait, targetJob) - kittenScore(a, trait, targetJob))[0];
+        if (candidate) {
+          best = { kitten: candidate, trait };
+          break;
+        }
+      }
+      if (!best || best.kitten.isLeader) {
+        if (village.leader) leaderPlanText = `Leader: ${village.leader.trait.title || village.leader.trait.name} (${village.leader.name || "kitten"})`;
+        return;
+      }
+      village.makeLeader(best.kitten);
+      leaderPlanText = `Leader: ${best.kitten.trait.title || best.trait} (${best.kitten.name || "kitten"})`;
+      pushLog(`👑 ${leaderPlanText}`);
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  // Promotions are a pure win when gold would otherwise overflow at the cap:
+  // they turn wasted income into permanently better workers. Gold below the
+  // overflow band is left alone for trade and gold-priced builds.
+  let nextPromoteAttempt = 0;
+
+  const maybePromoteKittens = (resources) => {
+    try {
+      const village = window.gamePage.village;
+      const gold = getRes(resources, "gold");
+      if (!village || !gold || !(gold.maxValue > 0)) return;
+      const now = Date.now();
+      if (gold.value < gold.maxValue * 0.92 || now < nextPromoteAttempt) return;
+      const before = gold.value;
+      try {
+        if (typeof village.promoteKittens === "function") {
+          village.promoteKittens();
+        } else if (village.leader && village.sim && typeof village.sim.promote === "function") {
+          village.sim.promote(village.leader, (village.leader.rank || 0) + 1);
+        }
+      } catch (error) {
+        /* promotion API mismatch — skip */
+      }
+      if (gold.value < before - 1) {
+        nextPromoteAttempt = now + 30000;
+        pushLog("🎖 promoted kittens (gold was capping)");
+      } else {
+        nextPromoteAttempt = now + 300000; // nobody promotable (exp/gold) — back off
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  /* ------------------------------- main loop -------------------------------- */
+
+  let statusEl;
+  let goalEl;
+  let bottleneckEl;
+  let scienceEl;
+  let planEl;
+  let jobsEl;
+  let buyEl;
+  let resetEl;
+  let leaderEl;
+  let craftEl;
+  let processingEl;
+  let externalSpendersEl;
+  let religionEl;
+  let diplomacyEl;
+  let policyEl;
+  let policySelectEl;
+  let policyApplyEl;
+  let nowEl;
+
+  const renderPolicyControl = (resources, goalKey) => {
+    if (!policyEl) return;
+    const choices = availablePolicyChoices(resources, goalKey);
+    policyEl.textContent = `📜 ${policyAdviceLine(resources, goalKey)}`;
+    if (!policySelectEl || !policyApplyEl) return;
+    const current = policySelectEl.value;
+    policySelectEl.innerHTML = "";
+    if (!choices.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "No exclusive policy pending (others auto-buy)";
+      policySelectEl.appendChild(option);
+      policySelectEl.disabled = true;
+      policyApplyEl.disabled = true;
+      return;
+    }
+    for (const choice of choices.slice(0, 6)) {
+      const option = document.createElement("option");
+      option.value = choice.meta.name;
+      option.textContent = `${choice === choices[0] ? "★ " : ""}${labelOf(choice.meta)} — ${choice.affordable ? "ready" : `need ${choice.missing || "resources"}`}`;
+      policySelectEl.appendChild(option);
+    }
+    policySelectEl.disabled = false;
+    policySelectEl.value = choices.some((choice) => choice.meta.name === current) ? current : choices[0].meta.name;
+    const selected = choices.find((choice) => choice.meta.name === policySelectEl.value);
+    policyApplyEl.disabled = !selected || !selected.affordable;
+  };
+
+  const engineRunning = () => {
+    try {
+      return window.kittenScientists.engine._timeoutMainLoop != null;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const tick = () => {
+    try {
+      resetTickCache();
+      let resources = resourceMap();
+      const goal = getGoal();
+      computeResetAdvisor();
+      watchNewUnlocks();
+      refineSurplusCatnip();
+      optimizeProcessing(resources, goal);
+      craftTowardTarget(resources, goal);
+      craftDiplomacyPrerequisites(resources, goal);
+      // Crafting can turn a plan affordable immediately.  Re-read resources and
+      // rebuild the per-tick target cache before buying, otherwise the next tick
+      // (and ongoing raw-resource drain) can steal the just-crafted window.
+      resetTickCache();
+      resources = resourceMap();
+      craftOverflowResources(resources, goal);
+      resetTickCache();
+      resources = resourceMap();
+      reserveFaithForReligionProgression(resources);
+      protectPlanFromExternalSpenders(resources, goal);
+      executePlan(resources, goal);
+      // Purchases can change resource stocks, caps, unlocks and per-tick effects;
+      // re-read before diplomacy/jobs so later decisions are based on the board
+      // after the buy, not on the planning snapshot from before it.
+      resetTickCache();
+      resources = resourceMap();
+      manageDiplomacy(resources, goal);
+      resetTickCache();
+      resources = resourceMap();
+      balanceJobs(goal, resources);
+      maybeSelectLeader(goal, resources);
+      maybePromoteKittens(resources);
+      autoHunt(resources);
+      trackActions();
+      if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
+      if (goalEl) {
+        const line = getGoalLine(resources, goal);
+        goalEl.textContent = line;
+        goalEl.style.display = line ? "" : "none";
+      }
+      if (bottleneckEl) bottleneckEl.textContent = `⚖ ${getBottleneck(resources)}`;
+      if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
+      if (planEl) planEl.textContent = getPlanLine(resources, goal);
+      if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
+      if (buyEl) buyEl.textContent = `🛒 ${buyPlanText}`;
+      if (resetEl) resetEl.textContent = resetAdvisorText;
+      if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
+      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
+      if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
+      if (externalSpendersEl) externalSpendersEl.textContent = `🛡 ${externalSpendersPlanText}`;
+      if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
+      if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
+      renderPolicyControl(resources, goal);
+      if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  /* ------------------------------- the panel -------------------------------- */
+
+  const KS_HIDE_KEY = "kgh.hideKS";
+  const MIN_KEY = "kgh.min";
+
+  // Hide/show the Kitten Scientists panel (its UI root is .kitten-scientists,
+  // inside #ksColumn). Automation keeps running either way.
+  const applyKSHidden = (hidden, btn) => {
+    document.body.classList.toggle("kgh-hide-ks", hidden);
+    localStorage.setItem(KS_HIDE_KEY, hidden ? "1" : "0");
+    if (btn) {
+      btn.textContent = hidden ? "Show KS" : "Hide KS";
+      btn.title = hidden ? "Show the Kitten Scientists settings panel" : "Hide the Kitten Scientists settings panel";
+    }
+  };
+
+  const buildPanel = () => {
+    if (!document.body) {
+      setTimeout(buildPanel, 250);
+      return;
+    }
+    const oldPanel = document.querySelector ? document.querySelector(".kgh-panel") : null;
+    if (oldPanel) oldPanel.remove();
+    const oldStyle = document.getElementById("kgh-style");
+    if (oldStyle) oldStyle.remove();
+    const style = document.createElement("style");
+    style.id = "kgh-style";
+    style.textContent =
+      "body.kgh-hide-ks #ksColumn,body.kgh-hide-ks .kitten-scientists,body.kgh-hide-ks [id*=kitten-scientists],body.kgh-hide-ks [class*=kitten-scientists]{display:none!important}" +
+      "body.kgh-helper-ready{overflow-x:hidden}" +
+      ".kgh-panel{box-sizing:border-box;width:min(320px,calc(100dvw - 16px));max-width:calc(100dvw - 16px);" +
+      "max-height:calc(100dvh - 16px);overflow:auto;overflow-x:hidden;contain:layout style;" +
+      "user-select:text;-webkit-user-select:text}" +
+      ".kgh-panel *{box-sizing:border-box;min-width:0;max-width:100%}" +
+      ".kgh-panel small,.kgh-panel pre,.kgh-panel div{overflow-wrap:anywhere;word-break:normal}" +
+      ".kgh-panel select{width:100%;min-width:0;user-select:auto;-webkit-user-select:auto}" +
+      ".kgh-row{display:flex;gap:6px;min-width:0}" +
+      ".kgh-grow{flex:1 1 auto;min-width:0}" +
+      // Buttons must never shrink or wrap their label ("Appl\ny"): the panel's
+      // global min-width:0 lets flex squeeze them, so pin them to content size.
+      ".kgh-panel button{white-space:nowrap;flex:0 0 auto}" +
+      ".kgh-note{display:block;color:#d9ccae;opacity:.78}" +
+      ".kgh-details{border-top:1px solid #9b7a4d50;padding-top:3px}" +
+      ".kgh-details>summary{cursor:pointer;opacity:.82;list-style:none}" +
+      ".kgh-details>summary::-webkit-details-marker{display:none}" +
+      ".kgh-details-body{display:grid;gap:4px;margin-top:4px}" +
+      ".kgh-log{overflow:hidden auto}" +
+      ".kgh-hbtn{cursor:pointer;background:transparent;color:#f7ead0;border:1px solid #9b7a4d;" +
+      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px;flex:0 0 auto}" +
+      "@media (max-width:700px){.kgh-panel{left:8px!important;right:8px!important;bottom:8px!important;width:auto!important;max-height:45dvh}}";
+    document.head.appendChild(style);
+
+    const box = document.createElement("div");
+    box.className = "kgh-panel";
+    box.style.cssText =
+      "position:fixed;right:8px;bottom:8px;z-index:99999;padding:8px 9px;" +
+      "background:#2b2118;color:#f7ead0;border:1px solid #9b7a4d;border-radius:5px;" +
+      "font:12px/1.35 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
+    box.innerHTML = [
+      '<div class="kgh-row" style="justify-content:space-between;align-items:center">',
+      '<strong style="font-size:13px">🐱 Kittens Helper</strong>',
+      '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-ks">Show KS</button>',
+      '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
+      '<div class="kgh-body" style="display:grid;gap:5px">',
+      '<div class="kgh-row"><select class="kgh-grow" aria-label="profile">',
+      '<option value="autopilot">Autopilot: play forward</option>',
+      '<option value="assist">Assist: jobs + advice</option>',
+      "</select><button type=\"button\" class=\"kgh-apply\" style=\"cursor:pointer\">Apply</button></div>",
+      '<select class="kgh-goal" aria-label="goal" style="width:100%">',
+      // Goal options come straight from GOALS so the dropdown, the planner and
+      // the progress line can never drift apart.
+      ...Object.entries(GOALS).map(([key, goal]) => `<option value="${key}">🏁 ${goal.label}</option>`),
+      "</select>",
+      '<select class="kgh-priority" aria-label="manual priority" style="width:100%">',
+      ...Object.entries(PRIORITIES).map(([key, priority]) => `<option value="${key}">🎚 ${priority.label}</option>`),
+      "</select>",
+      '<small class="kgh-status" style="color:#9fd0ff">…</small>',
+      '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
+      '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
+      '<small class="kgh-science" style="color:#bfe6a0">…</small>',
+      '<small class="kgh-plan" style="color:#a7e8e0;font-weight:700">…</small>',
+      '<small class="kgh-now" style="color:#e6d79a">…</small>',
+      '<details class="kgh-details"><summary>More automation details</summary><div class="kgh-details-body">',
+      '<small class="kgh-note"></small>',
+      '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
+      '<small class="kgh-buy" style="color:#b8e2ff">…</small>',
+      '<small class="kgh-reset" style="color:#a7f0b4">…</small>',
+      '<small class="kgh-leader" style="color:#ffd18f">…</small>',
+      '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
+      '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
+      '<small class="kgh-external-spenders" style="color:#9fd0ff">…</small>',
+      '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
+      '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
+      '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
+      '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
+      '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
+      '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
+      '</div></details>',
+      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
+      '<pre class="kgh-log" style="margin:0;max-height:78px;white-space:pre-wrap;' +
+        'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
+      "</div>",
+    ].join("");
+
+    const select = box.querySelector("select");
+    const goalSelect = box.querySelector(".kgh-goal");
+    const button = box.querySelector(".kgh-apply");
+    const prioritySelect = box.querySelector(".kgh-priority");
+    const note = box.querySelector(".kgh-note");
+    const ksBtn = box.querySelector(".kgh-ks");
+    const minBtn = box.querySelector(".kgh-min");
+    const body = box.querySelector(".kgh-body");
+    statusEl = box.querySelector(".kgh-status");
+    goalEl = box.querySelector(".kgh-goal-line");
+    bottleneckEl = box.querySelector(".kgh-bottleneck");
+    scienceEl = box.querySelector(".kgh-science");
+    planEl = box.querySelector(".kgh-plan");
+    jobsEl = box.querySelector(".kgh-jobs");
+    buyEl = box.querySelector(".kgh-buy");
+    resetEl = box.querySelector(".kgh-reset");
+    leaderEl = box.querySelector(".kgh-leader");
+    craftEl = box.querySelector(".kgh-craft");
+    processingEl = box.querySelector(".kgh-processing");
+    externalSpendersEl = box.querySelector(".kgh-external-spenders");
+    religionEl = box.querySelector(".kgh-religion");
+    diplomacyEl = box.querySelector(".kgh-diplomacy");
+    policyEl = box.querySelector(".kgh-policy");
+    policySelectEl = box.querySelector(".kgh-policy-select");
+    policyApplyEl = box.querySelector(".kgh-policy-apply");
+    nowEl = box.querySelector(".kgh-now");
+    logBox = box.querySelector(".kgh-log");
+
+    select.value = getProfileName();
+    select.addEventListener("change", () => {
+      note.textContent = PROFILE_INFO[select.value].note;
+    });
+    goalSelect.value = getGoal();
+    goalSelect.addEventListener("change", () => {
+      localStorage.setItem(GOAL_KEY, goalSelect.value);
+      activeTarget = null;
+      tick();
+    });
+    prioritySelect.value = getPriority();
+    prioritySelect.addEventListener("change", () => {
+      localStorage.setItem(PRIORITY_KEY, prioritySelect.value);
+      activeTarget = null;
+      tick();
+    });
+    button.addEventListener("click", () => applyProfile(select.value));
+    policyApplyEl.addEventListener("click", () => {
+      if (policySelectEl.value && buyPolicyChoice(policySelectEl.value)) tick();
+    });
+    policySelectEl.addEventListener("change", () => renderPolicyControl(resourceMap(), getGoal()));
+
+    ksBtn.addEventListener("click", () => {
+      applyKSHidden(!document.body.classList.contains("kgh-hide-ks"), ksBtn);
+    });
+    const applyMin = (min) => {
+      body.style.display = min ? "none" : "grid";
+      minBtn.textContent = min ? "+" : "–";
+      localStorage.setItem(MIN_KEY, min ? "1" : "0");
+    };
+    minBtn.addEventListener("click", () => applyMin(body.style.display !== "none"));
+
+    document.body.classList.add("kgh-helper-ready");
+    document.body.appendChild(box);
+    note.textContent = PROFILE_INFO[select.value].note;
+    applyKSHidden(localStorage.getItem(KS_HIDE_KEY) !== "0", ksBtn); // default hidden = minimal
+    applyMin(localStorage.getItem(MIN_KEY) === "1");
+    renderLog();
+    tick();
+    setInterval(tick, 4000);
+  };
+
+  /* ------------------------------- bootstrap -------------------------------- */
+
+  const ksReady = () =>
+    window.kittenScientists &&
+    typeof window.kittenScientists.getSettings === "function" &&
+    typeof window.kittenScientists.setSettings === "function" &&
+    window.gamePage &&
+    window.gamePage.resPool;
+
+  const injectFallbackLoader = () => {
+    try {
+      const script = document.createElement("script");
+      script.src = KS_FALLBACK_LOADER;
+      document.body.appendChild(script);
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  const waitForKittenScientists = async () => {
+    let injectedFallback = false;
+    for (let i = 0; i < 200; i += 1) {
+      if (ksReady()) return;
+      if (i === 40 && !injectedFallback) {
+        injectedFallback = true;
+        injectFallbackLoader();
+      }
+      await delay(250);
+    }
+    throw new Error("Kitten Scientists did not finish loading.");
+  };
+
+  waitForKittenScientists()
+    .then(() => {
+      applyProfile(getProfileName());
+      buildPanel();
+    })
+    .catch((error) => console.error("[KGH] Failed to start:", error));
 })();
