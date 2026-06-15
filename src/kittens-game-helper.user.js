@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.2.1
+// @version      1.2.0
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -697,11 +697,6 @@
     const reserved = new Set(target && !target.affordable ? reservedResourceNames(target, resources || resourceMap()) : []);
     const activeReserve = reserved.size > 0 || explorerSave;
     const allowed = activeReserve && target ? targetCraftOutputsFor(target, resources || resourceMap()) : new Set();
-    // KS craft settings cannot honor this helper's per-resource reserve floors,
-    // so target-chain crafting is helper-owned while a reserve is active.  Leave
-    // only the special catnip→wood support path enabled; craftTowardTarget() will
-    // make slabs/scaffolds/compendia/plates when doing so cannot steal a direct
-    // target input such as Observatory iron.
     const allowWoodSurplus = activeReserve && !reserved.has("catnip") && (!target || reserved.has("wood") || allowed.has("wood"));
     let paused = 0;
     const kept = [];
@@ -710,7 +705,7 @@
       if (!crafts || typeof crafts !== "object") continue;
       for (const [name, node] of Object.entries(crafts)) {
         if (!node || typeof node !== "object") continue;
-        const enable = activeReserve ? (name === "wood" && allowWoodSurplus) : (name === "wood" ? true : node.enabled !== false);
+        const enable = activeReserve ? (allowed.has(name) || (name === "wood" && allowWoodSurplus)) : (name === "wood" ? true : node.enabled !== false);
         if (activeReserve && !enable) paused += 1;
         if (enable && activeReserve) kept.push(craftLabel(name));
         setCraftNodeEnabled(node, enable);
@@ -718,7 +713,7 @@
       }
     }
     craftPolicyText = activeReserve
-      ? `Craft policy: paused ${paused} KS craft${paused === 1 ? "" : "s"}; helper owns target-chain crafting${kept.length ? `; allowed ${kept.slice(0, 4).join(", ")}` : ""}`
+      ? `Craft policy: paused ${paused} KS craft${paused === 1 ? "" : "s"}; allowed ${kept.slice(0, 4).join(", ") || "helper-only target crafting"}`
       : "Craft policy: KS crafts allowed (no active reserve)";
   };
 
