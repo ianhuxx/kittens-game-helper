@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.3
+// @version      1.1.4
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -2102,6 +2102,12 @@
   // and whatever the game adds next. The static input/output maps below are
   // only a fallback for metas whose effects are temporarily unreadable.
   const KNOWN_CONVERTERS = ["smelter", "calciner"];
+  // Toggle buildings that are pure benefit while ON (a production/ratio bonus,
+  // not a resource-draining conversion).  We keep these switched on for the
+  // player instead of leaving the on/off button to be flipped by hand.  If the
+  // game ever gives them a real input drain, the live-effect profile picks it
+  // up and the starvation guard below throttles them like any other converter.
+  const ALWAYS_ON_TOGGLES = ["steamworks"];
   const PROCESSOR_INPUTS = {
     smelter: ["wood", "minerals"],
     calciner: ["minerals", "oil"],
@@ -2111,22 +2117,37 @@
     calciner: ["iron", "titanium", "coal"],
   };
 
+  // A building is "togglable" when the game exposes an on/off count we can set.
+  const hasOnToggle = (meta) => meta && typeof meta.on === "number" && meta.val > 0;
+
   const converterBuildings = () => {
     const out = [];
     const seen = new Set();
     for (const meta of buildingMetas()) {
-      if (!meta || !meta.name || !(meta.val > 0) || seen.has(meta.name)) continue;
+      if (!meta || !meta.name || meta.unlocked === false || !(meta.val > 0) || seen.has(meta.name)) continue;
       const profile = processingProfileFor(meta);
-      if ((profile.inputs.length && profile.outputs.length) || KNOWN_CONVERTERS.includes(meta.name)) {
+      const isConverter = profile.inputs.length && profile.outputs.length;
+      const managedToggle = hasOnToggle(meta) && (KNOWN_CONVERTERS.includes(meta.name) || ALWAYS_ON_TOGGLES.includes(meta.name));
+      if (isConverter || managedToggle) {
         seen.add(meta.name);
         out.push(meta);
       }
     }
     return out;
   };
+
+  const resCapped = (resources, name) => {
+    const r = getRes(resources, name);
+    return !!(r && r.maxValue > 0 && r.value >= r.maxValue * 0.985);
+  };
   const pausedProcessors = {};
   let processingPlanText = "Processing: watching converters";
   let lastProcessingLog = 0;
+  // Two thresholds give the on/off controller hysteresis so it cannot flap a
+  // converter every 4-second tick: pause an input once it drops below STARVE,
+  // but do not resume until it climbs back above RESUME.
+  const PROCESSOR_STARVE_RATIO = 0.08;
+  const PROCESSOR_RESUME_RATIO = 0.22;
 
   const refreshAfterProcessorChange = () => {
     try {
@@ -2173,46 +2194,99 @@
     return needed;
   };
 
+  // Decide what each converter should be doing this tick.  Unlike the old
+  // one-way "pause when it steals a plan input" logic, this is a full on/off
+  // controller: converters (and pure-benefit toggles like the Steamworks) run
+  // at FULL by default so the player never has to flip the switch by hand, and
+  // are only throttled to 0 for a concrete reason — a plan conflict, a starved
+  // input, or producing nothing but capped output.  Returns the target `on`
+  // count plus a short reason used for the log line and hysteresis.
+  const desiredProcessorState = (meta, resources, missing, needed) => {
+    const name = meta.name;
+    const profile = processingProfileFor(meta);
+    const inputs = profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || [];
+    const outputs = profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || [];
+    const full = Math.max(0, meta.val || 0);
+    const wasStarvePaused = pausedProcessors[name] && pausedProcessors[name].reason === "starve";
+    const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
+
+    // (a) Plan conflict — the converter eats a resource the focused plan is
+    // currently short on while producing nothing the plan needs.  Yield it.
+    const conflictingInputs = inputs.filter((input) => missing.has(input) && resRatio(resources, input, 1) < 0.85);
+    const usefulOutputs = outputs.filter((output) => needed.has(output));
+    if (conflictingInputs.length > 0 && usefulOutputs.length === 0) {
+      return { on: 0, reason: "plan", detail: `saving ${conflictingInputs.map((input) => resTitle(resources, input)).join("+")}` };
+    }
+
+    // The plan urgently needs an output this converter actually makes — keep it
+    // running even if that drains a low input; the blocking cost wins.
+    const urgentOutput = outputs.some((output) => missing.has(output));
+
+    // (b) Base-economy starvation — an input is critically low AND already net
+    // draining, so running on would pin it at zero and starve the wider economy
+    // (e.g. a Smelter holding wood at 0).  Throttle unless an output is urgent.
+    const starvedInputs = inputs.filter((input) => resRatio(resources, input, 1) < lowRatio && productionFor(input) <= 0);
+    if (starvedInputs.length > 0 && !urgentOutput) {
+      return { on: 0, reason: "starve", detail: `protecting ${starvedInputs.map((input) => resTitle(resources, input)).join("+")}` };
+    }
+
+    // (c) Nothing useful to make — every output is capped and unneeded, so the
+    // converter would just burn inputs into full storage.  Idle it.
+    const outputsWanted = outputs.length === 0 || outputs.some((output) => needed.has(output) || !resCapped(resources, output));
+    if (!outputsWanted) {
+      return { on: 0, reason: "capped", detail: `${outputs.map((output) => resTitle(resources, output)).join("+")} full` };
+    }
+
+    // Otherwise: run it at full.
+    return { on: full, reason: "run", detail: "" };
+  };
+
   const optimizeProcessing = (resources, goalKey) => {
     try {
-      const target = getTargetCached(resources, goalKey);
-      if (!target) {
+      const converters = converterBuildings();
+      if (!converters.length) {
         processingPlanText = "Processing: watching converters";
         return;
       }
-      const missing = missingDirectCosts(target, resources);
-      const needed = resourcesNeededForTarget(target, resources);
+      const target = getTargetCached(resources, goalKey);
+      const missing = target ? missingDirectCosts(target, resources) : new Set();
+      const needed = target ? resourcesNeededForTarget(target, resources) : new Set();
       const changed = [];
 
-      for (const meta of converterBuildings()) {
+      for (const meta of converters) {
         const name = meta.name;
-        const profile = processingProfileFor(meta);
-        const inputs = profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || [];
-        const outputs = profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || [];
-        const conflictingInputs = inputs.filter((input) => missing.has(input) && resRatio(resources, input, 1) < 0.85);
-        const usefulOutputs = outputs.filter((output) => needed.has(output));
-        const shouldPause = conflictingInputs.length > 0 && usefulOutputs.length === 0;
         const currentOn = Math.max(0, meta.on || 0);
+        const state = desiredProcessorState(meta, resources, missing, needed);
 
-        if (shouldPause && currentOn > 0) {
-          pausedProcessors[name] = { on: currentOn, label: labelOf(meta) };
-          if (setProcessorOn(meta, 0)) changed.push(`paused ${labelOf(meta)} (saving ${conflictingInputs.map((input) => resTitle(resources, input)).join("+")})`);
-        } else if (!shouldPause && pausedProcessors[name]) {
-          const restore = Math.min(meta.val || 0, pausedProcessors[name].on || meta.val || 0);
-          if (setProcessorOn(meta, restore)) changed.push(`resumed ${labelOf(meta)}`);
+        if (state.on <= 0) {
+          if (currentOn > 0) {
+            pausedProcessors[name] = { on: currentOn, label: labelOf(meta), reason: state.reason };
+            if (setProcessorOn(meta, 0)) changed.push(`paused ${labelOf(meta)}${state.detail ? ` (${state.detail})` : ""}`);
+          } else if (pausedProcessors[name]) {
+            // Keep remembering why it is off so hysteresis/reporting hold.
+            pausedProcessors[name].reason = state.reason;
+          }
+        } else if (currentOn < state.on) {
+          if (setProcessorOn(meta, state.on)) {
+            changed.push(pausedProcessors[name] ? `resumed ${labelOf(meta)}` : `started ${labelOf(meta)}`);
+          }
+          delete pausedProcessors[name];
+        } else if (pausedProcessors[name]) {
+          // Already at/above target and no longer throttled — clear the memo.
           delete pausedProcessors[name];
         }
       }
 
       if (changed.length) {
-        processingPlanText = `Processing: ${changed.join("; ")} for ${labelOf(target.meta)}`;
+        const forText = target ? ` for ${labelOf(target.meta)}` : "";
+        processingPlanText = `Processing: ${changed.join("; ")}${forText}`;
         if (Date.now() - lastProcessingLog > 20000) {
           pushLog(`⚙ ${processingPlanText}`);
           lastProcessingLog = Date.now();
         }
       } else {
         const paused = Object.values(pausedProcessors).map((item) => item.label).filter(Boolean);
-        processingPlanText = paused.length ? `Processing: paused ${paused.join(", ")}` : "Processing: converters balanced";
+        processingPlanText = paused.length ? `Processing: paused ${paused.join(", ")}` : "Processing: converters running";
       }
     } catch (error) {
       /* ignore */
@@ -3490,19 +3564,57 @@
     return prices;
   };
 
-  const tradeWithRace = (race) => {
+  const tradeWithRace = (race, count = 1) => {
     const diplomacy = window.gamePage && window.gamePage.diplomacy;
+    const amount = Math.max(1, Math.floor(count) || 1);
     const beforeTitanium = resourceValue(resourceMap(), "titanium");
     const costsBefore = tradePricesForRace(race).map((price) => ({ name: price.name, value: resourceValue(resourceMap(), price.name) }));
     if (!diplomacy || !race) return false;
     try {
-      if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, 1);
-      else if (typeof diplomacy.trade === "function") diplomacy.trade(race);
+      if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, amount);
+      else if (typeof diplomacy.trade === "function") {
+        for (let i = 0; i < amount; i += 1) diplomacy.trade(race);
+      }
     } catch (error) {
       return false;
     }
     if (resourceValue(resourceMap(), "titanium") > beforeTitanium) return true;
     return costsBefore.some(({ name, value }) => resourceValue(resourceMap(), name) < value);
+  };
+
+  // How many Zebra trades we can fire in one batch.  Single-trade-per-tick is
+  // why hand-trading feels faster than the bot: with a 10s diplomacy throttle a
+  // 15%-odds trade trickles in titanium.  We batch up to what the SURPLUS (after
+  // plan reservations) can pay, but never more than is needed to cover the
+  // current titanium demand, and never enough to overflow the titanium cap.
+  const MAX_TRADE_BATCH = 50;
+  const affordableTradeCount = (prices, reserved, resources) => {
+    let count = Infinity;
+    for (const price of prices) {
+      if (!price || !price.name || !isFinite(price.val) || price.val <= 0) continue;
+      const stock = resourceValue(resources, price.name);
+      const hold = reserved[price.name] || (price.name === "catpower" ? reserved.manpower || 0 : 0);
+      const spendable = Math.max(0, stock - Math.max(0, hold));
+      count = Math.min(count, Math.floor(spendable / price.val));
+    }
+    return isFinite(count) ? Math.max(0, count) : 0;
+  };
+
+  const zebraTradeBatchSize = (resources, reserved, goalKey, prices) => {
+    const affordable = affordableTradeCount(prices, reserved, resources);
+    if (affordable <= 0) return 0;
+    const stats = zebraTitaniumStats(resources);
+    const perTrade = Math.max(0.1, stats.expected); // expected titanium per trade
+    const demand = titaniumDemandAmount(resources, goalKey);
+    const titanium = getRes(resources, "titanium");
+    // Enough trades to expect to cover the demand (at least one), capped so a
+    // lucky all-hit batch cannot blow far past the storage cap.
+    let batch = Math.max(1, Math.ceil(Math.max(demand, perTrade) / perTrade));
+    if (titanium && titanium.maxValue > 0) {
+      const headroom = Math.max(0, titanium.maxValue - titanium.value);
+      batch = Math.min(batch, Math.max(1, Math.ceil(headroom / Math.max(0.1, stats.amount))));
+    }
+    return Math.max(1, Math.min(batch, affordable, MAX_TRADE_BATCH));
   };
 
   const craftDiplomacyPrerequisites = (resources, goalKey) => {
@@ -3660,8 +3772,13 @@
       diplomacyPlanText = missing ? `Diplomacy: Zebra titanium trade needs ${missing} · ${odds}` : `Diplomacy: holding Zebra trade for plan reservations · ${odds}`;
       return false;
     }
-    if (tradeWithRace(zebras)) {
-      diplomacyPlanText = `Diplomacy: traded with Zebras for titanium path · ${odds}`;
+    const batch = zebraTradeBatchSize(resources, reserved, goalKey, prices);
+    const titaniumBefore = resourceValue(resources, "titanium");
+    if (tradeWithRace(zebras, batch)) {
+      const gained = Math.max(0, resourceValue(resourceMap(), "titanium") - titaniumBefore);
+      const batchNote = batch > 1 ? `×${batch}` : "";
+      const gainNote = gained > 0 ? ` (+${fmt(gained)} Ti)` : "";
+      diplomacyPlanText = `Diplomacy: traded with Zebras${batchNote} for titanium path${gainNote} · ${odds}`;
       pushLog(`🦓 ${diplomacyPlanText}`);
       return true;
     }

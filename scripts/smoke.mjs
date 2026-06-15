@@ -730,6 +730,49 @@ fakeNow += 25000;
 tickFn();
 check("titanium path: direct Zebra trade fallback obtains titanium for blocked upgrades", res("titanium").value > 0 && zebras.tradeTotal > 0);
 check("titanium path: Zebra odds and ship/trade balance are shown", /ships.*%.*Ti\/trade avg.*build toward/i.test(panelText(".kgh-diplomacy")));
+check("titanium path: trades fire in a batch, not one-at-a-time (faster than hand-trading)", zebras.tradeTotal > 1);
+
+
+/* Stage 8 — converter controller switches an idle converter ON by itself, so
+   the player never has to flip the Smelter/Steamworks button by hand. */
+const blastForge = {
+  name: "blastForge",
+  label: "Blast Forge",
+  unlocked: true,
+  val: 3,
+  on: 0, // left switched off — the controller must turn it on
+  prices: [{ name: "minerals", val: 100 }],
+  effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.2 },
+};
+buildings.push(blastForge);
+perTick.minerals = 0.3; // healthy, net-positive input
+res("minerals").value = 950;
+res("minerals").maxValue = 1000;
+res("iron").value = 40; // well below cap → output still wanted
+res("iron").maxValue = 300;
+fakeNow += 25000;
+tickFn();
+check("converters: an idle converter is switched ON when inputs are healthy and output wanted", blastForge.on === 3);
+
+/* Stage 9 — base-economy starvation guard throttles a running converter when an
+   input is critically low AND already net-draining, instead of pinning it at 0. */
+perTick.minerals = -0.3;
+res("minerals").value = 15; // ~1.5% of cap and draining → starved
+res("minerals").maxValue = 1000;
+fakeNow += 25000;
+tickFn();
+check("converters: running converter throttled to protect a starved, draining input", blastForge.on === 0);
+
+/* Stage 10 — input recovers well above the resume threshold → converter
+   restarts (hysteresis: it does NOT flap back on at the same low level it
+   paused at). Minerals are stocked abundantly so this isolates the starvation
+   guard from the plan-reservation pause. */
+perTick.minerals = 0.5;
+res("minerals").maxValue = 5000;
+res("minerals").value = 5000; // fully stocked → never "missing" for the plan
+fakeNow += 25000;
+tickFn();
+check("converters: converter restarts once the starved input recovers", blastForge.on === 3);
 
 
 if (failures.length) {
