@@ -657,10 +657,10 @@
   // left on, it can immediately convert a just-saved raw resource (e.g. the 900
   // iron for an Observatory) into a generic craft such as plates before the plan
   // click runs. During a focused reserve, let this helper's reservation-aware
-  // craftTowardTarget() do prerequisite crafting and pause every unrelated KS
-  // craft while a reserve is active. Wood-from-catnip remains allowed only when
-  // it supports the target and catnip itself is not reserved, preserving the
-  // early surplus-refine path without letting KS make side crafts like plates.
+  // craftTowardTarget() do prerequisite crafting and pause KS crafts while a
+  // reserve is active. Wood-from-catnip remains allowed only when it supports
+  // the target and catnip itself is not reserved, preserving the early
+  // surplus-refine path without letting KS make side crafts like plates.
   const craftChainOutputsFor = (name, out = new Set(), depth = 0) => {
     if (depth > 5 || !name || out.has(name)) return out;
     const craft = craftByName(name);
@@ -696,8 +696,8 @@
     if (!workshop) return;
     const reserved = new Set(target && !target.affordable ? reservedResourceNames(target, resources || resourceMap()) : []);
     const activeReserve = reserved.size > 0 || explorerSave;
-    const allowed = activeReserve && target ? targetCraftOutputsFor(target, resources || resourceMap()) : new Set();
-    const allowWoodSurplus = activeReserve && !reserved.has("catnip") && (!target || reserved.has("wood") || allowed.has("wood"));
+    const targetOutputs = activeReserve && target ? targetCraftOutputsFor(target, resources || resourceMap()) : new Set();
+    const allowWoodSurplus = activeReserve && !reserved.has("catnip") && (!target || reserved.has("wood") || targetOutputs.has("wood"));
     let paused = 0;
     const kept = [];
     for (const key of WORKSHOP_CRAFT_SETTING_KEYS) {
@@ -705,7 +705,7 @@
       if (!crafts || typeof crafts !== "object") continue;
       for (const [name, node] of Object.entries(crafts)) {
         if (!node || typeof node !== "object") continue;
-        const enable = activeReserve ? (allowed.has(name) || (name === "wood" && allowWoodSurplus)) : (name === "wood" ? true : node.enabled !== false);
+        const enable = activeReserve ? (name === "wood" && allowWoodSurplus) : (name === "wood" ? true : node.enabled !== false);
         if (activeReserve && !enable) paused += 1;
         if (enable && activeReserve) kept.push(craftLabel(name));
         setCraftNodeEnabled(node, enable);
@@ -2424,6 +2424,13 @@
       const have = ((getRes(resources, cost.name) || {}).value) || 0;
       const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
       if (deficit <= 0) continue;
+      if (cost.name === "titanium") {
+        const titaniumWait = waitSecondsForZebraTitanium(deficit, resources);
+        if (isFinite(titaniumWait)) {
+          worst = Math.max(worst, titaniumWait);
+          continue;
+        }
+      }
       // Resources with their own positive net production (wood, minerals…)
       // arrive directly — don't expand them into a craft chain, or a negative
       // catnip rate would mark a 25-second wood wait as "never".
@@ -2446,6 +2453,36 @@
         if (prod <= 0) return Number.POSITIVE_INFINITY;
         worst = Math.max(worst, missing / prod);
       }
+    }
+    return worst;
+  };
+
+  // Titanium usually has no ordinary positive production when Mansions and
+  // early workshop upgrades first appear. Treating a titanium deficit as a raw
+  // "no production" blocker makes those targets look unreachable; treating the
+  // current titanium bar as if it will fill by itself makes their ETA read
+  // "≈1s" while the player is really waiting on gold/catpower/slabs for Zebra
+  // trades.  Model the live Zebra trade route as the production path instead:
+  // expected titanium per trade determines how many caravans are needed, and
+  // the ETA is the slowest ETA among the resources needed to pay those trades.
+  const waitSecondsForZebraTitanium = (titaniumDeficit, resources) => {
+    if (!isFinite(titaniumDeficit) || titaniumDeficit <= 0) return 0;
+    const zebras = raceByName("zebras");
+    if (!zebras || !zebras.unlocked) return Number.POSITIVE_INFINITY;
+    const expectedTitanium = Math.max(0, zebraTitaniumStats(resources).expected || 0);
+    if (expectedTitanium <= 0) return Number.POSITIVE_INFINITY;
+    const tradesNeeded = Math.ceil(titaniumDeficit / expectedTitanium);
+    if (tradesNeeded <= 0) return 0;
+    let worst = 0;
+    for (const price of tradePricesForRace(zebras)) {
+      if (!price || !price.name || !isFinite(price.val) || price.val <= 0) continue;
+      const required = price.val * tradesNeeded;
+      const have = resourceValue(resources, price.name);
+      const deficit = Math.max(0, required - have - craftablePotential(price.name));
+      if (deficit <= 0) continue;
+      const prod = rawProductionForNeed(price.name);
+      if (prod <= 0) return Number.POSITIVE_INFINITY;
+      worst = Math.max(worst, deficit / prod);
     }
     return worst;
   };
