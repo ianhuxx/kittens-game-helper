@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.8
+// @version      1.1.9
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -57,6 +57,8 @@
   ];
 
   const KS_FALLBACK_LOADER = "https://kitten-science.com/stable.js";
+
+  const WORKSHOP_CRAFT_SETTING_KEYS = ["crafts", "resources"];
 
   // Irreversible / permanent / resource-burning / log-hiding automations.
   // Matched by key name anywhere in the KS settings tree and forced OFF.
@@ -640,6 +642,41 @@
 
   const reservedResourceNames = (target, resources) => Object.keys(reservedNeedsFor(target, resources));
 
+  const craftInputsFor = (name) => {
+    const craft = craftByName(name);
+    return craftPricesFor(craft).filter((price) => price && price.name && price.val > 0).map((price) => price.name);
+  };
+
+  const setCraftNodeEnabled = (node, enabled) => {
+    if (!node || typeof node !== "object") return;
+    if ("enabled" in node) node.enabled = enabled;
+  };
+
+  // KS crafting has no knowledge of this helper's active target reservation. If
+  // left on, it can immediately convert a just-saved raw resource (e.g. the 900
+  // iron for an Observatory) into a generic craft such as plates before the plan
+  // click runs. During a focused reserve, let this helper's reservation-aware
+  // craftTowardTarget() do prerequisite crafting and pause every KS craft whose
+  // inputs intersect the held resources. Wood-from-catnip remains allowed only
+  // when catnip itself is not reserved, preserving the early surplus-refine path.
+  const protectWorkshopCrafts = (settings, reservedNames) => {
+    const workshop = settings && settings.workshop;
+    if (!workshop) return;
+    const reserved = new Set(reservedNames || []);
+    for (const key of WORKSHOP_CRAFT_SETTING_KEYS) {
+      const crafts = workshop[key];
+      if (!crafts || typeof crafts !== "object") continue;
+      for (const [name, node] of Object.entries(crafts)) {
+        if (!node || typeof node !== "object") continue;
+        const inputs = craftInputsFor(name);
+        const conflicts = inputs.some((input) => reserved.has(input));
+        const allowWoodSurplus = name === "wood" && !reserved.has("catnip");
+        setCraftNodeEnabled(node, reserved.size ? allowWoodSurplus && !conflicts : name === "wood" ? true : node.enabled !== false);
+        if (name === "wood" && typeof node.trigger === "number") node.trigger = 0.5;
+      }
+    }
+  };
+
   const setExternalSpendersEnabled = (settings, enabled) => {
     if (!settings) return;
     for (const section of PURCHASE_SECTIONS) {
@@ -658,6 +695,7 @@
       const reserved = target && !target.affordable ? reservedResourceNames(target, resources) : [];
       const explorerSave = shouldSaveForExplorers(resources, goalKey);
       const shouldPause = reserved.length > 0 || explorerSave;
+      protectWorkshopCrafts(settings, reserved);
       setExternalSpendersEnabled(settings, !shouldPause);
       if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
 
@@ -4330,17 +4368,19 @@
       optimizeProcessing(resources, goal);
       craftTowardTarget(resources, goal);
       craftDiplomacyPrerequisites(resources, goal);
-      // Crafting can turn a plan affordable immediately.  Re-read resources and
-      // rebuild the per-tick target cache before buying, otherwise the next tick
-      // (and ongoing raw-resource drain) can steal the just-crafted window.
+      // Crafting or trade can turn a plan affordable immediately. Re-read and
+      // try the locked plan BEFORE any surplus/overflow conversion, otherwise a
+      // generic craft can spend the exact raw resource window the plan needed.
+      resetTickCache();
+      resources = resourceMap();
+      protectPlanFromExternalSpenders(resources, goal);
+      executePlan(resources, goal);
       resetTickCache();
       resources = resourceMap();
       craftOverflowResources(resources, goal);
       resetTickCache();
       resources = resourceMap();
       reserveFaithForReligionProgression(resources);
-      protectPlanFromExternalSpenders(resources, goal);
-      executePlan(resources, goal);
       // Purchases can change resource stocks, caps, unlocks and per-tick effects;
       // re-read before diplomacy/jobs so later decisions are based on the board
       // after the buy, not on the planning snapshot from before it.
