@@ -932,7 +932,7 @@
   // Craft toward `targetAmount` of a resource, recursively crafting missing
   // inputs first. Partial fills are fine: if inputs only cover a third of the
   // deficit, craft that third now instead of stalling until everything fits.
-  const tryCraftResource = (name, targetAmount, depth = 0) => {
+  const tryCraftResource = (name, targetAmount, depth = 0, target = null, topOutputName = name) => {
     if (depth > 5 || !isFinite(targetAmount) || targetAmount <= 0) return false;
     const resources = resourceMap();
     const current = getRes(resources, name);
@@ -950,7 +950,7 @@
       const neededInput = price.val * wantUnits;
       const input = getRes(resourceMap(), price.name);
       if (((input && input.value) || 0) < neededInput) {
-        tryCraftResource(price.name, neededInput, depth + 1); // best effort, clamp below
+        tryCraftResource(price.name, neededInput, depth + 1, target, topOutputName); // best effort, clamp below
       }
     }
 
@@ -958,7 +958,8 @@
     let units = wantUnits;
     for (const price of prices) {
       const input = getRes(fresh, price.name);
-      const available = Math.max(0, ((input && input.value) || 0) - craftFloorFor(fresh, price.name));
+      const floor = target ? overflowInputFloor(target, fresh, price.name, topOutputName) : craftFloorFor(fresh, price.name);
+      const available = Math.max(0, ((input && input.value) || 0) - floor);
       units = Math.min(units, Math.floor(available / price.val));
     }
     if (units <= 0) return false;
@@ -1094,7 +1095,7 @@
             planned = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
             craftPlanText = planned;
           }
-          tryCraftResource(cost.name, cost.val); // may overwrite plan text with "made N …"
+          tryCraftResource(cost.name, cost.val, 0, target, cost.name); // may overwrite plan text with "made N …"
         }
       }
       if (!planned) craftPlanText = "Craft: gathering raw inputs";

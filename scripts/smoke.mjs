@@ -96,6 +96,8 @@ const crafts = [
   { name: "wood", label: "Refine Catnip", unlocked: true, prices: [{ name: "catnip", val: 100 }] },
   { name: "beam", label: "Beam", unlocked: true, prices: [{ name: "wood", val: 175 }] },
   { name: "slab", label: "Slab", unlocked: true, prices: [{ name: "minerals", val: 250 }] },
+  { name: "plate", label: "Metal Plate", unlocked: true, prices: [{ name: "iron", val: 25 }] },
+  { name: "scaffold", label: "Scaffold", unlocked: true, prices: [{ name: "plate", val: 1 }] },
   { name: "ship", label: "Ship", unlocked: true, prices: [{ name: "scaffold", val: 1 }] },
   { name: "parchment", label: "Parchment", unlocked: true, prices: [{ name: "furs", val: 175 }] },
   { name: "manuscript", label: "Manuscript", unlocked: true, prices: [{ name: "culture", val: 400 }, { name: "parchment", val: 25 }] },
@@ -580,11 +582,34 @@ tickFn();
 check("crafted intermediate: upgrade bought in the same throttled tick", sawblades.researched === true && res("beam").value >= 0 && res("beam").value < 10);
 check("focus panel names upgrade priority clearly", logText().includes("plan upgrade Sawblades") || /FOCUS: .*WORKSHOP UPGRADE/i.test(panelText(".kgh-plan")));
 
+
 /* Cross-cutting village behaviors */
 check("leader elected from traits", village.leader != null && village.leader.trait.name !== "none");
 check("promotion: overflowing gold spent on kittens", promoteCalls > 0 && res("gold").value < 95);
 check("jobs: starvation guard reinforced farmers (net catnip < 0)", job("farmer").value >= 3);
 check("jobs: religion faith reserve directs priests", job("priest").value > 0);
+
+/* Stage 7b — crafting one target intermediate must not eat another direct target cost */
+for (const upgrade of gamePage.workshop.upgrades) upgrade.researched = true;
+buildings.forEach((building) => { building.unlocked = false; });
+const observatory = {
+  name: "observatory",
+  label: "Observatory",
+  unlocked: true,
+  val: 2,
+  on: 2,
+  prices: [{ name: "iron", val: 100 }, { name: "scaffold", val: 10 }],
+  effects: { scienceRatio: 0.1, scienceMax: 500 },
+};
+buildings.push(observatory);
+res("iron").value = 125;
+res("iron").maxValue = 1000;
+res("plate").value = 0;
+res("scaffold").value = 8;
+fakeNow += 25000;
+tickFn();
+check("crafted intermediate: scaffold crafting preserves Observatory's direct iron reserve", observatory.val === 2 && res("scaffold").value === 9 && res("iron").value >= 100);
+
 
 /* Calm hunting — happy village with stocked furs keeps hunters to a crew */
 village.happiness = 1.18; // >100% mood, like a real luxury-fed village
