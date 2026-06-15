@@ -2282,6 +2282,18 @@
     // the input always wins — the blocking output comes from another path.
     const starvedInputs = inputs.filter((input) => resRatio(resources, input, 1) < lowRatio && productionFor(input) <= 0);
     if (starvedInputs.length > 0) {
+      // If this converter is the path to a resource the focused plan is waiting
+      // on, do not shut it off completely just because an input is below the
+      // broad starvation threshold.  That created a deadlock in mid-game iron
+      // saves: the helper would focus an Observatory, reserve its iron, then
+      // pause every Smelter "protecting wood", leaving the missing iron to come
+      // only from incidental trades.  Keep a small trickle running while there
+      // is actual input stock, so the plan advances without letting the whole
+      // converter fleet pin the foundation resource at zero.
+      const hasInputStock = inputs.every((input) => (((getRes(resources, input) || {}).value) || 0) > 0);
+      if (usefulOutputs.length > 0 && hasInputStock) {
+        return { on: Math.min(full, Math.max(1, Math.ceil(full * 0.25))), reason: "run", detail: "" };
+      }
       return { on: 0, reason: "starve", detail: `protecting ${starvedInputs.map((input) => resTitle(resources, input)).join("+")}` };
     }
 
