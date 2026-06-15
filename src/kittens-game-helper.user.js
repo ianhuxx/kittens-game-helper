@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.6
+// @version      1.1.7
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -3455,13 +3455,25 @@
     return demand;
   };
 
+  // Ships are also stored like any resource: if the save caps the ship count
+  // (Harbour-limited storage etc.), there is no point planning a fleet larger
+  // than we can actually hold — building toward it just spins on a full bar.
+  const shipCapacity = (resources) => {
+    const ship = getRes(resources, "ship");
+    return ship && ship.maxValue > 0 ? ship.maxValue : Number.POSITIVE_INFINITY;
+  };
+  const shipsAreCapped = (resources) => {
+    const ship = getRes(resources, "ship");
+    return !!(ship && ship.maxValue > 0 && ship.value >= ship.maxValue - 0.5);
+  };
+
   const desiredZebraShipCount = (resources, goalKey) => {
     const demand = titaniumDemandAmount(resources, goalKey);
     if (demand <= 0) return 0;
-    if (demand <= 10) return 25;
-    if (demand <= 50) return 50;
-    if (demand <= 150) return 100;
-    return ZEBRA_TITANIUM_GUARANTEE_SHIPS;
+    const byDemand = demand <= 10 ? 25 : demand <= 50 ? 50 : demand <= 150 ? 100 : ZEBRA_TITANIUM_GUARANTEE_SHIPS;
+    // Never plan past the ship storage cap — at the cap the fleet is as big as
+    // it will get, so the helper should just trade at the resulting odds.
+    return Math.min(byDemand, Math.floor(shipCapacity(resources)));
   };
 
   const zebraTitaniumOddsText = (resources, goalKey) => {
@@ -3654,7 +3666,11 @@
       } else if (zebras && zebras.unlocked && craftByName("ship")) {
         const targetShips = desiredZebraShipCount(resources, goalKey);
         diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}`;
-        if (targetShips > Math.floor(ships)) {
+        if (shipsAreCapped(resources)) {
+          // Ship storage is full — the fleet can't grow, so don't spin on a
+          // capped bar; just keep trading at whatever odds the cap allows.
+          diplomacyPrepText = `Diplomacy prep: ship fleet at storage cap (${fmt(shipCapacity(resources))}) — trading at current odds`;
+        } else if (targetShips > Math.floor(ships)) {
           // Build toward the WHOLE intended fleet from surplus this tick
           // (tryCraftResource partial-fills and honours plan reservations), so
           // trade odds and payout ramp quickly instead of crawling up one ship
