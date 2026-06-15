@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.9
+// @version      1.2.0
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -656,25 +656,64 @@
   // left on, it can immediately convert a just-saved raw resource (e.g. the 900
   // iron for an Observatory) into a generic craft such as plates before the plan
   // click runs. During a focused reserve, let this helper's reservation-aware
-  // craftTowardTarget() do prerequisite crafting and pause every KS craft whose
-  // inputs intersect the held resources. Wood-from-catnip remains allowed only
-  // when catnip itself is not reserved, preserving the early surplus-refine path.
-  const protectWorkshopCrafts = (settings, reservedNames) => {
+  // craftTowardTarget() do prerequisite crafting and pause every unrelated KS
+  // craft while a reserve is active. Wood-from-catnip remains allowed only when
+  // it supports the target and catnip itself is not reserved, preserving the
+  // early surplus-refine path without letting KS make side crafts like plates.
+  const craftChainOutputsFor = (name, out = new Set(), depth = 0) => {
+    if (depth > 5 || !name || out.has(name)) return out;
+    const craft = craftByName(name);
+    if (!craft) return out;
+    out.add(name);
+    for (const price of craftPricesFor(craft)) {
+      if (price && price.name) craftChainOutputsFor(price.name, out, depth + 1);
+    }
+    return out;
+  };
+
+  const targetCraftOutputsFor = (target, resources) => {
+    const allowed = new Set();
+    if (!target) return allowed;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources || resourceMap(), cost.name) || {}).value) || 0;
+      if (have >= cost.val && !craftByName(cost.name)) continue;
+      craftChainOutputsFor(cost.name, allowed);
+    }
+    return allowed;
+  };
+
+  const craftOutputHelpsTarget = (target, outputName, resources) => {
+    if (!target || !outputName) return false;
+    return targetCraftOutputsFor(target, resources).has(outputName);
+  };
+
+  let craftPolicyText = "Craft policy: KS crafts ready";
+
+  const protectWorkshopCrafts = (settings, target, resources, explorerSave = false) => {
     const workshop = settings && settings.workshop;
     if (!workshop) return;
-    const reserved = new Set(reservedNames || []);
+    const reserved = new Set(target && !target.affordable ? reservedResourceNames(target, resources || resourceMap()) : []);
+    const activeReserve = reserved.size > 0 || explorerSave;
+    const allowed = activeReserve && target ? targetCraftOutputsFor(target, resources || resourceMap()) : new Set();
+    const allowWoodSurplus = activeReserve && !reserved.has("catnip") && (!target || reserved.has("wood") || allowed.has("wood"));
+    let paused = 0;
+    const kept = [];
     for (const key of WORKSHOP_CRAFT_SETTING_KEYS) {
       const crafts = workshop[key];
       if (!crafts || typeof crafts !== "object") continue;
       for (const [name, node] of Object.entries(crafts)) {
         if (!node || typeof node !== "object") continue;
-        const inputs = craftInputsFor(name);
-        const conflicts = inputs.some((input) => reserved.has(input));
-        const allowWoodSurplus = name === "wood" && !reserved.has("catnip");
-        setCraftNodeEnabled(node, reserved.size ? allowWoodSurplus && !conflicts : name === "wood" ? true : node.enabled !== false);
+        const enable = activeReserve ? (allowed.has(name) || (name === "wood" && allowWoodSurplus)) : (name === "wood" ? true : node.enabled !== false);
+        if (activeReserve && !enable) paused += 1;
+        if (enable && activeReserve) kept.push(craftLabel(name));
+        setCraftNodeEnabled(node, enable);
         if (name === "wood" && typeof node.trigger === "number") node.trigger = 0.5;
       }
     }
+    craftPolicyText = activeReserve
+      ? `Craft policy: paused ${paused} KS craft${paused === 1 ? "" : "s"}; allowed ${kept.slice(0, 4).join(", ") || "helper-only target crafting"}`
+      : "Craft policy: KS crafts allowed (no active reserve)";
   };
 
   const setExternalSpendersEnabled = (settings, enabled) => {
@@ -695,7 +734,7 @@
       const reserved = target && !target.affordable ? reservedResourceNames(target, resources) : [];
       const explorerSave = shouldSaveForExplorers(resources, goalKey);
       const shouldPause = reserved.length > 0 || explorerSave;
-      protectWorkshopCrafts(settings, reserved);
+      protectWorkshopCrafts(settings, target && !target.affordable ? target : null, resources, explorerSave);
       setExternalSpendersEnabled(settings, !shouldPause);
       if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
 
@@ -1036,7 +1075,7 @@
     const res = getRes(resources, name);
     if (!res || !res.maxValue || res.unlocked === false) return false;
     const ratio = res.value / res.maxValue;
-    const net = typeof res.perTickCached === "number" ? res.perTickCached : productionFor(name);
+    const net = productionFor(name);
     return ratio > 0.93 || (ratio > 0.86 && net > 0);
   };
 
@@ -1086,7 +1125,11 @@
         const output = getRes(resources, name);
         if (output && output.maxValue && output.value / output.maxValue > 0.92 && !targetNeedsResource(target, name)) continue;
         const hotInputs = prices.filter((price) => wouldWasteResource(resources, price.name));
-        if (!hotInputs.length && !targetNeedsResource(target, name)) continue;
+        const activeReserve = target && !target.affordable;
+        const helpsTarget = targetNeedsResource(target, name) || craftOutputHelpsTarget(target, name, resources);
+        const safeWoodOverflow = name === "wood" && !targetNeedsResource(target, "catnip") && wouldWasteResource(resources, "catnip");
+        if (activeReserve && !helpsTarget && !safeWoodOverflow) continue;
+        if (!hotInputs.length && !helpsTarget) continue;
         let maxUnits = Number.MAX_VALUE;
         for (const price of prices) {
           const input = getRes(resources, price.name);
@@ -1095,7 +1138,7 @@
           maxUnits = Math.min(maxUnits, Math.floor(Math.max(0, value - reserve) / price.val));
         }
         if (!isFinite(maxUnits) || maxUnits < 1) continue;
-        const targetBoost = targetNeedsResource(target, name) ? 100 : 0;
+        const targetBoost = targetNeedsResource(target, name) || craftOutputHelpsTarget(target, name, resources) ? 100 : 0;
         const heat = hotInputs.reduce((sum, price) => sum + Math.max(0, resRatio(resources, price.name, 0) - 0.86), 0);
         scored.push({ name, maxUnits, score: targetBoost + heat });
       }
@@ -2346,7 +2389,7 @@
       }
 
       if (changed.length) {
-        const forText = target ? ` for ${labelOf(target.meta)}` : "";
+        const forText = target && changed.some((item) => /started|resumed/.test(item)) ? ` for ${labelOf(target.meta)}` : "";
         processingPlanText = `Processing: ${changed.join("; ")}${forText}`;
         if (Date.now() - lastProcessingLog > 20000) {
           pushLog(`⚙ ${processingPlanText}`);
@@ -4419,7 +4462,7 @@
       if (buyEl) buyEl.textContent = `🛒 ${buyPlanText}`;
       if (resetEl) resetEl.textContent = resetAdvisorText;
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
-      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
+      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText} · ${craftPolicyText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (externalSpendersEl) externalSpendersEl.textContent = `🛡 ${externalSpendersPlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;

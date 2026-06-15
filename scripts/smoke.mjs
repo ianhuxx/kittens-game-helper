@@ -101,6 +101,10 @@ const crafts = [
   { name: "ship", label: "Ship", unlocked: true, prices: [{ name: "scaffold", val: 1 }] },
   { name: "parchment", label: "Parchment", unlocked: true, prices: [{ name: "furs", val: 175 }] },
   { name: "manuscript", label: "Manuscript", unlocked: true, prices: [{ name: "culture", val: 400 }, { name: "parchment", val: 25 }] },
+  { name: "compedium", label: "Compendium", unlocked: true, prices: [{ name: "manuscript", val: 50 }] },
+  { name: "blueprint", label: "Blueprint", unlocked: true, prices: [{ name: "science", val: 25000 }, { name: "compedium", val: 25 }] },
+  { name: "steel", label: "Steel", unlocked: true, prices: [{ name: "iron", val: 100 }, { name: "coal", val: 100 }] },
+  { name: "gear", label: "Gear", unlocked: true, prices: [{ name: "steel", val: 15 }] },
 ];
 const craft = (name) => crafts.find((c) => c.name === name);
 
@@ -270,6 +274,8 @@ const village = {
 };
 
 const perTick = { catnip: -0.4, wood: 0.4, minerals: 0.3, science: 0.2, culture: 0.2, manpower: 0.2, iron: 0.05, coal: 0.01, gold: 0.01 };
+const craftRatios = { plate: 0.16 };
+const resourcePerTickCalls = [];
 
 const diplomacy = {
   races: [
@@ -319,9 +325,12 @@ const gamePage = {
   upgrade() {},
   render() {},
   getEffect: () => 0,
-  getResCraftRatio: () => 0,
+  getResCraftRatio: (name) => (Number.isFinite(craftRatios[name]) ? craftRatios[name] : 0),
   ticksPerSecond: 5,
-  getResourcePerTick: (name) => (Number.isFinite(perTick[name]) ? perTick[name] : 0),
+  getResourcePerTick: (name, includeConversion) => {
+    resourcePerTickCalls.push({ name, includeConversion });
+    return Number.isFinite(perTick[name]) ? perTick[name] : 0;
+  },
   craft(name, amount) {
     const c = craft(name);
     if (!c || amount <= 0) return false;
@@ -329,7 +338,7 @@ const gamePage = {
       if (res(p.name).value < p.val * amount) return false;
     }
     for (const p of c.prices) res(p.name).value -= p.val * amount;
-    res(name).value += amount;
+    res(name).value += amount * (1 + gamePage.getResCraftRatio(name));
     return true;
   },
 };
@@ -356,7 +365,23 @@ const ksSettings = {
   space: S({ trigger: 1 }),
   time: S({ reset: S() }),
   trade: S({ trigger: 0.8 }),
-  workshop: S({ crafts: { wood: S({ trigger: 0.95 }), beam: S({ trigger: 0.9 }) }, upgrades: { printingPress: S() } }),
+  workshop: S({
+    crafts: {
+      wood: S({ trigger: 0.95 }),
+      beam: S({ trigger: 0.9 }),
+      slab: S({ trigger: 0.9 }),
+      plate: S({ trigger: 0.9 }),
+      steel: S({ trigger: 0.9 }),
+      gear: S({ trigger: 0.9 }),
+      scaffold: S({ trigger: 0.9 }),
+      ship: S({ trigger: 0.9 }),
+      parchment: S({ trigger: 0.9 }),
+      manuscript: S({ trigger: 0.9 }),
+      compedium: S({ trigger: 0.9 }),
+      blueprint: S({ trigger: 0.9 }),
+    },
+    upgrades: { printingPress: S() },
+  }),
   village: S({
     jobs: { woodcutter: S(), farmer: S() },
     hunt: S({ trigger: 0.98 }),
@@ -461,6 +486,20 @@ check("reservation: affordable Mine NOT bought while Library saves up", building
 check("policy: non-exclusive auto-bought", policies[2].researched === true);
 check("policy: exclusive choices left for the player", policies[0].researched === false && policies[1].researched === false);
 check("policy: panel flags the exclusive decision", /exclusive/i.test(panelText(".kgh-policy")));
+check("production reads: helper requests conversion-aware net per tick", resourcePerTickCalls.some((call) => call.includeConversion === true));
+
+/* Stage 1b — active reserves pause unrelated KS crafts and helper overflow */
+res("iron").value = 295;
+res("iron").maxValue = 300;
+const plateBeforeReserveCraftGuard = res("plate").value;
+fakeNow += 5000;
+tickFn();
+check("KS workshop: unrelated plate craft disabled while focused reserve is active", appliedSettings.workshop.crafts.plate.enabled === false && /paused .*KS craft/.test(panelText(".kgh-craft")));
+check("overflow: hot iron is not converted into plate while Library reserve is active", res("plate").value === plateBeforeReserveCraftGuard);
+check("craft ratios: fake game models fractional craft outputs", gamePage.craft("plate", 1) === true && Math.abs(res("plate").value - (plateBeforeReserveCraftGuard + 1.16)) < 1e-9);
+res("plate").value = plateBeforeReserveCraftGuard;
+res("iron").value = 50;
+res("iron").maxValue = 300;
 
 /* Stage 2 — savings complete: the plan pushes through BEFORE the cheap rival */
 fakeNow += 5000;
