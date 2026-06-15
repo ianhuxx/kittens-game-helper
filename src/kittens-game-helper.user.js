@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.7
+// @version      1.1.8
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -2707,6 +2707,18 @@
       weights.farmer = Math.max(weights.farmer || 0, 10 + Math.min(25, -netCatnipPerSecond * 2));
     }
     if (resRatio(resources, "catnip") < 0.2 && jobByName("farmer")) weights.farmer = Math.max(weights.farmer || 0, 20);
+
+    // Wood starvation guard (symmetric to the catnip one): when wood is NET
+    // NEGATIVE and the bank is draining, staff woodcutters directly.  Without
+    // this, a plan that does not itself list wood leaves the wood pathway
+    // unstaffed; wood drains to ~0 and that silently pauses the Smelter
+    // (no iron → no plate → no ships → titanium stalls) even while catnip
+    // overflows by hundreds per second.
+    const netWoodPerSecond = productionFor("wood");
+    const woodcutterJob = jobByName("woodcutter");
+    if (woodcutterJob && netWoodPerSecond < 0 && resRatio(resources, "wood") < 0.5) {
+      weights.woodcutter = Math.max(weights.woodcutter || 0, 8 + Math.min(20, -netWoodPerSecond));
+    }
     if (!Object.values(weights).some((w) => w > 0)) {
       const fallback = bestWoodJob() || jobByName("woodcutter") || jobByName("farmer") || jobs[0];
       if (fallback) weights[fallback.name] = 1;
@@ -3837,13 +3849,48 @@
     return false;
   };
 
+  // The Zebra Relations policies (culture-cost, mutually exclusive) change how
+  // the Zebras deal with us; Appeasement is the trade-friendly side — better
+  // relations and trade outcomes.  The generic policy automation leaves
+  // exclusive choices to the player, but when titanium is gated behind Zebra
+  // trades this policy IS the bottleneck lever, so adopt the trade side as a
+  // one-time pick instead of leaving it unbought while titanium stalls.
+  const zebraTradePolicyMeta = () => {
+    for (const meta of policyMetas()) {
+      if (!policyOpen(meta)) continue;
+      const id = `${(meta && meta.name) || ""} ${labelOf(meta)}`.toLowerCase();
+      if (/zebra/.test(id) && /appeas/.test(id)) return meta;
+    }
+    return null;
+  };
+
+  const maybeAdoptZebraTradePolicy = (resources, reserved, goalKey) => {
+    if (!titaniumNeededSoon(resources, goalKey)) return false;
+    const zebras = raceByName("zebras");
+    if (!zebras || !zebras.unlocked) return false;
+    const meta = zebraTradePolicyMeta();
+    if (!meta) return false;
+    const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resources) };
+    const prices = pricesFor("policy", meta);
+    if (!candidate.affordable || !pricesRespectReservations(prices, reserved, resources)) {
+      diplomacyPlanText = `Diplomacy: saving for ${labelOf(meta)} — improves Zebra titanium trades`;
+      return false;
+    }
+    if (buyCandidate(candidate)) {
+      diplomacyPlanText = `Diplomacy: adopted ${labelOf(meta)} to improve Zebra titanium trades`;
+      pushLog(`📜 ${diplomacyPlanText}`);
+      return true;
+    }
+    return false;
+  };
+
   const manageDiplomacy = (resources, goalKey) => {
     try {
       if (getProfileName() !== "autopilot") return;
       if (Date.now() - lastDiplomacyAction < 10000) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = reservedNeedsFor(target, resources);
-      if (maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeBuildEmbassy(resources, reserved)) {
+      if (maybeAdoptZebraTradePolicy(resources, reserved, goalKey) || maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeBuildEmbassy(resources, reserved)) {
         lastDiplomacyAction = Date.now();
         return;
       }
