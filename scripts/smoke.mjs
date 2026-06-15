@@ -796,6 +796,20 @@ fakeNow += 25000;
 tickFn();
 check("converters: pseudo-output (pollution) does not keep a capped converter running", polluter.on === 0);
 
+/* Stage 12 — ship storage cap: a capped fleet must NOT be built past its limit
+   (no spinning on a full ship bar); the helper just trades at the resulting
+   odds. Inputs are plentiful so only the cap can stop the build. */
+titaniumSaw.researched = false; // keep a titanium-blocked target alive
+res("titanium").value = 0;
+res("titanium").maxValue = 100;
+res("scaffold").value = 100; // plenty of ship inputs — only the cap should stop the build
+res("ship").value = 3;
+res("ship").maxValue = 3; // fleet is at its storage cap
+const shipBeforeCap = res("ship").value;
+fakeNow += 25000;
+tickFn();
+check("ship cap: capped fleet is not built past its storage limit", res("ship").value === shipBeforeCap);
+
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
