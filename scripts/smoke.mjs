@@ -810,6 +810,47 @@ fakeNow += 25000;
 tickFn();
 check("ship cap: capped fleet is not built past its storage limit", res("ship").value === shipBeforeCap);
 
+/* Stage 13 — wood starvation guard: wood net-negative and draining must staff
+   woodcutters even when the plan doesn't list wood, so the Smelter→iron→plate→
+   ship→titanium chain doesn't silently stall while catnip overflows. */
+village.getKittens = () => 40; // larger village so the rebalance is visible past the deadband
+village.getFreeKittens = () => 20;
+for (const rn of ["minerals", "iron", "coal", "science", "furs"]) {
+  const x = res(rn);
+  if (x) { x.maxValue = x.maxValue || 1000; x.value = x.maxValue; } // full banks zero rival jobs
+}
+perTick.wood = -4; // wood draining hard
+perTick.catnip = 8; // catnip healthy → catnip guard stays off
+res("wood").value = 50;
+res("wood").maxValue = 3000; // ~2% of cap → starved
+res("catnip").value = 3500;
+res("catnip").maxValue = 5000;
+const woodcuttersBefore = job("woodcutter").value;
+for (let i = 0; i < 3; i += 1) { fakeNow += 25000; tickFn(); }
+check("jobs: wood starvation guard staffs woodcutters when wood drains (catnip fine)", job("woodcutter").value > woodcuttersBefore);
+
+/* Stage 14 — Zebra Relations: Appeasement is adopted to improve titanium trades.
+   The generic automation leaves exclusive policies to the player, but this one
+   is the titanium bottleneck lever, so the diplomacy manager adopts it. */
+policies.push({
+  name: "zebraRelationsAppeasement",
+  label: "Zebra Relations: Appeasement",
+  unlocked: true,
+  researched: false,
+  blocked: false,
+  blocks: ["zebraRelationsBellicosity"], // exclusive — normally left to the player
+  prices: [{ name: "culture", val: 1000 }],
+  effects: {},
+});
+res("culture").value = 3000;
+res("culture").maxValue = 3000; // capped → free to spend
+res("titanium").value = 0; // titanium still needed via Zebra trade (zebras unlocked earlier)
+fakeNow += 25000;
+tickFn();
+fakeNow += 25000;
+tickFn();
+check("diplomacy: Zebra Relations Appeasement adopted to improve titanium trades", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true);
+
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
