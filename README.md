@@ -4,10 +4,12 @@ One-click **autopilot** for [Kittens Game](https://kittensgame.com/web/) that ru
 your browser, **continues the save you already have**, and shows you what to build or
 research next.
 
-It is a thin wrapper around [**Kitten Scientists**](https://github.com/kitten-science/kitten-scientists)
-(KS) — the proven, open-source automation engine for this game. This project doesn't
-re-invent the automation; it loads KS, turns on every **safe** automation for you, and
-keeps the dangerous stuff (prestige **resets**) off so your progress is never wiped.
+It runs a helper-owned autopilot with [**Kitten Scientists**](https://github.com/kitten-science/kitten-scientists)
+(KS) loaded as a compatibility/utility layer. The helper owns the decisions that can
+spend resources for the active plan, including builds, research, upgrades, jobs, hunting,
+crafting guards and diplomacy fallbacks. During an active reserve it pauses unrelated KS
+spenders/crafts so an outside queue cannot turn saved inputs into plates, slabs or other
+side crafts behind your back. Prestige **resets** stay off so your progress is never wiped.
 
 > **Why not machine learning?** Kittens Game is deterministic and already "solved" by
 > well-known heuristics. There is no published ML/RL bot for it, and rule-based tools
@@ -35,7 +37,7 @@ to log into; the game is stored locally in your browser.
 
 | Mode | What it does |
 | --- | --- |
-| **Autopilot: play forward** *(default)* | The helper picks a plan, **reserves the resources the plan needs**, buys the plan the moment it's affordable, and spends only true surplus on everything else. Kitten Scientists keeps running crafting, trade, faith, space, festivals and time acceleration; the helper runs jobs, hunting, leader/promotions, policies (non-exclusive only) and all building/research/upgrade purchases. It also **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. |
+| **Autopilot: play forward** *(default)* | The helper picks a plan, **reserves the resources the plan needs**, buys the plan the moment it's affordable, and spends only true surplus on everything else. The helper owns all strategic spending and pauses unrelated KS craft/trade/space/time spenders while saving, so active-plan inputs are not silently converted into side crafts such as Metal Plate. It also **refines surplus catnip into wood** to break the classic early wood/mineral starvation. You never touch a number. |
 | **Assist: jobs + advice** | Only rebalances jobs, hunts, holds festivals and watches for star events. **You** decide what to build/research — the advisor line tells you what's next. |
 
 **Both modes keep prestige resets OFF**, plus other irreversible/resource-burning
@@ -46,7 +48,7 @@ So it always *continues* your existing game — it will never reset it behind yo
 
 The bottom-right box is a live dashboard:
 
-- **KS engine:** `running ✓` / `stopped` — confirms automation is actually ticking.
+- **KS engine:** `running ✓` / `stopped` — confirms automation is actually ticking; the panel title also shows the installed helper version.
 - **⚖ Bottleneck:** the thing currently holding you back — a *capped* resource being
   wasted (e.g. `science capped — build more storage`) or a *starved* one
   (e.g. `wood starved (refining catnip)`).
@@ -100,7 +102,8 @@ affordable first. That cannot happen anymore:
 
 1. Kitten Scientists' bonfire/science/workshop-upgrade buyers are **switched off** —
    the helper is the only thing buying buildings, research and workshop upgrades.
-   (KS keeps crafting, trade, religion, space, time and festivals.)
+   While a target is still saving, unrelated KS craft/trade/space/time spenders are also
+   paused; only target-chain crafts and safe catnip→wood support remain allowed.
 2. The helper picks the most **valuable** reachable step as the plan — not the
    cheapest ready one — using one universal scoring framework: each candidate's
    *parsed metadata effects* (`woodPerTick`, `scienceMax`, `maxKittens`, …) are priced
@@ -181,12 +184,11 @@ logic feeds job balancing, so missing steel pushes work toward the raw inputs be
 (coal/geologists and minerals/iron support) instead of treating steel as an impossible
 resource.
 
-It also watches resource storage pressure. If wood, minerals, iron, coal, culture/science
-inputs, or other craft inputs are close to capping, it converts a conservative slice into
-useful workshop goods such as beams, slabs, plates, steel, gears, parchment, manuscripts,
-compediums, or blueprints. It keeps reserves (especially catnip for food and catpower for
-hunting) and prefers the craft that helps the current plan, so overflow becomes progress
-instead of waste.
+It also watches resource storage pressure. If there is **no active reserve**, hot inputs can
+be converted into useful workshop goods such as beams, slabs, plates, steel, gears,
+parchment, manuscripts, compediums, or blueprints. If a plan is actively saving, generic
+overflow is narrowed to target-chain crafts (plus safe catnip→wood support), so unrelated
+Metal Plate or slab conversion cannot steal the run-up to the focused build/research.
 
 
 ## Leader selection & promotions
