@@ -48,7 +48,7 @@ So it always *continues* your existing game — it will never reset it behind yo
 
 The bottom-right box is a live dashboard:
 
-- **KS engine:** `running ✓` / `stopped` — confirms automation is actually ticking.
+- **KS engine:** `running ✓` / `stopped` — confirms automation is actually ticking; the panel title also shows the installed helper version.
 - **⚖ Bottleneck:** the thing currently holding you back — a *capped* resource being
   wasted (e.g. `science capped — build more storage`) or a *starved* one
   (e.g. `wood starved (refining catnip)`).

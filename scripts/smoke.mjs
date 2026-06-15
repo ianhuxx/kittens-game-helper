@@ -649,6 +649,23 @@ fakeNow += 25000;
 tickFn();
 check("crafted intermediate: scaffold crafting preserves Observatory's direct iron reserve", observatory.val === 2 && res("scaffold").value === 9 && res("iron").value >= 100);
 
+/* Stage 7c — do not craft Plate for Scaffold until direct Observatory iron is covered */
+observatory.prices = [{ name: "iron", val: 1000 }, { name: "scaffold", val: 10 }];
+res("iron").value = 500;
+res("iron").maxValue = 1500;
+res("plate").value = 0;
+res("scaffold").value = 8;
+appliedSettings.workshop.crafts.plate.enabled = true;
+fakeNow += 25000;
+tickFn();
+check("crafted intermediate: plate waits while Observatory direct iron is still short", res("plate").value === 0 && res("scaffold").value === 8 && res("iron").value >= 500);
+check("KS workshop: target-chain plate is still paused because helper owns reserve-safe crafting", appliedSettings.workshop.crafts.plate.enabled === false);
+observatory.prices = [{ name: "iron", val: 100 }, { name: "scaffold", val: 10 }];
+res("iron").value = 125;
+res("iron").maxValue = 1000;
+res("plate").value = 0;
+res("scaffold").value = 9;
+
 
 /* Calm hunting — happy village with stocked furs keeps hunters to a crew */
 village.happiness = 1.18; // >100% mood, like a real luxury-fed village

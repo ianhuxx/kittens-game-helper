@@ -31,6 +31,7 @@
   const STORAGE_KEY = "kgh.profile";
   const LOG_KEY = "kgh.log";
   const DEFAULT_PROFILE = "autopilot";
+  const HELPER_VERSION = "1.2.1";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1094,6 +1095,16 @@
   const overflowInputFloor = (target, resources, inputName, outputName) => {
     let floor = craftFloorFor(resources, inputName);
     if (!target) return floor;
+
+    // If the active target directly needs this input and is still short, no
+    // lower-priority craft may consume it. This closes the Observatory trap:
+    // crafting Plate for missing Scaffold must wait until the direct Iron bill
+    // is already covered.
+    const directInputCost = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name === inputName && isFinite(cost.val) && cost.val > 0);
+    if (directInputCost && inputName !== outputName) {
+      const haveDirect = ((getRes(resources, inputName) || {}).value) || 0;
+      if (haveDirect < directInputCost.val) return Number.MAX_SAFE_INTEGER;
+    }
 
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
@@ -4534,7 +4545,7 @@
       "font:12px/1.35 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
     box.innerHTML = [
       '<div class="kgh-row" style="justify-content:space-between;align-items:center">',
-      '<strong style="font-size:13px">🐱 Kittens Helper</strong>',
+      '<strong style="font-size:13px">🐱 Kittens Helper</strong><small style="opacity:.7;margin-left:4px">v' + HELPER_VERSION + '</small>',
       '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-ks">Show KS</button>',
       '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
       '<div class="kgh-body" style="display:grid;gap:5px">',
