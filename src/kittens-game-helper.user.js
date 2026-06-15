@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.4
+// @version      1.1.5
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -2201,7 +2201,10 @@
   // are only throttled to 0 for a concrete reason — a plan conflict, a starved
   // input, or producing nothing but capped output.  Returns the target `on`
   // count plus a short reason used for the log line and hysteresis.
-  const desiredProcessorState = (meta, resources, missing, needed) => {
+  const reservedHoldFor = (reserved, input) =>
+    (reserved[input] || 0) || (input === "manpower" ? reserved.catpower || 0 : input === "catpower" ? reserved.manpower || 0 : 0);
+
+  const desiredProcessorState = (meta, resources, missing, needed, reserved) => {
     const name = meta.name;
     const profile = processingProfileFor(meta);
     const inputs = profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || [];
@@ -2209,24 +2212,31 @@
     const full = Math.max(0, meta.val || 0);
     const wasStarvePaused = pausedProcessors[name] && pausedProcessors[name].reason === "starve";
     const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
+    const usefulOutputs = outputs.filter((output) => needed.has(output));
 
     // (a) Plan conflict — the converter eats a resource the focused plan is
-    // currently short on while producing nothing the plan needs.  Yield it.
-    const conflictingInputs = inputs.filter((input) => missing.has(input) && resRatio(resources, input, 1) < 0.85);
-    const usefulOutputs = outputs.filter((output) => needed.has(output));
-    if (conflictingInputs.length > 0 && usefulOutputs.length === 0) {
+    // short on OR has RESERVED (and isn't abundantly above that reservation)
+    // while producing nothing the plan needs.  Yield the input so a converter
+    // started at full by default cannot drain a stock the plan is saving — e.g.
+    // an Academy waiting on science still keeps the minerals it has reserved.
+    // Inputs sitting near their cap are exempt: converting that overflow is
+    // safe (the reservation keeps a fat buffer) and avoids wasting the surplus.
+    const conflictingInputs = usefulOutputs.length ? [] : inputs.filter((input) => {
+      if (resRatio(resources, input, 1) >= 0.85) return false;
+      return missing.has(input) || reservedHoldFor(reserved, input) > 0;
+    });
+    if (conflictingInputs.length > 0) {
       return { on: 0, reason: "plan", detail: `saving ${conflictingInputs.map((input) => resTitle(resources, input)).join("+")}` };
     }
 
-    // The plan urgently needs an output this converter actually makes — keep it
-    // running even if that drains a low input; the blocking cost wins.
-    const urgentOutput = outputs.some((output) => missing.has(output));
-
     // (b) Base-economy starvation — an input is critically low AND already net
     // draining, so running on would pin it at zero and starve the wider economy
-    // (e.g. a Smelter holding wood at 0).  Throttle unless an output is urgent.
+    // (e.g. a Smelter holding wood at 0 to chase a trickle of titanium).  This
+    // is NOT overridden by a "needed output": a converter run dry produces
+    // almost nothing yet keeps the foundational resource pinned, so protecting
+    // the input always wins — the blocking output comes from another path.
     const starvedInputs = inputs.filter((input) => resRatio(resources, input, 1) < lowRatio && productionFor(input) <= 0);
-    if (starvedInputs.length > 0 && !urgentOutput) {
+    if (starvedInputs.length > 0) {
       return { on: 0, reason: "starve", detail: `protecting ${starvedInputs.map((input) => resTitle(resources, input)).join("+")}` };
     }
 
@@ -2251,12 +2261,13 @@
       const target = getTargetCached(resources, goalKey);
       const missing = target ? missingDirectCosts(target, resources) : new Set();
       const needed = target ? resourcesNeededForTarget(target, resources) : new Set();
+      const reserved = target ? reservedNeedsFor(target, resources) : {};
       const changed = [];
 
       for (const meta of converters) {
         const name = meta.name;
         const currentOn = Math.max(0, meta.on || 0);
-        const state = desiredProcessorState(meta, resources, missing, needed);
+        const state = desiredProcessorState(meta, resources, missing, needed, reserved);
 
         if (state.on <= 0) {
           if (currentOn > 0) {
@@ -3636,11 +3647,13 @@
         diplomacyPrepText = "Diplomacy prep: saving Catpower to send explorers for Zebras";
       } else if (zebras && zebras.unlocked && craftByName("ship")) {
         const targetShips = desiredZebraShipCount(resources, goalKey);
+        diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}`;
         if (targetShips > Math.floor(ships)) {
-          diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}`;
-          tryCraftResource("ship", Math.floor(ships) + 1);
-        } else {
-          diplomacyPrepText = `Diplomacy prep: ${zebraTitaniumOddsText(resources, goalKey)}`;
+          // Build toward the WHOLE intended fleet from surplus this tick
+          // (tryCraftResource partial-fills and honours plan reservations), so
+          // trade odds and payout ramp quickly instead of crawling up one ship
+          // per tick while low-odds trades trickle in titanium and stall the plan.
+          tryCraftResource("ship", targetShips);
         }
       }
     } catch (error) {
