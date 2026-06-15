@@ -28,10 +28,9 @@
 (function kittensGameHelper() {
   "use strict";
 
-  const STORAGE_KEY = "kgh.profile";
+  const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const DEFAULT_PROFILE = "autopilot";
-  const HELPER_VERSION = "1.2.1";
+  const HELPER_VERSION = "1.3.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -84,22 +83,13 @@
   // should wait for near-cap faith instead of firing as soon as any faith exists.
   const PURCHASE_SECTIONS = ["space", "time", "trade"];
 
-  const PROFILE_INFO = {
-    autopilot: {
-      label: "Autopilot: play forward",
-      note: "Safe autopilot is on: the plan reserves what it needs and buys itself; jobs, crafting, hunting, leader and storage fixes run too. Resets stay OFF.",
-    },
-    assist: {
-      label: "Assist: jobs + advice",
-      note: "Light mode: jobs, hunting, festivals, event watching, and advice only. You choose builds and research.",
-    },
-  };
-
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const getProfileName = () => {
+  // Autopilot is the only mode — on by default. The UI toggles it; when off,
+  // the helper disables all KS automations so you drive manually.
+  const isAutopilotOn = () => {
     const stored = localStorage.getItem(STORAGE_KEY);
-    return PROFILE_INFO[stored] ? stored : DEFAULT_PROFILE;
+    return stored !== "0";
   };
 
   // Goals steer the advisor toward a destination you pick (autopilot still
@@ -313,37 +303,24 @@
     }
   };
 
-  const buildSettings = (profileName) => {
+  const buildSettings = () => {
     const settings = window.kittenScientists.getSettings();
 
-    if (profileName === "assist") {
-      setEnabledDeep(settings, false);
-      if (settings.engine) {
-        settings.engine.enabled = true;
-        settings.engine.interval = 1500;
-      }
-      if (settings.village) setEnabledDeep(settings.village, true, "village");
-      if (settings.science) {
-        settings.science.enabled = true;
-        if (settings.science.observe) setEnabledDeep(settings.science.observe, true, "observe");
-      }
-    } else {
-      setEnabledDeep(settings, true);
-      if (settings.engine) {
-        settings.engine.enabled = true;
-        settings.engine.interval = 1000;
-        if (settings.engine.resources) settings.engine.resources.enabled = false;
-      }
-      for (const section of PURCHASE_SECTIONS) {
-        if (settings[section]) setTriggersDeep(settings[section], 0);
-      }
-      for (const section of ["space", "time"]) {
-        if (settings[section]) raiseZeroMaxes(settings[section]);
-      }
-      configureReligionProgression(settings);
-      takeOverPurchasing(settings);
-      enableCatnipRefining(settings);
+    setEnabledDeep(settings, true);
+    if (settings.engine) {
+      settings.engine.enabled = true;
+      settings.engine.interval = 1000;
+      if (settings.engine.resources) settings.engine.resources.enabled = false;
     }
+    for (const section of PURCHASE_SECTIONS) {
+      if (settings[section]) setTriggersDeep(settings[section], 0);
+    }
+    for (const section of ["space", "time"]) {
+      if (settings[section]) raiseZeroMaxes(settings[section]);
+    }
+    configureReligionProgression(settings);
+    takeOverPurchasing(settings);
+    enableCatnipRefining(settings);
 
     disableKSJobsAndHunt(settings);
     return settings;
@@ -360,12 +337,10 @@
     }
   };
 
-  const applyProfile = (profileName) => {
-    const name = PROFILE_INFO[profileName] ? profileName : DEFAULT_PROFILE;
-    window.kittenScientists.setSettings(buildSettings(name));
-    localStorage.setItem(STORAGE_KEY, name);
+  const applyProfile = () => {
+    window.kittenScientists.setSettings(buildSettings());
     ensureEngineRunning();
-    pushLog(`▶ ${PROFILE_INFO[name].label} applied`);
+    pushLog(`▶ Autopilot applied — ${isAutopilotOn() ? "ON" : "OFF"}`);
     tick();
   };
 
@@ -728,7 +703,6 @@
 
   const protectPlanFromExternalSpenders = (resources, goalKey) => {
     try {
-      if (getProfileName() !== "autopilot") return;
       const settings = window.kittenScientists && window.kittenScientists.getSettings && window.kittenScientists.getSettings();
       if (!settings) return;
       const target = getTargetCached(resources, goalKey);
@@ -3483,7 +3457,6 @@
 
   const executePlan = (resources, goalKey) => {
     try {
-      if (getProfileName() !== "autopilot") return;
       computeResetAdvisor();
       const now = Date.now();
       const target = getTargetCached(resources, goalKey);
@@ -3701,7 +3674,7 @@
   });
 
   const titaniumDiscoveryPending = (resources, goalKey) => {
-    if (getProfileName() !== "autopilot" || !explorerFeeCanFit(resources)) return false;
+    if (!explorerFeeCanFit(resources)) return false;
     const zebras = raceByName("zebras");
     if (zebras && zebras.unlocked) return false;
     if (!titaniumNeededSoon(resources, goalKey)) return false;
@@ -3709,7 +3682,7 @@
   };
 
   const shouldSaveForExplorers = (resources, goalKey) => {
-    if (getProfileName() !== "autopilot" || !explorerFeeCanFit(resources)) return false;
+    if (!explorerFeeCanFit(resources)) return false;
     if (!hasDiscoverableRaceNow(resources) && !titaniumDiscoveryPending(resources, goalKey)) return false;
     return explorerPrices().some((price) => resourceValue(resources, price.name) < price.val);
   };
@@ -3802,7 +3775,7 @@
 
   const craftDiplomacyPrerequisites = (resources, goalKey) => {
     try {
-      if (getProfileName() !== "autopilot" || !titaniumNeededSoon(resources, goalKey)) {
+      if (!titaniumNeededSoon(resources, goalKey)) {
         diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
         return;
       }
@@ -4028,7 +4001,6 @@
 
   const manageDiplomacy = (resources, goalKey) => {
     try {
-      if (getProfileName() !== "autopilot") return;
       if (Date.now() - lastDiplomacyAction < 10000) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = reservedNeedsFor(target, resources);
@@ -4586,10 +4558,7 @@
       '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-ks">Show KS</button>',
       '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
       '<div class="kgh-body" style="display:grid;gap:5px">',
-      '<div class="kgh-row"><select class="kgh-grow" aria-label="profile">',
-      '<option value="autopilot">Autopilot: play forward</option>',
-      '<option value="assist">Assist: jobs + advice</option>',
-      "</select><button type=\"button\" class=\"kgh-apply\" style=\"cursor:pointer\">Apply</button></div>",
+      '<div class="kgh-row"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer">Autopilot: ON</button></div>',
       '<select class="kgh-goal" aria-label="goal" style="width:100%">',
       // Goal options come straight from GOALS so the dropdown, the planner and
       // the progress line can never drift apart.
@@ -4628,9 +4597,8 @@
 
     const select = box.querySelector("select");
     const goalSelect = box.querySelector(".kgh-goal");
-    const button = box.querySelector(".kgh-apply");
+    const toggleBtn = box.querySelector(".kgh-autopilot");
     const prioritySelect = box.querySelector(".kgh-priority");
-    const note = box.querySelector(".kgh-note");
     const ksBtn = box.querySelector(".kgh-ks");
     const minBtn = box.querySelector(".kgh-min");
     const body = box.querySelector(".kgh-body");
@@ -4654,10 +4622,17 @@
     nowEl = box.querySelector(".kgh-now");
     logBox = box.querySelector(".kgh-log");
 
-    select.value = getProfileName();
-    select.addEventListener("change", () => {
-      note.textContent = PROFILE_INFO[select.value].note;
+    const syncToggle = () => {
+      toggleBtn.textContent = `Autopilot: ${isAutopilotOn() ? "ON" : "OFF"}`;
+      toggleBtn.style.background = isAutopilotOn() ? "#2d6b3f" : "#5a3a3a";
+    };
+    toggleBtn.addEventListener("click", () => {
+      const next = isAutopilotOn() ? "0" : "1";
+      localStorage.setItem(STORAGE_KEY, next);
+      syncToggle();
+      applyProfile();
     });
+    syncToggle();
     goalSelect.value = getGoal();
     goalSelect.addEventListener("change", () => {
       localStorage.setItem(GOAL_KEY, goalSelect.value);
@@ -4670,7 +4645,6 @@
       activeTarget = null;
       tick();
     });
-    button.addEventListener("click", () => applyProfile(select.value));
     policyApplyEl.addEventListener("click", () => {
       if (policySelectEl.value && buyPolicyChoice(policySelectEl.value)) tick();
     });
@@ -4688,7 +4662,6 @@
 
     document.body.classList.add("kgh-helper-ready");
     document.body.appendChild(box);
-    note.textContent = PROFILE_INFO[select.value].note;
     applyKSHidden(localStorage.getItem(KS_HIDE_KEY) !== "0", ksBtn); // default hidden = minimal
     applyMin(localStorage.getItem(MIN_KEY) === "1");
     renderLog();
@@ -4730,7 +4703,7 @@
 
   waitForKittenScientists()
     .then(() => {
-      applyProfile(getProfileName());
+      applyProfile();
       buildPanel();
     })
     .catch((error) => console.error("[KGH] Failed to start:", error));

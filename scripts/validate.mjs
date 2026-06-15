@@ -22,9 +22,8 @@ const required = [
   '"reset"',
   '"transcend"',
   '"sacrifice"',
-  // Both profiles must exist.
+  // Autopilot toggle must exist.
   "autopilot",
-  "assist",
   // The "build as soon as affordable" trigger fix must stay in place.
   "PURCHASE_SECTIONS",
   "setTriggersDeep",
@@ -97,7 +96,7 @@ const required = [
   "emphasis",
   // Jobs discover what each job produces from the game's own metadata.
   "jobResourceFor",
-  // The Apply button must never wrap its label ("Appl\\ny") — panel buttons
+  // The autopilot toggle button must never wrap its label — panel buttons
   // are pinned to content size.
   ".kgh-panel button{white-space:nowrap;flex:0 0 auto}",
   // Policies: non-exclusive auto-buy; exclusive (blocks-list) stays manual.
