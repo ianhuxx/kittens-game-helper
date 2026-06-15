@@ -774,6 +774,42 @@ fakeNow += 25000;
 tickFn();
 check("converters: converter restarts once the starved input recovers", blastForge.on === 3);
 
+/* Stage 11 — a converter with a non-resource pseudo-output (e.g. pollution)
+   must still idle when its REAL output is capped and unneeded, instead of
+   looking productive forever and burning inputs into full storage. */
+const polluter = {
+  name: "polluter",
+  label: "Polluter",
+  unlocked: true,
+  val: 2,
+  on: 2,
+  prices: [{ name: "minerals", val: 100 }],
+  effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.2, cathPollutionPerTickProd: 0.01 },
+};
+buildings.push(polluter);
+perTick.minerals = 0.5;
+res("minerals").value = 5000; // abundant input (no plan conflict / starvation)
+res("minerals").maxValue = 5000;
+res("iron").value = 300; // real output fully capped and unneeded
+res("iron").maxValue = 300;
+fakeNow += 25000;
+tickFn();
+check("converters: pseudo-output (pollution) does not keep a capped converter running", polluter.on === 0);
+
+/* Stage 12 — ship storage cap: a capped fleet must NOT be built past its limit
+   (no spinning on a full ship bar); the helper just trades at the resulting
+   odds. Inputs are plentiful so only the cap can stop the build. */
+titaniumSaw.researched = false; // keep a titanium-blocked target alive
+res("titanium").value = 0;
+res("titanium").maxValue = 100;
+res("scaffold").value = 100; // plenty of ship inputs — only the cap should stop the build
+res("ship").value = 3;
+res("ship").maxValue = 3; // fleet is at its storage cap
+const shipBeforeCap = res("ship").value;
+fakeNow += 25000;
+tickFn();
+check("ship cap: capped fleet is not built past its storage limit", res("ship").value === shipBeforeCap);
+
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
