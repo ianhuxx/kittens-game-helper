@@ -774,6 +774,28 @@ fakeNow += 25000;
 tickFn();
 check("converters: converter restarts once the starved input recovers", blastForge.on === 3);
 
+/* Stage 11 — a converter with a non-resource pseudo-output (e.g. pollution)
+   must still idle when its REAL output is capped and unneeded, instead of
+   looking productive forever and burning inputs into full storage. */
+const polluter = {
+  name: "polluter",
+  label: "Polluter",
+  unlocked: true,
+  val: 2,
+  on: 2,
+  prices: [{ name: "minerals", val: 100 }],
+  effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.2, cathPollutionPerTickProd: 0.01 },
+};
+buildings.push(polluter);
+perTick.minerals = 0.5;
+res("minerals").value = 5000; // abundant input (no plan conflict / starvation)
+res("minerals").maxValue = 5000;
+res("iron").value = 300; // real output fully capped and unneeded
+res("iron").maxValue = 300;
+fakeNow += 25000;
+tickFn();
+check("converters: pseudo-output (pollution) does not keep a capped converter running", polluter.on === 0);
+
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

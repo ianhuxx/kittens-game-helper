@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.1.5
+// @version      1.1.6
 // @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -2207,8 +2207,14 @@
   const desiredProcessorState = (meta, resources, missing, needed, reserved) => {
     const name = meta.name;
     const profile = processingProfileFor(meta);
-    const inputs = profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || [];
-    const outputs = profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || [];
+    // Keep only real resources: a live effect can list a pseudo-output such as
+    // `cathPollution` that has no resPool entry, so it is never "capped" and
+    // would keep the converter looking productive (burning inputs into full
+    // storage) forever.  Filtering to actual resources makes the cap and
+    // starvation tests below see only what is really produced/consumed.
+    const isRealRes = (resName) => !!getRes(resources, resName);
+    const inputs = (profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || []).filter(isRealRes);
+    const outputs = (profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || []).filter(isRealRes);
     const full = Math.max(0, meta.val || 0);
     const wasStarvePaused = pausedProcessors[name] && pausedProcessors[name].reason === "starve";
     const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
