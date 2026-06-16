@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.0
+// @version      2.1.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -486,6 +486,35 @@
     return targetCraftOutputsFor(target, resources).has(outputName);
   };
 
+
+  const TARGET_TRADE_CHAIN = new Set(["parchment", "manuscript", "compedium", "compendium"]);
+  let stickyTargetChainReserve = { until: 0, names: new Set(), label: "" };
+
+  const activeTargetChainResources = (target, resources) => {
+    const names = new Set();
+    if (!target || target.affordable) return names;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources || resourceMap(), cost.name) || {}).value) || 0;
+      if (have >= cost.val) continue;
+      if (TARGET_TRADE_CHAIN.has(cost.name)) {
+        craftChainOutputsFor(cost.name, names);
+        names.add(cost.name);
+      }
+    }
+    return names;
+  };
+
+  const refreshStickyTargetChainReserve = (target, resources) => {
+    const names = activeTargetChainResources(target, resources);
+    if (names.size) {
+      stickyTargetChainReserve = { until: Date.now() + 120000, names, label: labelOf(target.meta) };
+    }
+    return names;
+  };
+
+  const stickyReservesResource = (name) => stickyTargetChainReserve.names.has(name) && Date.now() < stickyTargetChainReserve.until;
+
   // --- native reservation status ---------------------------------------------
   // The helper is now the ONLY actor that spends resources, and every spender it
   // owns (planner, prerequisite/overflow crafting, trade, diplomacy) already
@@ -629,6 +658,29 @@
       if (!catpower || !gold) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
+      refreshStickyTargetChainReserve(target, resources);
+      const targeted = races
+        .map((race) => targetTradeScore(race, target, resources, reserved))
+        .filter((item) => item && item.score > 0.0005)
+        .sort((a, b) => b.score - a.score)[0];
+      if (targeted && !shouldSaveForExplorers(resources, goalKey)) {
+        const race = targeted.race;
+        const before = resourceMap();
+        diplomacy.tradeAll(race);
+        const after = resourceMap();
+        lastTradeAt = Date.now();
+        diplomacyPlanText = `Targeted trade: ${race.title || race.name || "partner"} for ${labelOf(target.meta)} Compendium chain`;
+        const gains = targeted.goods.map(({ name }) => {
+          const delta = resourceValue(after, name) - resourceValue(before, name);
+          return delta > 0 ? `+${fmt(delta)} ${resTitle(after, name)}` : null;
+        }).filter(Boolean).join(", ");
+        const costs = targeted.prices.map((price) => {
+          const delta = resourceValue(after, price.name) - resourceValue(before, price.name);
+          return delta < 0 ? `${fmt(delta)} ${resTitle(after, price.name)}` : null;
+        }).filter(Boolean).join(", ");
+        pushLog(`🤝 ${race.title || race.name || "partner"} trade: ${gains || `targeted ${labelOf(target.meta)} chain`}${costs ? ` (${costs})` : ""}`);
+        return;
+      }
       if ((reserved.manpower || 0) > 0 || (reserved.gold || 0) > 0) return; // plan owns these
       if (shouldSaveForExplorers(resources, goalKey)) return; // explorers get first call on catpower
       const catpowerHot = catpower.maxValue > 0 && catpower.value / catpower.maxValue > 0.9;
@@ -1041,7 +1093,11 @@
   // minerals → slab when the focus itself is still reserving minerals.
   const overflowInputFloor = (target, resources, inputName, outputName, forPlanChain = false) => {
     let floor = craftFloorFor(resources, inputName, forPlanChain);
+    if (stickyReservesResource(inputName) && inputName !== outputName && !stickyReservesResource(outputName)) return Number.MAX_SAFE_INTEGER;
     if (!target) return floor;
+
+    const chain = refreshStickyTargetChainReserve(target, resources);
+    if (chain.has(inputName) && inputName !== outputName && !chain.has(outputName)) return Number.MAX_SAFE_INTEGER;
 
     // If the active target directly needs this input and is still short, no
     // lower-priority craft may consume it. This closes the Observatory trap:
@@ -4512,7 +4568,7 @@
       if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, amount);
       else if (typeof diplomacy.trade === "function") {
         for (let i = 0; i < amount; i += 1) diplomacy.trade(race);
-      }
+      } else if (typeof diplomacy.tradeAll === "function") diplomacy.tradeAll(race);
     } catch (error) {
       return false;
     }
@@ -4756,6 +4812,93 @@
     return false;
   };
 
+
+  const tradeSellExpected = (sell) => {
+    if (!sell || !sell.name) return 0;
+    const amount = isFinite(sell.value) ? sell.value : (isFinite(sell.val) ? sell.val : 0);
+    const chance = isFinite(sell.chance) ? sell.chance / 100 : 1;
+    return Math.max(0, amount * Math.max(0, Math.min(1, chance || 0)));
+  };
+
+  const targetTradeChainDemand = (target, resources) => {
+    const demand = {};
+    if (!target || target.affordable) return demand;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (!TARGET_TRADE_CHAIN.has(cost.name)) continue;
+      const have = resourceValue(resources, cost.name);
+      const missing = Math.max(0, cost.val - have - craftablePotential(cost.name));
+      if (missing <= 0 && have >= cost.val) continue;
+      demand[cost.name] = Math.max(demand[cost.name] || 0, Math.max(1, cost.val - have));
+      for (const name of craftChainOutputsFor(cost.name)) demand[name] = Math.max(demand[name] || 0, 1);
+    }
+    return demand;
+  };
+
+  const targetTradeYieldValue = (demand, sellName, amount) => {
+    if (!amount || amount <= 0) return 0;
+    if (demand.compedium && sellName === "compedium") return amount;
+    if (demand.compedium && sellName === "compendium") return amount;
+    if (demand.compedium && sellName === "manuscript") return amount / 50;
+    if (demand.compedium && sellName === "parchment") return amount / (50 * 25);
+    if (demand.compedium && sellName === "furs") return amount / (50 * 25 * 175);
+    if (demand.manuscript && sellName === "manuscript") return amount / 50;
+    if (demand.manuscript && sellName === "parchment") return amount / (50 * 25);
+    if (demand.parchment && sellName === "parchment") return amount / (50 * 25);
+    return 0;
+  };
+
+  const targetTradeScore = (race, target, resources, reserved) => {
+    const demand = targetTradeChainDemand(target, resources);
+    if (!Object.keys(demand).length) return null;
+    const prices = tradePricesForRace(race);
+    if (!prices.length || !pricesRespectReservations(prices, reserved, resources)) return null;
+    const affordable = affordableTradeCount(prices, reserved, resources);
+    if (affordable <= 0) return null;
+    let value = 0;
+    const goods = [];
+    for (const sell of race.sells || []) {
+      const expected = tradeSellExpected(sell);
+      const contribution = targetTradeYieldValue(demand, sell.name, expected);
+      if (contribution > 0) {
+        value += contribution;
+        goods.push({ name: sell.name, expected });
+      }
+    }
+    if (value <= 0) return null;
+    const scarcePenalty = prices.some((price) => {
+      const stock = resourceValue(resources, price.name);
+      const cap = ((getRes(resources, price.name) || {}).maxValue) || 0;
+      return cap > 0 && stock / cap < 0.15;
+    }) ? 0.25 : 0;
+    return { race, prices, affordable, goods, score: value - scarcePenalty, value };
+  };
+
+  const maybeTradeForTargetChain = (resources, reserved, goalKey, target) => {
+    const options = unlockedRaces()
+      .map((race) => targetTradeScore(race, target, resources, reserved))
+      .filter((item) => item && item.score > 0.0005)
+      .sort((a, b) => b.score - a.score);
+    const best = options[0];
+    if (!best) return false;
+    const batch = Math.max(1, Math.min(best.affordable, 10));
+    const before = resourceMap();
+    if (!tradeWithRace(best.race, batch)) return false;
+    const after = resourceMap();
+    const gains = best.goods.map(({ name }) => {
+      const delta = resourceValue(after, name) - resourceValue(before, name);
+      return delta > 0 ? `+${fmt(delta)} ${resTitle(after, name)}` : null;
+    }).filter(Boolean).join(", ");
+    const costs = best.prices.map((price) => {
+      const delta = resourceValue(after, price.name) - resourceValue(before, price.name);
+      return delta < 0 ? `${fmt(delta)} ${resTitle(after, price.name)}` : null;
+    }).filter(Boolean).join(", ");
+    const raceName = best.race.title || best.race.name || "civilization";
+    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} Compendium chain`;
+    pushLog(`🤝 ${raceName} trade: ${gains || "target-chain goods"}${costs ? ` (${costs})` : ""}`);
+    return true;
+  };
+
   const maybeBuildEmbassy = (resources, reserved) => {
     if (!writingResearched()) return false;
     const races = unlockedRaces()
@@ -4813,7 +4956,8 @@
       if (Date.now() - lastDiplomacyAction < 10000) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = reservedNeedsFor(target, resources);
-      if (maybeAdoptZebraTradePolicy(resources, reserved, goalKey) || maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeBuildEmbassy(resources, reserved)) {
+      refreshStickyTargetChainReserve(target, resources);
+      if (maybeAdoptZebraTradePolicy(resources, reserved, goalKey) || maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeTradeForTargetChain(resources, reserved, goalKey, target) || maybeBuildEmbassy(resources, reserved)) {
         lastDiplomacyAction = Date.now();
         return;
       }
@@ -4900,7 +5044,7 @@
 
   const TRADE_LOOT_RESOURCES = new Set([
     "wood", "minerals", "iron", "coal", "gold", "titanium", "uranium",
-    "furs", "ivory", "spice", "unicorns", "starchart", "blueprint",
+    "furs", "ivory", "spice", "unicorns", "starchart", "blueprint", "parchment", "manuscript", "compedium",
     "beam", "slab", "plate", "steel", "gear", "scaffold", "ship",
   ]);
 
@@ -4936,8 +5080,14 @@
       .sort((a, b) => b.delta - a.delta);
 
     if (!spent.length || !loot.length) return;
+    const spentCatpowerOnly = spent.every(({ name }) => name === "manpower" || name === "catpower");
+    const huntLootOnly = loot.every(({ name }) => name === "furs" || name === "ivory");
     const lootText = loot.slice(0, 4).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
     const spendText = spent.slice(0, 3).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
+    if (spentCatpowerOnly && huntLootOnly) {
+      pushLog(`🏹 hunting: ${lootText}${spendText ? ` (${spendText})` : ""}`);
+      return;
+    }
     pushLog(`🤝 trade: ${lootText}${spendText ? ` (${spendText})` : ""}`);
   };
 

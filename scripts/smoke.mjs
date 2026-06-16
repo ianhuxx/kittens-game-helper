@@ -307,8 +307,22 @@ const diplomacy = {
   getManpowerCost: () => 50,
   getGoldCost: () => 15,
   getMaxTradeAmt: () => 1,
-  tradeAll() {
+  tradeAll(race) {
     tradeCalls += 1;
+    if (race && race.name === "sharks" && canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "iron", val: 100 }])) {
+      res("manpower").value -= 50;
+      res("gold").value -= 15;
+      res("iron").value -= 100;
+      res("parchment").value += 7;
+      res("manuscript").value += 4.8;
+      res("compedium").value += 1.4;
+      race.tradeTotal = (race.tradeTotal || 0) + 1;
+    } else if (race && race.name === "lizards" && canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }])) {
+      res("manpower").value -= 50;
+      res("gold").value -= 15;
+      res("minerals").value += 100;
+      race.tradeTotal = (race.tradeTotal || 0) + 1;
+    }
   },
 };
 
@@ -1134,6 +1148,15 @@ const setupAcoustics = () => {
   res("manpower").value = 800; res("manpower").maxValue = 3225;
   res("gold").value = 95; res("gold").maxValue = 500;
   res("slab").value = 25; res("plate").value = 15;
+  res("iron").value = 250; res("iron").maxValue = 300;
+  let sharks = diplomacy.races.find((race) => race.name === "sharks");
+  if (!sharks) {
+    sharks = { name: "sharks", title: "Sharks", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], buys: [{ name: "iron", val: 100 }], sells: [{ name: "parchment", value: 7, chance: 100 }, { name: "manuscript", value: 4.8, chance: 100 }, { name: "compedium", value: 1.4, chance: 100 }] };
+    diplomacy.races.push(sharks);
+  }
+  sharks.unlocked = true; sharks.tradeTotal = 0;
+  const lizards = diplomacy.races.find((race) => race.name === "lizards");
+  if (lizards) lizards.tradeTotal = 0;
   storage.set("kgh.goal", "balanced");
   dbg.forceActiveTarget(null); // clear any prior lock + sprint
 };
@@ -1288,6 +1311,61 @@ fakeNow += 30000;
 tickFn();
 check("Test G: hot iron is NOT converted to Metal Plate while the Acoustics sprint runs", res("plate").value === plateBeforeOverflow && !/Metal Plate/i.test(panelText(".kgh-craft")));
 check("Test G: the active sprint chain still owns the plan", dbg.activeSprint()?.techName === "acoustics");
+
+/* ---------------------------------------------------------------------
+ * Test G2 — Target-aware Shark trades and Compendium reserve protection
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+res("science").value = 60000;
+res("compedium").value = 14;
+res("manuscript").value = 0;
+res("parchment").value = 0;
+res("manpower").value = 500; res("manpower").maxValue = 3225; // enough for caravan, not near cap
+res("gold").value = 100;
+res("iron").value = 250;
+res("wood").value = 0; // Lizards' room score should not beat Sharks
+const sharksG2 = diplomacy.races.find((race) => race.name === "sharks");
+const lizardsG2 = diplomacy.races.find((race) => race.name === "lizards");
+const sharkBeforeG2 = sharksG2.tradeTotal || 0;
+const lizardBeforeG2 = lizardsG2.tradeTotal || 0;
+fakeNow += 30000;
+dbg.selectStrategicTarget("balanced");
+tickFn();
+check("Test G2: Acoustics Compendium shortage uses targeted Shark trade over Lizard", (sharksG2.tradeTotal || 0) > sharkBeforeG2 && (lizardsG2.tradeTotal || 0) === lizardBeforeG2 && /Targeted trade: Sharks for Acoustics Compendium chain/i.test(panelText(".kgh-diplomacy")));
+
+setupAcoustics();
+res("science").value = 60000;
+res("compedium").value = 40;
+res("science").maxValue = 80000;
+const blueprintsBeforeG2 = res("blueprint") ? res("blueprint").value : 0;
+// Ensure a blueprint resource exists in this fixture if later game metadata exposes it.
+if (!res("blueprint")) resources.push(R("blueprint", 0, 0, "Blueprint"));
+const compBeforeBlueprintGuard = res("compedium").value;
+fakeNow += 30000;
+dbg.selectStrategicTarget("balanced");
+tickFn();
+check("Test G2: overflow does NOT craft Blueprint from Acoustics-reserved Compendium", res("compedium").value >= compBeforeBlueprintGuard && res("blueprint").value === blueprintsBeforeG2);
+
+setupAcoustics();
+res("science").value = 60000;
+res("compedium").value = 40;
+fakeNow += 30000;
+dbg.selectStrategicTarget("balanced");
+dbg.forceActiveTarget(null); // simulate a brief sprint recalculation gap
+const compBeforeStickyGap = res("compedium").value;
+tickFn();
+check("Test G2: sticky target-chain reserve survives a brief sprint recalculation gap", res("compedium").value >= compBeforeStickyGap);
+
+setupAcoustics();
+const tradeLogBeforeHunt = logText();
+res("manpower").value = 500;
+res("furs").value = 0;
+res("ivory").value = 0;
+fakeNow += 60000;
+village.huntAll();
+tickFn();
+const newLogAfterHunt = logText().slice(tradeLogBeforeHunt.length);
+check("Test G2: hunting resource deltas are not logged as trade", !/🤝 trade: .*Furs/i.test(newLogAfterHunt));
 
 /* ---------------------------------------------------------------------
  * Test H — Purchase safety: raw metadata fallback disabled by default
