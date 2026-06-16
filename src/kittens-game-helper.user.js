@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.0.1
+// @version      2.0.2
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.0.1";
+  const HELPER_VERSION = "2.0.2";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -331,8 +331,9 @@
       progress = Math.min(progress, possible / cost.val);
       if (have < cost.val) {
         affordable = false;
-        const storageHint = res && res.maxValue > 0 && cost.val > res.maxValue && !craftByName(cost.name)
-          ? ` (storage cap ${fmt(res.maxValue)})`
+        const cap = liveCapFor(resources, cost.name);
+        const storageHint = res && cap > 0 && cost.val > cap && !craftByName(cost.name)
+          ? ` (storage cap ${fmt(cap)})`
           : "";
         const craftHint = !storageHint && craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
         missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${storageHint || craftHint}`);
@@ -623,6 +624,61 @@
     goalClosure: null,
     goalSupport: null,
     fxRefreshed: new WeakSet(),
+  };
+
+  // Live resource telemetry.  The game API can expose production through
+  // several cached fields depending on version/mods, and those fields sometimes
+  // lag behind UI/controller updates.  Keep a short rolling observation of the
+  // actual resource bars so cap, rate and ETA math can prefer what is happening
+  // on the current save over any baked-in assumption.
+  const RESOURCE_TELEMETRY_MAX_AGE_MS = 15000;
+  const RESOURCE_TELEMETRY_MIN_SPAN_MS = 3500;
+  const RESOURCE_TELEMETRY_MAX_SAMPLES = 8;
+  const resourceTelemetry = Object.create(null);
+
+  const liveResourceCap = (res) => {
+    if (!res) return 0;
+    for (const key of ["maxValue", "maxValueCached", "maxValueBase"]) {
+      const value = res[key];
+      if (isFinite(value) && value > 0) return value;
+    }
+    return 0;
+  };
+
+  const sampleResourceTelemetry = () => {
+    const now = Date.now();
+    try {
+      for (const res of window.gamePage.resPool.resources || []) {
+        if (!res || !res.name || !isFinite(res.value)) continue;
+        const key = res.name === "catpower" ? "manpower" : res.name;
+        const entry = resourceTelemetry[key] || (resourceTelemetry[key] = { samples: [] });
+        entry.cap = liveResourceCap(res);
+        entry.title = res.title || res.name;
+        entry.samples.push({ t: now, value: res.value, cap: entry.cap });
+        while (entry.samples.length > RESOURCE_TELEMETRY_MAX_SAMPLES) entry.samples.shift();
+        while (entry.samples.length > 1 && now - entry.samples[0].t > RESOURCE_TELEMETRY_MAX_AGE_MS) entry.samples.shift();
+      }
+    } catch (error) {
+      /* the game is still booting */
+    }
+  };
+
+  const observedProductionFor = (name) => {
+    const entry = resourceTelemetry[name === "catpower" ? "manpower" : name];
+    if (!entry || entry.samples.length < 2) return null;
+    const first = entry.samples[0];
+    const last = entry.samples[entry.samples.length - 1];
+    const span = last.t - first.t;
+    if (span < RESOURCE_TELEMETRY_MIN_SPAN_MS) return null;
+    const delta = last.value - first.value;
+    if (!isFinite(delta)) return null;
+    return delta / (span / 1000);
+  };
+
+  const liveCapFor = (resources, name) => {
+    const res = getRes(resources, name);
+    const telemetry = resourceTelemetry[name === "catpower" ? "manpower" : name];
+    return Math.max(liveResourceCap(res), (telemetry && telemetry.cap) || 0);
   };
 
   const resetTickCache = () => {
@@ -1040,27 +1096,47 @@
   const woodCatnipCost = () => {
     try {
       const craft = window.gamePage.workshop.getCraft && window.gamePage.workshop.getCraft("wood");
-      const price = craft && craft.prices && craft.prices.find((p) => p.name === "catnip");
+      const price = craft && craftPricesFor(craft).find((p) => p.name === "catnip");
       if (price && price.val > 0) return price.val;
     } catch (error) {
-      /* default */
+      /* no live craft price yet */
     }
-    return 100;
+    return null;
+  };
+
+  const jobMarginalProductionPerSecond = (job, resourceName) => {
+    if (!job || !resourceName) return null;
+    const key = resourceName === "catpower" ? "manpower" : resourceName;
+    try {
+      if (job.modifiers && isFinite(job.modifiers[key])) return job.modifiers[key] * ticksPerSecond();
+      const count = Math.max(0, Number(job.value) || 0);
+      if (count > 0) {
+        const prod = window.gamePage.village && window.gamePage.village.getResProduction
+          ? window.gamePage.village.getResProduction()
+          : {};
+        const total = prod && prod[key];
+        if (isFinite(total)) return (total * ticksPerSecond()) / count;
+      }
+    } catch (error) {
+      /* no stable marginal signal for this job yet */
+    }
+    return null;
   };
 
   // Pathway math: to get more WOOD, is it better to add a Woodcutter (direct) or
   // a Farmer (catnip, which we refine into wood)? Compare wood-per-kitten of each.
   const bestWoodJob = () => {
     try {
-      const prod = window.gamePage.village.getResProduction ? window.gamePage.village.getResProduction() : {};
       const cutter = jobByName("woodcutter");
       const farmer = jobByName("farmer");
       if (!cutter) return farmer;
       if (!farmer) return cutter;
-      const woodPerCutter = cutter.value > 0 && prod.wood ? prod.wood / cutter.value : null;
-      const catnipPerFarmer = farmer.value > 0 && prod.catnip ? prod.catnip / farmer.value : null;
+      const woodPerCutter = jobMarginalProductionPerSecond(cutter, "wood");
+      const catnipPerFarmer = jobMarginalProductionPerSecond(farmer, "catnip");
       if (woodPerCutter == null || catnipPerFarmer == null) return cutter; // not enough data → direct
-      const woodViaRefine = catnipPerFarmer / woodCatnipCost();
+      const refineCost = woodCatnipCost();
+      if (!(refineCost > 0)) return cutter;
+      const woodViaRefine = catnipPerFarmer / refineCost;
       return woodViaRefine > woodPerCutter ? farmer : cutter;
     } catch (error) {
       return jobByName("woodcutter");
@@ -1119,7 +1195,8 @@
 
   const resRatio = (resources, name, fallback = 1) => {
     const r = getRes(resources, name);
-    return r && r.maxValue > 0 ? r.value / r.maxValue : fallback;
+    const cap = liveCapFor(resources, name);
+    return r && cap > 0 ? r.value / cap : fallback;
   };
 
   const resTitle = (resources, name) => {
@@ -1481,17 +1558,29 @@
     const resourceName = name === "catpower" ? "manpower" : name;
     if (Object.prototype.hasOwnProperty.call(tickCache.production, resourceName)) return tickCache.production[resourceName];
     let result = 0;
+    const observed = observedProductionFor(resourceName);
     try {
       const game = window.gamePage;
       if (game && typeof game.getResourcePerTick === "function") {
         const perTick = game.getResourcePerTick(resourceName, true);
         if (isFinite(perTick)) result = perTick * ticksPerSecond();
+        // Prefer the live bar delta once we have enough samples.  This catches
+        // production changed by seasonal modifiers, processing buildings,
+        // worker reassignment and temporary effects before cached API fields
+        // settle.  Large one-off jumps (trade/craft/build spends) are ignored
+        // here by trusting the API when the sample wildly disagrees.
+        if (observed != null && Math.abs(observed - result) <= Math.max(25, Math.abs(result) * 3)) {
+          result = observed;
+        }
         tickCache.production[resourceName] = result;
         return result;
       }
       const res = getRes(resourceMap(), resourceName);
       if (res && isFinite(res.perTickCached)) {
         result = res.perTickCached * ticksPerSecond();
+        if (observed != null && Math.abs(observed - result) <= Math.max(25, Math.abs(result) * 3)) {
+          result = observed;
+        }
         tickCache.production[resourceName] = result;
         return result;
       }
@@ -1500,6 +1589,9 @@
       result = isFinite(value) ? value * ticksPerSecond() : 0;
     } catch (error) {
       result = 0;
+    }
+    if (observed != null && (result === 0 || Math.abs(observed - result) <= Math.max(25, Math.abs(result) * 3))) {
+      result = observed;
     }
     tickCache.production[resourceName] = result;
     return result;
@@ -1578,8 +1670,9 @@
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       if (craftByName(cost.name)) continue;
       const res = getRes(resources, cost.name);
-      if (!res || !res.maxValue || res.maxValue <= 0 || cost.val <= res.maxValue) continue;
-      blockers.push({ name: cost.name, need: cost.val, max: res.maxValue });
+      const cap = liveCapFor(resources, cost.name);
+      if (!res || cap <= 0 || cost.val <= cap) continue;
+      blockers.push({ name: cost.name, need: cost.val, max: cap });
     }
     return blockers;
   };
@@ -2616,6 +2709,11 @@
     if (resRatio(resources, "minerals") < 0.3) scoreNeed(needs, "minerals", 6 * (0.3 - resRatio(resources, "minerals")) / 0.3);
     const emphasis = (GOALS[goalKey] && GOALS[goalKey].emphasis) || {};
     if ((emphasis.science || 1) > 1 && resRatio(resources, "science") < 0.92) scoreNeed(needs, "science", 3);
+    // Faith has no always-visible "next tech" equivalent, but it is a capped
+    // bank with compounding religion value.  Keep a small live-data baseline
+    // when priests exist and faith has storage headroom; the cap check below
+    // still removes the need the moment the actual bar is full.
+    if (jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
 
     // Include the same immediate diplomacy work the executor will try later in
     // the tick.  Trade routes and explorers are resource sinks just like a
@@ -2926,14 +3024,17 @@
   const getBottleneck = (resources) => {
     for (const name of SPENDABLE) {
       const r = resources.get(name);
-      if (r && r.maxValue > 0 && r.value >= r.maxValue * 0.99) {
+      const cap = liveCapFor(resources, name);
+      if (r && cap > 0 && r.value >= cap * 0.99) {
         const fix = name === "manpower" ? "send hunters" : "build more storage / spend it";
-        return `${r.title || name} is capped — ${fix}`;
+        const rate = productionFor(name);
+        return `${r.title || name} is capped (${fmt(r.value)}/${fmt(cap)}, ${rate >= 0 ? "+" : ""}${fmt(rate)}/s live) — ${fix}`;
       }
     }
     for (const name of RAW) {
       const r = resources.get(name);
-      if (r && r.maxValue > 0 && r.value < r.maxValue * 0.05) {
+      const cap = liveCapFor(resources, name);
+      if (r && cap > 0 && r.value < cap * 0.05) {
         const tip = name === "wood" ? " (refining catnip)" : " (more production/jobs)";
         return `${r.title || name} starved${tip}`;
       }
@@ -4356,6 +4457,7 @@
   const tick = () => {
     try {
       resetTickCache();
+      sampleResourceTelemetry();
       let resources = resourceMap();
       const goal = getGoal();
       computeResetAdvisor();
