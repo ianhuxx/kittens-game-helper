@@ -344,7 +344,19 @@ const applyPhase = (st, phase) => {
       { name: "satellite", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, prices: [{ name: "starchart", val: 325 }, { name: "science", val: 50000 }], effects: { scienceMax: 5000, scienceRatio: 0.05 } },
       { name: "spaceElevator", label: "Space Elevator", unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "science", val: 75000 }, { name: "titanium", val: 50 }], effects: { prodTransferBonus: 1 } },
     ];
-    st.gamePage.space = { programs, getProgram: (id) => programs.find((p) => p.name === id) };
+    st.gamePage.space = {
+      programs,
+      getProgram: (id) => programs.find((p) => p.name === id),
+      build(item) {
+        const program = typeof item === "string" ? programs.find((p) => p.name === item) : item;
+        if (!program) return false;
+        for (const p of program.prices) if ((res(p.name) || {}).value < p.val) return false;
+        for (const p of program.prices) res(p.name).value -= p.val;
+        program.val = (program.val || 0) + 1;
+        program.on = (program.on || 0) + 1;
+        return true;
+      },
+    };
     st.onTick = () => { const sc = res("starchart"); sc.value = Math.min(sc.maxValue, sc.value + 8); };
   }
 };

@@ -312,6 +312,13 @@ const diplomacy = {
   },
 };
 
+const canPay = (prices = []) => prices.every((p) => res(p.name) && res(p.name).value >= p.val);
+const pay = (prices = []) => {
+  if (!canPay(prices)) return false;
+  for (const p of prices) res(p.name).value -= p.val;
+  return true;
+};
+
 const gamePage = {
   opts: { noConfirm: false },
   resPool: {
@@ -324,16 +331,42 @@ const gamePage = {
   bld: {
     buildingsData: buildings,
     getPrices: (name) => (buildings.find((b) => b.name === name) || {}).prices || [],
+    build(name) {
+      const meta = buildings.find((b) => b.name === name);
+      if (!meta || !pay(meta.prices || [])) return false;
+      meta.val = (meta.val || 0) + 1;
+      meta.on = (meta.on || 0) + 1;
+      return true;
+    },
   },
   science: {
     techs,
     policies,
     get: (name) => techs.find((t) => t.name === name),
     getPrices: (meta) => (meta && meta.prices) || [],
+    research(item) {
+      const meta = typeof item === "string" ? techs.find((t) => t.name === item) : item;
+      if (!meta || !pay(meta.prices || [])) return false;
+      meta.researched = true;
+      return true;
+    },
+    researchPolicy(item) {
+      const meta = typeof item === "string" ? policies.find((p) => p.name === item) : item;
+      if (!meta || !pay(meta.prices || [])) return false;
+      meta.researched = true;
+      return true;
+    },
   },
   religion: {
     faith: 200,
     religionUpgrades,
+    build(item) {
+      const meta = typeof item === "string" ? religionUpgrades.find((u) => u.name === item) : item;
+      if (!meta || !pay(meta.prices || [])) return false;
+      meta.val = (meta.val || 0) + 1;
+      meta.on = (meta.on || 0) + 1;
+      return true;
+    },
     praise() {
       praiseCalls += 1;
       res("faith").value = 0.0001;
@@ -346,6 +379,12 @@ const gamePage = {
     getCraft: (name) => craft(name),
     getCraftPrice: (c) => (c && c.prices) || [],
     getPrices: (meta) => (meta && meta.prices) || [],
+    research(item) {
+      const meta = typeof item === "string" ? workshopUpgrades.find((u) => u.name === item) : item;
+      if (!meta || !pay(meta.prices || [])) return false;
+      meta.researched = true;
+      return true;
+    },
   },
   village,
   calendar,
@@ -1031,6 +1070,66 @@ res("wood").maxValue = 3000;
 perTick.wood = 0.4;
 perTick.iron = 0.05;
 perTick.gold = 0.01;
+
+/* Acceptance: capped science must break a Temple lock and protect the
+   Acoustics compendium/manuscript/parchment chain. */
+const acoustics = {
+  name: "acoustics",
+  label: "Acoustics",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 60000 }, { name: "compedium", val: 60 }],
+  unlocks: { buildings: ["chapel"], upgrades: ["amphitheatre"] },
+};
+const temple = {
+  name: "temple",
+  label: "Temple",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "gold", val: 100 }, { name: "slab", val: 25 }, { name: "plate", val: 15 }, { name: "manuscript", val: 10 }],
+  effects: { cultureMax: 150, faithMax: 100 },
+};
+techs.push(acoustics);
+buildings.push(temple);
+for (const tech of techs) {
+  if (tech !== acoustics) tech.researched = true;
+}
+workshopUpgrades.forEach((upgrade) => { upgrade.researched = true; });
+res("science").value = 60250;
+res("science").maxValue = 60250;
+res("compedium").value = 11.36;
+res("manuscript").value = 12;
+res("parchment").value = 80;
+res("furs").value = 12000;
+res("furs").maxValue = 20000000;
+res("culture").value = 12000;
+res("culture").maxValue = 2000000;
+res("gold").value = 95;
+res("gold").maxValue = 500;
+res("slab").value = 25;
+res("plate").value = 15;
+perTick.science = 0.2;
+perTick.culture = 0.2;
+perTick.furs = 0.5;
+storage.set("kgh.goal", "science");
+fakeNow += 25000;
+const acceptanceDecision = context.window.__kghDebug.selectStrategicTarget("science");
+const acceptanceRejected = acceptanceDecision.rejectedTopCandidates || [];
+const acceptanceProtected = [...(acceptanceDecision.protectedChain || new Set())];
+const acceptanceReserved = context.window.__kghDebug.reservedNeedsFor(acceptanceDecision.target);
+check("acceptance: capped science planner selects Acoustics research", acceptanceDecision.target?.kind === "research" && acceptanceDecision.target?.meta?.name === "acoustics");
+check("acceptance: active layer is Science cap unlock", acceptanceDecision.layer === "Science cap unlock");
+check("acceptance: Temple is rejected behind Acoustics", acceptanceRejected.some((item) => item.target?.kind === "build" && item.target?.meta?.name === "temple"));
+check("acceptance: rejection reason mentions capped science and craft chain", acceptanceRejected.some((item) => /science capped/i.test(item.reason || "") && /compedium|compendium|manuscript/i.test(item.reason || "")));
+check("acceptance: protected chain includes compendium/manuscript/parchment", ["compedium", "manuscript", "parchment"].every((name) => acceptanceProtected.includes(name)));
+check("acceptance: reservation is for Acoustics, not Temple", acceptanceReserved.compedium >= 60 && context.window.__kghDebug.targetId(acceptanceDecision.target) === "research:acoustics");
+context.window.__kghDebug.forceActiveTarget({ kind: "build", meta: temple });
+tickFn();
+check("acceptance: Temple lock breaks to Acoustics", /Science cap unlock/i.test(panelText(".kgh-plan")) && /Acoustics/i.test(panelText(".kgh-plan")) && !/FOCUS: .*Temple/i.test(panelText(".kgh-plan")));
+check("acceptance: panel explains protected chain and Temple rejection", /Compendium|compedium/i.test(panelText(".kgh-plan")) && /Manuscript/i.test(panelText(".kgh-plan")) && /Temple/i.test(panelText(".kgh-plan")));
+techs.splice(techs.indexOf(acoustics), 1);
+buildings.splice(buildings.indexOf(temple), 1);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

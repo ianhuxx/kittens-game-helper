@@ -2574,6 +2574,7 @@
       manualPriorityBoostFor(kind, meta) +
       noveltyBoostFor(candidate);
     if (speedrunMode() && isEarlyGame()) {
+      const profile = candidateEffectProfile(kind, meta);
       const firstInstance = kind === "build" && (!meta.val || meta.val <= 0);
       const unlocksContent = (meta.unlocks && meta.unlocks.length) || (profile.unlocks && profile.unlocks.length);
       score += TUNING.earlyGameBonus * (firstInstance ? 1.4 : 1) * (unlocksContent ? TUNING.earlyGameUnlockMult : 1);
@@ -2655,6 +2656,157 @@
         return { ...withEvaluation, score: candidateScore(withEvaluation, resources, goal, goalKey) };
       })
       .sort((a, b) => b.score - a.score);
+  };
+
+  /* ---------------- phase-gated hierarchical planner ---------------- */
+
+  const STRATEGIC_LAYERS = {
+    scienceCap: "Science cap unlock",
+    hardUnlock: "Hard unlock / milestone",
+    storage: "Storage blocker",
+    production: "Production bottleneck",
+    housing: "Housing / population",
+    economy: "Economy / normal growth",
+    longProject: "Long project",
+  };
+
+  let lastStrategicDecision = null;
+
+  const resValueOf = (resources, name) => ((getRes(resources, name) || {}).value) || 0;
+  const resMaxOf = (resources, name) => ((getRes(resources, name) || {}).maxValue) || 0;
+  const isNearResourceCap = (resources, name, ratio = CAP_RELIEF_RATIO) => {
+    const max = resMaxOf(resources, name);
+    return max > 0 && resValueOf(resources, name) / max >= ratio;
+  };
+
+  const craftChainNamesFor = (name, out = new Set(), depth = 0) => {
+    if (!name || depth > 6 || out.has(name)) return out;
+    out.add(name);
+    const craft = craftByName(name);
+    if (!craft) return out;
+    for (const price of craftPricesFor(craft)) {
+      if (price && price.name) craftChainNamesFor(price.name, out, depth + 1);
+    }
+    return out;
+  };
+
+  const candidateCraftChainResources = (candidate) => {
+    const names = new Set();
+    if (!candidate) return names;
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (!cost || !cost.name || cost.val <= 0) continue;
+      craftChainNamesFor(cost.name, names);
+    }
+    return names;
+  };
+
+  const candidateUsesAnyCraftChain = (candidate, chain) => {
+    if (!candidate || !chain || !chain.size) return false;
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (cost && chain.has(cost.name)) return true;
+    }
+    return false;
+  };
+
+  const hasObtainablePathFor = (resources, name, amount) => {
+    if (!isFinite(amount) || amount <= 0) return true;
+    const max = resMaxOf(resources, name);
+    if (max > 0 && amount > max) return false;
+    const have = resValueOf(resources, name);
+    if (have >= amount) return true;
+    if (craftByName(name)) {
+      const raw = rawPathRequirements(name, amount - have);
+      return Object.entries(raw).every(([rawName, rawAmount]) => {
+        const rawMax = resMaxOf(resources, rawName);
+        const rawProd = rawProductionForNeed(rawName);
+        if (rawMax > 0 && rawAmount > rawMax && rawProd <= 0) return false;
+        return resValueOf(resources, rawName) >= rawAmount || rawProd > 0 || rawName === "titanium";
+      });
+    }
+    return rawProductionForNeed(name) > 0 || name === "titanium";
+  };
+
+  const reachableScienceCapTechs = (candidates, resources, goalKey) => {
+    if (!isNearResourceCap(resources, "science")) return [];
+    const science = getRes(resources, "science");
+    const scienceAvailable = (science && science.maxValue) || resValueOf(resources, "science");
+    return candidates
+      .filter((candidate) => candidate.kind === "research" && candidate.meta && !candidate.meta.researched)
+      .filter((candidate) => pricesFor("research", candidate.meta).every((cost) => {
+        if (!cost || !cost.name || cost.val <= 0) return true;
+        if (cost.name === "science") return scienceAvailable >= cost.val;
+        return hasObtainablePathFor(resources, cost.name, cost.val);
+      }))
+      .map((candidate) => {
+        const profile = candidateEffectProfile(candidate.kind, candidate.meta);
+        const goalPath = goalFrontierNames(goalKey).has(candidate.meta.name) || goalClosureNames(goalKey).has(candidate.meta.name);
+        const unlockValue = gatewayValue(candidate.meta) + (profile.unlocks || []).length + Object.keys(profile.perTick || {}).length;
+        return {
+          ...candidate,
+          _phaseScore: (goalPath ? 10000 : 0) + unlockValue * 100 - waitSecondsForCandidate(candidate, resources) / 60 - pricesFor(candidate.kind, candidate.meta).length,
+        };
+      })
+      .sort((a, b) => b._phaseScore - a._phaseScore);
+  };
+
+  const classifyCandidateLayer = (candidate, resources, goalKey) => {
+    if (!candidate) return STRATEGIC_LAYERS.economy;
+    if (candidate.kind === "research" || candidate.kind === "upgrade") {
+      const profile = candidateEffectProfile(candidate.kind, candidate.meta);
+      if (goalFrontierNames(goalKey).has(candidate.meta.name) || goalClosureNames(goalKey).has(candidate.meta.name) ||
+          gatewayValue(candidate.meta) > 0 || (profile.unlocks || []).length || Object.keys(profile.perTick || {}).length) {
+        return STRATEGIC_LAYERS.hardUnlock;
+      }
+    }
+    if (directStorageBlockers(candidate.kind, candidate.meta, resources).length > 0 || isStorageMeta(candidate.meta)) return STRATEGIC_LAYERS.storage;
+    if (candidate.kind === "build" && ["hut", "logHouse", "mansion"].includes(candidate.meta && candidate.meta.name)) return STRATEGIC_LAYERS.housing;
+    if (candidate.kind === "religion" || candidate.kind === "space" || candidate.kind === "time" ||
+        (candidate.kind === "build" && ["temple", "ziggurat"].includes(candidate.meta && candidate.meta.name))) return STRATEGIC_LAYERS.longProject;
+    return STRATEGIC_LAYERS.economy;
+  };
+
+  const selectStrategicTarget = (resources, goalKey) => {
+    const candidates = gatherCandidates(resources, goalKey);
+    const preferred = candidates[0] || null;
+    const cappedTechs = reachableScienceCapTechs(candidates, resources, goalKey);
+    if (cappedTechs.length) {
+      const target = cappedTechs[0];
+      const protectedChain = candidateCraftChainResources(target);
+      const chainConflicts = candidates
+        .filter((candidate) => candidate !== target && candidateUsesAnyCraftChain(candidate, protectedChain))
+        .sort((a, b) => (classifyCandidateLayer(b, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0) -
+          (classifyCandidateLayer(a, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0));
+      const rejected = chainConflicts.length ? chainConflicts : candidates.filter((candidate) => candidate !== target).slice(0, 1);
+      return {
+        candidates,
+        target,
+        layer: STRATEGIC_LAYERS.scienceCap,
+        reason: `${labelOf(target.meta)} is reachable while science is capped; protecting ${[...protectedChain].slice(0, 4).map((n) => resTitle(resources, n)).join("→") || "science"} chain`,
+        protectedChain,
+        rejectedTopCandidates: rejected.slice(0, 5).map((candidate) => ({
+          target: candidate,
+          reason: candidateUsesAnyCraftChain(candidate, protectedChain)
+            ? `deferred because science capped and ${labelOf(target.meta)} reachable through ${[...protectedChain].filter((n) => craftByName(n)).slice(0, 3).join("/")} chain`
+            : `deferred behind active ${STRATEGIC_LAYERS.scienceCap} layer`,
+        })),
+      };
+    }
+
+    // Outside urgent overrides, preserve the mature ROI scorer as the normal
+    // economy layer. This keeps existing production/titanium/storage behaviour
+    // stable while the phase planner decides when a higher-priority layer (such
+    // as science-cap relief) is allowed to preempt it.
+    const target = preferred;
+    const activeLayer = classifyCandidateLayer(target, resources, goalKey);
+    const rejected = candidates.find((candidate) => targetId(candidate) !== targetId(target)) || null;
+    return {
+      candidates,
+      target,
+      layer: activeLayer,
+      reason: `selected best candidate inside ${activeLayer} layer`,
+      protectedChain: candidateCraftChainResources(target),
+      rejectedTopCandidates: rejected ? [{ target: rejected, reason: `not in active ${activeLayer} layer or lower score inside layer` }] : [],
+    };
   };
 
   const CAP_RELIEF_RATIO = 0.985;
@@ -2746,8 +2898,11 @@
   };
 
   const chooseWorkTarget = (resources, goalKey) => {
-    const candidates = gatherCandidates(resources, goalKey);
-    const preferred = candidates[0] || null;
+    const decision = selectStrategicTarget(resources, goalKey);
+    lastStrategicDecision = decision;
+    tickCache.candidates = decision.candidates;
+    const candidates = decision.candidates;
+    const preferred = decision.target || candidates[0] || null;
     const now = Date.now();
 
     // The lock is what makes plans PUSH THROUGH. The executor reserves the
@@ -2758,13 +2913,26 @@
       const locked = findCandidateById(candidates, activeTarget.id);
       const age = now - activeTarget.startedAt;
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
+      const lockedLayer = locked ? classifyCandidateLayer(locked, resources, goalKey) : "";
+      const preferredWait = preferred ? waitSecondsForCandidate(preferred, resources) : Number.POSITIVE_INFINITY;
+      const preferredChain = candidateCraftChainResources(preferred);
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && preferred.score > locked.score * 1.3 + 8;
-      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked) {
+      const scienceCapBreak = locked && decision.layer === STRATEGIC_LAYERS.scienceCap && targetId(locked) !== targetId(preferred) &&
+        !candidateSpendsAny(locked, ["science"]) && !isStorageMeta(locked.meta);
+      const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
+      const chainConflictBreak = locked && preferred && decision.layer === STRATEGIC_LAYERS.scienceCap &&
+        candidateUsesAnyCraftChain(locked, preferredChain) && targetId(locked) !== targetId(preferred);
+      const layerChangedBreak = locked && preferred && decision.layer === STRATEGIC_LAYERS.scienceCap &&
+        lockedLayer !== decision.layer && targetId(locked) !== targetId(preferred);
+      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked ||
+          scienceCapBreak || nearTechBreak || chainConflictBreak || layerChangedBreak) {
+        if (scienceCapBreak || chainConflictBreak) pushLog(`🔓 breaking lock: ${decision.reason}`);
         activeTarget = null;
       } else if (!muchBetter) {
+        lastStrategicDecision.target = locked;
         return locked;
       } else {
         activeTarget = null;
@@ -3316,6 +3484,7 @@
     try {
       const target = getTargetCached(resources, goalKey);
       if (!target) return "🎯 FOCUS: scanning unlocked buildings/research/upgrades";
+      const decision = lastStrategicDecision;
       const reqs = formatRequirements(target.kind, target.meta, resources);
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
@@ -3326,7 +3495,17 @@
         : "";
       const sprintTag = target._sprint ? " 🚀SPRINT" : "";
       const titaniumHint = titaniumRouteHint(resources, goalKey);
-      return `🎯 FOCUS: ${focusLabel(target)} — ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${sprintTag}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}${reqs ? ` (${reqs})` : ""}`;
+      const layerNote = decision && decision.layer ? `Layer: ${decision.layer} · ${decision.reason}` : "Layer: Economy / normal growth";
+      const protectedNote = decision && decision.protectedChain && decision.protectedChain.size
+        ? ` · protecting ${[...decision.protectedChain].slice(0, 4).map((name) => resTitle(resources, name)).join("→")}`
+        : "";
+      const rejected = decision && decision.rejectedTopCandidates && decision.rejectedTopCandidates.length
+        ? decision.rejectedTopCandidates.filter((item) => item && item.target).slice(0, 3)
+        : [];
+      const rejectNote = rejected.length
+        ? ` · rejected: ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}`
+        : "";
+      return `🎯 ${layerNote}${protectedNote}${rejectNote}\nFOCUS: ${focusLabel(target)} — ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${sprintTag}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}${reqs ? ` (${reqs})` : ""}`;
     } catch (error) {
       return "🎯 FOCUS: —";
     }
@@ -3446,6 +3625,8 @@
     });
   };
 
+  const ALLOW_RAW_METADATA_BUY_FALLBACK = false;
+
   const rawPayPrices = (prices) => {
     const game = window.gamePage;
     if (!game || !game.resPool) return false;
@@ -3495,7 +3676,6 @@
     if (!game || !meta || !name) return [];
     const attempts = [
       () => buyViaGameController(candidate),
-      () => buyViaRawMetadata(candidate),
     ];
     if (candidate.kind === "research" || candidate.kind === "policy") {
       attempts.push(
@@ -3523,6 +3703,25 @@
         () => game.bld && typeof game.bld.build === "function" && game.bld.build(name, 1),
         () => game.bld && typeof game.bld.construct === "function" && game.bld.construct(name),
       );
+    }
+    if (candidate.kind === "space") {
+      attempts.push(
+        () => game.space && typeof game.space.build === "function" && game.space.build(name),
+        () => game.space && typeof game.space.build === "function" && game.space.build(candidate.meta),
+        () => game.space && typeof game.space.buildProgram === "function" && game.space.buildProgram(name),
+        () => game.space && typeof game.space.buildProgram === "function" && game.space.buildProgram(candidate.meta),
+      );
+    }
+    if (candidate.kind === "time") {
+      attempts.push(
+        () => game.time && typeof game.time.build === "function" && game.time.build(name),
+        () => game.time && typeof game.time.build === "function" && game.time.build(candidate.meta),
+        () => game.time && typeof game.time.buy === "function" && game.time.buy(name),
+        () => game.time && typeof game.time.buy === "function" && game.time.buy(candidate.meta),
+      );
+    }
+    if (ALLOW_RAW_METADATA_BUY_FALLBACK) {
+      attempts.push(() => buyViaRawMetadata(candidate));
     }
     return attempts;
   };
@@ -4840,6 +5039,28 @@
     renderLog();
     tick();
     setInterval(tick, HELPER_TICK_MS);
+  };
+
+  window.__kghDebug = {
+    selectStrategicTarget(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      const decision = selectStrategicTarget(resources, goalKey);
+      lastStrategicDecision = decision;
+      tickCache.candidates = decision.candidates;
+      return decision;
+    },
+    reservedNeedsFor(target) {
+      return reservedNeedsFor(target, resourceMap());
+    },
+    forceActiveTarget(candidate) {
+      activeTarget = candidate ? {
+        id: targetId(candidate),
+        startedAt: Date.now() - getTargetLockMinMs() - 1000,
+        initialVal: VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0,
+      } : null;
+    },
+    targetId,
   };
 
   /* ------------------------------- bootstrap -------------------------------- */
