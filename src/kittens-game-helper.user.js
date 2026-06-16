@@ -1102,6 +1102,7 @@
     return JOB_RESOURCE[job.name] || null;
   };
   const LUXURY_RESOURCES = ["furs", "ivory", "spice"];
+  const HELPER_TICK_MS = 2000;
   const JOB_REBALANCE_MIN_MS = 20000;
   const JOB_WEIGHT_SMOOTHING = 0.35;
   const JOB_COUNT_DEADBAND_RATIO = 0.08;
@@ -2585,6 +2586,15 @@
     if (resRatio(resources, "minerals") < 0.3) scoreNeed(needs, "minerals", 6 * (0.3 - resRatio(resources, "minerals")) / 0.3);
     const emphasis = (GOALS[goalKey] && GOALS[goalKey].emphasis) || {};
     if ((emphasis.science || 1) > 1 && resRatio(resources, "science") < 0.92) scoreNeed(needs, "science", 3);
+
+    // Include the same immediate diplomacy work the executor will try later in
+    // the tick.  Trade routes and explorers are resource sinks just like a
+    // building price: if Zebra titanium is queued but catpower/gold/slabs are
+    // missing, the job balancer must see those deficits instead of optimizing
+    // only for the visible build target (for example, a library's wood).
+    for (const [name, weight] of Object.entries(diplomacyResourcePressure(resources, goalKey))) {
+      scoreNeed(needs, name, weight);
+    }
     scoreNeed(needs, "manpower", huntingEconomyNeed(resources));
     if ((emphasis.production || 1) > 1) scoreNeed(needs, resRatio(resources, "minerals") <= resRatio(resources, "wood") ? "minerals" : "wood", 3);
     if ((emphasis.food || 1) > 1 || (emphasis.housing || 1) > 1) scoreNeed(needs, "catnip", 3);
@@ -3533,7 +3543,7 @@
   const titaniumDiscoveryPending = (resources, goalKey) => {
     if (!explorerFeeCanFit(resources)) return false;
     const zebras = raceByName("zebras");
-    if (zebras && zebras.unlocked) return false;
+    if (!zebras || zebras.unlocked) return false;
     if (!titaniumNeededSoon(resources, goalKey)) return false;
     return resourceValue(resources, "ship") >= 1 || !!craftByName("ship");
   };
@@ -3665,6 +3675,33 @@
     } catch (error) {
       /* ignore diplomacy prerequisite crafting failures */
     }
+  };
+
+
+  const diplomacyResourcePressure = (resources, goalKey) => {
+    const pressure = {};
+    const addPriceDeficits = (prices, multiplier = 1) => {
+      for (const price of prices || []) {
+        if (!price || !price.name || !isFinite(price.val) || price.val <= 0) continue;
+        const have = resourceValue(resources, price.name) + craftablePotential(price.name);
+        const deficit = Math.max(0, price.val - have);
+        if (deficit <= 0) continue;
+        const cap = (getRes(resources, price.name) || {}).maxValue || 0;
+        const capScale = cap > 0 ? Math.min(1, deficit / cap) : 0.5;
+        pressure[price.name === "catpower" ? "manpower" : price.name] = (pressure[price.name === "catpower" ? "manpower" : price.name] || 0) + multiplier * (2 + capScale * 10);
+      }
+    };
+
+    if (shouldSaveForExplorers(resources, goalKey)) addPriceDeficits(explorerPrices(), 1.4);
+
+    if (titaniumNeededSoon(resources, goalKey)) {
+      const zebras = raceByName("zebras");
+      if (zebras && zebras.unlocked) {
+        addPriceDeficits(tradePricesForRace(zebras), 1.8);
+      }
+    }
+
+    return pressure;
   };
 
   const pricesRespectReservations = (prices, reserved, resources) => prices.every((price) => {
@@ -4505,7 +4542,7 @@
     applyMin(localStorage.getItem(MIN_KEY) === "1");
     renderLog();
     tick();
-    setInterval(tick, 4000);
+    setInterval(tick, HELPER_TICK_MS);
   };
 
   /* ------------------------------- bootstrap -------------------------------- */
