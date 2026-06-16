@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.0.3
+// @version      2.0.4
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.0.3";
+  const HELPER_VERSION = "2.0.4";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2709,6 +2709,7 @@
   };
 
   const CAPPED_REFILL_RESOURCES = new Set(["science", "culture", "faith"]);
+  const HUNT_OUTPUT_RESOURCES = new Set(["furs", "ivory", "spice"]);
 
   // Repeated cap-drain reachability for craft chains.  A target may need more
   // total science/culture than the bank can hold (e.g. many Compendium crafts),
@@ -2747,6 +2748,27 @@
       return { reachable: true, eta, chain };
     }
 
+    // Hunts are a repeatable production path, not a one-time storage check.
+    // A compendium chain can need many waves of furs; requiring all cumulative
+    // furs or catpower up front made capped Acoustics look unreachable whenever
+    // catpower was temporarily low.  If catpower can refill (or is already
+    // stocked enough for a hunt), furs are reachable by waiting and hunting.
+    if (HUNT_OUTPUT_RESOURCES.has(name)) {
+      chain.add("manpower");
+      const huntCost = Math.max(1, 100 - (typeof window.gamePage.getEffect === "function" ? (window.gamePage.getEffect("huntCatpowerDiscount") || 0) : 0));
+      const cp = getRes(resources, "manpower") || getRes(resources, "catpower");
+      const cpHave = (cp && cp.value) || 0;
+      const cpProd = rawProductionForNeed("manpower");
+      if (cpHave >= huntCost || cpProd > 0) {
+        const cpWait = cpHave >= huntCost ? 0 : (huntCost - cpHave) / cpProd;
+        // Use a conservative per-hunt yield. The exact yield varies by game
+        // state, but a positive hunt route is enough for ownership decisions;
+        // the executor/job balancer will repeat hunts until the chain clears.
+        const hunts = Math.ceil(deficit / 50);
+        return { reachable: true, eta: cpWait + Math.max(0, hunts - 1) * huntCost / Math.max(cpProd || huntCost, 1), chain };
+      }
+    }
+
     if (prod > 0 || name === "titanium") {
       return { reachable: true, eta: prod > 0 ? deficit / prod : waitSecondsForZebraTitanium(deficit, resources), chain };
     }
@@ -2758,6 +2780,15 @@
   };
 
   const hasObtainablePathFor = (resources, name, amount) => capDrainReachabilityFor(resources, name, amount).reachable;
+
+  const validStickyScienceCapTarget = (candidate, resources) => {
+    if (!candidate || candidate.kind !== "research" || !candidate.meta || candidate.meta.researched || !isOpen(candidate.meta)) return false;
+    if (!isNearResourceCap(resources, "science")) return false;
+    return pricesFor("research", candidate.meta).every((cost) => {
+      if (!cost || !cost.name || cost.val <= 0) return true;
+      return capDrainReachabilityFor(resources, cost.name, cost.val).reachable;
+    });
+  };
 
   const reachableScienceCapTechs = (candidates, resources, goalKey) => {
     if (!isNearResourceCap(resources, "science")) return [];
@@ -2807,7 +2838,10 @@
     const preferred = candidates[0] || null;
     const cappedTechs = reachableScienceCapTechs(candidates, resources, goalKey);
     if (cappedTechs.length) {
-      const target = cappedTechs[0];
+      const sticky = activeTarget && activeTarget.layer === STRATEGIC_LAYERS.scienceCap
+        ? findCandidateById(cappedTechs, activeTarget.id)
+        : null;
+      const target = sticky && validStickyScienceCapTarget(sticky, resources) ? sticky : cappedTechs[0];
       const protectedChain = target._capDrainChain && target._capDrainChain.size ? target._capDrainChain : candidateCraftChainResources(target);
       const chainConflicts = candidates
         .filter((candidate) => candidate !== target && candidateUsesAnyCraftChain(candidate, protectedChain))
@@ -2949,6 +2983,7 @@
     if (activeTarget) {
       const locked = findCandidateById(candidates, activeTarget.id);
       const age = now - activeTarget.startedAt;
+      const stickyScienceCap = activeTarget.layer === STRATEGIC_LAYERS.scienceCap && validStickyScienceCapTarget(locked, resources);
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
       const lockedLayer = locked ? classifyCandidateLayer(locked, resources, goalKey) : "";
       const preferredWait = preferred ? waitSecondsForCandidate(preferred, resources) : Number.POSITIVE_INFINITY;
@@ -2964,6 +2999,12 @@
         candidateUsesAnyCraftChain(locked, preferredChain) && targetId(locked) !== targetId(preferred);
       const layerChangedBreak = locked && preferred && decision.layer === STRATEGIC_LAYERS.scienceCap &&
         lockedLayer !== decision.layer && targetId(locked) !== targetId(preferred);
+      if (stickyScienceCap) {
+        lastStrategicDecision.target = locked;
+        lastStrategicDecision.layer = STRATEGIC_LAYERS.scienceCap;
+        lastStrategicDecision.protectedChain = locked._capDrainChain && locked._capDrainChain.size ? locked._capDrainChain : candidateCraftChainResources(locked);
+        return locked;
+      }
       if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked ||
           scienceCapBreak || nearTechBreak || chainConflictBreak || layerChangedBreak) {
         if (scienceCapBreak || chainConflictBreak) pushLog(`🔓 breaking lock: ${decision.reason}`);
@@ -2981,6 +3022,7 @@
         id: targetId(preferred),
         startedAt: now,
         initialVal: VAL_BASED_KINDS.has(preferred.kind) ? preferred.meta.val || 0 : 0,
+        layer: decision.layer,
       };
     }
     return preferred;
@@ -2990,6 +3032,7 @@
     const needs = {};
     const target = getTargetCached(resources, goalKey);
     if (target && !target.affordable) {
+      const scienceCapFocus = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap && target.kind === "research";
       for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) {
         const closeness = Math.max(0.05, Math.min(1, blocker.max / Math.max(1, blocker.need)));
         scoreNeed(needs, blocker.name, 12 + Math.min(18, closeness * 18));
@@ -3006,6 +3049,12 @@
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
+      if (scienceCapFocus) {
+        const chain = lastStrategicDecision.protectedChain || candidateCraftChainResources(target);
+        if (["compedium", "compendium", "manuscript", "parchment", "furs"].some((name) => chain.has(name))) {
+          scoreNeed(needs, "manpower", 24);
+        }
+      }
     }
 
     // Lookahead: the next few runner-up candidates also pull a little weight,
@@ -3055,7 +3104,10 @@
     // bank with compounding religion value.  Keep a small live-data baseline
     // when priests exist and faith has storage headroom; the cap check below
     // still removes the need the moment the actual bar is full.
-    if (jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
+    const scienceCapFocus = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap && target && target.kind === "research";
+    const targetCostsFaith = target && pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === "faith");
+    if (!scienceCapFocus && jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
+    if (scienceCapFocus && !targetCostsFaith && !religionTarget && !isNearResourceCap(resources, "faith")) needs.faith = 0;
 
     // Include the same immediate diplomacy work the executor will try later in
     // the tick.  Trade routes and explorers are resource sinks just like a
@@ -3070,7 +3122,7 @@
     if ((emphasis.food || 1) > 1 || (emphasis.housing || 1) > 1) scoreNeed(needs, "catnip", 3);
 
     for (const name of ["science", "faith", "culture", "manpower"]) {
-      if (name === "manpower" && huntingEconomyNeed(resources) > 0.5) continue;
+      if (name === "manpower" && (huntingEconomyNeed(resources) > 0.5 || (lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap))) continue;
       if (resRatio(resources, name) > 0.94) needs[name] = 0;
     }
     for (const name of ["wood", "minerals", "catnip", "coal"]) {
@@ -3335,8 +3387,12 @@
       if (!village || !cp || !cp.maxValue || typeof village.huntAll !== "function") return;
       const discount = typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0;
       const huntCost = Math.max(1, 100 - discount);
+      const target = getTargetCached(resources, getGoal());
+      const chainHuntNeed = target && lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap &&
+        [...(lastStrategicDecision.protectedChain || new Set())].some((name) => ["furs", "parchment", "manuscript", "compedium", "compendium"].includes(name));
       const economyNeed = huntingEconomyNeed(resources);
-      let threshold = economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
+      let threshold = chainHuntNeed ? Math.max(huntCost, cp.maxValue * 0.08) :
+        economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
       // Exploration shares this bank. While an undiscovered trade partner is
       // waiting and the cap can fit the explorer fee, hold hunting back far
       // enough that it can never permanently starve "Send explorers"
@@ -3348,7 +3404,7 @@
       if (cp.value >= threshold) {
         village.huntAll();
         if (Date.now() - lastHuntLog > 30000) {
-          const reason = economyNeed > 0.5 ? " for luxuries/mood" : "";
+          const reason = chainHuntNeed ? " for Acoustics furs chain" : economyNeed > 0.5 ? " for luxuries/mood" : "";
           pushLog(`🏹 sent hunters${reason}`);
           lastHuntLog = Date.now();
         }
@@ -5102,6 +5158,16 @@
     },
     reservedNeedsFor(target) {
       return reservedNeedsFor(target, resourceMap());
+    },
+    planText(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return getPlanLine(resources, goalKey);
+    },
+    nowText(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return getNowAction(resources, goalKey);
     },
     forceActiveTarget(candidate) {
       activeTarget = candidate ? {
