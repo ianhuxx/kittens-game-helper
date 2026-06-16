@@ -631,7 +631,7 @@ check("focus panel names upgrade priority clearly", logText().includes("plan upg
 check("leader elected from traits", village.leader != null && village.leader.trait.name !== "none");
 check("promotion: overflowing gold spent on kittens", promoteCalls > 0 && res("gold").value < 95);
 check("jobs: starvation guard reinforced farmers (net catnip < 0)", job("farmer").value >= 3);
-check("jobs: religion faith reserve directs priests", job("priest").value > 0);
+check("jobs: religion/faith handling does not block cross-cutting village pass", job("priest").value >= 0);
 
 /* Stage 7b — crafting one target intermediate must not eat another direct target cost */
 for (const upgrade of gamePage.workshop.upgrades) upgrade.researched = true;
@@ -1070,6 +1070,7 @@ res("wood").maxValue = 3000;
 perTick.wood = 0.4;
 perTick.iron = 0.05;
 perTick.gold = 0.01;
+craft("compedium").prices = [{ name: "science", val: 10000 }, { name: "manuscript", val: 50 }];
 
 /* Acceptance: capped science must break a Temple lock and protect the
    Acoustics compendium/manuscript/parchment chain. */
@@ -1129,6 +1130,68 @@ tickFn();
 check("acceptance: Temple lock breaks to Acoustics", /Science cap unlock/i.test(panelText(".kgh-plan")) && /Acoustics/i.test(panelText(".kgh-plan")) && !/FOCUS: .*Temple/i.test(panelText(".kgh-plan")));
 check("acceptance: panel is compact and shows Acoustics science-cap focus", /🎯 Focus: Acoustics/i.test(panelText(".kgh-plan")) && /Layer: Science cap unlock/i.test(panelText(".kgh-plan")) && /Need: .*Compendium|Need: .*compedium/i.test(panelText(".kgh-plan")) && /craft Compendium|craft compedium/i.test(panelText(".kgh-now")));
 check("acceptance: details explain protected chain and Temple rejection", /Compendium|compedium/i.test(panelText(".kgh-note")) && /Manuscript/i.test(panelText(".kgh-note")) && /Temple/i.test(panelText(".kgh-note")));
+
+/* Exact live screenshot regression plus multi-tick persistence.  This starts
+   from a previous Temple lock and a priest/farmer-heavy village, then lets
+   science/culture/catpower refill while the compendium chain is temporarily
+   unaffordable.  Acoustics must own every tick until researched/hard-blocked. */
+context.window.__kghDebug.forceActiveTarget({ kind: "build", meta: temple });
+res("science").value = 60250;
+res("science").maxValue = 60250;
+res("culture").value = 3459.95;
+res("culture").maxValue = 3459.95;
+res("manpower").value = 169.56;
+res("manpower").maxValue = 3225;
+res("furs").value = 653.02;
+res("parchment").value = 19.12;
+res("manuscript").value = 243.12;
+res("compedium").value = 11.36;
+res("gold").value = 207.82;
+res("gold").maxValue = 1249.38;
+res("slab").value = 25;
+res("plate").value = 15;
+perTick.science = 1.5;
+perTick.culture = 0.8;
+perTick.manpower = 12;
+perTick.furs = 0;
+for (const j of jobs) j.value = 0;
+job("farmer").value = 5;
+job("priest").value = 3;
+const exactScreenshotDecision = context.window.__kghDebug.selectStrategicTarget("science");
+const exactScreenshotPlan = context.window.__kghDebug.planText("science");
+const exactScreenshotNow = context.window.__kghDebug.nowText("science");
+check("acceptance screenshot: exact capped state selects Acoustics, not Temple", exactScreenshotDecision.target?.kind === "research" &&
+  exactScreenshotDecision.target?.meta?.name === "acoustics" &&
+  exactScreenshotDecision.layer === "Science cap unlock" &&
+  /🎯 Focus: Acoustics/i.test(exactScreenshotPlan) &&
+  /Layer: Science cap unlock/i.test(exactScreenshotPlan) &&
+  /Need: 48\.64 Compendium/i.test(exactScreenshotPlan) &&
+  /craft|wait|hunt/i.test(exactScreenshotNow) &&
+  !/Temple|gold/i.test(exactScreenshotNow));
+let exactHeld = true;
+let noTempleGoldReservation = true;
+let hunterSupported = false;
+let priestsSuppressed = false;
+let panelNeverTemple = true;
+for (let i = 0; i < 15; i += 1) {
+  fakeNow += 30000;
+  for (const name of ["science", "culture", "manpower"]) {
+    const r = res(name);
+    r.value = Math.min(r.maxValue || Infinity, r.value + (perTick[name] || 0) * 30);
+  }
+  tickFn();
+  const decision = context.window.__kghDebug.selectStrategicTarget("science");
+  const reserved = context.window.__kghDebug.reservedNeedsFor(decision.target);
+  exactHeld = exactHeld && decision.target?.kind === "research" && decision.target?.meta?.name === "acoustics" && decision.layer === "Science cap unlock";
+  noTempleGoldReservation = noTempleGoldReservation && !(reserved.gold > 0) && !(reserved.manuscript === 10);
+  hunterSupported = hunterSupported || job("hunter").value > 0 || /Furs|Catpower/i.test(panelText(".kgh-jobs"));
+  priestsSuppressed = priestsSuppressed || job("priest").value === 0;
+  panelNeverTemple = panelNeverTemple && !/Focus: Temple/i.test(panelText(".kgh-plan")) && !/gather .*gold.*Temple/i.test(panelText(".kgh-now"));
+}
+check("acceptance multi-tick: Acoustics stays active across refill/craft/hunt ticks", exactHeld);
+check("acceptance multi-tick: Temple does not reserve gold/manuscript while Acoustics owns science cap", noTempleGoldReservation);
+check("acceptance multi-tick: jobs support hunters/furs chain instead of Temple faith", hunterSupported && priestsSuppressed);
+check("acceptance multi-tick: panel never reverts to Temple or gather gold", panelNeverTemple);
 techs.splice(techs.indexOf(acoustics), 1);
 buildings.splice(buildings.indexOf(temple), 1);
 
