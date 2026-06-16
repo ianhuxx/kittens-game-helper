@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.0.5
+// @version      2.1.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.0.5";
+  const HELPER_VERSION = "2.1.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1253,6 +1253,8 @@
   let lastJobLog = 0;
   let lastJobSignature = "";
   let jobPlanText = "Jobs: waiting…";
+  let jobSuppressText = "";
+  let lastJobContext = "";
 
   const getRes = (resources, name) => resources.get(name) || (name === "catpower" ? resources.get("manpower") : null);
 
@@ -2660,8 +2662,14 @@
 
   /* ---------------- phase-gated hierarchical planner ---------------- */
 
+  // Ordered planner layers.  The highest layer that yields a target wins:
+  //   researchSprint > hardUnlock/storage > production/housing/economy > longProject.
+  // The Research-sprint layer is a persistent CONTRACT (see activeSprint below):
+  // once a sprint owns the plan it is validated — not re-derived — each tick, so
+  // spending science on Compendium (which drops science below cap) does NOT hand
+  // the plan back to generic scoring / Temple.
   const STRATEGIC_LAYERS = {
-    scienceCap: "Science cap unlock",
+    researchSprint: "Research sprint",
     hardUnlock: "Hard unlock / milestone",
     storage: "Storage blocker",
     production: "Production bottleneck",
@@ -2738,7 +2746,7 @@
       for (const price of prices) {
         const inputCap = resMaxOf(resources, price.name);
         if (inputCap > 0 && price.val > inputCap) {
-          return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, price.name)} cap below one ${craftLabel(name)} craft`, chain };
+          return { reachable: false, perStepCapBlocked: true, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, price.name)} cap below one ${craftLabel(name)} craft`, chain };
         }
         const child = capDrainReachabilityFor(resources, price.name, price.val * units, depth + 1, new Set([...stack, name]));
         for (const item of child.chain || []) chain.add(item);
@@ -2786,69 +2794,204 @@
     return price ? price.val : 0;
   };
 
-  const scienceStorageEligibility = (tech, resources) => {
+  // Cap-drain banks are spent-and-refilled across ticks (science/culture/faith).
+  // Their final purchase must fit storage all at once, but a craft chain may need
+  // far more cumulative units than the cap holds — that is reachable by repeated
+  // spend/refill cycles.  Huntable resources are produced by repeatable hunts.
+  const CAP_DRAIN_RESOURCES = new Set(["science", "culture", "faith"]);
+  const HUNTABLE_RESOURCES = new Set(["furs", "ivory", "spice"]);
+
+  const scienceStorageReason = (tech, resources) => {
     const cost = researchScienceCost(tech);
     const max = resMaxOf(resources, "science");
-    if (cost > 0 && max > 0 && cost > max) {
-      return { eligible: false, reason: `science storage blocked ${fmt(max)}/${fmt(cost)}` };
+    return `science storage blocked ${fmt(max)}/${fmt(cost)}`;
+  };
+
+  // A research's own final science price must fit current science storage. If it
+  // does not, the tech is storage-blocked (Electricity) — it may inform the
+  // storage layer but can NEVER be an active research-sprint craft target.
+  const finalScienceFitsCap = (tech, resources) => {
+    const cost = researchScienceCost(tech);
+    const max = resMaxOf(resources, "science");
+    return !(cost > 0 && max > 0 && cost > max);
+  };
+
+  /* ----------------------------- craft-chain solver -------------------------
+   * Can `target` (any candidate) actually be reached from the current board?
+   * Returns a rich, testable result rather than a single boolean:
+   *   { reachable, hardBlocked, blockers, protectedChain, currentStep,
+   *     neededText, eta, perStepCapsOk, finalPurchaseCapsOk }
+   * Cumulative cap-drain cost (science/culture across many Compendium crafts)
+   * does NOT need to fit at once; only each individual craft/research STEP and
+   * the final tech purchase must fit storage.
+   */
+  const deepestActionableStep = (resources, name, depth = 0, seen = new Set()) => {
+    if (depth > 7 || seen.has(name)) return name;
+    seen.add(name);
+    const craft = craftByName(name);
+    if (!craft) return name; // raw / produced / huntable input — make it directly
+    const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+    // Descend into a craftable input that is itself still short.
+    for (const price of prices) {
+      if (resValueOf(resources, price.name) < price.val && craftByName(price.name)) {
+        return deepestActionableStep(resources, price.name, depth + 1, seen);
+      }
     }
-    return { eligible: true, reason: "" };
+    // Otherwise surface a short non-craft input (furs to hunt, science to refill).
+    for (const price of prices) {
+      if (resValueOf(resources, price.name) < price.val && !craftByName(price.name)) return price.name;
+    }
+    return name; // every input on hand — craft this now
   };
 
-  const validStickyScienceCapTarget = (candidate, resources) => {
-    if (!candidate || candidate.kind !== "research" || !candidate.meta || candidate.meta.researched || !isOpen(candidate.meta)) return false;
-    if (!isNearResourceCap(resources, "science")) return false;
-    if (!scienceStorageEligibility(candidate.meta, resources).eligible) return false;
-    return pricesFor("research", candidate.meta).every((cost) => {
-      if (!cost || !cost.name || cost.val <= 0) return true;
-      // Repeated cap-drain is allowed for craft intermediates only. The final
-      // tech's own science price must fit in storage, which was checked above.
-      if (cost.name === "science") return cost.val <= resMaxOf(resources, "science");
-      return capDrainReachabilityFor(resources, cost.name, cost.val).reachable;
-    });
+  const solveCraftChain = (resources, target) => {
+    const protectedChain = new Set();
+    const blockers = [];
+    let eta = 0;
+    let perStepCapsOk = true;
+    let finalPurchaseCapsOk = true;
+    let firstShortCraft = null;
+
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const cap = resMaxOf(resources, cost.name);
+      const have = resValueOf(resources, cost.name);
+      // Direct final cost in a non-craftable bank above its cap = storage-blocked.
+      if (!craftByName(cost.name) && cap > 0 && cost.val > cap && !HUNTABLE_RESOURCES.has(cost.name)) {
+        finalPurchaseCapsOk = false;
+        protectedChain.add(cost.name);
+        blockers.push({ name: cost.name, kind: "finalCap", need: cost.val, cap, text: `${resTitle(resources, cost.name)} storage ${fmt(cap)}/${fmt(cost.val)}` });
+        continue;
+      }
+      if (have >= cost.val) { protectedChain.add(cost.name); continue; }
+      if (craftByName(cost.name) && !firstShortCraft) firstShortCraft = cost.name;
+      const reach = capDrainReachabilityFor(resources, cost.name, cost.val);
+      for (const item of reach.chain || []) protectedChain.add(item);
+      eta = Math.max(eta, isFinite(reach.eta) ? reach.eta : 0);
+      if (reach.perStepCapBlocked) perStepCapsOk = false;
+      if (!reach.reachable) {
+        blockers.push({ name: cost.name, kind: reach.perStepCapBlocked ? "stepCap" : "unreachable", text: reach.reason || `no path for ${resTitle(resources, cost.name)}` });
+      }
+    }
+
+    const currentStep = firstShortCraft ? deepestActionableStep(resources, firstShortCraft) : "";
+    const hardBlocked = !finalPurchaseCapsOk || !perStepCapsOk || blockers.some((b) => b.kind === "unreachable");
+    const reachable = !hardBlocked;
+    const missing = pricesFor(target.kind, target.meta)
+      .filter((cost) => cost && cost.name && cost.val > 0 && resValueOf(resources, cost.name) < cost.val)
+      .map((cost) => `${fmt(cost.val - resValueOf(resources, cost.name))} ${craftByName(cost.name) ? craftLabel(cost.name) : resTitle(resources, cost.name)}`);
+    return { reachable, hardBlocked, blockers, protectedChain, currentStep, neededText: missing.slice(0, 3).join(", "), eta, perStepCapsOk, finalPurchaseCapsOk };
   };
 
-  const splitScienceCapResearchCandidates = (candidates, resources, goalKey) => {
-    const actionableCappedScienceTechs = [];
-    const storageBlockedScienceTechs = [];
-    const futureOrHardBlockedTechs = [];
-    if (!isNearResourceCap(resources, "science")) return { actionableCappedScienceTechs, storageBlockedScienceTechs, futureOrHardBlockedTechs };
-    for (const candidate of candidates.filter((item) => item.kind === "research" && item.meta && !item.meta.researched)) {
-      const storage = scienceStorageEligibility(candidate.meta, resources);
-      if (!storage.eligible) {
-        storageBlockedScienceTechs.push({ candidate, reason: storage.reason });
+  /* ------------------------- research-sprint contracts ----------------------
+   * A research SPRINT is a persistent contract owning the plan while an
+   * actionable tech is assembled across many ticks.  It is the structural fix
+   * for the "science cap layer disappears → Temple" bug: science being near cap
+   * can START a sprint, but is NEVER required to KEEP it.
+   */
+  let activeSprint = null;
+  // {
+  //   id, techName, startedAt, reason, protectedChain, lastValidatedAt,
+  //   blockers, currentStep, solver, candidate
+  // }
+
+  // A tech is "chain-gated" when it still needs a craftable intermediate it does
+  // not yet hold enough of (Compendium for Acoustics).  This is the multi-tick
+  // case that must persist as a sprint even when science is well below cap.
+  const researchChainGated = (tech, resources) =>
+    pricesFor("research", tech).some((cost) =>
+      cost && cost.name && cost.val > 0 && craftByName(cost.name) && resValueOf(resources, cost.name) < cost.val);
+
+  // What can START a new sprint: science at/near cap, OR a clear actionable
+  // craft-chain path.  (Cheap science-only techs go through normal scoring.)
+  const sprintTriggered = (tech, resources) =>
+    isNearResourceCap(resources, "science") || researchChainGated(tech, resources);
+
+  // Build the actionable / deferred research buckets for sprint planning.
+  // Actionable: open, unresearched, final science fits cap, chain reachable, and
+  // sprint-triggered.  Deferred: storage-blocked (Electricity) or hard-blocked.
+  const actionableResearchSprints = (candidates, resources, goalKey) => {
+    const actionable = [];
+    const deferred = [];
+    for (const candidate of candidates) {
+      if (candidate.kind !== "research" || !candidate.meta || candidate.meta.researched || !isOpen(candidate.meta)) continue;
+      if (!finalScienceFitsCap(candidate.meta, resources)) {
+        deferred.push({ candidate, reason: scienceStorageReason(candidate.meta, resources), kind: "storage" });
         continue;
       }
-      const analyses = pricesFor("research", candidate.meta).map((cost) => {
-        if (!cost || !cost.name || cost.val <= 0) return { reachable: true, eta: 0, chain: new Set() };
-        if (cost.name === "science") return { reachable: cost.val <= resMaxOf(resources, "science"), eta: 0, chain: new Set(["science"]), reason: "blocked by science storage" };
-        const directBlock = directStorageBlockers("research", { prices: [cost] }, resources);
-        if (directBlock.length) return { reachable: false, eta: Number.POSITIVE_INFINITY, chain: new Set([cost.name]), reason: `${resTitle(resources, cost.name)} storage blocked` };
-        return capDrainReachabilityFor(resources, cost.name, cost.val);
-      });
-      if (analyses.some((analysis) => !analysis.reachable)) {
-        futureOrHardBlockedTechs.push({ candidate, reason: (analyses.find((analysis) => !analysis.reachable) || {}).reason || "missing unreachable prerequisite" });
+      const solver = solveCraftChain(resources, candidate);
+      if (!solver.reachable) {
+        deferred.push({ candidate, reason: (solver.blockers[0] && solver.blockers[0].text) || "unreachable prerequisite", kind: "hardBlocked" });
         continue;
       }
-      const chain = new Set();
-      analyses.forEach((analysis) => (analysis.chain || new Set()).forEach((name) => chain.add(name)));
+      if (!sprintTriggered(candidate.meta, resources)) continue; // actionable but not a multi-tick sprint
       const profile = candidateEffectProfile(candidate.kind, candidate.meta);
       const goalPath = goalFrontierNames(goalKey).has(candidate.meta.name) || goalClosureNames(goalKey).has(candidate.meta.name);
       const unlockValue = gatewayValue(candidate.meta) + (profile.unlocks || []).length + Object.keys(profile.perTick || {}).length;
-      const eta = Math.max(0, ...analyses.map((analysis) => analysis.eta || 0));
-      actionableCappedScienceTechs.push({
-        ...candidate,
-        _capDrainEta: eta,
-        _capDrainChain: chain,
-        _phaseScore: (goalPath ? 10000 : 0) + unlockValue * 100 - eta / 60 - pricesFor(candidate.kind, candidate.meta).length,
-      });
+      const sciCost = researchScienceCost(candidate.meta);
+      const phaseScore = (goalPath ? 10000 : 0) + unlockValue * 100 - (solver.eta || 0) / 60 - sciCost / 100000;
+      actionable.push({ candidate, solver, phaseScore });
     }
-    actionableCappedScienceTechs.sort((a, b) => b._phaseScore - a._phaseScore);
-    return { actionableCappedScienceTechs, storageBlockedScienceTechs, futureOrHardBlockedTechs };
+    actionable.sort((a, b) => b.phaseScore - a.phaseScore);
+    return { actionable, deferred };
   };
 
-  const reachableScienceCapTechs = (candidates, resources, goalKey) => {
-    return splitScienceCapResearchCandidates(candidates, resources, goalKey).actionableCappedScienceTechs;
+  const sprintCandidate = (sprint, candidates) =>
+    candidates.find((c) => c.kind === "research" && c.meta && c.meta.name === sprint.techName) || null;
+
+  // A sprint stays valid while its tech is still open, unresearched, its final
+  // science cost fits cap and its chain is not hard-blocked.  Crucially this does
+  // NOT require science near cap and does NOT require it to still be chain-gated.
+  const sprintStillValid = (sprint, candidates, resources) => {
+    if (!sprint) return { valid: false };
+    const candidate = sprintCandidate(sprint, candidates);
+    if (!candidate) return { valid: false, reason: `${sprint.techName} no longer available` };
+    const meta = candidate.meta;
+    if (meta.researched) return { valid: false, reason: `${labelOf(meta)} researched` };
+    if (!isOpen(meta)) return { valid: false, reason: `${labelOf(meta)} no longer open` };
+    if (!finalScienceFitsCap(meta, resources)) return { valid: false, reason: scienceStorageReason(meta, resources) };
+    const solver = solveCraftChain(resources, candidate);
+    if (solver.hardBlocked) return { valid: false, reason: (solver.blockers[0] && solver.blockers[0].text) || "hard-blocked" };
+    return { valid: true, candidate, solver };
+  };
+
+  // Validate the existing sprint (keep it), else discover a new one. Returns
+  // { sprint, deferred, actionable }.  Pure on resources except for the
+  // module-level activeSprint contract it manages.
+  const planResearchSprint = (candidates, resources, goalKey) => {
+    const { actionable, deferred } = actionableResearchSprints(candidates, resources, goalKey);
+    if (activeSprint) {
+      const check = sprintStillValid(activeSprint, candidates, resources);
+      if (check.valid) {
+        activeSprint.lastValidatedAt = Date.now();
+        activeSprint.candidate = check.candidate;
+        activeSprint.solver = check.solver;
+        activeSprint.protectedChain = check.solver.protectedChain.size ? check.solver.protectedChain : activeSprint.protectedChain;
+        activeSprint.currentStep = check.solver.currentStep;
+        activeSprint.blockers = check.solver.blockers;
+        return { sprint: activeSprint, deferred, actionable };
+      }
+      if (check.reason) pushLog(`✅ research sprint ended: ${check.reason}`);
+      activeSprint = null;
+    }
+    if (actionable.length) {
+      const best = actionable[0];
+      activeSprint = {
+        id: targetId(best.candidate),
+        techName: best.candidate.meta.name,
+        startedAt: Date.now(),
+        lastValidatedAt: Date.now(),
+        reason: isNearResourceCap(resources, "science") ? "science at cap" : "actionable research chain",
+        protectedChain: best.solver.protectedChain,
+        blockers: best.solver.blockers,
+        currentStep: best.solver.currentStep,
+        solver: best.solver,
+        candidate: best.candidate,
+      };
+      pushLog(`🔬 research sprint: ${labelOf(best.candidate.meta)} (${activeSprint.reason})`);
+      return { sprint: activeSprint, deferred, actionable };
+    }
+    return { sprint: null, deferred, actionable };
   };
 
   const classifyCandidateLayer = (candidate, resources, goalKey) => {
@@ -2867,48 +3010,57 @@
     return STRATEGIC_LAYERS.economy;
   };
 
+  const isLongProject = (candidate, resources, goalKey) =>
+    !!candidate && classifyCandidateLayer(candidate, resources, goalKey) === STRATEGIC_LAYERS.longProject;
+
+  // Items deferred behind an active sprint, for the details panel: storage-blocked
+  // future research (Electricity) and long projects / chain-users (Temple).
+  const buildSprintDeferrals = (candidates, resources, goalKey, target, protectedChain, deferred) => {
+    const out = [];
+    for (const item of deferred) out.push({ target: item.candidate, reason: item.reason });
+    const chainUsers = candidates
+      .filter((c) => c !== target && targetId(c) !== targetId(target))
+      .filter((c) => isLongProject(c, resources, goalKey) || candidateUsesAnyCraftChain(c, protectedChain))
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
+      .slice(0, 3)
+      .map((c) => ({
+        target: c,
+        reason: candidateUsesAnyCraftChain(c, protectedChain)
+          ? `active Research sprint owns ${[...protectedChain].filter((n) => craftByName(n)).slice(0, 2).map((n) => resTitle(resources, n)).join("/") || "craft"} chain`
+          : "deferred behind active Research sprint",
+      }));
+    for (const item of chainUsers) out.push(item);
+    return out.slice(0, 6);
+  };
+
+  /* ------------------------------ layer selector ----------------------------
+   * Ordered: safety guard (upstream) → active/new research sprint → storage /
+   * economy scoring → long project.  Long projects can only win when no sprint
+   * owns the plan.
+   */
   const selectStrategicTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
-    const preferred = candidates[0] || null;
-    const scienceBuckets = splitScienceCapResearchCandidates(candidates, resources, goalKey);
-    const cappedTechs = scienceBuckets.actionableCappedScienceTechs;
-    if (cappedTechs.length) {
-      const sticky = activeTarget && activeTarget.layer === STRATEGIC_LAYERS.scienceCap
-        ? findCandidateById(cappedTechs, activeTarget.id)
-        : null;
-      const target = sticky && validStickyScienceCapTarget(sticky, resources) ? sticky : cappedTechs[0];
-      const protectedChain = target._capDrainChain && target._capDrainChain.size ? target._capDrainChain : candidateCraftChainResources(target);
-      const chainConflicts = candidates
-        .filter((candidate) => candidate !== target && candidateUsesAnyCraftChain(candidate, protectedChain))
-        .sort((a, b) => (classifyCandidateLayer(b, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0) -
-          (classifyCandidateLayer(a, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0));
-      const rejected = chainConflicts.length ? chainConflicts : candidates.filter((candidate) => candidate !== target).slice(0, 1);
-      const storageDeferred = scienceBuckets.storageBlockedScienceTechs.map((item) => ({
-        target: item.candidate,
-        reason: item.reason || "blocked by science storage",
-      }));
-      const chainDeferred = rejected.slice(0, 5).map((candidate) => ({
-        target: candidate,
-        reason: candidateUsesAnyCraftChain(candidate, protectedChain)
-          ? `deferred because science capped and ${labelOf(target.meta)} reachable through ${[...protectedChain].filter((n) => craftByName(n)).slice(0, 3).join("/")} chain`
-          : `deferred behind active ${STRATEGIC_LAYERS.scienceCap} layer`,
-      }));
+    const { sprint, deferred } = planResearchSprint(candidates, resources, goalKey);
+
+    if (sprint && sprint.candidate) {
+      const target = sprint.candidate;
+      const protectedChain = sprint.protectedChain && sprint.protectedChain.size ? sprint.protectedChain : candidateCraftChainResources(target);
+      const chainText = [...protectedChain].filter((n) => craftByName(n)).slice(0, 3).map((n) => resTitle(resources, n)).join("→") || "science";
       return {
         candidates,
         target,
-        layer: STRATEGIC_LAYERS.scienceCap,
-        reason: `${labelOf(target.meta)} is reachable while science is capped; protecting ${[...protectedChain].slice(0, 4).map((n) => resTitle(resources, n)).join("→") || "science"} chain`,
+        layer: STRATEGIC_LAYERS.researchSprint,
+        reason: `${labelOf(target.meta)} research sprint owns the ${chainText} chain`,
         protectedChain,
-        scienceBuckets,
-        rejectedTopCandidates: [...storageDeferred, ...chainDeferred].slice(0, 5),
+        sprint,
+        rejectedTopCandidates: buildSprintDeferrals(candidates, resources, goalKey, target, protectedChain, deferred),
       };
     }
 
-    // Outside urgent overrides, preserve the mature ROI scorer as the normal
-    // economy layer. This keeps existing production/titanium/storage behaviour
-    // stable while the phase planner decides when a higher-priority layer (such
-    // as science-cap relief) is allowed to preempt it.
-    const target = preferred;
+    // No sprint: fall back to the mature ROI scorer (storage / production /
+    // housing / economy / long project), which already raises storage blockers
+    // and producer prerequisites by pressure.
+    const target = candidates[0] || null;
     const activeLayer = classifyCandidateLayer(target, resources, goalKey);
     const rejected = candidates.find((candidate) => targetId(candidate) !== targetId(target)) || null;
     return {
@@ -2917,7 +3069,7 @@
       layer: activeLayer,
       reason: `selected best candidate inside ${activeLayer} layer`,
       protectedChain: candidateCraftChainResources(target),
-      rejectedTopCandidates: rejected ? [{ target: rejected, reason: `not in active ${activeLayer} layer or lower score inside layer` }] : [],
+      rejectedTopCandidates: rejected ? [{ target: rejected, reason: `lower score inside ${activeLayer} layer` }] : [],
     };
   };
 
@@ -3017,38 +3169,30 @@
     const preferred = decision.target || candidates[0] || null;
     const now = Date.now();
 
-    // The lock is what makes plans PUSH THROUGH. The executor reserves the
-    // locked target's resources and buys it the moment it's ready, so the lock
-    // only breaks on completion, a storage block, a long timeout, or a rival
-    // that is MUCH better — never on ordinary score wobble.
+    // A valid research sprint IS the lock — the contract persists across ticks
+    // (validated in planResearchSprint), so the economy target lock must not
+    // fight it.  Return the sprint candidate directly.
+    if (decision.layer === STRATEGIC_LAYERS.researchSprint) {
+      activeTarget = null;
+      return preferred;
+    }
+
+    // Non-sprint economy lock: makes ordinary plans (Library, Mine, …) PUSH
+    // THROUGH. The executor reserves the locked target's resources and buys it
+    // the moment it is ready, so the lock only breaks on completion, a storage
+    // block, a long timeout, a far-cheaper research, or a much better rival.
     if (activeTarget) {
       const locked = findCandidateById(candidates, activeTarget.id);
       const age = now - activeTarget.startedAt;
-      const stickyScienceCap = activeTarget.layer === STRATEGIC_LAYERS.scienceCap && validStickyScienceCapTarget(locked, resources);
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
-      const lockedLayer = locked ? classifyCandidateLayer(locked, resources, goalKey) : "";
       const preferredWait = preferred ? waitSecondsForCandidate(preferred, resources) : Number.POSITIVE_INFINITY;
-      const preferredChain = candidateCraftChainResources(preferred);
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && preferred.score > locked.score * 1.3 + 8;
-      const scienceCapBreak = locked && decision.layer === STRATEGIC_LAYERS.scienceCap && targetId(locked) !== targetId(preferred) &&
-        !candidateSpendsAny(locked, ["science"]) && !isStorageMeta(locked.meta);
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
-      const chainConflictBreak = locked && preferred && decision.layer === STRATEGIC_LAYERS.scienceCap &&
-        candidateUsesAnyCraftChain(locked, preferredChain) && targetId(locked) !== targetId(preferred);
-      const layerChangedBreak = locked && preferred && decision.layer === STRATEGIC_LAYERS.scienceCap &&
-        lockedLayer !== decision.layer && targetId(locked) !== targetId(preferred);
-      if (stickyScienceCap) {
-        lastStrategicDecision.target = locked;
-        lastStrategicDecision.layer = STRATEGIC_LAYERS.scienceCap;
-        lastStrategicDecision.protectedChain = locked._capDrainChain && locked._capDrainChain.size ? locked._capDrainChain : candidateCraftChainResources(locked);
-        return locked;
-      }
-      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage || lockedIsStorageBlocked ||
-          scienceCapBreak || nearTechBreak || chainConflictBreak || layerChangedBreak) {
-        if (scienceCapBreak || chainConflictBreak) pushLog(`🔓 breaking lock: ${decision.reason}`);
+      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage ||
+          lockedIsStorageBlocked || nearTechBreak) {
         activeTarget = null;
       } else if (!muchBetter) {
         lastStrategicDecision.target = locked;
@@ -3069,11 +3213,71 @@
     return preferred;
   };
 
+  // While a research sprint owns the plan, jobs serve the sprint's craft chain
+  // and nothing else: missing Compendium → Manuscript/Science, Manuscript →
+  // Parchment/Culture, Parchment → Furs, Furs → Catpower/Hunter.  Priests and
+  // scholars are suppressed unless their bank is the genuine bottleneck.
+  const researchSprintJobNeeds = (sprint, resources) => {
+    const needs = {};
+    const target = sprint.candidate;
+    const chain = sprint.protectedChain || new Set();
+    jobSuppressText = "Suppressed: faith baseline during Research sprint";
+
+    // Map each still-missing chain cost onto the jobs that can refill it. This
+    // walks craft prices recursively, so Furs lands on Hunters (manpower).
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (resValueOf(resources, cost.name) >= cost.val) continue;
+      if (cost.name === "science") continue; // cap-aware scholar handling below
+      scoreResourcePathNeed(needs, cost.name, 22);
+    }
+
+    // Hunters: boosted when furs / parchment / manuscript / compendium is the
+    // live bottleneck (catpower turns into furs turns into the whole chain).
+    const hasShortCraftCost = pricesFor(target.kind, target.meta).some((c) =>
+      c && c.name && c.val > 0 && craftByName(c.name) && resValueOf(resources, c.name) < c.val);
+    const chainNeedsFurs = hasShortCraftCost &&
+      ["furs", "parchment", "manuscript", "compedium", "compendium"].some((name) => chain.has(name));
+    if (chainNeedsFurs && jobByName("hunter")) scoreNeed(needs, "manpower", 26);
+
+    // Scholars: 0 while science is capped; allowed only when science is genuinely
+    // the refill bottleneck — below the final research cost AND not near cap.
+    const sciCost = researchScienceCost(target.meta);
+    const sciHave = resValueOf(resources, "science");
+    if (jobByName("scholar") && !isNearResourceCap(resources, "science") && sciHave < sciCost) {
+      scoreNeed(needs, "science", 6);
+    }
+
+    // Priests: suppressed unless faith is capped or the tech itself costs faith.
+    const targetCostsFaith = pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === "faith");
+    if (jobByName("priest") && (isNearResourceCap(resources, "faith") || targetCostsFaith)) {
+      scoreNeed(needs, "faith", 6);
+      jobSuppressText = "";
+    }
+
+    // Farmers: catnip safety floor only (the starvation guard in desiredJobCounts
+    // still forces them on net-negative catnip / a draining pantry).
+    if (resRatio(resources, "catnip") < 0.25) scoreNeed(needs, "catnip", 14);
+    // Wood floor so the economy does not seize while hunters run the chain.
+    if (resRatio(resources, "wood") < 0.3) scoreNeed(needs, "wood", 4 * (0.3 - resRatio(resources, "wood")) / 0.3);
+
+    // Anti-waste: never staff a capped bank (keeps scholars off full science).
+    for (const name of ["science", "faith", "culture"]) {
+      if (resRatio(resources, name) > 0.94) needs[name] = 0;
+    }
+    return { needs, target };
+  };
+
   const resourceNeeds = (goalKey, resources) => {
     const needs = {};
     const target = getTargetCached(resources, goalKey);
+    const sprint = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint
+      ? lastStrategicDecision.sprint : null;
+    if (sprint && sprint.candidate && !target?.affordable) {
+      return researchSprintJobNeeds(sprint, resources);
+    }
+    jobSuppressText = "";
     if (target && !target.affordable) {
-      const scienceCapFocus = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap && target.kind === "research";
       for (const blocker of directStorageBlockers(target.kind, target.meta, resources)) {
         const closeness = Math.max(0.05, Math.min(1, blocker.max / Math.max(1, blocker.need)));
         scoreNeed(needs, blocker.name, 12 + Math.min(18, closeness * 18));
@@ -3090,12 +3294,6 @@
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
-      if (scienceCapFocus) {
-        const chain = lastStrategicDecision.protectedChain || candidateCraftChainResources(target);
-        if (["compedium", "compendium", "manuscript", "parchment", "furs"].some((name) => chain.has(name))) {
-          scoreNeed(needs, "manpower", 24);
-        }
-      }
     }
 
     // Lookahead: the next few runner-up candidates also pull a little weight,
@@ -3145,10 +3343,7 @@
     // bank with compounding religion value.  Keep a small live-data baseline
     // when priests exist and faith has storage headroom; the cap check below
     // still removes the need the moment the actual bar is full.
-    const scienceCapFocus = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap && target && target.kind === "research";
-    const targetCostsFaith = target && pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === "faith");
-    if (!scienceCapFocus && jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
-    if (scienceCapFocus && !targetCostsFaith && !religionTarget && !isNearResourceCap(resources, "faith")) needs.faith = 0;
+    if (jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
 
     // Include the same immediate diplomacy work the executor will try later in
     // the tick.  Trade routes and explorers are resource sinks just like a
@@ -3163,7 +3358,7 @@
     if ((emphasis.food || 1) > 1 || (emphasis.housing || 1) > 1) scoreNeed(needs, "catnip", 3);
 
     for (const name of ["science", "faith", "culture", "manpower"]) {
-      if (name === "manpower" && (huntingEconomyNeed(resources) > 0.5 || (lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap))) continue;
+      if (name === "manpower" && huntingEconomyNeed(resources) > 0.5) continue;
       if (resRatio(resources, name) > 0.94) needs[name] = 0;
     }
     for (const name of ["wood", "minerals", "catnip", "coal"]) {
@@ -3218,6 +3413,11 @@
     const total = Math.max(0, totalWorkers - reserved);
     const { needs, target } = resourceNeeds(goalKey, resources);
     const weights = {};
+    // Jobs whose output bank is full are HARD-zeroed: a scholar on a capped
+    // science bank produces pure waste, so it leaves immediately instead of
+    // decaying through the smoother over many ticks (this is what keeps
+    // scholars at 0 the instant science caps, even mid research-sprint).
+    const cappedZeroJobs = new Set();
 
     for (const job of jobs) {
       const produced = jobResourceFor(job);
@@ -3234,7 +3434,7 @@
       // essentially full — unless the economy still wants it (hunting keeps
       // luxuries/mood up even when catpower is high).
       const keepForEconomy = needKey === "manpower" && huntingEconomyNeed(resources) > 0.5;
-      if (resRatio(resources, needKey, 0) > 0.94 && !keepForEconomy) weight = 0;
+      if (resRatio(resources, needKey, 0) > 0.94 && !keepForEconomy) { weight = 0; cappedZeroJobs.add(job.name); }
       // Hunting beyond the luxury/mood need is busywork: when furs are well
       // stocked and the village is happy, crafting-chain pressure (parchment →
       // furs → catpower) must not march half the settlement into the woods.
@@ -3270,6 +3470,18 @@
       if (fallback) weights[fallback.name] = 1;
     }
 
+    // When entering, leaving, or switching a research sprint, the prior smoothed
+    // distribution must NOT linger — reset it so the new chain's jobs take over
+    // immediately instead of decaying the old priest/farmer-heavy split over many
+    // ticks.  (Within steady economy mode the sprint id stays "", so ordinary
+    // target changes never reset the smoothing and the village does not churn.)
+    const jobContext = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint && lastStrategicDecision.sprint
+      ? lastStrategicDecision.sprint.id : "";
+    if (jobContext !== lastJobContext) {
+      smoothedJobWeights = {};
+      lastJobContext = jobContext;
+    }
+
     // Smooth noisy per-tick weights so tiny ratio changes do not whip kittens
     // back and forth between jobs.  Safety overrides (starving catnip) still
     // win because they push the raw weight far above the smoothed baseline.
@@ -3278,6 +3490,7 @@
       const raw = weights[job.name] || 0;
       const previous = smoothedJobWeights[job.name];
       nextSmoothed[job.name] = previous == null ? raw : previous * (1 - JOB_WEIGHT_SMOOTHING) + raw * JOB_WEIGHT_SMOOTHING;
+      if (cappedZeroJobs.has(job.name)) nextSmoothed[job.name] = 0; // capped bank → drop staffing now, not over many ticks
       if (raw === 0 && nextSmoothed[job.name] < 0.2) nextSmoothed[job.name] = 0;
       weights[job.name] = nextSmoothed[job.name];
     }
@@ -3344,13 +3557,19 @@
       }
     }
 
-    const needLine = Object.entries(needs)
-      .filter(([, w]) => w > 0)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3)
-      .map(([name]) => resTitle(resources, name))
-      .join(" + ");
-    jobPlanText = `Jobs: ${needLine || "balanced"}${target ? ` for ${labelOf(target.meta)}` : ""}`;
+    const sprint = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint
+      ? lastStrategicDecision.sprint : null;
+    if (sprint && (needs.manpower || 0) > 0) {
+      jobPlanText = `Jobs: Hunters for furs/parchment/compendium`;
+    } else {
+      const needLine = Object.entries(needs)
+        .filter(([, w]) => w > 0)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([name]) => resTitle(resources, name))
+        .join(" + ");
+      jobPlanText = `Jobs: ${needLine || "balanced"}${target ? ` for ${labelOf(target.meta)}` : ""}`;
+    }
     return desired;
   };
 
@@ -3429,8 +3648,14 @@
       const discount = typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0;
       const huntCost = Math.max(1, 100 - discount);
       const target = getTargetCached(resources, getGoal());
-      const chainHuntNeed = target && lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.scienceCap &&
-        [...(lastStrategicDecision.protectedChain || new Set())].some((name) => ["furs", "parchment", "manuscript", "compedium", "compendium"].includes(name));
+      // A research sprint whose chain still needs furs/parchment/manuscript/
+      // compendium turns hunting into plan work: drop the threshold so we hunt
+      // as soon as a hunt is affordable, instead of waiting near the cap.
+      const sprint = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint
+        ? lastStrategicDecision.sprint : null;
+      const chainHuntNeed = !!sprint &&
+        [...(lastStrategicDecision.protectedChain || new Set())]
+          .some((name) => ["furs", "parchment", "manuscript", "compedium", "compendium"].includes(name));
       const economyNeed = huntingEconomyNeed(resources);
       let threshold = chainHuntNeed ? Math.max(huntCost, cp.maxValue * 0.08) :
         economyNeed > 0.5 ? Math.max(huntCost, cp.maxValue * 0.25) : Math.max(huntCost, cp.maxValue * 0.75);
@@ -3445,7 +3670,8 @@
       if (cp.value >= threshold) {
         village.huntAll();
         if (Date.now() - lastHuntLog > 30000) {
-          const reason = chainHuntNeed ? " for Acoustics furs chain" : economyNeed > 0.5 ? " for luxuries/mood" : "";
+          const chainLabel = sprint && sprint.candidate ? labelOf(sprint.candidate.meta) : "research";
+          const reason = chainHuntNeed ? ` for furs for ${chainLabel} chain` : economyNeed > 0.5 ? " for luxuries/mood" : "";
           pushLog(`🏹 sent hunters${reason}`);
           lastHuntLog = Date.now();
         }
@@ -3614,42 +3840,70 @@
 
   const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase()}`;
 
+  // Compact "Need:" summary — the still-missing direct costs (cap-drain banks
+  // and craft intermediates), e.g. "12.29K Science, 27.2 Compendium".
+  const planNeedSummary = (resources, target) => {
+    const out = [];
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = resValueOf(resources, cost.name);
+      if (have >= cost.val) continue;
+      const label = craftByName(cost.name) ? craftLabel(cost.name) : resTitle(resources, cost.name);
+      out.push(`${fmt(cost.val - have)} ${label}`);
+    }
+    return out.slice(0, 3);
+  };
+
+  // MAIN panel — must stay compact: Focus + Layer + Need only.  All reasoning
+  // (protected chain, deferrals, ETA) lives in "More automation details".
   const getPlanLine = (resources, goalKey) => {
     try {
       const target = getTargetCached(resources, goalKey);
       if (!target) return "🎯 Focus: scanning";
-      const decision = lastStrategicDecision;
-      const layer = (decision && decision.layer) || "Economy / normal growth";
-      const missingCraft = pricesFor(target.kind, target.meta)
-        .find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
-      const need = missingCraft
-        ? `\nNeed: ${fmt(missingCraft.val - (((getRes(resources, missingCraft.name) || {}).value) || 0))} ${craftLabel(missingCraft.name)}`
-        : target.affordable ? "\nNeed: ready now" : target.missing ? `\nNeed: ${target.missing}` : "";
-      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}${need}`;
+      const layer = (lastStrategicDecision && lastStrategicDecision.layer) || STRATEGIC_LAYERS.economy;
+      const needs = planNeedSummary(resources, target);
+      const needLine = target.affordable ? "ready now" : needs.join(", ") || target.missing || "prerequisites";
+      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}\nNeed: ${needLine}`;
     } catch (error) {
       return "🎯 Focus: —";
     }
   };
+
+  // Ordered chain members for display, craft order top-down (Compendium →
+  // Manuscript → Parchment → Furs), filtered to the interesting craft/hunt steps.
+  const protectedChainLabels = (resources, chain) =>
+    [...(chain || new Set())]
+      .filter((name) => craftByName(name) || HUNTABLE_RESOURCES.has(name))
+      .slice(0, 6)
+      .map((name) => resTitle(resources, name));
 
   const getAutomationDetailsLine = (resources, goalKey) => {
     try {
       const target = getTargetCached(resources, goalKey);
       if (!target) return "";
       const decision = lastStrategicDecision;
+      // Research-sprint details: protected chain + deferrals + job drivers.
+      if (decision && decision.layer === STRATEGIC_LAYERS.researchSprint && decision.sprint) {
+        const parts = [];
+        const chain = protectedChainLabels(resources, decision.protectedChain);
+        if (chain.length) parts.push(`Protected chain: ${chain.join(" → ")}`);
+        for (const item of (decision.rejectedTopCandidates || []).filter((i) => i && i.target).slice(0, 4)) {
+          parts.push(`Deferred ${labelOf(item.target.meta)}: ${item.reason}`);
+        }
+        if (jobPlanText) parts.push(jobPlanText.replace(/^Jobs:\s*/, "Jobs: "));
+        if (jobSuppressText) parts.push(jobSuppressText);
+        return parts.join(" · ");
+      }
+      // Economy details: state + ETA + reservation + deferrals (unchanged shape).
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
-      const eta = formatEta(target._capDrainEta != null ? target._capDrainEta : waitSecondsForCandidate(target, resources));
+      const eta = formatEta(waitSecondsForCandidate(target, resources));
       const reserved = target.affordable ? [] : Object.keys(reservedNeedsFor(target, resources));
       const reserveNote = reserved.length ? ` · reserving ${reserved.slice(0, 4).map((name) => resTitle(resources, name)).join("+")}` : "";
-      const protectedNote = decision && decision.protectedChain && decision.protectedChain.size
-        ? ` · protected chain ${[...decision.protectedChain].slice(0, 6).map((name) => resTitle(resources, name)).join("→")}`
-        : "";
-      const rejected = decision && decision.rejectedTopCandidates && decision.rejectedTopCandidates.length
-        ? decision.rejectedTopCandidates.filter((item) => item && item.target).slice(0, 3)
-        : [];
+      const rejected = (decision && decision.rejectedTopCandidates || []).filter((item) => item && item.target).slice(0, 3);
       const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
       const titaniumHint = titaniumRouteHint(resources, goalKey);
-      return `${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${protectedNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
+      return `${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
     } catch (error) {
       return "";
     }
@@ -3659,6 +3913,20 @@
     const target = getTargetCached(resources, goalKey);
     if (!target) return "scanning…";
     if (target.affordable) return `buying ${focusLabel(target).toLowerCase()} ${labelOf(target.meta)}`;
+    const decision = lastStrategicDecision;
+    // Research-sprint action: surface the immediate chain step (craft / hunt /
+    // refill), e.g. "craft Compendium for Acoustics chain".
+    if (decision && decision.layer === STRATEGIC_LAYERS.researchSprint && decision.sprint) {
+      const label = labelOf(target.meta);
+      const step = decision.sprint.currentStep;
+      if (step && HUNTABLE_RESOURCES.has(step)) return `hunt for ${resTitle(resources, step)} for ${label} chain`;
+      if (step && craftByName(step)) return `craft ${craftLabel(step)} for ${label} chain`;
+      if (step && CAP_DRAIN_RESOURCES.has(step)) return `wait/refill ${resTitle(resources, step)} for ${label} chain`;
+      // No craftable step short → only the cap-drain banks remain to refill.
+      const shortBank = pricesFor(target.kind, target.meta).find((c) => c && c.name && CAP_DRAIN_RESOURCES.has(c.name) && resValueOf(resources, c.name) < c.val);
+      if (shortBank) return `wait/refill ${resTitle(resources, shortBank.name)} for ${label} chain`;
+      return `advancing ${label} chain`;
+    }
     const titaniumHint = titaniumRouteHint(resources, goalKey);
     if (titaniumHint) return `titanium path: ${titaniumHint}`;
     const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
@@ -3891,8 +4159,16 @@
   const reservedNeedsFor = (target, resources) => {
     const reserved = {};
     if (!target || target.affordable) return reserved;
+    // For a research sprint we protect the CRAFT chain (Compendium/Manuscript/
+    // Parchment/Furs), not the cap-drain banks: science/culture are spent and
+    // refilled continuously, and over-reserving them would block chain
+    // accelerators (e.g. a Printing Press that produces manuscripts).  We only
+    // reserve a cap-drain bank once it is near cap (about to complete the buy).
+    const isSprintTarget = target.kind === "research" && activeSprint && activeSprint.candidate &&
+      targetId(target) === activeSprint.id;
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (isSprintTarget && CAP_DRAIN_RESOURCES.has(cost.name) && !isNearResourceCap(resources, cost.name)) continue;
       const res = getRes(resources, cost.name);
       if (res && res.maxValue > 0 && cost.val > res.maxValue) continue;
       reserved[cost.name] = Math.max(reserved[cost.name] || 0, cost.val);
@@ -5160,12 +5436,14 @@
     goalSelect.addEventListener("change", () => {
       localStorage.setItem(GOAL_KEY, goalSelect.value);
       activeTarget = null;
+      activeSprint = null; // a manual goal change is an explicit priority change
       tick();
     });
     prioritySelect.value = getPriority();
     prioritySelect.addEventListener("change", () => {
       localStorage.setItem(PRIORITY_KEY, prioritySelect.value);
       activeTarget = null;
+      activeSprint = null;
       tick();
     });
     policyApplyEl.addEventListener("click", () => {
@@ -5205,12 +5483,27 @@
       const resources = resourceMap();
       return getPlanLine(resources, goalKey);
     },
+    detailsText(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      getTargetCached(resources, goalKey);
+      return getAutomationDetailsLine(resources, goalKey);
+    },
     nowText(goalKey = getGoal()) {
       resetTickCache();
       const resources = resourceMap();
       return getNowAction(resources, goalKey);
     },
+    activeSprint() {
+      return activeSprint;
+    },
+    solveChain(candidate) {
+      return solveCraftChain(resourceMap(), candidate);
+    },
     forceActiveTarget(candidate) {
+      // A debug/manual target override resets BOTH locks so the planner starts
+      // from a clean state (mirrors an explicit player priority change).
+      activeSprint = null;
       activeTarget = candidate ? {
         id: targetId(candidate),
         startedAt: Date.now() - getTargetLockMinMs() - 1000,
