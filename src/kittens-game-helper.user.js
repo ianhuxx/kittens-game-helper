@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.0.2
+// @version      2.0.3
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.0.2";
+  const HELPER_VERSION = "2.0.3";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2708,44 +2708,81 @@
     return false;
   };
 
-  const hasObtainablePathFor = (resources, name, amount) => {
-    if (!isFinite(amount) || amount <= 0) return true;
+  const CAPPED_REFILL_RESOURCES = new Set(["science", "culture", "faith"]);
+
+  // Repeated cap-drain reachability for craft chains.  A target may need more
+  // total science/culture than the bank can hold (e.g. many Compendium crafts),
+  // but that is still reachable by spending a capped bank, waiting for refill,
+  // and spending it again.  Reject only when one individual craft/research step
+  // cannot fit in storage, or when an input has no production/craft/trade path.
+  const capDrainReachabilityFor = (resources, name, amount, depth = 0, stack = new Set()) => {
+    if (!isFinite(amount) || amount <= 0) return { reachable: true, eta: 0, chain: new Set([name]) };
+    if (depth > 8 || stack.has(name)) return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no path for ${name}`, chain: new Set([name]) };
+    const chain = new Set([name]);
     const max = resMaxOf(resources, name);
-    if (max > 0 && amount > max) return false;
     const have = resValueOf(resources, name);
-    if (have >= amount) return true;
-    if (craftByName(name)) {
-      const raw = rawPathRequirements(name, amount - have);
-      return Object.entries(raw).every(([rawName, rawAmount]) => {
-        const rawMax = resMaxOf(resources, rawName);
-        const rawProd = rawProductionForNeed(rawName);
-        if (rawMax > 0 && rawAmount > rawMax && rawProd <= 0) return false;
-        return resValueOf(resources, rawName) >= rawAmount || rawProd > 0 || rawName === "titanium";
-      });
+    const deficit = Math.max(0, amount - have);
+    const prod = rawProductionForNeed(name);
+    if (max > 0 && amount > max && !CAPPED_REFILL_RESOURCES.has(name) && !craftByName(name)) {
+      return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, name)} storage cap blocks ${fmt(amount)}`, chain };
     }
-    return rawProductionForNeed(name) > 0 || name === "titanium";
+    if (deficit <= 0) return { reachable: true, eta: 0, chain };
+
+    const craft = craftByName(name);
+    if (craft) {
+      const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+      if (!prices.length) return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no priced craft path for ${name}`, chain };
+      const units = Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name))));
+      let eta = 0;
+      for (const price of prices) {
+        const inputCap = resMaxOf(resources, price.name);
+        if (inputCap > 0 && price.val > inputCap) {
+          return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, price.name)} cap below one ${craftLabel(name)} craft`, chain };
+        }
+        const child = capDrainReachabilityFor(resources, price.name, price.val * units, depth + 1, new Set([...stack, name]));
+        for (const item of child.chain || []) chain.add(item);
+        if (!child.reachable) return { ...child, chain };
+        eta = Math.max(eta, child.eta || 0);
+      }
+      return { reachable: true, eta, chain };
+    }
+
+    if (prod > 0 || name === "titanium") {
+      return { reachable: true, eta: prod > 0 ? deficit / prod : waitSecondsForZebraTitanium(deficit, resources), chain };
+    }
+    if (CAPPED_REFILL_RESOURCES.has(name)) {
+      if (max > 0 && amount > max) return { reachable: true, eta: prod > 0 ? deficit / prod : 0, chain };
+      return { reachable: prod > 0, eta: prod > 0 ? deficit / prod : Number.POSITIVE_INFINITY, reason: `no ${resTitle(resources, name)} refill`, chain };
+    }
+    return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no path for ${resTitle(resources, name)}`, chain };
   };
+
+  const hasObtainablePathFor = (resources, name, amount) => capDrainReachabilityFor(resources, name, amount).reachable;
 
   const reachableScienceCapTechs = (candidates, resources, goalKey) => {
     if (!isNearResourceCap(resources, "science")) return [];
-    const science = getRes(resources, "science");
-    const scienceAvailable = (science && science.maxValue) || resValueOf(resources, "science");
     return candidates
       .filter((candidate) => candidate.kind === "research" && candidate.meta && !candidate.meta.researched)
-      .filter((candidate) => pricesFor("research", candidate.meta).every((cost) => {
-        if (!cost || !cost.name || cost.val <= 0) return true;
-        if (cost.name === "science") return scienceAvailable >= cost.val;
-        return hasObtainablePathFor(resources, cost.name, cost.val);
-      }))
       .map((candidate) => {
+        const analyses = pricesFor("research", candidate.meta).map((cost) => {
+          if (!cost || !cost.name || cost.val <= 0) return { reachable: true, eta: 0, chain: new Set() };
+          return capDrainReachabilityFor(resources, cost.name, cost.val);
+        });
+        if (analyses.some((analysis) => !analysis.reachable)) return null;
+        const chain = new Set();
+        analyses.forEach((analysis) => (analysis.chain || new Set()).forEach((name) => chain.add(name)));
         const profile = candidateEffectProfile(candidate.kind, candidate.meta);
         const goalPath = goalFrontierNames(goalKey).has(candidate.meta.name) || goalClosureNames(goalKey).has(candidate.meta.name);
         const unlockValue = gatewayValue(candidate.meta) + (profile.unlocks || []).length + Object.keys(profile.perTick || {}).length;
+        const eta = Math.max(0, ...analyses.map((analysis) => analysis.eta || 0));
         return {
           ...candidate,
-          _phaseScore: (goalPath ? 10000 : 0) + unlockValue * 100 - waitSecondsForCandidate(candidate, resources) / 60 - pricesFor(candidate.kind, candidate.meta).length,
+          _capDrainEta: eta,
+          _capDrainChain: chain,
+          _phaseScore: (goalPath ? 10000 : 0) + unlockValue * 100 - eta / 60 - pricesFor(candidate.kind, candidate.meta).length,
         };
       })
+      .filter(Boolean)
       .sort((a, b) => b._phaseScore - a._phaseScore);
   };
 
@@ -2771,7 +2808,7 @@
     const cappedTechs = reachableScienceCapTechs(candidates, resources, goalKey);
     if (cappedTechs.length) {
       const target = cappedTechs[0];
-      const protectedChain = candidateCraftChainResources(target);
+      const protectedChain = target._capDrainChain && target._capDrainChain.size ? target._capDrainChain : candidateCraftChainResources(target);
       const chainConflicts = candidates
         .filter((candidate) => candidate !== target && candidateUsesAnyCraftChain(candidate, protectedChain))
         .sort((a, b) => (classifyCandidateLayer(b, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0) -
@@ -3483,31 +3520,41 @@
   const getPlanLine = (resources, goalKey) => {
     try {
       const target = getTargetCached(resources, goalKey);
-      if (!target) return "🎯 FOCUS: scanning unlocked buildings/research/upgrades";
+      if (!target) return "🎯 Focus: scanning";
       const decision = lastStrategicDecision;
-      const reqs = formatRequirements(target.kind, target.meta, resources);
+      const layer = (decision && decision.layer) || "Economy / normal growth";
+      const missingCraft = pricesFor(target.kind, target.meta)
+        .find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
+      const need = missingCraft
+        ? `\nNeed: ${fmt(missingCraft.val - (((getRes(resources, missingCraft.name) || {}).value) || 0))} ${craftLabel(missingCraft.name)}`
+        : target.affordable ? "\nNeed: ready now" : target.missing ? `\nNeed: ${target.missing}` : "";
+      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}${need}`;
+    } catch (error) {
+      return "🎯 Focus: —";
+    }
+  };
+
+  const getAutomationDetailsLine = (resources, goalKey) => {
+    try {
+      const target = getTargetCached(resources, goalKey);
+      if (!target) return "";
+      const decision = lastStrategicDecision;
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
       const state = target.affordable ? "ready now" : storageBlock ? `storage-blocked: ${storageBlock}` : `missing ${target.missing || "prerequisites"}`;
-      const eta = formatEta(waitSecondsForCandidate(target, resources));
+      const eta = formatEta(target._capDrainEta != null ? target._capDrainEta : waitSecondsForCandidate(target, resources));
       const reserved = target.affordable ? [] : Object.keys(reservedNeedsFor(target, resources));
-      const reserveNote = reserved.length
-        ? ` · reserving ${reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+")}`
-        : "";
-      const sprintTag = target._sprint ? " 🚀SPRINT" : "";
-      const titaniumHint = titaniumRouteHint(resources, goalKey);
-      const layerNote = decision && decision.layer ? `Layer: ${decision.layer} · ${decision.reason}` : "Layer: Economy / normal growth";
+      const reserveNote = reserved.length ? ` · reserving ${reserved.slice(0, 4).map((name) => resTitle(resources, name)).join("+")}` : "";
       const protectedNote = decision && decision.protectedChain && decision.protectedChain.size
-        ? ` · protecting ${[...decision.protectedChain].slice(0, 4).map((name) => resTitle(resources, name)).join("→")}`
+        ? ` · protected chain ${[...decision.protectedChain].slice(0, 6).map((name) => resTitle(resources, name)).join("→")}`
         : "";
       const rejected = decision && decision.rejectedTopCandidates && decision.rejectedTopCandidates.length
         ? decision.rejectedTopCandidates.filter((item) => item && item.target).slice(0, 3)
         : [];
-      const rejectNote = rejected.length
-        ? ` · rejected: ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}`
-        : "";
-      return `🎯 ${layerNote}${protectedNote}${rejectNote}\nFOCUS: ${focusLabel(target)} — ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${sprintTag}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}${reqs ? ` (${reqs})` : ""}`;
+      const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
+      const titaniumHint = titaniumRouteHint(resources, goalKey);
+      return `${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${protectedNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
     } catch (error) {
-      return "🎯 FOCUS: —";
+      return "";
     }
   };
 
@@ -4784,6 +4831,7 @@
   let policySelectEl;
   let policyApplyEl;
   let nowEl;
+  let noteEl;
 
   const renderPolicyControl = (resources, goalKey) => {
     if (!policyEl) return;
@@ -4868,6 +4916,7 @@
       if (bottleneckEl) bottleneckEl.textContent = `⚖ ${getBottleneck(resources)}`;
       if (scienceEl) scienceEl.textContent = `🔬 Next science: ${getNextScience(resources, goal)}`;
       if (planEl) planEl.textContent = getPlanLine(resources, goal);
+      if (noteEl) noteEl.textContent = getAutomationDetailsLine(resources, goal);
       if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
       if (buyEl) buyEl.textContent = `🛒 ${buyPlanText}`;
       if (resetEl) resetEl.textContent = resetAdvisorText;
@@ -4996,6 +5045,7 @@
     policySelectEl = box.querySelector(".kgh-policy-select");
     policyApplyEl = box.querySelector(".kgh-policy-apply");
     nowEl = box.querySelector(".kgh-now");
+    noteEl = box.querySelector(".kgh-note");
     logBox = box.querySelector(".kgh-log");
 
     const syncToggle = () => {

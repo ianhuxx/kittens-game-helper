@@ -484,7 +484,7 @@ check(
 );
 
 check("plan: Library chosen over storage-blocked Theology and cheap Mine", /Library/.test(panelText(".kgh-plan")));
-check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
+check("ETA shown in automation details", /ETA/.test(panelText(".kgh-note")));
 check("plan: reservation visible in the panel", /reserving/i.test(panelText(".kgh-plan")) || /saving for/i.test(panelText(".kgh-buy")));
 check("reservation: reserve status reports holding the plan's inputs (nothing external left to pause)", /holding/i.test(panelText(".kgh-reserve")));
 check("reservation: affordable Mine NOT bought while Library saves up", buildings[1].val === 2);
@@ -804,7 +804,7 @@ res("ivory").value = 0;
 fakeNow += 25000;
 tickFn();
 check("titanium path: catpower is saved for Zebra explorers before the first ship is ready", res("manpower").value === 400 && (/Zebra|titanium path|first Ship/i.test(panelText(".kgh-diplomacy")) || /titanium path|first Ship/i.test(panelText(".kgh-plan"))));
-check("titanium path: advisor explains the ship → explorer → Zebra trade route", /titanium path: craft first Ship/i.test(panelText(".kgh-plan")) && /titanium path: craft first Ship/i.test(panelText(".kgh-now")));
+check("titanium path: advisor explains the ship → explorer → Zebra trade route", /titanium path: craft first Ship/i.test(panelText(".kgh-note")) && /titanium path: craft first Ship/i.test(panelText(".kgh-now")));
 res("scaffold").value = 1;
 res("manpower").value = 1100;
 fakeNow += 25000;
@@ -1127,7 +1127,8 @@ check("acceptance: reservation is for Acoustics, not Temple", acceptanceReserved
 context.window.__kghDebug.forceActiveTarget({ kind: "build", meta: temple });
 tickFn();
 check("acceptance: Temple lock breaks to Acoustics", /Science cap unlock/i.test(panelText(".kgh-plan")) && /Acoustics/i.test(panelText(".kgh-plan")) && !/FOCUS: .*Temple/i.test(panelText(".kgh-plan")));
-check("acceptance: panel explains protected chain and Temple rejection", /Compendium|compedium/i.test(panelText(".kgh-plan")) && /Manuscript/i.test(panelText(".kgh-plan")) && /Temple/i.test(panelText(".kgh-plan")));
+check("acceptance: panel is compact and shows Acoustics science-cap focus", /🎯 Focus: Acoustics/i.test(panelText(".kgh-plan")) && /Layer: Science cap unlock/i.test(panelText(".kgh-plan")) && /Need: .*Compendium|Need: .*compedium/i.test(panelText(".kgh-plan")) && /craft Compendium|craft compedium/i.test(panelText(".kgh-now")));
+check("acceptance: details explain protected chain and Temple rejection", /Compendium|compedium/i.test(panelText(".kgh-note")) && /Manuscript/i.test(panelText(".kgh-note")) && /Temple/i.test(panelText(".kgh-note")));
 techs.splice(techs.indexOf(acoustics), 1);
 buildings.splice(buildings.indexOf(temple), 1);
 
