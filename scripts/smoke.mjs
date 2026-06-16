@@ -971,6 +971,53 @@ fakeNow += 25000;
 tickFn();
 check("native trade: near-capped surplus catpower is traded with a partner selling a wanted good", tradeCalls > tradeBefore);
 
+/* Overflow reserve through converter inputs — if the active plan is missing
+   converter outputs (iron/gold), the converter's live-effect inputs (wood) are
+   not surplus for unrelated crafts such as beams. */
+const alloyShrine = {
+  name: "alloyShrine",
+  label: "Alloy Shrine",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "iron", val: 120 }, { name: "gold", val: 80 }],
+  effects: { scienceMax: 50000 },
+};
+const arborSmelter = {
+  name: "arborSmelter",
+  label: "Arbor Smelter",
+  unlocked: true,
+  val: 1,
+  on: 1,
+  prices: [],
+  effects: { woodPerTickCon: -0.01, ironPerTickProd: 0.01, goldPerTickProd: 0.01 },
+};
+buildings.push(alloyShrine, arborSmelter);
+res("iron").value = 20;
+res("iron").maxValue = 300;
+res("gold").value = 10;
+res("gold").maxValue = 100;
+res("wood").value = 2950;
+res("wood").maxValue = 3000;
+res("beam").value = 0;
+perTick.wood = 2;
+perTick.iron = 0.01;
+perTick.gold = 0.01;
+const beamsBeforeConverterReserve = res("beam").value;
+fakeNow += 25000;
+tickFn();
+check("overflow: wood reserved as converter input for missing iron/gold instead of crafted into beams", res("beam").value === beamsBeforeConverterReserve);
+buildings.splice(buildings.indexOf(alloyShrine), 1);
+buildings.splice(buildings.indexOf(arborSmelter), 1);
+res("iron").value = 50;
+res("iron").maxValue = 300;
+res("gold").value = 95;
+res("gold").maxValue = 100;
+res("wood").value = 450;
+res("wood").maxValue = 3000;
+perTick.wood = 0.4;
+perTick.iron = 0.05;
+perTick.gold = 0.01;
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

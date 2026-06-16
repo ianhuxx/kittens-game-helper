@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.0.0
+// @version      2.0.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.0.0";
+  const HELPER_VERSION = "2.0.1";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -933,6 +933,9 @@
       const haveDirect = ((getRes(resources, inputName) || {}).value) || 0;
       if (haveDirect < directInputCost.val) return Number.MAX_SAFE_INTEGER;
     }
+
+    const converterInputs = converterInputsNeededForMissingCosts(target, resources);
+    if (converterInputs.has(inputName) && inputName !== outputName) return Number.MAX_SAFE_INTEGER;
 
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
@@ -2102,6 +2105,32 @@
     return missing;
   };
 
+  const converterInputNamesForOutput = (outputName) => {
+    const inputs = new Set();
+    for (const meta of buildingMetas()) {
+      if (!meta || meta.unlocked === false || !(meta.val > 0)) continue;
+      const profile = processingProfileFor(meta);
+      if (!profile.outputs.includes(outputName)) continue;
+      for (const input of profile.inputs) {
+        if (getRes(resourceMap(), input)) inputs.add(input);
+      }
+    }
+    return inputs;
+  };
+
+  const converterInputsNeededForMissingCosts = (target, resources) => {
+    const needed = new Set();
+    if (!target) return needed;
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = ((getRes(resources, cost.name) || {}).value) || 0;
+      const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
+      if (deficit <= 0) continue;
+      for (const input of converterInputNamesForOutput(cost.name)) needed.add(input);
+    }
+    return needed;
+  };
+
   const resourcesNeededForTarget = (target, resources) => {
     const needed = new Set(resourceNamesFromPrices(target.kind, target.meta));
     for (const cost of pricesFor(target.kind, target.meta)) {
@@ -2112,6 +2141,7 @@
       const raw = {};
       rawPathRequirements(cost.name, deficit, raw);
       for (const name of Object.keys(raw)) needed.add(name);
+      for (const name of converterInputNamesForOutput(cost.name)) needed.add(name);
     }
     return needed;
   };
