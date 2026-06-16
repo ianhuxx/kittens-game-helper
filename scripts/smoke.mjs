@@ -1082,6 +1082,14 @@ const acoustics = {
   prices: [{ name: "science", val: 60000 }, { name: "compedium", val: 60 }],
   unlocks: { buildings: ["chapel"], upgrades: ["amphitheatre"] },
 };
+const electricity = {
+  name: "electricity",
+  label: "Electricity",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 71250 }, { name: "compedium", val: 100 }],
+  unlocks: { buildings: ["factory"], upgrades: ["battery"] },
+};
 const temple = {
   name: "temple",
   label: "Temple",
@@ -1091,10 +1099,10 @@ const temple = {
   prices: [{ name: "gold", val: 100 }, { name: "slab", val: 25 }, { name: "plate", val: 15 }, { name: "manuscript", val: 10 }],
   effects: { cultureMax: 150, faithMax: 100 },
 };
-techs.push(acoustics);
+techs.push(acoustics, electricity);
 buildings.push(temple);
 for (const tech of techs) {
-  if (tech !== acoustics) tech.researched = true;
+  if (tech !== acoustics && tech !== electricity) tech.researched = true;
 }
 workshopUpgrades.forEach((upgrade) => { upgrade.researched = true; });
 res("science").value = 60250;
@@ -1121,10 +1129,11 @@ const acceptanceProtected = [...(acceptanceDecision.protectedChain || new Set())
 const acceptanceReserved = context.window.__kghDebug.reservedNeedsFor(acceptanceDecision.target);
 check("acceptance: capped science planner selects Acoustics research", acceptanceDecision.target?.kind === "research" && acceptanceDecision.target?.meta?.name === "acoustics");
 check("acceptance: active layer is Science cap unlock", acceptanceDecision.layer === "Science cap unlock");
+check("acceptance: Electricity is deferred from science-cap layer by science storage", acceptanceRejected.some((item) => item.target?.kind === "research" && item.target?.meta?.name === "electricity" && /science storage blocked/i.test(item.reason || "")));
 check("acceptance: Temple is rejected behind Acoustics", acceptanceRejected.some((item) => item.target?.kind === "build" && item.target?.meta?.name === "temple"));
 check("acceptance: rejection reason mentions capped science and craft chain", acceptanceRejected.some((item) => /science capped/i.test(item.reason || "") && /compedium|compendium|manuscript/i.test(item.reason || "")));
 check("acceptance: protected chain includes compendium/manuscript/parchment", ["compedium", "manuscript", "parchment"].every((name) => acceptanceProtected.includes(name)));
-check("acceptance: reservation is for Acoustics, not Temple", acceptanceReserved.compedium >= 60 && context.window.__kghDebug.targetId(acceptanceDecision.target) === "research:acoustics");
+check("acceptance: reservation is for Acoustics, not Electricity or Temple", acceptanceReserved.compedium >= 60 && acceptanceReserved.compedium < 100 && context.window.__kghDebug.targetId(acceptanceDecision.target) === "research:acoustics");
 context.window.__kghDebug.forceActiveTarget({ kind: "build", meta: temple });
 tickFn();
 check("acceptance: Temple lock breaks to Acoustics", /Science cap unlock/i.test(panelText(".kgh-plan")) && /Acoustics/i.test(panelText(".kgh-plan")) && !/FOCUS: .*Temple/i.test(panelText(".kgh-plan")));
@@ -1167,12 +1176,14 @@ check("acceptance screenshot: exact capped state selects Acoustics, not Temple",
   /Layer: Science cap unlock/i.test(exactScreenshotPlan) &&
   /Need: 48\.64 Compendium/i.test(exactScreenshotPlan) &&
   /craft|wait|hunt/i.test(exactScreenshotNow) &&
-  !/Temple|gold/i.test(exactScreenshotNow));
+  !/Electricity/i.test(exactScreenshotPlan) &&
+  !/Temple|gold|Electricity/i.test(exactScreenshotNow));
 let exactHeld = true;
 let noTempleGoldReservation = true;
 let hunterSupported = false;
 let priestsSuppressed = false;
 let panelNeverTemple = true;
+let electricityNeverActive = true;
 for (let i = 0; i < 15; i += 1) {
   fakeNow += 30000;
   for (const name of ["science", "culture", "manpower"]) {
@@ -1183,15 +1194,18 @@ for (let i = 0; i < 15; i += 1) {
   const decision = context.window.__kghDebug.selectStrategicTarget("science");
   const reserved = context.window.__kghDebug.reservedNeedsFor(decision.target);
   exactHeld = exactHeld && decision.target?.kind === "research" && decision.target?.meta?.name === "acoustics" && decision.layer === "Science cap unlock";
+  electricityNeverActive = electricityNeverActive && decision.target?.meta?.name !== "electricity" && (decision.rejectedTopCandidates || []).some((item) => item.target?.meta?.name === "electricity" && /science storage blocked/i.test(item.reason || ""));
   noTempleGoldReservation = noTempleGoldReservation && !(reserved.gold > 0) && !(reserved.manuscript === 10);
   hunterSupported = hunterSupported || job("hunter").value > 0 || /Furs|Catpower/i.test(panelText(".kgh-jobs"));
   priestsSuppressed = priestsSuppressed || job("priest").value === 0;
   panelNeverTemple = panelNeverTemple && !/Focus: Temple/i.test(panelText(".kgh-plan")) && !/gather .*gold.*Temple/i.test(panelText(".kgh-now"));
 }
 check("acceptance multi-tick: Acoustics stays active across refill/craft/hunt ticks", exactHeld);
+check("acceptance multi-tick: Electricity never becomes active while science storage-blocked", electricityNeverActive);
 check("acceptance multi-tick: Temple does not reserve gold/manuscript while Acoustics owns science cap", noTempleGoldReservation);
 check("acceptance multi-tick: jobs support hunters/furs chain instead of Temple faith", hunterSupported && priestsSuppressed);
 check("acceptance multi-tick: panel never reverts to Temple or gather gold", panelNeverTemple);
+techs.splice(techs.indexOf(electricity), 1);
 techs.splice(techs.indexOf(acoustics), 1);
 buildings.splice(buildings.indexOf(temple), 1);
 
