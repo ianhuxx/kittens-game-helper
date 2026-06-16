@@ -1,28 +1,29 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      1.2.0
-// @description  Smart one-click autopilot for Kittens Game. Loads Kitten Scientists for crafting/trade/religion/festivals, but owns building/research/upgrade purchases itself: it picks a plan, RESERVES the resources the plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable, and spends only true surplus on everything else. One universal decision framework — every candidate is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. New content is handled automatically: freshly unlocked buildings/techs/upgrades (Mint, Mansion, Observatory, …) are detected, logged and immediately re-planned with a short evaluation boost, converter buildings are discovered from their live effects instead of name lists, and explorers/embassies are sent from the game's own prices. Goals are tech-tree milestones with live n/m progress or effect-category emphases. Recursive prerequisite planning, lookahead-aware job rebalancing (wood-vs-catnip pathway math + starvation guard), prerequisite crafting, overflow conversion, converter pausing, leader election, gold-overflow promotions, hunting. Prestige resets stay OFF.
+// @version      2.0.0
+// @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
 // @match        https://kittensgame.com/alpha/*
 // @match        https://*.kittensgame.com/*
 // @match        http://bloodrizer.ru/games/kittens/*
-// @require      https://github.com/kitten-science/kitten-scientists/releases/download/v2.0.0-beta.11/kitten-scientists-2.0.0-beta.11.user.js
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
 /*
- * Kittens Game Helper — smart autopilot on top of Kitten Scientists (KS).
+ * Kittens Game Helper — a self-contained autopilot that drives the game's own
+ * API directly (no Kitten Scientists, no third-party engine to fight).
  * On every page load it:
- *   1. waits for the game (window.gamePage) and KS (window.kittenScientists),
- *   2. enables every SAFE automation by walking the live KS settings tree,
- *   3. sets build/research triggers to "buy as soon as affordable" and tells KS
- *      to refine surplus catnip into wood (the usual early-game bottleneck),
- *   4. forces irreversible / permanent / resource-burning automations OFF,
- *   5. shows a panel: bottleneck, next science, and a live log of what it did.
+ *   1. waits for the game (window.gamePage.resPool + bld),
+ *   2. sets gamePage.opts.noConfirm so automation is never blocked by a dialog,
+ *   3. runs ONE tick loop that plans, reserves, buys, crafts, trades, manages
+ *      jobs/leader/hunting/religion/festivals and claims star events — every
+ *      spender consulting the same reservation so they never undercut the plan,
+ *   4. keeps irreversible actions out of every candidate/trade list (isDeniedKey),
+ *   5. shows a panel: bottleneck, next science, plan, and a live action log.
  */
 
 (function kittensGameHelper() {
@@ -30,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "1.3.0";
+  const HELPER_VERSION = "2.0.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -56,37 +57,20 @@
     { name: "anachronomancy", cost: 375, label: "Anachronomancy chain" },
   ];
 
-  const KS_FALLBACK_LOADER = "https://kitten-science.com/stable.js";
-
-  const WORKSHOP_CRAFT_SETTING_KEYS = ["crafts", "resources"];
-
-  // Irreversible / permanent / resource-burning / log-hiding automations.
-  // Matched by key name anywhere in the KS settings tree and forced OFF.
+  // Irreversible / permanent / resource-burning actions. Matched by name and
+  // kept OUT of every candidate and trade list, so the helper can never reset,
+  // transcend, sacrifice, shatter time crystals or time-skip. This is the single
+  // native safety guard now that there is no external engine to disable.
   const DENY_SUBSTRINGS = ["reset", "transcend", "sacrifice", "shatter", "timeskip"];
   const DENY_EXACT = new Set([
     "adore",
-    "upgradeBuildings",
-    "promoteKittens",
     "policies", // permanent, often exclusive choices — left to the player
-    "filters", // KS log filters — keep off so the activity log stays visible
   ]);
-
-  // KS sections we still let buy things, gated by a storage-percent "trigger".
-  // Setting these to 0 means "buy as soon as it's affordable". Bonfire, science
-  // and workshop upgrades are NOT here: the helper buys those itself so the plan
-  // can reserve resources — KS would otherwise spend the savings on cheap items.
-  // These sections are also paused dynamically while the active plan is saving
-  // scarce resources.  That makes the reservation contract universal: KS trade,
-  // space and time automations cannot drain gold/culture/catpower/etc. out from
-  // under a focused build/research target.
-  // Religion is tuned separately: "Praise the Sun" converts banked faith, so it
-  // should wait for near-cap faith instead of firing as soon as any faith exists.
-  const PURCHASE_SECTIONS = ["space", "time", "trade"];
 
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // Autopilot is the only mode — on by default. The UI toggles it; when off,
-  // the helper disables all KS automations so you drive manually.
+  // Autopilot is the only mode — on by default; the header toggle is a label for
+  // the current state. Resets always stay off regardless (see isDeniedKey).
   const isAutopilotOn = () => {
     const stored = localStorage.getItem(STORAGE_KEY);
     return stored !== "0";
@@ -162,184 +146,22 @@
     return DENY_SUBSTRINGS.some((needle) => lower.includes(needle));
   };
 
-  const setEnabledDeep = (node, value, key) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const child of node) setEnabledDeep(child, value);
-      return;
-    }
-    if (isDeniedKey(key)) {
-      if ("enabled" in node) node.enabled = false;
-      return;
-    }
-    if ("enabled" in node) node.enabled = value;
-    for (const [childKey, childVal] of Object.entries(node)) {
-      if (childKey === "enabled") continue;
-      if (childVal && typeof childVal === "object") setEnabledDeep(childVal, value, childKey);
-    }
-  };
-
-  const setTriggersDeep = (node, value) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const child of node) setTriggersDeep(child, value);
-      return;
-    }
-    if (typeof node.trigger === "number") node.trigger = value;
-    for (const child of Object.values(node)) {
-      if (child && typeof child === "object") setTriggersDeep(child, value);
-    }
-  };
-
-  // A build limit ("max") of 0 means "never build this". Raise those so every
-  // unlocked structure keeps getting built.
-  const raiseZeroMaxes = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const child of node) raiseZeroMaxes(child);
-      return;
-    }
-    if (typeof node.max === "number" && node.max === 0) node.max = 1e9;
-    for (const child of Object.values(node)) {
-      if (child && typeof child === "object") raiseZeroMaxes(child);
-    }
-  };
-
-  // We manage jobs, hunting, leader election and promotions ourselves
-  // (goal-aware, with pathway math and gold-overflow gating), so turn OFF KS's
-  // own versions to stop the two systems fighting. Festivals and the rest of
-  // the Village section stay on.
-  const disableKSJobsAndHunt = (settings) => {
-    const village = settings && settings.village;
-    if (!village) return;
-    const jobs = village.jobs || village.job;
-    if (jobs && typeof jobs === "object") {
-      for (const job of Object.values(jobs)) {
-        if (job && typeof job === "object") job.enabled = false;
-      }
-    }
-    for (const key of ["hunt", "electLeader", "promoteLeader"]) {
-      if (village[key] && typeof village[key] === "object") village[key].enabled = false;
-    }
-  };
-
-  // Tell KS to refine surplus catnip into wood. Catnip is the one resource that
-  // overflows early, while wood/minerals starve — this breaks that deadlock.
-  const enableCatnipRefining = (settings) => {
-    const crafts = settings.workshop && (settings.workshop.crafts || settings.workshop.resources);
-    if (crafts && crafts.wood && typeof crafts.wood === "object") {
-      crafts.wood.enabled = true;
-      crafts.wood.trigger = 0.5; // refine only when catnip is over half-full
-    }
-  };
-
-  const RELIGION_GENERAL_TRIGGER = 0.5;
-  const RELIGION_UPGRADE_TRIGGER = 0.25;
+  // Praise the Sun converts the whole faith bank into worship, so we only do it
+  // when faith is near its storage cap and no faith-priced upgrade is pending.
   const RELIGION_PRAISE_TRIGGER = 0.95;
 
-  const religionNodeType = (key) => {
-    const lower = String(key || "").toLowerCase();
-    if (lower.includes("praise") || lower === "faith" || lower.includes("faith")) return "praise";
-    if (lower.includes("upgrade") || lower.includes("build") || lower.includes("solar") || lower.includes("apocrypha")) {
-      return "upgrade";
-    }
-    return "general";
-  };
-
-  const tuneReligionNode = (node, key) => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const child of node) tuneReligionNode(child, key);
-      return;
-    }
-    if (isDeniedKey(key)) {
-      if ("enabled" in node) node.enabled = false;
-      return;
-    }
-    if ("enabled" in node) node.enabled = true;
-    if (typeof node.trigger === "number") {
-      const type = religionNodeType(key);
-      node.trigger = type === "praise"
-        ? RELIGION_PRAISE_TRIGGER
-        : type === "upgrade"
-          ? RELIGION_UPGRADE_TRIGGER
-          : RELIGION_GENERAL_TRIGGER;
-    }
-    for (const [childKey, childVal] of Object.entries(node)) {
-      if (childKey === "enabled" || childKey === "trigger") continue;
-      if (childVal && typeof childVal === "object") tuneReligionNode(childVal, childKey);
-    }
-  };
-
-  // Religion needs different pacing than trade/space/time.  Most religion
-  // upgrades are progress, but "Praise the Sun" converts the faith bank into
-  // worship; doing that at trigger 0 starves near-term upgrade choices.  Keep
-  // upgrade buyers willing to act, force irreversible actions off via the deny
-  // list, and only praise when faith is close to storage cap.
-  const configureReligionProgression = (settings) => {
-    if (!settings || !settings.religion) return;
-    tuneReligionNode(settings.religion, "religion");
-  };
-
-  // The helper owns ALL building/research/workshop-upgrade purchasing so the
-  // active plan can reserve resources. KS keeps crafting, trade, religion,
-  // space, time and village automations — but its competing buyers go dark.
-  const takeOverPurchasing = (settings) => {
-    if (settings.bonfire) setEnabledDeep(settings.bonfire, false, "bonfire");
-    const science = settings.science;
-    if (science) {
-      science.enabled = true; // the section stays on for observe (star events)
-      for (const key of ["techs", "tech", "technologies"]) {
-        if (science[key] && typeof science[key] === "object") setEnabledDeep(science[key], false, key);
-      }
-      if (science.observe) setEnabledDeep(science.observe, true, "observe");
-    }
-    const workshop = settings.workshop;
-    if (workshop) {
-      workshop.enabled = true; // crafts stay on
-      for (const key of ["upgrades", "upgrade", "research", "technologies"]) {
-        if (workshop[key] && typeof workshop[key] === "object") setEnabledDeep(workshop[key], false, key);
-      }
-    }
-  };
-
-  const buildSettings = () => {
-    const settings = window.kittenScientists.getSettings();
-
-    setEnabledDeep(settings, true);
-    if (settings.engine) {
-      settings.engine.enabled = true;
-      settings.engine.interval = 1000;
-      if (settings.engine.resources) settings.engine.resources.enabled = false;
-    }
-    for (const section of PURCHASE_SECTIONS) {
-      if (settings[section]) setTriggersDeep(settings[section], 0);
-    }
-    for (const section of ["space", "time"]) {
-      if (settings[section]) raiseZeroMaxes(settings[section]);
-    }
-    configureReligionProgression(settings);
-    takeOverPurchasing(settings);
-    enableCatnipRefining(settings);
-
-    disableKSJobsAndHunt(settings);
-    return settings;
-  };
-
-  const ensureEngineRunning = () => {
-    try {
-      const engine = window.kittenScientists && window.kittenScientists.engine;
-      if (engine && engine._timeoutMainLoop == null && typeof engine.start === "function") {
-        engine.start(false);
-      }
-    } catch (error) {
-      /* the enabled flag will start it on the next KS tick */
-    }
-  };
-
+  // The helper drives the game's own API directly — there is no external engine
+  // to configure, enable or fight. "Applying" the profile just makes sure the
+  // game will not pop a confirmation dialog mid-automation (build-all, policy,
+  // Adore the Galaxy) and kicks an immediate tick. Irreversible actions
+  // (reset/transcend/sacrifice/shatter/timeskip) never enter any candidate or
+  // trade list — isDeniedKey() filters them out — so they can never fire.
   const applyProfile = () => {
-    window.kittenScientists.setSettings(buildSettings());
-    ensureEngineRunning();
+    try {
+      if (window.gamePage && window.gamePage.opts) window.gamePage.opts.noConfirm = true;
+    } catch (error) {
+      /* a missing opts object just means dialogs stay manual; harmless */
+    }
     pushLog(`▶ Autopilot applied — ${isAutopilotOn() ? "ON" : "OFF"}`);
     tick();
   };
@@ -580,62 +402,14 @@
       })[0] || null;
   };
 
-  const setReligionPraiseState = (settings, enabled, trigger = RELIGION_PRAISE_TRIGGER) => {
-    const visit = (node, key) => {
-      if (!node || typeof node !== "object") return;
-      if (Array.isArray(node)) {
-        for (const child of node) visit(child, key);
-        return;
-      }
-      if (religionNodeType(key) === "praise") {
-        if ("enabled" in node) node.enabled = enabled;
-        if (typeof node.trigger === "number") node.trigger = trigger;
-        return;
-      }
-      for (const [childKey, childVal] of Object.entries(node)) {
-        if (childVal && typeof childVal === "object") visit(childVal, childKey);
-      }
-    };
-    if (settings && settings.religion) visit(settings.religion, "religion");
-  };
-
-
-  const externalSectionHasPurchases = (section) => PURCHASE_SECTIONS.includes(section);
-
-  const externalSpenderLabel = (section) => section.charAt(0).toUpperCase() + section.slice(1);
-
-  // KS owns a few broad purchasing systems whose exact costs can vary by race,
-  // era and unlock state.  Because those buyers run outside this helper's
-  // purchase loop, they cannot call respectsReservations() before spending.
-  // When the focused plan is still saving, pause those external spenders instead
-  // of trying to mirror every possible KS trade/space/time price.  This is the
-  // universal guard that prevents e.g. lizard trades from repeatedly consuming
-  // the gold reserved for a Temple.
-  let externalSpendersPlanText = "External spenders: watching KS trade/space/time";
   let diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
-  let externalSpendersPaused = false;
-  let lastExternalSpenderLog = 0;
 
   const reservedResourceNames = (target, resources) => Object.keys(reservedNeedsFor(target, resources));
 
-  const craftInputsFor = (name) => {
-    const craft = craftByName(name);
-    return craftPricesFor(craft).filter((price) => price && price.name && price.val > 0).map((price) => price.name);
-  };
-
-  const setCraftNodeEnabled = (node, enabled) => {
-    if (!node || typeof node !== "object") return;
-    if ("enabled" in node) node.enabled = enabled;
-  };
-
-  // KS crafting has no knowledge of this helper's active target reservation. If
-  // left on, it can immediately convert a just-saved raw resource (e.g. the 900
-  // iron for an Observatory) into a generic craft such as plates before the plan
-  // click runs. During a focused reserve, let this helper's reservation-aware
-  // craftTowardTarget() do prerequisite crafting and pause KS crafts while a
-  // reserve is active. Wood-from-catnip remains allowed only when it supports
-  // the target and catnip itself is not reserved, preserving the early
-  // surplus-refine path without letting KS make side crafts like plates.
+  // Craft-chain reachability: which craft outputs feed the active target. The
+  // native overflow crafter uses this so that, during a reserve, only crafts
+  // that actually advance the focused plan (plus safe catnip→wood) run, while
+  // its own reservation floors keep reserved raw inputs from being consumed.
   const craftChainOutputsFor = (name, out = new Set(), depth = 0) => {
     if (depth > 5 || !name || out.has(name)) return out;
     const craft = craftByName(name);
@@ -664,93 +438,173 @@
     return targetCraftOutputsFor(target, resources).has(outputName);
   };
 
-  let craftPolicyText = "Craft policy: KS crafts ready";
+  // --- native reservation status ---------------------------------------------
+  // The helper is now the ONLY actor that spends resources, and every spender it
+  // owns (planner, prerequisite/overflow crafting, trade, diplomacy) already
+  // consults reservedNeedsFor()/respectsReservations() before spending. There is
+  // nothing external left to pause — this line just reports what is reserved.
+  let reservePlanText = "Reserve: no active reservation";
 
-  const protectWorkshopCrafts = (settings, target, resources, explorerSave = false) => {
-    const workshop = settings && settings.workshop;
-    if (!workshop) return;
-    const reserved = new Set(target && !target.affordable ? reservedResourceNames(target, resources || resourceMap()) : []);
-    const activeReserve = reserved.size > 0 || explorerSave;
-    const targetOutputs = activeReserve && target ? targetCraftOutputsFor(target, resources || resourceMap()) : new Set();
-    const allowWoodSurplus = activeReserve && !reserved.has("catnip") && (!target || reserved.has("wood") || targetOutputs.has("wood"));
-    let paused = 0;
-    const kept = [];
-    for (const key of WORKSHOP_CRAFT_SETTING_KEYS) {
-      const crafts = workshop[key];
-      if (!crafts || typeof crafts !== "object") continue;
-      for (const [name, node] of Object.entries(crafts)) {
-        if (!node || typeof node !== "object") continue;
-        const enable = activeReserve ? (name === "wood" && allowWoodSurplus) : (name === "wood" ? true : node.enabled !== false);
-        if (activeReserve && !enable) paused += 1;
-        if (enable && activeReserve) kept.push(craftLabel(name));
-        setCraftNodeEnabled(node, enable);
-        if (name === "wood" && typeof node.trigger === "number") node.trigger = 0.5;
-      }
-    }
-    craftPolicyText = activeReserve
-      ? `Craft policy: paused ${paused} KS craft${paused === 1 ? "" : "s"}; allowed ${kept.slice(0, 4).join(", ") || "helper-only target crafting"}`
-      : "Craft policy: KS crafts allowed (no active reserve)";
-  };
-
-  const setExternalSpendersEnabled = (settings, enabled) => {
-    if (!settings) return;
-    for (const section of PURCHASE_SECTIONS) {
-      if (!externalSectionHasPurchases(section) || !settings[section]) continue;
-      setEnabledDeep(settings[section], enabled, section);
-      if (enabled) setTriggersDeep(settings[section], 0);
-    }
-  };
-
-  const protectPlanFromExternalSpenders = (resources, goalKey) => {
+  const updateReserveStatus = (resources, goalKey) => {
     try {
-      const settings = window.kittenScientists && window.kittenScientists.getSettings && window.kittenScientists.getSettings();
-      if (!settings) return;
       const target = getTargetCached(resources, goalKey);
       const reserved = target && !target.affordable ? reservedResourceNames(target, resources) : [];
       const explorerSave = shouldSaveForExplorers(resources, goalKey);
-      const shouldPause = reserved.length > 0 || explorerSave;
-      protectWorkshopCrafts(settings, target && !target.affordable ? target : null, resources, explorerSave);
-      setExternalSpendersEnabled(settings, !shouldPause);
-      if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
-
-      if (shouldPause) {
+      if (reserved.length) {
         const shown = reserved.slice(0, 3).map((name) => resTitle(resources, name)).join("+");
-        externalSpendersPlanText = explorerSave && !reserved.length
-          ? "External spenders: paused Trade/Space/Time while saving Catpower for explorers"
-          : `External spenders: paused ${PURCHASE_SECTIONS.map(externalSpenderLabel).join("/")} while saving ${shown} for ${labelOf(target.meta)}`;
-        if (!externalSpendersPaused || Date.now() - lastExternalSpenderLog > 60000) {
-          pushLog(`🛡 ${externalSpendersPlanText}`);
-          lastExternalSpenderLog = Date.now();
-        }
+        reservePlanText = `Reserve: holding ${shown} for ${labelOf(target.meta)}`;
+      } else if (explorerSave) {
+        reservePlanText = "Reserve: holding Catpower for explorers";
       } else {
-        externalSpendersPlanText = `External spenders: ${PURCHASE_SECTIONS.map(externalSpenderLabel).join("/")} allowed (no active resource reserve)`;
+        reservePlanText = "Reserve: no active reservation — surplus free to spend";
       }
-      externalSpendersPaused = shouldPause;
     } catch (error) {
-      /* ignore external-spender pacing failures */
+      /* ignore reserve-status failures */
     }
   };
 
+  // --- native praise control --------------------------------------------------
+  // Praise the Sun is a pure faith→worship conversion (religion.praise()). We
+  // fire it directly only when faith is near its cap AND no faith-priced upgrade
+  // is still being saved for, so we never spend the bank an upgrade still needs.
+  // (Religion *upgrades* themselves are bought by the planner via ReligionBtnController.)
   let religionPlanText = "Religion: watching faith";
 
-  const reserveFaithForReligionProgression = (resources) => {
+  const managePraise = (resources) => {
     try {
-      const settings = window.kittenScientists && window.kittenScientists.getSettings && window.kittenScientists.getSettings();
-      if (!settings || !settings.religion) return;
-      configureReligionProgression(settings);
+      const religion = window.gamePage && window.gamePage.religion;
+      if (!religion || typeof religion.praise !== "function") return;
       const next = nextFaithReligionUpgrade(resources);
       if (next) {
-        setReligionPraiseState(settings, false);
         religionPlanText = next.affordable
           ? `Religion: ${labelOf(next.meta)} ready; holding praise until it is bought`
           : `Religion: saving faith for ${labelOf(next.meta)} (${next.missing || "faith needed"})`;
+        return; // hold the faith bank for the pending upgrade
+      }
+      const faith = getRes(resources, "faith");
+      if (faith && faith.maxValue > 0 && faith.value / faith.maxValue >= RELIGION_PRAISE_TRIGGER) {
+        religion.praise();
+        religionPlanText = "Religion: praised the sun (faith → worship)";
+        pushLog("☀ praised the sun");
       } else {
-        setReligionPraiseState(settings, true, RELIGION_PRAISE_TRIGGER);
         religionPlanText = "Religion: praise waits near cap; no faith upgrade pending";
       }
-      if (window.kittenScientists.setSettings) window.kittenScientists.setSettings(settings);
     } catch (error) {
-      /* ignore religion pacing failures */
+      /* ignore praise failures */
+    }
+  };
+
+  // --- native astronomical events --------------------------------------------
+  // KS used to claim star events; now we call the game's own observe handler
+  // directly the moment one is available (free science + starcharts).
+  const maybeObserveStars = () => {
+    try {
+      const calendar = window.gamePage && window.gamePage.calendar;
+      if (!calendar || typeof calendar.observeHandler !== "function") return;
+      if ((calendar.observeRemainingTime || 0) > 0) {
+        calendar.observeHandler();
+        pushLog("🔭 observed an astronomical event (science + starcharts)");
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  // --- native festivals -------------------------------------------------------
+  // Drama & Poetry unlocks festivals (double birth rate + happiness while
+  // active). village.holdFestival() sets the duration but does NOT pay, so we
+  // pay the exact cost the in-game button charges. Reservation- and waste-aware:
+  // never dips into a saving plan, and only refreshes when the current festival
+  // is nearly over (with the carnivals perk holdFestival stacks, so this still
+  // only spends when the buffer is low).
+  const FESTIVAL_COST = [
+    { name: "manpower", val: 1500 },
+    { name: "culture", val: 5000 },
+    { name: "parchment", val: 2500 },
+  ];
+
+  const maybeHoldFestival = (resources) => {
+    try {
+      const game = window.gamePage;
+      const village = game && game.village;
+      const calendar = game && game.calendar;
+      if (!village || !calendar || typeof village.holdFestival !== "function") return;
+      const drama = game.science && game.science.get && game.science.get("drama");
+      if (!drama || !drama.researched) return;
+      if (!FESTIVAL_COST.every((cost) => ((getRes(resources, cost.name) || {}).value || 0) >= cost.val)) return;
+      const target = getTargetCached(resources, getGoal());
+      const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
+      if (FESTIVAL_COST.some((cost) => (reserved[cost.name] || 0) > 0)) return;
+      const buffer = calendar.daysPerSeason || 100;
+      if ((calendar.festivalDays || 0) > buffer) return;
+      village.holdFestival(1);
+      if (game.resPool && typeof game.resPool.addResEvent === "function") {
+        for (const cost of FESTIVAL_COST) game.resPool.addResEvent(cost.name, -cost.val);
+      }
+      pushLog("🎉 held a festival (happiness + birth rate up)");
+    } catch (error) {
+      /* ignore festival failures */
+    }
+  };
+
+  // --- native surplus trading -------------------------------------------------
+  // KS used to own general trade; now we trade directly. tradeAll() pays its own
+  // catpower+gold+goods cost, so this only decides WHEN to trade: when catpower
+  // is near its cap (otherwise wasted at the ceiling), nothing is reserved, the
+  // explorer/zebra-titanium path isn't saving catpower, and a trade partner
+  // actually sells something we still have room to store.
+  let lastTradeAt = 0;
+
+  const tradeWantScore = (race, resources) => {
+    let score = 0;
+    for (const sell of (race && race.sells) || []) {
+      if (!sell || !sell.name) continue;
+      const res = getRes(resources, sell.name);
+      if (!res || res.unlocked === false) continue;
+      if (res.maxValue > 0 && res.value / res.maxValue > 0.95) continue; // no room — skip
+      const fill = res.maxValue > 0 ? res.value / res.maxValue : 0.5;
+      score += (1 - fill) * (sell.value || 1) * (sell.chance ? sell.chance / 100 : 1);
+    }
+    return score;
+  };
+
+  const manageTrade = (resources, goalKey) => {
+    try {
+      if (Date.now() - lastTradeAt < 12000) return; // pace trading
+      const game = window.gamePage;
+      const diplomacy = game && game.diplomacy;
+      if (!diplomacy || typeof diplomacy.tradeAll !== "function" || typeof diplomacy.getMaxTradeAmt !== "function") return;
+      const races = (diplomacy.races || []).filter((race) => race && race.unlocked && !race.collapsed);
+      if (!races.length) return;
+      const catpower = getRes(resources, "manpower");
+      const gold = getRes(resources, "gold");
+      if (!catpower || !gold) return;
+      const target = getTargetCached(resources, goalKey);
+      const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
+      if ((reserved.manpower || 0) > 0 || (reserved.gold || 0) > 0) return; // plan owns these
+      if (shouldSaveForExplorers(resources, goalKey)) return; // explorers get first call on catpower
+      const catpowerHot = catpower.maxValue > 0 && catpower.value / catpower.maxValue > 0.9;
+      if (!catpowerHot) return; // only convert near-capped (otherwise-wasted) catpower
+      // A trade also pays the race's "buys" goods, so never trade with a partner
+      // whose buy good the plan is reserving.
+      const buysReserved = (race) => (race.buys || []).some((buy) => buy && (reserved[buy.name] || 0) > 0);
+      let best = null;
+      let bestScore = 0;
+      for (const race of races) {
+        if (buysReserved(race)) continue;
+        const score = tradeWantScore(race, resources);
+        if (score > bestScore && diplomacy.getMaxTradeAmt(race) >= 1) {
+          best = race;
+          bestScore = score;
+        }
+      }
+      if (best) {
+        diplomacy.tradeAll(best);
+        lastTradeAt = Date.now();
+        pushLog(`🤝 traded surplus catpower with ${best.title || best.name || "a partner"}`);
+      }
+    } catch (error) {
+      /* ignore trade failures */
     }
   };
 
@@ -2531,6 +2385,9 @@
       /* ignore */
     }
     return candidates
+      // Native safety guard: irreversible/permanent actions (reset, transcend,
+      // sacrifice, shatter, time-skip, adore) can never become a plan target.
+      .filter((c) => c.meta && !isDeniedKey(c.meta.name))
       .map((c) => {
         const evaluation = evaluate(c.kind, c.meta, resources);
         const withEvaluation = { ...c, ...evaluation };
@@ -4388,7 +4245,7 @@
   let leaderEl;
   let craftEl;
   let processingEl;
-  let externalSpendersEl;
+  let reserveStatusEl;
   let religionEl;
   let diplomacyEl;
   let policyEl;
@@ -4424,13 +4281,10 @@
     policyApplyEl.disabled = !selected || !selected.affordable;
   };
 
-  const engineRunning = () => {
-    try {
-      return window.kittenScientists.engine._timeoutMainLoop != null;
-    } catch (error) {
-      return false;
-    }
-  };
+  // The helper drives the game itself — there is no external engine. "Running"
+  // just means our own loop is ticking; the heartbeat is the last tick time.
+  let lastTickAt = 0;
+  const helperRunning = () => lastTickAt > 0 && Date.now() - lastTickAt < 15000;
 
   const tick = () => {
     try {
@@ -4439,6 +4293,7 @@
       const goal = getGoal();
       computeResetAdvisor();
       watchNewUnlocks();
+      maybeObserveStars();
       refineSurplusCatnip();
       optimizeProcessing(resources, goal);
       craftTowardTarget(resources, goal);
@@ -4448,28 +4303,30 @@
       // generic craft can spend the exact raw resource window the plan needed.
       resetTickCache();
       resources = resourceMap();
-      protectPlanFromExternalSpenders(resources, goal);
+      updateReserveStatus(resources, goal);
       executePlan(resources, goal);
       resetTickCache();
       resources = resourceMap();
       craftOverflowResources(resources, goal);
       resetTickCache();
       resources = resourceMap();
-      reserveFaithForReligionProgression(resources);
+      managePraise(resources);
       // Purchases can change resource stocks, caps, unlocks and per-tick effects;
       // re-read before diplomacy/jobs so later decisions are based on the board
       // after the buy, not on the planning snapshot from before it.
       resetTickCache();
       resources = resourceMap();
       manageDiplomacy(resources, goal);
+      manageTrade(resources, goal);
       resetTickCache();
       resources = resourceMap();
       balanceJobs(goal, resources);
       maybeSelectLeader(goal, resources);
       maybePromoteKittens(resources);
       autoHunt(resources);
+      maybeHoldFestival(resources);
       trackActions();
-      if (statusEl) statusEl.textContent = `KS engine: ${engineRunning() ? "running ✓" : "stopped ✗ — click Apply"}`;
+      if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
       if (goalEl) {
         const line = getGoalLine(resources, goal);
         goalEl.textContent = line;
@@ -4482,13 +4339,14 @@
       if (buyEl) buyEl.textContent = `🛒 ${buyPlanText}`;
       if (resetEl) resetEl.textContent = resetAdvisorText;
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
-      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText} · ${craftPolicyText}`;
+      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
-      if (externalSpendersEl) externalSpendersEl.textContent = `🛡 ${externalSpendersPlanText}`;
+      if (reserveStatusEl) reserveStatusEl.textContent = `🛡 ${reservePlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
+      lastTickAt = Date.now();
     } catch (error) {
       /* ignore */
     }
@@ -4496,19 +4354,7 @@
 
   /* ------------------------------- the panel -------------------------------- */
 
-  const KS_HIDE_KEY = "kgh.hideKS";
   const MIN_KEY = "kgh.min";
-
-  // Hide/show the Kitten Scientists panel (its UI root is .kitten-scientists,
-  // inside #ksColumn). Automation keeps running either way.
-  const applyKSHidden = (hidden, btn) => {
-    document.body.classList.toggle("kgh-hide-ks", hidden);
-    localStorage.setItem(KS_HIDE_KEY, hidden ? "1" : "0");
-    if (btn) {
-      btn.textContent = hidden ? "Show KS" : "Hide KS";
-      btn.title = hidden ? "Show the Kitten Scientists settings panel" : "Hide the Kitten Scientists settings panel";
-    }
-  };
 
   const buildPanel = () => {
     if (!document.body) {
@@ -4522,7 +4368,6 @@
     const style = document.createElement("style");
     style.id = "kgh-style";
     style.textContent =
-      "body.kgh-hide-ks #ksColumn,body.kgh-hide-ks .kitten-scientists,body.kgh-hide-ks [id*=kitten-scientists],body.kgh-hide-ks [class*=kitten-scientists]{display:none!important}" +
       "body.kgh-helper-ready{overflow-x:hidden}" +
       ".kgh-panel{box-sizing:border-box;width:min(320px,calc(100dvw - 16px));max-width:calc(100dvw - 16px);" +
       "max-height:calc(100dvh - 16px);overflow:auto;overflow-x:hidden;contain:layout style;" +
@@ -4555,8 +4400,7 @@
     box.innerHTML = [
       '<div class="kgh-row" style="justify-content:space-between;align-items:center">',
       '<strong style="font-size:13px">🐱 Kittens Helper</strong><small style="opacity:.7;margin-left:4px">v' + HELPER_VERSION + '</small>',
-      '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-ks">Show KS</button>',
-      '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
+      '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
       '<div class="kgh-body" style="display:grid;gap:5px">',
       '<div class="kgh-row"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer">Autopilot: ON</button></div>',
       '<select class="kgh-goal" aria-label="goal" style="width:100%">',
@@ -4581,7 +4425,7 @@
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
-      '<small class="kgh-external-spenders" style="color:#9fd0ff">…</small>',
+      '<small class="kgh-reserve" style="color:#9fd0ff">…</small>',
       '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
       '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
@@ -4599,7 +4443,6 @@
     const goalSelect = box.querySelector(".kgh-goal");
     const toggleBtn = box.querySelector(".kgh-autopilot");
     const prioritySelect = box.querySelector(".kgh-priority");
-    const ksBtn = box.querySelector(".kgh-ks");
     const minBtn = box.querySelector(".kgh-min");
     const body = box.querySelector(".kgh-body");
     statusEl = box.querySelector(".kgh-status");
@@ -4613,7 +4456,7 @@
     leaderEl = box.querySelector(".kgh-leader");
     craftEl = box.querySelector(".kgh-craft");
     processingEl = box.querySelector(".kgh-processing");
-    externalSpendersEl = box.querySelector(".kgh-external-spenders");
+    reserveStatusEl = box.querySelector(".kgh-reserve");
     religionEl = box.querySelector(".kgh-religion");
     diplomacyEl = box.querySelector(".kgh-diplomacy");
     policyEl = box.querySelector(".kgh-policy");
@@ -4650,9 +4493,6 @@
     });
     policySelectEl.addEventListener("change", () => renderPolicyControl(resourceMap(), getGoal()));
 
-    ksBtn.addEventListener("click", () => {
-      applyKSHidden(!document.body.classList.contains("kgh-hide-ks"), ksBtn);
-    });
     const applyMin = (min) => {
       body.style.display = min ? "none" : "grid";
       minBtn.textContent = min ? "+" : "–";
@@ -4662,7 +4502,6 @@
 
     document.body.classList.add("kgh-helper-ready");
     document.body.appendChild(box);
-    applyKSHidden(localStorage.getItem(KS_HIDE_KEY) !== "0", ksBtn); // default hidden = minimal
     applyMin(localStorage.getItem(MIN_KEY) === "1");
     renderLog();
     tick();
@@ -4671,39 +4510,26 @@
 
   /* ------------------------------- bootstrap -------------------------------- */
 
-  const ksReady = () =>
-    window.kittenScientists &&
-    typeof window.kittenScientists.getSettings === "function" &&
-    typeof window.kittenScientists.setSettings === "function" &&
+  // We only need the game itself now — no third-party library to wait for. The
+  // helper reads and drives window.gamePage directly, so it boots as soon as the
+  // game's resource pool exists.
+  const gameReady = () =>
     window.gamePage &&
-    window.gamePage.resPool;
+    window.gamePage.resPool &&
+    Array.isArray(window.gamePage.resPool.resources) &&
+    window.gamePage.bld;
 
-  const injectFallbackLoader = () => {
-    try {
-      const script = document.createElement("script");
-      script.src = KS_FALLBACK_LOADER;
-      document.body.appendChild(script);
-    } catch (error) {
-      /* ignore */
-    }
-  };
-
-  const waitForKittenScientists = async () => {
-    let injectedFallback = false;
-    for (let i = 0; i < 200; i += 1) {
-      if (ksReady()) return;
-      if (i === 40 && !injectedFallback) {
-        injectedFallback = true;
-        injectFallbackLoader();
-      }
+  const waitForGame = async () => {
+    for (let i = 0; i < 240; i += 1) {
+      if (gameReady()) return;
       await delay(250);
     }
-    throw new Error("Kitten Scientists did not finish loading.");
+    throw new Error("Kittens Game did not finish loading.");
   };
 
-  waitForKittenScientists()
+  waitForGame()
     .then(() => {
-      applyProfile();
+      applyProfile(); // sets opts.noConfirm before any purchase can fire a dialog
       buildPanel();
     })
     .catch((error) => console.error("[KGH] Failed to start:", error));
