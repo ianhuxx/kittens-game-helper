@@ -875,6 +875,31 @@ const woodcuttersBefore = job("woodcutter").value;
 for (let i = 0; i < 3; i += 1) { fakeNow += 25000; tickFn(); }
 check("jobs: wood starvation guard staffs woodcutters when wood drains (catnip fine)", job("woodcutter").value > woodcuttersBefore);
 
+/* Stage 13b — diplomacy pressure feeds job balancing: if a queued Zebra trade
+   is blocked by catpower, hunters must be staffed even when the visible build
+   target is asking for another resource. */
+for (const j of jobs) j.value = 0;
+job("farmer").value = 25;
+job("miner").value = 15;
+job("woodcutter").value = 1;
+village.getKittens = () => 59;
+village.getFreeKittens = () => 18;
+perTick.wood = 2;
+perTick.catnip = 20;
+perTick.manpower = 0.05;
+res("manpower").value = 30;
+res("manpower").maxValue = 2600;
+res("gold").value = 100;
+res("slab").value = 1000;
+res("titanium").value = 0;
+res("titanium").maxValue = 200;
+zebras.unlocked = true;
+zebras.hidden = false;
+const huntersBeforeTradePressure = job("hunter").value;
+fakeNow += 25000;
+tickFn();
+check("jobs: Zebra trade catpower deficit staffs hunters generically", job("hunter").value > huntersBeforeTradePressure);
+
 /* Stage 14 — Zebra Relations: Appeasement is adopted to improve titanium trades.
    The generic automation leaves exclusive policies to the player, but this one
    is the titanium bottleneck lever, so the diplomacy manager adopts it. */
