@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.0.4
+// @version      2.0.5
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.0.4";
+  const HELPER_VERSION = "2.0.5";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2781,40 +2781,74 @@
 
   const hasObtainablePathFor = (resources, name, amount) => capDrainReachabilityFor(resources, name, amount).reachable;
 
+  const researchScienceCost = (tech) => {
+    const price = pricesFor("research", tech).find((cost) => cost && cost.name === "science" && isFinite(cost.val) && cost.val > 0);
+    return price ? price.val : 0;
+  };
+
+  const scienceStorageEligibility = (tech, resources) => {
+    const cost = researchScienceCost(tech);
+    const max = resMaxOf(resources, "science");
+    if (cost > 0 && max > 0 && cost > max) {
+      return { eligible: false, reason: `science storage blocked ${fmt(max)}/${fmt(cost)}` };
+    }
+    return { eligible: true, reason: "" };
+  };
+
   const validStickyScienceCapTarget = (candidate, resources) => {
     if (!candidate || candidate.kind !== "research" || !candidate.meta || candidate.meta.researched || !isOpen(candidate.meta)) return false;
     if (!isNearResourceCap(resources, "science")) return false;
+    if (!scienceStorageEligibility(candidate.meta, resources).eligible) return false;
     return pricesFor("research", candidate.meta).every((cost) => {
       if (!cost || !cost.name || cost.val <= 0) return true;
+      // Repeated cap-drain is allowed for craft intermediates only. The final
+      // tech's own science price must fit in storage, which was checked above.
+      if (cost.name === "science") return cost.val <= resMaxOf(resources, "science");
       return capDrainReachabilityFor(resources, cost.name, cost.val).reachable;
     });
   };
 
+  const splitScienceCapResearchCandidates = (candidates, resources, goalKey) => {
+    const actionableCappedScienceTechs = [];
+    const storageBlockedScienceTechs = [];
+    const futureOrHardBlockedTechs = [];
+    if (!isNearResourceCap(resources, "science")) return { actionableCappedScienceTechs, storageBlockedScienceTechs, futureOrHardBlockedTechs };
+    for (const candidate of candidates.filter((item) => item.kind === "research" && item.meta && !item.meta.researched)) {
+      const storage = scienceStorageEligibility(candidate.meta, resources);
+      if (!storage.eligible) {
+        storageBlockedScienceTechs.push({ candidate, reason: storage.reason });
+        continue;
+      }
+      const analyses = pricesFor("research", candidate.meta).map((cost) => {
+        if (!cost || !cost.name || cost.val <= 0) return { reachable: true, eta: 0, chain: new Set() };
+        if (cost.name === "science") return { reachable: cost.val <= resMaxOf(resources, "science"), eta: 0, chain: new Set(["science"]), reason: "blocked by science storage" };
+        const directBlock = directStorageBlockers("research", { prices: [cost] }, resources);
+        if (directBlock.length) return { reachable: false, eta: Number.POSITIVE_INFINITY, chain: new Set([cost.name]), reason: `${resTitle(resources, cost.name)} storage blocked` };
+        return capDrainReachabilityFor(resources, cost.name, cost.val);
+      });
+      if (analyses.some((analysis) => !analysis.reachable)) {
+        futureOrHardBlockedTechs.push({ candidate, reason: (analyses.find((analysis) => !analysis.reachable) || {}).reason || "missing unreachable prerequisite" });
+        continue;
+      }
+      const chain = new Set();
+      analyses.forEach((analysis) => (analysis.chain || new Set()).forEach((name) => chain.add(name)));
+      const profile = candidateEffectProfile(candidate.kind, candidate.meta);
+      const goalPath = goalFrontierNames(goalKey).has(candidate.meta.name) || goalClosureNames(goalKey).has(candidate.meta.name);
+      const unlockValue = gatewayValue(candidate.meta) + (profile.unlocks || []).length + Object.keys(profile.perTick || {}).length;
+      const eta = Math.max(0, ...analyses.map((analysis) => analysis.eta || 0));
+      actionableCappedScienceTechs.push({
+        ...candidate,
+        _capDrainEta: eta,
+        _capDrainChain: chain,
+        _phaseScore: (goalPath ? 10000 : 0) + unlockValue * 100 - eta / 60 - pricesFor(candidate.kind, candidate.meta).length,
+      });
+    }
+    actionableCappedScienceTechs.sort((a, b) => b._phaseScore - a._phaseScore);
+    return { actionableCappedScienceTechs, storageBlockedScienceTechs, futureOrHardBlockedTechs };
+  };
+
   const reachableScienceCapTechs = (candidates, resources, goalKey) => {
-    if (!isNearResourceCap(resources, "science")) return [];
-    return candidates
-      .filter((candidate) => candidate.kind === "research" && candidate.meta && !candidate.meta.researched)
-      .map((candidate) => {
-        const analyses = pricesFor("research", candidate.meta).map((cost) => {
-          if (!cost || !cost.name || cost.val <= 0) return { reachable: true, eta: 0, chain: new Set() };
-          return capDrainReachabilityFor(resources, cost.name, cost.val);
-        });
-        if (analyses.some((analysis) => !analysis.reachable)) return null;
-        const chain = new Set();
-        analyses.forEach((analysis) => (analysis.chain || new Set()).forEach((name) => chain.add(name)));
-        const profile = candidateEffectProfile(candidate.kind, candidate.meta);
-        const goalPath = goalFrontierNames(goalKey).has(candidate.meta.name) || goalClosureNames(goalKey).has(candidate.meta.name);
-        const unlockValue = gatewayValue(candidate.meta) + (profile.unlocks || []).length + Object.keys(profile.perTick || {}).length;
-        const eta = Math.max(0, ...analyses.map((analysis) => analysis.eta || 0));
-        return {
-          ...candidate,
-          _capDrainEta: eta,
-          _capDrainChain: chain,
-          _phaseScore: (goalPath ? 10000 : 0) + unlockValue * 100 - eta / 60 - pricesFor(candidate.kind, candidate.meta).length,
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => b._phaseScore - a._phaseScore);
+    return splitScienceCapResearchCandidates(candidates, resources, goalKey).actionableCappedScienceTechs;
   };
 
   const classifyCandidateLayer = (candidate, resources, goalKey) => {
@@ -2836,7 +2870,8 @@
   const selectStrategicTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
     const preferred = candidates[0] || null;
-    const cappedTechs = reachableScienceCapTechs(candidates, resources, goalKey);
+    const scienceBuckets = splitScienceCapResearchCandidates(candidates, resources, goalKey);
+    const cappedTechs = scienceBuckets.actionableCappedScienceTechs;
     if (cappedTechs.length) {
       const sticky = activeTarget && activeTarget.layer === STRATEGIC_LAYERS.scienceCap
         ? findCandidateById(cappedTechs, activeTarget.id)
@@ -2848,18 +2883,24 @@
         .sort((a, b) => (classifyCandidateLayer(b, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0) -
           (classifyCandidateLayer(a, resources, goalKey) === STRATEGIC_LAYERS.longProject ? 1 : 0));
       const rejected = chainConflicts.length ? chainConflicts : candidates.filter((candidate) => candidate !== target).slice(0, 1);
+      const storageDeferred = scienceBuckets.storageBlockedScienceTechs.map((item) => ({
+        target: item.candidate,
+        reason: item.reason || "blocked by science storage",
+      }));
+      const chainDeferred = rejected.slice(0, 5).map((candidate) => ({
+        target: candidate,
+        reason: candidateUsesAnyCraftChain(candidate, protectedChain)
+          ? `deferred because science capped and ${labelOf(target.meta)} reachable through ${[...protectedChain].filter((n) => craftByName(n)).slice(0, 3).join("/")} chain`
+          : `deferred behind active ${STRATEGIC_LAYERS.scienceCap} layer`,
+      }));
       return {
         candidates,
         target,
         layer: STRATEGIC_LAYERS.scienceCap,
         reason: `${labelOf(target.meta)} is reachable while science is capped; protecting ${[...protectedChain].slice(0, 4).map((n) => resTitle(resources, n)).join("→") || "science"} chain`,
         protectedChain,
-        rejectedTopCandidates: rejected.slice(0, 5).map((candidate) => ({
-          target: candidate,
-          reason: candidateUsesAnyCraftChain(candidate, protectedChain)
-            ? `deferred because science capped and ${labelOf(target.meta)} reachable through ${[...protectedChain].filter((n) => craftByName(n)).slice(0, 3).join("/")} chain`
-            : `deferred behind active ${STRATEGIC_LAYERS.scienceCap} layer`,
-        })),
+        scienceBuckets,
+        rejectedTopCandidates: [...storageDeferred, ...chainDeferred].slice(0, 5),
       };
     }
 
