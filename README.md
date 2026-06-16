@@ -170,6 +170,28 @@ The tech tree is walked in both directions every tick:
 - Crafted prerequisites recurse the same way (iron + coal → steel → gear), and jobs are
   pointed at the raw inputs behind the active plan.
 
+## One coherent plan: what it shows is what it does
+
+Every subsystem is subordinate to the **one locked plan**, so the panel never says one
+thing while the bot does another. When the plan is blocked on a resource, the helper
+resolves the prerequisite the right way and the display names that exact sub-action:
+
+- **Craftable** (compendium ← manuscript ← parchment ← furs): it drives the whole craft
+  chain toward the plan, and the plan's chain takes priority over the idle luxury reserve
+  so it can't stall waiting on a happiness cushion (the catnip *starvation* reserve is
+  never touched).
+- **Produced by a building** (a Calciner needs oil → it builds the **Oil Well first**, then
+  the Calciner becomes reachable). Any unlocked producer of a needed, un-craftable resource
+  is built before the thing that needs it.
+- **From trade** (titanium ← Zebra trades): the ship → explorer → Zebra-trade route runs
+  **only while the locked plan actually needs titanium** — never just because titanium is
+  low or some far-off candidate uses it. With an unrelated plan, no Zebra trading happens
+  and no "titanium path" is shown.
+
+The late game is covered by the same engine: **space programs** and **Chronoforge / Void
+structures** are scored, reserved for, and bought through the game's own controllers, just
+like bonfire buildings — so the planner doesn't go blank after Rocketry.
+
 ## Policies: automatic where safe, yours where permanent
 
 Policies with an empty `blocks` list can never lock anything out — the helper buys those
@@ -271,8 +293,12 @@ scripts/smoke.mjs                 Behavioral test: runs the script against a moc
                                   proves the plan reserves & pushes through, gateway techs win,
                                   policies split auto/manual, leader/promotions/jobs fire, and
                                   the native praise/festival/trade/observe subsystems work
-scripts/stress.mjs                Multi-run stress harness (npm run stress)
-package.json                      npm test (validate + smoke)
+scripts/simulate.mjs              Multi-scenario harness (npm run simulate): drives the bot
+                                  through early / mid / titanium-trap / titanium-needed /
+                                  craft-chain / oil-well-producer / late-game-space states and
+                                  asserts progress, plan↔action coherence, no off-plan titanium,
+                                  and that prerequisite chains (craft, produce, trade) are driven
+package.json                      npm test (validate + smoke + simulate)
 LICENSE                           MIT
 ```
 

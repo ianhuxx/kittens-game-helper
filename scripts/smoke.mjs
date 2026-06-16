@@ -915,12 +915,25 @@ policies.push({
 });
 res("culture").value = 3000;
 res("culture").maxValue = 3000; // capped → free to spend
-res("titanium").value = 0; // titanium still needed via Zebra trade (zebras unlocked earlier)
+res("titanium").value = 0;
+
+// (a) COHERENCE: the locked plan here is Mint (needs minerals, not titanium), so
+// the bot must NOT force-adopt the Zebra policy or run the titanium/Zebra path —
+// global titanium scarcity alone is not a reason to act. (This is the regression
+// guard for "saving for X but doing Zebra trading underneath".)
+fakeNow += 25000;
+tickFn();
+check("coherence: a non-titanium plan does NOT trigger Zebra policy adoption or the titanium path", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === false && !/titanium path|Zebra/i.test(panelText(".kgh-now")));
+
+// (b) Now make the titanium-blocked Titanium Saw the locked plan (retire the
+// rival buildings so the only open candidate is the Saw, which needs titanium):
+// the policy IS the titanium bottleneck lever, so it gets adopted.
+buildings.forEach((b) => { b.unlocked = false; });
 fakeNow += 25000;
 tickFn();
 fakeNow += 25000;
 tickFn();
-check("diplomacy: Zebra Relations Appeasement adopted to improve titanium trades", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true);
+check("diplomacy: Zebra Relations Appeasement adopted once the plan genuinely needs titanium", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true && /titanium/i.test(panelText(".kgh-plan")));
 
 /* Stage N — native subsystems that replaced Kitten Scientists fire directly ---- */
 
