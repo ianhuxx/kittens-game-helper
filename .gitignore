@@ -13,3 +13,6 @@ npm-debug.log*
 .idea/
 .vscode/
 *.swp
+
+# Upstream source fetched locally for research/reference only (not part of this repo)
+.kg_src/

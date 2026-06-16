@@ -2,10 +2,9 @@
 //
 // It does not (and cannot) drive a browser. It verifies that:
 //   1. the userscript body parses (no syntax errors),
-//   2. the Kitten Scientists @require pin is present,
-//   3. the reset-safety denylist is intact (so we never auto-reset a save),
-//   4. both profiles still exist,
-//   5. the extra smart-play layers remain wired into the panel.
+//   2. the bot is fully NATIVE — no Kitten Scientists / external engine,
+//   3. the reset-safety guard is intact (irreversible actions can't be planned),
+//   4. native execution + every smart-play layer is still wired in.
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -14,29 +13,62 @@ import vm from "node:vm";
 const scriptPath = fileURLToPath(new URL("../src/kittens-game-helper.user.js", import.meta.url));
 const source = await readFile(scriptPath, "utf8");
 
+// The helper now drives the game's own API directly. None of these may appear:
+// any reintroduction of Kitten Scientists or a settings-tree bridge is a
+// regression of the native rewrite.
+const forbidden = [
+  "kittenScientists",
+  "kitten-scientists",
+  "@require",
+  "getSettings",
+  "setSettings",
+  "_timeoutMainLoop",
+];
+const leaked = forbidden.filter((token) => source.includes(token));
+if (leaked.length > 0) {
+  console.error("✗ Native rewrite regressed — found external-engine tokens:", leaked.join(", "));
+  process.exit(1);
+}
+
 const required = [
-  // KS must be pinned so behavior is reproducible.
-  "kitten-scientists/releases/download/v2.0.0-beta.11/",
-  // Safety: irreversible automations must stay denied.
+  // Boots on the game alone, and suppresses confirm dialogs natively.
+  "waitForGame",
+  "gameReady",
+  "opts.noConfirm",
+  // Reset-safety: irreversible actions are filtered OUT of every candidate list.
   "DENY_SUBSTRINGS",
   '"reset"',
   '"transcend"',
   '"sacrifice"',
+  "isDeniedKey",
+  "!isDeniedKey(c.meta.name)",
   // Autopilot toggle must exist.
   "autopilot",
-  // The "build as soon as affordable" trigger fix must stay in place.
-  "PURCHASE_SECTIONS",
-  "setTriggersDeep",
-  // Smart-play layers added on top of KS should stay wired in.
-  "OVERFLOW_CRAFTS",
-  "maybeSelectLeader",
-  "kgh-leader",
-  "kgh-craft",
-  // Ready-now purchases must use the game UI controllers first so workshop
-  // upgrades and bonfire buildings behave like hand-clicked buttons.
+  // Native execution: purchases go through the game's own button controllers.
   "buyViaGameController",
   "UpgradeButtonController",
   "BuildingBtnModernController",
+  "TechButtonController",
+  "ReligionBtnController",
+  // Native subsystems that replaced KS (praise / stars / festivals / trade) and
+  // the reservation status line that replaced the external-spender pauser.
+  "managePraise",
+  "religion.praise",
+  "maybeObserveStars",
+  "observeHandler",
+  "maybeHoldFestival",
+  "holdFestival",
+  "manageTrade",
+  "tradeAll",
+  "updateReserveStatus",
+  "RELIGION_PRAISE_TRIGGER",
+  // Plan execution + the reservation contract every native spender consults.
+  "executePlan",
+  "gatherCandidates",
+  "reservedNeedsFor",
+  "respectsReservations",
+  "kgh-reserve",
+  "kgh-buy",
   // The plan should include a rough completion estimate.
   "formatEta",
   "ETA",
@@ -45,41 +77,8 @@ const required = [
   "kgh-processing",
   // Kittens Game intentionally spells this resource ID as compedium.
   "compedium",
-  // The helper owns bonfire/science/workshop-upgrade purchasing (KS's buyers
-  // are disabled) so the plan can RESERVE resources and push through.
-  "takeOverPurchasing",
-  "executePlan",
-  "reservedNeedsFor",
-  "respectsReservations",
-  "protectPlanFromExternalSpenders",
-  "kgh-external-spenders",
-  "kgh-buy",
-  // Religion: praise waits for a high faith bank so upgrades get a chance.
-  "configureReligionProgression",
-  "RELIGION_PRAISE_TRIGGER",
-  "reserveFaithForReligionProgression",
-  "nextFaithReligionUpgrade",
-  "kgh-religion",
-  "ReligionBtnController",
-  "refreshJobManagementUI",
-  "candidate.kind === \"religion\"",
-  "culture",
-  // Diplomacy: KS usually owns trade, but the helper keeps a direct fallback for
-  // explorers and embassies so catpower/culture caps become progress.
-  "manageDiplomacy",
-  "trackDiplomacyActionDeltas",
-  "trackTradeResourceDeltas",
-  "maybeSendExplorers",
-  "maybeBuildEmbassy",
-  "EmbassyButtonController",
-  "kgh-diplomacy",
-  // Recursive prerequisite planning: gateway techs and goal frontiers.
-  "gatewayValue",
-  "frontierFor",
-  "goalFrontierNames",
-  // Universal decision framework: candidates are scored from parsed game
-  // metadata (effects) against the current economy — no keyword tables —
-  // with every weight centralized in TUNING.
+  // Universal decision framework: candidates scored from parsed game metadata
+  // (effects) against the current economy — no keyword tables — every weight in TUNING.
   "TUNING",
   "metaEffectProfile",
   "parseEffectEntry",
@@ -87,45 +86,60 @@ const required = [
   "goalAlignmentBoost",
   "spendBonusFor",
   "scarcityWeight",
-  // Goal system: tech-tree milestone closures with live progress, or
-  // effect-category emphases.
+  // Recursive prerequisite planning: gateway techs and goal frontiers.
+  "gatewayValue",
+  "frontierFor",
+  "goalFrontierNames",
+  // Goal system: tech-tree milestone closures with live progress, or emphases.
   "goalClosureNames",
   "goalProgress",
   "goalSupportResources",
   "profileMatchesCategory",
   "emphasis",
+  // Crafting + overflow control (reservation-aware, our crafter is the only one).
+  "OVERFLOW_CRAFTS",
+  "craftTowardTarget",
+  "craftOverflowResources",
+  "kgh-craft",
+  // Religion upgrades are planned natively; faith reserve directs priests.
+  'candidate.kind === "religion"',
+  "nextFaithReligionUpgrade",
+  "kgh-religion",
+  "culture",
   // Jobs discover what each job produces from the game's own metadata.
   "jobResourceFor",
-  // The autopilot toggle button must never wrap its label — panel buttons
-  // are pinned to content size.
+  "refreshJobManagementUI",
+  // Village care that must stay wired in (native village API).
+  "maybeSelectLeader",
+  "maybePromoteKittens",
+  "kgh-leader",
+  "resetTickCache",
+  // Calm hunting: chain pressure may not flood hunters at healthy furs/mood.
+  "fursHealthy",
+  // The autopilot toggle button must never wrap its label.
   ".kgh-panel button{white-space:nowrap;flex:0 0 auto}",
   // Policies: non-exclusive auto-buy; exclusive (blocks-list) stays manual.
   "policyIsExclusive",
   "autoPolicyChoice",
-  // Village care that must stay wired in.
-  "maybePromoteKittens",
-  "resetTickCache",
-  // Calm hunting: chain pressure may not flood hunters at healthy furs/mood.
-  "fursHealthy",
-  // New-content awareness: fresh unlocks (Mint, Mansion, Observatory, …)
-  // break the target lock, get logged and get a short evaluation boost.
+  // Diplomacy: explorers/embassies sent from the game's own prices.
+  "manageDiplomacy",
+  "maybeSendExplorers",
+  "maybeBuildEmbassy",
+  "EmbassyButtonController",
+  "kgh-diplomacy",
+  "zebraTitaniumStats",
+  "desiredZebraShipCount",
+  "shipCraftWouldStealFromActivePlan",
+  // New-content awareness: fresh unlocks broke the lock, logged, boosted.
   "watchNewUnlocks",
   "noveltyBoostFor",
   "🆕 unlocked",
-  // Live effects: calculateEffects-backed numbers (Observatory science) are
-  // refreshed before profiling so new unlocks are valued correctly.
   "refreshMetaEffects",
-  // Converters are discovered from PerTickCon/Prod effects, not name lists.
+  // Converters discovered from PerTickCon/Prod effects, not name lists.
   "converterBuildings",
   "PerTick(?:Base|Autoprod|Con|Prod)?",
-  // Exploration reads the game's own explorer fee and is never starved by
-  // auto-hunting (hunting holds the fee back while a race is discoverable).
   "explorerPrices",
   "hasLockedDiscoverableRace",
-  "zebraTitaniumStats",
-  "desiredZebraShipCount",
-  "zebraTitaniumOddsText",
-  "shipCraftWouldStealFromActivePlan",
   // Housing value scales with how full the village is (Mansion timing).
   "housingSaturation",
 ];
@@ -146,4 +160,4 @@ try {
   process.exit(1);
 }
 
-console.log("✓ Userscript parses, KS is pinned, and reset-safety denylist is intact.");
+console.log("✓ Userscript parses, is fully native (no Kitten Scientists), and the reset-safety guard is intact.");

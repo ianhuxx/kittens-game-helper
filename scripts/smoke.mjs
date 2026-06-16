@@ -134,6 +134,10 @@ const buildings = [
     prices: [{ name: "beam", val: 200 }, { name: "slab", val: 350 }],
     effects: { manpowerMax: 500, woodMax: 1000, mineralsMax: 1000, ironMax: 250, coalMax: 250 },
   },
+  // Safety bait: a denied ("reset") action that is the CHEAPEST unlocked item.
+  // If isDeniedKey() were not filtering candidates, the planner would grab it
+  // immediately — so its val staying 0 proves irreversible actions are excluded.
+  { name: "resetWorld", label: "Reset World", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 1 }], effects: {} },
 ];
 
 const techs = [
@@ -233,8 +237,22 @@ const kittens = [
 ];
 
 let promoteCalls = 0;
+let observeCalls = 0;
+let praiseCalls = 0;
+let festivalCalls = 0;
+let tradeCalls = 0;
 
-const calendar = { festivalDays: 0 };
+const calendar = {
+  festivalDays: 0,
+  daysPerSeason: 100,
+  observeRemainingTime: 0,
+  observeHandler() {
+    observeCalls += 1;
+    this.observeRemainingTime = 0;
+    const science = res("science");
+    science.value = Math.min(science.maxValue || Infinity, science.value + 1000);
+  },
+};
 
 const village = {
   happiness: 0.92,
@@ -271,6 +289,10 @@ const village = {
   },
   getResProduction: () => ({ catnip: 5, wood: 2, minerals: 1.5, science: 1, manpower: 0.5 }),
   updateResourceProduction() {},
+  holdFestival(amt) {
+    festivalCalls += amt || 1;
+    calendar.festivalDays += 400 * (amt || 1);
+  },
 };
 
 const perTick = { catnip: -0.4, wood: 0.4, minerals: 0.3, science: 0.2, culture: 0.2, manpower: 0.2, iron: 0.05, coal: 0.01, gold: 0.01 };
@@ -279,14 +301,19 @@ const resourcePerTickCalls = [];
 
 const diplomacy = {
   races: [
-    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [] },
+    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], sells: [{ name: "minerals", value: 100, chance: 100 }] },
   ],
   get: (name) => diplomacy.races.find((race) => race.name === name),
   getManpowerCost: () => 50,
   getGoldCost: () => 15,
+  getMaxTradeAmt: () => 1,
+  tradeAll() {
+    tradeCalls += 1;
+  },
 };
 
 const gamePage = {
+  opts: { noConfirm: false },
   resPool: {
     resources,
     get: (name) => res(name),
@@ -307,6 +334,10 @@ const gamePage = {
   religion: {
     faith: 200,
     religionUpgrades,
+    praise() {
+      praiseCalls += 1;
+      res("faith").value = 0.0001;
+    },
   },
   workshop: {
     upgrades: workshopUpgrades,
@@ -343,64 +374,6 @@ const gamePage = {
   },
 };
 
-/* ------------------------------- fake KS ----------------------------------- */
-
-const S = (extra = {}) => ({ enabled: false, ...extra });
-const ksSettings = {
-  engine: S({ interval: 2000, resources: S() }),
-  bonfire: S({ trigger: 0.75, buildings: { library: S({ trigger: 0.9, max: 0 }), mine: S({ trigger: 0.9, max: 0 }) } }),
-  science: S({
-    trigger: 0.5,
-    observe: S(),
-    techs: { theology: S(), machinery: S(), trivia: S() },
-    policies: { liberty: S(), openFairs: S() },
-  }),
-  religion: S({
-    trigger: 0.2,
-    faith: S({ trigger: 0.2 }),
-    solarRevolution: S({ trigger: 0.2 }),
-    adore: S(),
-    sacrificeUnicorns: S(),
-  }),
-  space: S({ trigger: 1 }),
-  time: S({ reset: S() }),
-  trade: S({ trigger: 0.8 }),
-  workshop: S({
-    crafts: {
-      wood: S({ trigger: 0.95 }),
-      beam: S({ trigger: 0.9 }),
-      slab: S({ trigger: 0.9 }),
-      plate: S({ trigger: 0.9 }),
-      steel: S({ trigger: 0.9 }),
-      gear: S({ trigger: 0.9 }),
-      scaffold: S({ trigger: 0.9 }),
-      ship: S({ trigger: 0.9 }),
-      parchment: S({ trigger: 0.9 }),
-      manuscript: S({ trigger: 0.9 }),
-      compedium: S({ trigger: 0.9 }),
-      blueprint: S({ trigger: 0.9 }),
-    },
-    upgrades: { printingPress: S() },
-  }),
-  village: S({
-    jobs: { woodcutter: S(), farmer: S() },
-    hunt: S({ trigger: 0.98 }),
-    holdFestivals: S(),
-    electLeader: S(),
-    promoteLeader: S(),
-    promoteKittens: S({ trigger: 1 }),
-  }),
-};
-
-let appliedSettings = null;
-const kittenScientists = {
-  getSettings: () => ksSettings,
-  setSettings(s) {
-    appliedSettings = s;
-  },
-  engine: { _timeoutMainLoop: 1, start() {} },
-};
-
 /* ------------------------------ run the script ----------------------------- */
 
 let fakeNow = Date.now();
@@ -425,7 +398,6 @@ const context = {
   document: documentMock,
   localStorage: localStorageMock,
   gamePage,
-  kittenScientists,
   setTimeout,
   clearTimeout,
   setInterval: (fn) => {
@@ -459,42 +431,36 @@ const panelText = (sel) => {
 };
 const logText = () => (localStorageMock.getItem("kgh.log") || "[]").toString();
 
-check("script bootstrapped and applied KS settings", appliedSettings != null && typeof tickFn === "function");
+check("script bootstrapped natively (noConfirm set; no external engine)", gamePage.opts.noConfirm === true && typeof tickFn === "function");
 
-/* Stage 1 — KS takeover + reservation holds (mine must NOT eat library wood) */
+/* Stage 1 — native ownership + reservation holds (mine must NOT eat library wood) */
+calendar.observeRemainingTime = 100; // a star event is available this tick
 fakeNow += 5000;
 tickFn();
-check("KS bonfire buying disabled (helper owns builds)", appliedSettings.bonfire.enabled === false && appliedSettings.bonfire.buildings.mine.enabled === false);
-check("KS tech buying disabled, star observation kept", appliedSettings.science.techs.machinery.enabled === false && appliedSettings.science.observe.enabled === true);
-check("KS workshop upgrades disabled, crafts kept (catnip→wood at 50%)", appliedSettings.workshop.upgrades.printingPress.enabled === false && appliedSettings.workshop.crafts.wood.enabled === true && appliedSettings.workshop.crafts.wood.trigger === 0.5);
-check("KS jobs/hunt/leader automations disabled (ours run)", appliedSettings.village.jobs.woodcutter.enabled === false && appliedSettings.village.hunt.enabled === false && appliedSettings.village.electLeader.enabled === false && appliedSettings.village.promoteLeader.enabled === false);
-check("KS festivals stay on; resets/adore/sacrifice/policies stay off", appliedSettings.village.holdFestivals.enabled === true && appliedSettings.time.reset.enabled === false && appliedSettings.religion.adore.enabled === false && appliedSettings.religion.sacrificeUnicorns.enabled === false && appliedSettings.science.policies.liberty.enabled === false);
+check("native: star event observed automatically the moment it is available", observeCalls === 1 && calendar.observeRemainingTime === 0);
+check("safety: cheapest item is a denied 'reset' action and is NEVER bought (isDeniedKey)", buildings.find((b) => b.name === "resetWorld").val === 0);
 check(
-  "religion progression waits to praise but still considers upgrades",
-  appliedSettings.religion.trigger === 0.5
-    && appliedSettings.religion.faith.trigger === 0.95
-    && appliedSettings.religion.faith.enabled === false
-    && appliedSettings.religion.solarRevolution.trigger === 0.25
-    && /Solar Chant/.test(panelText(".kgh-religion")),
+  "religion: praise is HELD while a faith upgrade (Solar Chant) is still being saved for",
+  praiseCalls === 0 && /Solar Chant/.test(panelText(".kgh-religion")),
 );
 
 check("plan: Library chosen over storage-blocked Theology and cheap Mine", /Library/.test(panelText(".kgh-plan")));
 check("ETA shown in plan line", /ETA/.test(panelText(".kgh-plan")));
 check("plan: reservation visible in the panel", /reserving/i.test(panelText(".kgh-plan")) || /saving for/i.test(panelText(".kgh-buy")));
-check("reservation: KS external spenders paused while focused plan saves", appliedSettings.trade.enabled === false && appliedSettings.space.enabled === false && appliedSettings.time.enabled === false && /paused Space\/Time\/Trade/.test(panelText(".kgh-external-spenders")));
+check("reservation: reserve status reports holding the plan's inputs (nothing external left to pause)", /holding/i.test(panelText(".kgh-reserve")));
 check("reservation: affordable Mine NOT bought while Library saves up", buildings[1].val === 2);
 check("policy: non-exclusive auto-bought", policies[2].researched === true);
 check("policy: exclusive choices left for the player", policies[0].researched === false && policies[1].researched === false);
 check("policy: panel flags the exclusive decision", /exclusive/i.test(panelText(".kgh-policy")));
 check("production reads: helper requests conversion-aware net per tick", resourcePerTickCalls.some((call) => call.includeConversion === true));
 
-/* Stage 1b — active reserves pause unrelated KS crafts and helper overflow */
+/* Stage 1b — during an active reserve the native crafter leaves reserved inputs alone */
 res("iron").value = 295;
 res("iron").maxValue = 300;
 const plateBeforeReserveCraftGuard = res("plate").value;
 fakeNow += 5000;
 tickFn();
-check("KS workshop: unrelated plate craft disabled while focused reserve is active", appliedSettings.workshop.crafts.plate.enabled === false && /paused .*KS craft/.test(panelText(".kgh-craft")));
+check("overflow: no unrelated Metal Plate conversion is logged while the Library reserve is active", !/Metal Plate/i.test(panelText(".kgh-craft")));
 check("overflow: hot iron is not converted into plate while Library reserve is active", res("plate").value === plateBeforeReserveCraftGuard);
 check("craft ratios: fake game models fractional craft outputs", gamePage.craft("plate", 1) === true && Math.abs(res("plate").value - (plateBeforeReserveCraftGuard + 1.16)) < 1e-9);
 res("plate").value = plateBeforeReserveCraftGuard;
@@ -655,11 +621,10 @@ res("iron").value = 500;
 res("iron").maxValue = 1500;
 res("plate").value = 0;
 res("scaffold").value = 8;
-appliedSettings.workshop.crafts.plate.enabled = true;
 fakeNow += 25000;
 tickFn();
 check("crafted intermediate: plate waits while Observatory direct iron is still short", res("plate").value === 0 && res("scaffold").value === 8 && res("iron").value >= 500);
-check("KS workshop: target-chain plate is still paused because helper owns reserve-safe crafting", appliedSettings.workshop.crafts.plate.enabled === false);
+check("reserve-safe crafting: the helper is the only crafter, so plate is not fabricated while direct iron is short", res("plate").value === 0);
 observatory.prices = [{ name: "iron", val: 100 }, { name: "scaffold", val: 10 }];
 res("iron").value = 125;
 res("iron").maxValue = 1000;
@@ -799,7 +764,7 @@ res("furs").value = 0;
 res("ivory").value = 0;
 fakeNow += 25000;
 tickFn();
-check("titanium path: catpower is saved for Zebra explorers before the first ship is ready", res("manpower").value === 400 && /paused Space\/Time\/Trade/.test(panelText(".kgh-external-spenders")));
+check("titanium path: catpower is saved for Zebra explorers before the first ship is ready", res("manpower").value === 400 && (/Zebra|titanium path|first Ship/i.test(panelText(".kgh-diplomacy")) || /titanium path|first Ship/i.test(panelText(".kgh-plan"))));
 check("titanium path: advisor explains the ship → explorer → Zebra trade route", /titanium path: craft first Ship/i.test(panelText(".kgh-plan")) && /titanium path: craft first Ship/i.test(panelText(".kgh-now")));
 res("scaffold").value = 1;
 res("manpower").value = 1100;
@@ -931,6 +896,55 @@ tickFn();
 fakeNow += 25000;
 tickFn();
 check("diplomacy: Zebra Relations Appeasement adopted to improve titanium trades", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true);
+
+/* Stage N — native subsystems that replaced Kitten Scientists fire directly ---- */
+
+// Praise: managePraise() converts the faith bank to worship the moment faith is
+// near its cap AND no faith-priced upgrade is still being saved for.
+religionUpgrades[0].on = 1; // Solar Chant already owned → no faith upgrade pending
+res("faith").value = 100;
+res("faith").maxValue = 100;
+const praiseBefore = praiseCalls;
+fakeNow += 25000;
+tickFn();
+check("native praise: fires (faith → worship) when faith is near cap and no faith upgrade is pending", praiseCalls > praiseBefore && res("faith").value < 1);
+
+// Festival: maybeHoldFestival() holds one when Drama is researched, the cost is
+// affordable, and none of its inputs are reserved by the plan.
+techs.push({ name: "drama", label: "Drama and Poetry", unlocked: true, researched: true, prices: [], unlocks: {} });
+res("manpower").maxValue = 3000;
+res("manpower").value = 1600;
+res("culture").maxValue = 12000;
+res("culture").value = 7000;
+res("parchment").maxValue = 5000;
+res("parchment").value = 3000;
+// Festival runs at the end of the tick, so isolate it from auto-hunt (which
+// otherwise drains the same catpower in this single synthetic tick; in-game the
+// catpower regenerates between festivals). huntAll is exercised by its own checks.
+const origHuntAll = village.huntAll;
+village.huntAll = () => {};
+diplomacy.races.forEach((r) => { r.unlocked = true; }); // no discoverable race → no explorer spend
+res("titanium").value = res("titanium").maxValue || 100;
+calendar.festivalDays = 0;
+const festivalBefore = festivalCalls;
+fakeNow += 25000;
+tickFn();
+village.huntAll = origHuntAll;
+check("native festival: held when Drama is researched and the cost is affordable", festivalCalls > festivalBefore && calendar.festivalDays > 0);
+
+// Trade: manageTrade() converts near-capped (otherwise-wasted) catpower into a
+// scarce good a partner sells, while nothing is reserved and no explorer save is on.
+res("titanium").value = res("titanium").maxValue || 100; // remove titanium pressure → no explorer saving
+res("manpower").maxValue = 1000;
+res("manpower").value = 985; // near cap → would be wasted
+res("minerals").value = 0; // lizards sell minerals; plenty of room to store them
+res("minerals").maxValue = 1000;
+res("gold").value = 600;
+res("gold").maxValue = 1000;
+const tradeBefore = tradeCalls;
+fakeNow += 25000;
+tickFn();
+check("native trade: near-capped surplus catpower is traded with a partner selling a wanted good", tradeCalls > tradeBefore);
 
 
 if (failures.length) {
