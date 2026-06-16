@@ -128,6 +128,27 @@ Storage-blocked targets still redirect into storage: if **Theology** needs more 
 than your science cap, Libraries/Academies/Observatories get boosted until the cap can
 actually hold the price, and the ⚖/🧭 lines say so.
 
+### Research sprints (persistent unlock contracts)
+
+A research that needs a multi-tick **craft chain** — e.g. Acoustics ← Compendium ←
+Manuscript ← Parchment ← Furs — becomes an *active research sprint*: a contract that owns
+the plan until the tech is researched or genuinely hard-blocked.
+
+- A sprint can **start** from capped/near-capped science *or* any clear actionable
+  research chain; once started, science being below cap (which is *expected* — crafting
+  Compendium spends it) **never** cancels it.
+- While a sprint is valid, long projects (Temple, religion, ziggurat, space/time) are
+  **deferred** and may not reserve the chain's resources (no more "craft Manuscript for
+  Temple" while Acoustics is open).
+- A research whose **final** science price exceeds your science cap (e.g. Electricity at
+  71.25K with a 60.27K cap) is **storage-blocked** — it informs the storage layer but can
+  never become the active craft target.
+- Jobs follow the chain: **Hunters** for furs/parchment/compendium, scholars only when a
+  science refill below cap is the real bottleneck, priests suppressed unless faith is
+  capped or the tech costs faith, farmers at the catnip safety floor only. The compact
+  panel shows `🎯 Focus / Layer: Research sprint / Need`; the protected chain, deferrals
+  and job drivers live under **More automation details**.
+
 ## New content is handled automatically
 
 Nothing in the planner is a name list, so new game content never needs a code change:

@@ -1072,8 +1072,17 @@ perTick.iron = 0.05;
 perTick.gold = 0.01;
 craft("compedium").prices = [{ name: "science", val: 10000 }, { name: "manuscript", val: 50 }];
 
-/* Acceptance: capped science must break a Temple lock and protect the
-   Acoustics compendium/manuscript/parchment chain. */
+/* =====================================================================
+ * REGRESSION SUITE — persistent research sprints (v2.1.0)
+ *
+ * Sections: planner unit · multi-tick loop · job balancer ·
+ * reservation/protection · panel text · auto-hunt · purchase safety.
+ * These exercise the REAL multi-tick loop (changing resources, target
+ * locks, reservations, crafting, hunting, job smoothing), not a single
+ * static planner call — the v2.0.5 tests passed while live play failed
+ * precisely because they only checked one snapshot.
+ * =================================================================== */
+const dbg = context.window.__kghDebug;
 const acoustics = {
   name: "acoustics",
   label: "Acoustics",
@@ -1105,106 +1114,191 @@ for (const tech of techs) {
   if (tech !== acoustics && tech !== electricity) tech.researched = true;
 }
 workshopUpgrades.forEach((upgrade) => { upgrade.researched = true; });
-res("science").value = 60250;
-res("science").maxValue = 60250;
-res("compedium").value = 11.36;
-res("manuscript").value = 12;
-res("parchment").value = 80;
-res("furs").value = 12000;
-res("furs").maxValue = 20000000;
-res("culture").value = 12000;
-res("culture").maxValue = 2000000;
-res("gold").value = 95;
-res("gold").maxValue = 500;
-res("slab").value = 25;
-res("plate").value = 15;
 perTick.science = 0.2;
 perTick.culture = 0.2;
 perTick.furs = 0.5;
-storage.set("kgh.goal", "science");
-fakeNow += 25000;
-const acceptanceDecision = context.window.__kghDebug.selectStrategicTarget("science");
-const acceptanceRejected = acceptanceDecision.rejectedTopCandidates || [];
-const acceptanceProtected = [...(acceptanceDecision.protectedChain || new Set())];
-const acceptanceReserved = context.window.__kghDebug.reservedNeedsFor(acceptanceDecision.target);
-check("acceptance: capped science planner selects Acoustics research", acceptanceDecision.target?.kind === "research" && acceptanceDecision.target?.meta?.name === "acoustics");
-check("acceptance: active layer is Science cap unlock", acceptanceDecision.layer === "Science cap unlock");
-check("acceptance: Electricity is deferred from science-cap layer by science storage", acceptanceRejected.some((item) => item.target?.kind === "research" && item.target?.meta?.name === "electricity" && /science storage blocked/i.test(item.reason || "")));
-check("acceptance: Temple is rejected behind Acoustics", acceptanceRejected.some((item) => item.target?.kind === "build" && item.target?.meta?.name === "temple"));
-check("acceptance: rejection reason mentions capped science and craft chain", acceptanceRejected.some((item) => /science capped/i.test(item.reason || "") && /compedium|compendium|manuscript/i.test(item.reason || "")));
-check("acceptance: protected chain includes compendium/manuscript/parchment", ["compedium", "manuscript", "parchment"].every((name) => acceptanceProtected.includes(name)));
-check("acceptance: reservation is for Acoustics, not Electricity or Temple", acceptanceReserved.compedium >= 60 && acceptanceReserved.compedium < 100 && context.window.__kghDebug.targetId(acceptanceDecision.target) === "research:acoustics");
-context.window.__kghDebug.forceActiveTarget({ kind: "build", meta: temple });
-tickFn();
-check("acceptance: Temple lock breaks to Acoustics", /Science cap unlock/i.test(panelText(".kgh-plan")) && /Acoustics/i.test(panelText(".kgh-plan")) && !/FOCUS: .*Temple/i.test(panelText(".kgh-plan")));
-check("acceptance: panel is compact and shows Acoustics science-cap focus", /🎯 Focus: Acoustics/i.test(panelText(".kgh-plan")) && /Layer: Science cap unlock/i.test(panelText(".kgh-plan")) && /Need: .*Compendium|Need: .*compedium/i.test(panelText(".kgh-plan")) && /craft Compendium|craft compedium/i.test(panelText(".kgh-now")));
-check("acceptance: details explain protected chain and Temple rejection", /Compendium|compedium/i.test(panelText(".kgh-note")) && /Manuscript/i.test(panelText(".kgh-note")) && /Temple/i.test(panelText(".kgh-note")));
+perTick.manpower = 2;
 
-/* Exact live screenshot regression plus multi-tick persistence.  This starts
-   from a previous Temple lock and a priest/farmer-heavy village, then lets
-   science/culture/catpower refill while the compendium chain is temporarily
-   unaffordable.  Acoustics must own every tick until researched/hard-blocked. */
-context.window.__kghDebug.forceActiveTarget({ kind: "build", meta: temple });
-res("science").value = 60250;
-res("science").maxValue = 60250;
-res("culture").value = 3459.95;
-res("culture").maxValue = 3459.95;
-res("manpower").value = 169.56;
-res("manpower").maxValue = 3225;
-res("furs").value = 653.02;
-res("parchment").value = 19.12;
-res("manuscript").value = 243.12;
-res("compedium").value = 11.36;
-res("gold").value = 207.82;
-res("gold").maxValue = 1249.38;
-res("slab").value = 25;
-res("plate").value = 15;
-perTick.science = 1.5;
-perTick.culture = 0.8;
-perTick.manpower = 12;
-perTick.furs = 0;
-for (const j of jobs) j.value = 0;
-job("farmer").value = 5;
-job("priest").value = 3;
-const exactScreenshotDecision = context.window.__kghDebug.selectStrategicTarget("science");
-const exactScreenshotPlan = context.window.__kghDebug.planText("science");
-const exactScreenshotNow = context.window.__kghDebug.nowText("science");
-check("acceptance screenshot: exact capped state selects Acoustics, not Temple", exactScreenshotDecision.target?.kind === "research" &&
-  exactScreenshotDecision.target?.meta?.name === "acoustics" &&
-  exactScreenshotDecision.layer === "Science cap unlock" &&
-  /🎯 Focus: Acoustics/i.test(exactScreenshotPlan) &&
-  /Layer: Science cap unlock/i.test(exactScreenshotPlan) &&
-  /Need: 48\.64 Compendium/i.test(exactScreenshotPlan) &&
-  /craft|wait|hunt/i.test(exactScreenshotNow) &&
-  !/Electricity/i.test(exactScreenshotPlan) &&
-  !/Temple|gold|Electricity/i.test(exactScreenshotNow));
-let exactHeld = true;
-let noTempleGoldReservation = true;
-let hunterSupported = false;
-let priestsSuppressed = false;
-let panelNeverTemple = true;
-let electricityNeverActive = true;
-for (let i = 0; i < 15; i += 1) {
+// Common Acoustics board.  Each test tweaks from this baseline.  Capped
+// science here so the sprint starts; later tests deliberately drop it.
+const setupAcoustics = () => {
+  acoustics.researched = false;
+  electricity.researched = false;
+  temple.val = 0; temple.on = 0;
+  res("science").value = 60000; res("science").maxValue = 60000;
+  res("culture").value = 12000; res("culture").maxValue = 12000;
+  res("compedium").value = 11.36;
+  res("manuscript").value = 12;
+  res("parchment").value = 80;
+  res("furs").value = 12000; res("furs").maxValue = 20000000;
+  res("manpower").value = 800; res("manpower").maxValue = 3225;
+  res("gold").value = 95; res("gold").maxValue = 500;
+  res("slab").value = 25; res("plate").value = 15;
+  storage.set("kgh.goal", "balanced");
+  dbg.forceActiveTarget(null); // clear any prior lock + sprint
+};
+
+/* ---------------------------------------------------------------------
+ * Test A — Acoustics starts from capped science (planner unit)
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+fakeNow += 25000;
+const aDecision = dbg.selectStrategicTarget("balanced");
+const aRejected = aDecision.rejectedTopCandidates || [];
+const aChain = [...(aDecision.protectedChain || new Set())];
+const aReserved = dbg.reservedNeedsFor(aDecision.target);
+check("Test A: capped science selects research:acoustics", aDecision.target?.kind === "research" && aDecision.target?.meta?.name === "acoustics" && dbg.targetId(aDecision.target) === "research:acoustics");
+check("Test A: active layer is Research sprint", aDecision.layer === "Research sprint");
+check("Test A: an Acoustics sprint contract is live", dbg.activeSprint()?.techName === "acoustics");
+check("Test A: Temple is deferred behind the sprint", aRejected.some((item) => item.target?.kind === "build" && item.target?.meta?.name === "temple"));
+check("Test A: protected chain includes compendium/manuscript/parchment/furs", ["compedium", "manuscript", "parchment", "furs"].every((name) => aChain.includes(name)));
+check("Test A: no Temple gold/manuscript reservation (chain reserved, not Temple)", !(aReserved.gold > 0) && aReserved.manuscript !== 10 && aReserved.compedium >= 60 && aReserved.compedium < 100);
+
+/* ---------------------------------------------------------------------
+ * Test B — Acoustics persists after science drops below cap (multi-tick)
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+fakeNow += 25000;
+dbg.selectStrategicTarget("balanced"); // start the sprint at cap
+res("science").value = 30000; // now well below cap — must NOT cancel the sprint
+let bHeld = true;
+let bNoTempleReserve = true;
+let bChainAction = true;
+let bNoTempleFocus = true;
+for (let i = 0; i < 20; i += 1) {
   fakeNow += 30000;
-  for (const name of ["science", "culture", "manpower"]) {
-    const r = res(name);
-    r.value = Math.min(r.maxValue || Infinity, r.value + (perTick[name] || 0) * 30);
-  }
+  res("science").value = Math.min(res("science").maxValue, 30000 + (i % 5) * 1000); // refill/drain wobble, always < cap
   tickFn();
-  const decision = context.window.__kghDebug.selectStrategicTarget("science");
-  const reserved = context.window.__kghDebug.reservedNeedsFor(decision.target);
-  exactHeld = exactHeld && decision.target?.kind === "research" && decision.target?.meta?.name === "acoustics" && decision.layer === "Science cap unlock";
-  electricityNeverActive = electricityNeverActive && decision.target?.meta?.name !== "electricity" && (decision.rejectedTopCandidates || []).some((item) => item.target?.meta?.name === "electricity" && /science storage blocked/i.test(item.reason || ""));
-  noTempleGoldReservation = noTempleGoldReservation && !(reserved.gold > 0) && !(reserved.manuscript === 10);
-  hunterSupported = hunterSupported || job("hunter").value > 0 || /Furs|Catpower/i.test(panelText(".kgh-jobs"));
-  priestsSuppressed = priestsSuppressed || job("priest").value === 0;
-  panelNeverTemple = panelNeverTemple && !/Focus: Temple/i.test(panelText(".kgh-plan")) && !/gather .*gold.*Temple/i.test(panelText(".kgh-now"));
+  const d = dbg.selectStrategicTarget("balanced");
+  const reserved = dbg.reservedNeedsFor(d.target);
+  bHeld = bHeld && d.target?.meta?.name === "acoustics" && d.layer === "Research sprint";
+  bNoTempleReserve = bNoTempleReserve && !(reserved.gold > 0) && reserved.manuscript !== 10;
+  bChainAction = bChainAction && /craft|wait|hunt|advanc/i.test(dbg.nowText("balanced"));
+  bNoTempleFocus = bNoTempleFocus && !/Focus: Temple/i.test(panelText(".kgh-plan")) && !/Long project/i.test(panelText(".kgh-plan"));
 }
-check("acceptance multi-tick: Acoustics stays active across refill/craft/hunt ticks", exactHeld);
-check("acceptance multi-tick: Electricity never becomes active while science storage-blocked", electricityNeverActive);
-check("acceptance multi-tick: Temple does not reserve gold/manuscript while Acoustics owns science cap", noTempleGoldReservation);
-check("acceptance multi-tick: jobs support hunters/furs chain instead of Temple faith", hunterSupported && priestsSuppressed);
-check("acceptance multi-tick: panel never reverts to Temple or gather gold", panelNeverTemple);
+check("Test B: Acoustics stays the active target for all 20 ticks below cap", bHeld);
+check("Test B: long project / Temple never becomes active", bNoTempleFocus);
+check("Test B: current action stays a craft/wait/hunt chain step", bChainAction);
+check("Test B: Temple manuscript/gold never reserved during the sprint", bNoTempleReserve);
+
+/* ---------------------------------------------------------------------
+ * Test C — exact v2.0.5 live-screenshot failure (multi-tick start below cap)
+ * science 44.94K/60.47K (NOT near cap) yet Acoustics must own the plan.
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+storage.set("kgh.goal", "speedrun"); // speedrun mode active
+res("science").value = 44940; res("science").maxValue = 60470;
+res("culture").value = 3335.42; res("culture").maxValue = 3335.42;
+res("compedium").value = 32.80;
+res("manuscript").value = 46.94;
+res("parchment").value = 12.92;
+res("furs").value = 315.22;
+res("manpower").value = 673.48; res("manpower").maxValue = 3225;
+perTick.manpower = 12;
+fakeNow += 25000;
+const cDecision = dbg.selectStrategicTarget("speedrun");
+const cPlan = dbg.planText("speedrun");
+const cNow = dbg.nowText("speedrun");
+check("Test C: 74%-science screenshot focuses Acoustics, not Temple", cDecision.target?.meta?.name === "acoustics" && cDecision.layer === "Research sprint");
+check("Test C: science NOT near cap does not cancel the sprint", res("science").value / res("science").maxValue < 0.8 && dbg.activeSprint()?.techName === "acoustics");
+check("Test C: panel focus is Acoustics / Research sprint with a chain action", /Focus: Acoustics/i.test(cPlan) && /Layer: Research sprint/i.test(cPlan) && /Compendium/i.test(cPlan) && /craft|wait|hunt|advanc/i.test(cNow));
+check("Test C: panel never shows Electricity or a Temple/gold action", !/Electricity/i.test(cPlan) && !/Temple|gather .*gold/i.test(cNow));
+
+/* ---------------------------------------------------------------------
+ * Test D — Electricity is storage-blocked, never an active sprint
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+res("science").value = 60250; res("science").maxValue = 60270; // 60.25K / 60.27K
+res("compedium").value = 11.36;
+fakeNow += 25000;
+const dDecision = dbg.selectStrategicTarget("balanced");
+const dRejected = dDecision.rejectedTopCandidates || [];
+const elecSolver = dbg.solveChain({ kind: "research", meta: electricity });
+const compediumBeforeD = res("compedium").value;
+tickFn();
+check("Test D: Acoustics selected over storage-blocked Electricity", dDecision.target?.meta?.name === "acoustics");
+check("Test D: Electricity deferred from the sprint by science storage", dRejected.some((item) => item.target?.meta?.name === "electricity" && /science storage blocked/i.test(item.reason || "")));
+check("Test D: solver marks Electricity final science over cap (not buyable)", elecSolver.finalPurchaseCapsOk === false && elecSolver.reachable === false);
+check("Test D: no Compendium crafted FOR Electricity (only Acoustics chain runs)", electricity.researched === false && res("compedium").value <= compediumBeforeD + 60);
+
+/* ---------------------------------------------------------------------
+ * Test E — Job balancer follows the Acoustics chain (Hunters > Priests)
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+res("science").value = 60000; res("science").maxValue = 60000; // capped → scholars suppressed
+// The whole chain is blocked on furs, so no Compendium/Manuscript craft spends
+// science this tick: science stays capped and scholars must stay at zero.
+res("furs").value = 30; // furs are the live bottleneck
+res("parchment").value = 0;
+res("manuscript").value = 0;
+res("compedium").value = 11.36;
+res("manpower").value = 600; res("manpower").maxValue = 3225;
+perTick.manpower = 12;
+res("faith").value = 10; res("faith").maxValue = 100; // faith below cap, irrelevant
+res("catnip").value = 3500; res("catnip").maxValue = 5000; perTick.catnip = 8; // catnip safe
+for (const j of jobs) j.value = 0;
+job("farmer").value = 12; // prior priest/farmer-heavy split that must NOT linger
+job("priest").value = 8;
+village.getKittens = () => 20;
+village.getFreeKittens = () => 4;
+fakeNow += 40000;
+tickFn();
+fakeNow += 40000;
+tickFn();
+const workers = 20;
+check("Test E: Hunters materially exceed Priests", job("hunter").value > job("priest").value && job("hunter").value >= 3);
+check("Test E: Priests suppressed (<= 10% of workers and <= 3)", job("priest").value <= Math.max(3, workers * 0.1) && job("priest").value <= 3);
+check("Test E: Scholars 0 while science is capped", job("scholar").value === 0);
+check("Test E: Farmers only at safety floor (no generic farmer army)", job("farmer").value <= 3);
+check("Test E: details name hunters/furs for the Acoustics chain", /Hunters for furs/i.test(panelText(".kgh-jobs")) && /Hunters for furs|Furs/i.test(panelText(".kgh-note")));
+check("Test E: faith baseline is flagged suppressed during the sprint", /Suppressed: faith baseline during Research sprint/i.test(panelText(".kgh-note")));
+
+/* ---------------------------------------------------------------------
+ * Test F — Auto-hunt fires at the chain threshold for the sprint
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+res("science").value = 30000; res("science").maxValue = 60000; // below cap, sprint persists
+res("furs").value = 30; // chain needs furs
+res("parchment").value = 0;
+res("manpower").value = 400; res("manpower").maxValue = 3225; // 12% of cap: above 8% chain threshold, below 75% mood threshold
+perTick.manpower = 5;
+diplomacy.races.forEach((r) => { r.unlocked = true; r.hidden = false; }); // no discoverable race → explorer reserve not in play
+res("titanium").value = res("titanium").maxValue || 100;
+let acHuntCalls = 0;
+const realHuntAll = village.huntAll;
+village.huntAll = () => { acHuntCalls += 1; realHuntAll(); };
+const fursBeforeHunt = res("furs").value;
+fakeNow += 60000; // clear the hunt-log throttle
+dbg.selectStrategicTarget("balanced"); // ensure the sprint owns the plan this tick
+tickFn();
+village.huntAll = realHuntAll;
+check("Test F: auto-hunt fires at the lowered chain threshold (12% < normal 75%)", acHuntCalls > 0 && res("furs").value > fursBeforeHunt);
+check("Test F: hunt log names the Acoustics chain", /sent hunters for furs for Acoustics chain/i.test(logText()));
+check("Test F: hunting respects the catpower reserve (never driven negative)", res("manpower").value >= 0);
+
+/* ---------------------------------------------------------------------
+ * Test G — Overflow crafting does not spam irrelevant Metal Plate
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+res("science").value = 45000; res("science").maxValue = 60000;
+res("iron").value = 295; res("iron").maxValue = 300; // hot iron → tempting to craft Plate
+res("plate").value = 15;
+const plateBeforeOverflow = res("plate").value;
+fakeNow += 30000;
+tickFn();
+check("Test G: hot iron is NOT converted to Metal Plate while the Acoustics sprint runs", res("plate").value === plateBeforeOverflow && !/Metal Plate/i.test(panelText(".kgh-craft")));
+check("Test G: the active sprint chain still owns the plan", dbg.activeSprint()?.techName === "acoustics");
+
+/* ---------------------------------------------------------------------
+ * Test H — Purchase safety: raw metadata fallback disabled by default
+ * ------------------------------------------------------------------- */
+check("Test H: ALLOW_RAW_METADATA_BUY_FALLBACK is false by default", /const ALLOW_RAW_METADATA_BUY_FALLBACK = false/.test(source));
+check("Test H: raw metadata buy is gated behind the (disabled) debug flag", /if \(ALLOW_RAW_METADATA_BUY_FALLBACK\)[\s\S]{0,80}buyViaRawMetadata/.test(source));
+check("Test H: normal play never mutates meta.researched/val via a raw fallback", !/meta\.researched = true;[\s\S]{0,40}rawPayPrices/.test(source));
+
+// Tear down the Acoustics scenario so the suite leaves a clean tree.
+electricity.researched = true;
+acoustics.researched = true;
 techs.splice(techs.indexOf(electricity), 1);
 techs.splice(techs.indexOf(acoustics), 1);
 buildings.splice(buildings.indexOf(temple), 1);

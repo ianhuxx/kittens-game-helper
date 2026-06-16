@@ -69,6 +69,18 @@ const required = [
   "respectsReservations",
   "kgh-reserve",
   "kgh-buy",
+  // Persistent research-sprint contracts (v2.1.0 planner restructure): a sprint
+  // started by capped/near-cap science OR a clear actionable craft chain, then
+  // validated (NOT re-derived) each tick so spending science on Compendium never
+  // hands the plan back to Temple / generic scoring.
+  "activeSprint",
+  "solveCraftChain",
+  "planResearchSprint",
+  "sprintStillValid",
+  "finalScienceFitsCap",
+  "researchSprintJobNeeds",
+  "Research sprint",
+  "STRATEGIC_LAYERS",
   // The plan should include a rough completion estimate.
   "formatEta",
   "ETA",
@@ -161,6 +173,9 @@ const required = [
   "VAL_BASED_KINDS",
   "SpaceProgramBtnController",
   "ChronoforgeBtnController",
+  // Purchase safety: the raw-metadata buy fallback stays OFF by default; official
+  // controller/API purchase only. If it fails, the item is benched, never poked.
+  "ALLOW_RAW_METADATA_BUY_FALLBACK = false",
 ];
 
 const missing = required.filter((token) => !source.includes(token));
