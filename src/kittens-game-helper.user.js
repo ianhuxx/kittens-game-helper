@@ -293,11 +293,58 @@
     return out;
   };
 
+  // Space programs and Chronoforge/Void structures are stackable buildings of
+  // the SAME controller family as bonfire buildings, so the planner treats them
+  // as extra "build"-style candidates (kinds "space"/"time"). This is what lets
+  // the reservation-backed planner finally cover the late game. Enumerated
+  // defensively — these managers are empty until the relevant tech unlocks them.
+  const spaceMetas = () => {
+    try {
+      const space = window.gamePage && window.gamePage.space;
+      return Array.isArray(space && space.programs) ? space.programs : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const timeMetas = () => {
+    const out = [];
+    try {
+      const time = window.gamePage && window.gamePage.time;
+      if (Array.isArray(time && time.chronoforgeUpgrades)) out.push(...time.chronoforgeUpgrades);
+      if (Array.isArray(time && time.voidspaceUpgrades)) out.push(...time.voidspaceUpgrades);
+    } catch (error) {
+      /* ignore */
+    }
+    return out;
+  };
+
+  // Current scaled price of a stackable meta: base × priceRatio^owned. Mirrors
+  // BuildingStackableBtnController for planning/affordability; the real buy still
+  // goes through the game's own controller (exact discounts) in buyViaGameController.
+  const scaledStackablePrices = (meta) => {
+    const base = (meta && (meta.prices || meta.price)) || [];
+    const ratio = (meta && meta.priceRatio) || 1;
+    const owned = (meta && meta.val) || 0;
+    if (ratio === 1 || owned === 0 || !base.length) return base;
+    const mult = Math.pow(ratio, owned);
+    return base.map((price) => ({ name: price.name, val: price.val * mult }));
+  };
+
+  // Kinds whose "owned" count is a numeric val (vs a researched flag).
+  const VAL_BASED_KINDS = new Set(["build", "space", "time"]);
+
+  // Space/time candidate is open while unlocked and (for one-time missions) not
+  // already built; stackable structures stay open.
+  const spaceTimeOpen = (meta) =>
+    meta && meta.unlocked !== false && meta.researched !== true && !(meta.noStackable && (meta.on || meta.val || 0) >= 1);
+
   const pricesFor = (kind, meta) => {
     try {
       if (kind === "build" && window.gamePage.bld.getPrices) {
         return window.gamePage.bld.getPrices(meta.name) || meta.prices || [];
       }
+      if (kind === "space" || kind === "time") return scaledStackablePrices(meta);
       if ((kind === "research" || kind === "policy") && window.gamePage.science.getPrices) {
         return window.gamePage.science.getPrices(meta) || meta.prices || [];
       }
@@ -632,6 +679,7 @@
       candidates: null,
       target: undefined,
       pressure: null,
+      producerDemand: null,
       goalFrontier: null,
       goalClosure: null,
       goalSupport: null,
@@ -654,6 +702,11 @@
   const getStoragePressureCached = (resources, goal, goalKey = goalKeyFor(goal)) => {
     if (!tickCache.pressure) tickCache.pressure = storageBlockPressure(resources, goal, goalKey);
     return tickCache.pressure;
+  };
+
+  const getProductionDemandCached = (resources, goalKey) => {
+    if (!tickCache.producerDemand) tickCache.producerDemand = productionDemand(resources, goalKey);
+    return tickCache.producerDemand;
   };
 
   /* ------------------------- economy balancing action ------------------------ */
@@ -829,9 +882,16 @@
   // Liquid floor crafting must respect: food/catpower reserves plus a luxury
   // cushion — furs/ivory/spice above zero are a happiness bonus, so crafting
   // (e.g. furs→parchment for a manuscript chain) must never wipe them out.
-  const craftFloorFor = (resources, name) => {
+  // forPlanChain: when a craft serves the ACTIVE PLAN (e.g. furs → parchment →
+  // manuscript → compendium for a tech the plan needs), keep only a minimal
+  // luxury cushion so the plan's own chain is never blocked by the idle
+  // happiness reserve. Idle/overflow crafting keeps the larger cushion. The
+  // catnip starvation reserve and catpower reserve are NEVER relaxed.
+  const craftFloorFor = (resources, name, forPlanChain = false) => {
     let floor = craftReserveFor(resources, name);
-    if (LUXURY_RESOURCES.includes(name)) floor = Math.max(floor, luxuryStockTarget(resources, name) * 3);
+    if (LUXURY_RESOURCES.includes(name)) {
+      floor = Math.max(floor, luxuryStockTarget(resources, name) * (forPlanChain ? 1 : 3));
+    }
     return floor;
   };
 
@@ -864,7 +924,10 @@
     let units = wantUnits;
     for (const price of prices) {
       const input = getRes(fresh, price.name);
-      const floor = target ? overflowInputFloor(target, fresh, price.name, topOutputName) : craftFloorFor(fresh, price.name);
+      // This craft is serving the active plan's chain, so reserve only a minimal
+      // luxury cushion (forPlanChain) — the plan must not be blocked by the idle
+      // happiness reserve, but the catnip starvation reserve still holds.
+      const floor = target ? overflowInputFloor(target, fresh, price.name, topOutputName, true) : craftFloorFor(fresh, price.name);
       const available = Math.max(0, ((input && input.value) || 0) - floor);
       units = Math.min(units, Math.floor(available / price.val));
     }
@@ -920,8 +983,8 @@
   // overflow crafting still help by making a needed intermediate (minerals →
   // slab when the focus needs slabs), while preventing contradictions such as
   // minerals → slab when the focus itself is still reserving minerals.
-  const overflowInputFloor = (target, resources, inputName, outputName) => {
-    let floor = craftFloorFor(resources, inputName);
+  const overflowInputFloor = (target, resources, inputName, outputName, forPlanChain = false) => {
+    let floor = craftFloorFor(resources, inputName, forPlanChain);
     if (!target) return floor;
 
     // If the active target directly needs this input and is still short, no
@@ -1248,6 +1311,8 @@
     waitPenaltyCap: 14, // log-scaled time-to-afford penalty
     unreachablePenalty: 22, // no production path at all
     storageBlockPenalty: 48, // a cost sits above a storage cap
+    producerPrereqBoost: 30, // build the producer of a resource the focus needs but can't make
+                             // (e.g. Oil Well before a Calciner that needs oil)
     pressureKind: { research: 34, upgrade: 24, religion: 14, build: 14 },
     pressureGatewayScale: 8,
     pressureGatewayCap: 26,
@@ -1658,6 +1723,49 @@
       /* ignore */
     }
     return pressure;
+  };
+
+  // Buildings whose live effects PRODUCE a per-tick resource. This is the
+  // generic form of the titanium ship/trade path: when the focus is blocked on a
+  // resource the village has no source for and can't craft (e.g. a Calciner that
+  // needs oil), find the building that makes it (the Oil Well) so the planner can
+  // prioritise building the producer first instead of locking an unreachable target.
+  const producerBuildingsFor = (name) => {
+    const out = [];
+    try {
+      for (const meta of buildingMetas()) {
+        if (!meta || meta.unlocked === false) continue;
+        const profile = metaEffectProfile(meta);
+        if ((profile.perTick[name] || 0) > 0) out.push(meta);
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return out;
+  };
+
+  // Resources a FOCUSED candidate needs but the village cannot obtain yet: not
+  // craftable, no current production, short of the cost — but a producer building
+  // exists. Titanium is excluded (the Zebra/ship path owns it). The result keys
+  // are resource names with unmet demand; candidateScore boosts their producers.
+  const productionDemand = (resources, goalKey) => {
+    const demand = {};
+    const goal = GOALS[goalKey];
+    const visit = (kind, meta) => {
+      if (!isOpen(meta) || !storageBlockerIsFocused(kind, meta, goal, goalKey)) return;
+      for (const cost of pricesFor(kind, meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        if (cost.name === "titanium" || craftByName(cost.name)) continue;
+        const have = ((getRes(resources, cost.name) || {}).value) || 0;
+        if (have >= cost.val || productionFor(cost.name) > 0) continue;
+        if (producerBuildingsFor(cost.name).length) demand[cost.name] = (demand[cost.name] || 0) + 1;
+      }
+    };
+    try { for (const t of techList()) visit("research", t); } catch (error) { /* ignore */ }
+    try { for (const u of window.gamePage.workshop.upgrades || []) visit("upgrade", u); } catch (error) { /* ignore */ }
+    try { for (const u of religionUpgrades()) if (religionUpgradeVisible(u)) visit("religion", u); } catch (error) { /* ignore */ }
+    try { for (const b of buildingMetas()) visit("build", b); } catch (error) { /* ignore */ }
+    return demand;
   };
 
 
@@ -2350,6 +2458,21 @@
       score += Math.min(TUNING.gatewayCap, gatewayValue(meta) * TUNING.gatewayScale);
       if (goalFrontierNames(goalKey).has(meta.name)) score += TUNING.frontierBoost;
     }
+    // Producer prerequisite: if this building makes a resource a focused target
+    // needs but can't produce or craft (oil for a Calciner), lift it so it is
+    // built first — the generic version of the titanium ship/trade path.
+    if (kind === "build") {
+      const prodDemand = getProductionDemandCached(resources, goalKey);
+      if (Object.keys(prodDemand).length) {
+        const buildProfile = candidateEffectProfile(kind, meta);
+        for (const name of Object.keys(buildProfile.perTick || {})) {
+          if ((buildProfile.perTick[name] || 0) > 0 && (prodDemand[name] || 0) > 0) {
+            score += TUNING.producerPrereqBoost;
+            break;
+          }
+        }
+      }
+    }
     return score - waitPenalty - idleStoragePenalty - storageBlockPenalty;
   };
 
@@ -2380,6 +2503,20 @@
     try {
       for (const b of buildingMetas()) {
         if (b && b.unlocked !== false) candidates.push({ kind: "build", weight: 2, meta: b });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const p of spaceMetas()) {
+        if (spaceTimeOpen(p)) candidates.push({ kind: "space", weight: 2, meta: p });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      for (const t of timeMetas()) {
+        if (spaceTimeOpen(t)) candidates.push({ kind: "time", weight: 2, meta: t });
       }
     } catch (error) {
       /* ignore */
@@ -2429,7 +2566,7 @@
     if (!candidate || !candidate.meta) return true;
     if (candidate.kind === "research" || candidate.kind === "upgrade" || candidate.kind === "policy") return !!candidate.meta.researched;
     if (candidate.kind === "religion") return religionUpgradePurchased(candidate.meta);
-    if (candidate.kind === "build" && activeTarget && activeTarget.id === targetId(candidate)) {
+    if (VAL_BASED_KINDS.has(candidate.kind) && activeTarget && activeTarget.id === targetId(candidate)) {
       return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
     }
     return false;
@@ -2514,7 +2651,7 @@
       activeTarget = {
         id: targetId(preferred),
         startedAt: now,
-        initialVal: preferred.kind === "build" ? preferred.meta.val || 0 : 0,
+        initialVal: VAL_BASED_KINDS.has(preferred.kind) ? preferred.meta.val || 0 : 0,
       };
     }
     return preferred;
@@ -2973,8 +3110,9 @@
 
 
   const titaniumRouteHint = (resources, goalKey) => {
-    const target = getTargetCached(resources, goalKey);
-    if (!targetNeedsResource(target, "titanium") || !targetMissingResource(target, resources, "titanium")) return "";
+    // Identical scope to titaniumNeededSoon(): the panel's titanium line shows
+    // exactly when (and only when) the bot is actually running the titanium path.
+    if (!titaniumNeededSoon(resources, goalKey)) return "";
     const zebras = raceByName("zebras");
     if (zebras && zebras.unlocked) {
       const missing = tradePricesForRace(zebras)
@@ -3025,9 +3163,11 @@
     upgrade: "WORKSHOP UPGRADE",
     religion: "RELIGION UPGRADE",
     policy: "POLICY",
+    space: "SPACE PROGRAM",
+    time: "TIME STRUCTURE",
   };
 
-  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜" };
+  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳" };
 
   const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase()}`;
 
@@ -3079,7 +3219,7 @@
 
   const purchaseComplete = (candidate, initialVal) => {
     if (!candidate || !candidate.meta) return false;
-    if (candidate.kind === "build") return ((candidate.meta.val || 0) > (initialVal || 0));
+    if (VAL_BASED_KINDS.has(candidate.kind)) return ((candidate.meta.val || 0) > (initialVal || 0));
     if (candidate.kind === "religion") return religionUpgradePurchased(candidate.meta);
     return !!candidate.meta.researched;
   };
@@ -3123,6 +3263,20 @@
         opts: (name) => ({ building: name }),
       };
     }
+    if (kind === "space") {
+      return {
+        path: ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
+    if (kind === "time") {
+      // Chronoforge controller for CFU; Void-space metas fall through to the
+      // reservation-safe raw-metadata buy path (which pays prices + increments val).
+      return {
+        path: ["classes", "ui", "time", "ChronoforgeBtnController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
     return null;
   };
 
@@ -3140,7 +3294,7 @@
     if (!model) return false;
     if (typeof controller.updateEnabled === "function") controller.updateEnabled(model);
     const result = controller.buyItem(model, { boughtByQueue: true });
-    return !!(result && result.itemBought) || purchaseComplete(candidate, candidate.kind === "build" ? ((meta.val || 0) - 1) : 0);
+    return !!(result && result.itemBought) || purchaseComplete(candidate, VAL_BASED_KINDS.has(candidate.kind) ? ((meta.val || 0) - 1) : 0);
   };
 
   const canPayPrices = (prices) => {
@@ -3173,7 +3327,7 @@
   const applyRawPurchaseEffects = (candidate) => {
     const game = window.gamePage;
     const meta = candidate.meta;
-    if (candidate.kind === "build" || candidate.kind === "religion") {
+    if (VAL_BASED_KINDS.has(candidate.kind) || candidate.kind === "religion") {
       meta.val = (meta.val || 0) + 1;
       meta.on = (meta.on || 0) + 1;
     } else {
@@ -3233,7 +3387,7 @@
   };
 
   const buyCandidate = (candidate) => {
-    const initialVal = candidate.kind === "build" ? candidate.meta.val || 0 : 0;
+    const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
     for (const attempt of purchaseAttemptsFor(candidate)) {
       try {
         attempt();
@@ -3549,16 +3703,27 @@
     return pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === name && resourceValue(resources, name) < cost.val);
   };
 
+  // Titanium acquisition (ship craft → explorers → Zebra trade) is a SUB-ACTION
+  // of the locked plan, never a standalone goal. It fires only when the current
+  // target genuinely needs titanium — as a direct cost, or hidden behind a
+  // craftable cost (e.g. alloy = titanium + steel). Previously this also fired on
+  // global titanium scarcity (titanium < 50% cap) or on ANY of the top-12
+  // candidates needing titanium, which made the bot run Zebra trades and ship
+  // crafts while the panel showed an unrelated plan — the displayed plan and the
+  // actual spending disagreed. Scoping it to the locked target keeps them in sync
+  // (it matches titaniumRouteHint(), which drives the panel's titanium line).
   const titaniumNeededSoon = (resources, goalKey) => {
-    const titanium = getRes(resources, "titanium");
-    if (titanium && titanium.unlocked !== false && titanium.maxValue > 0 && titanium.value < Math.min(titanium.maxValue * 0.5, 50)) {
-      return true;
-    }
     const target = getTargetCached(resources, goalKey);
+    if (!target || target.affordable) return false;
     if (targetMissingResource(target, resources, "titanium")) return true;
-    return getCandidatesCached(resources, goalKey).slice(0, 12).some((candidate) =>
-      !candidate.affordable && pricesFor(candidate.kind, candidate.meta).some((cost) => cost && cost.name === "titanium" && resourceValue(resources, "titanium") < cost.val),
-    );
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      const have = resourceValue(resources, cost.name);
+      if (have >= cost.val || !craftByName(cost.name)) continue;
+      const raw = rawPathRequirements(cost.name, Math.max(1, cost.val - have));
+      if ((raw.titanium || 0) > 0) return true;
+    }
+    return false;
   };
 
   const tradePricesForRace = (race) => {

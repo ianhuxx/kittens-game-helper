@@ -142,6 +142,25 @@ const required = [
   "hasLockedDiscoverableRace",
   // Housing value scales with how full the village is (Mansion timing).
   "housingSaturation",
+  // Plan ↔ action coherence: the titanium/Zebra path is a SUB-ACTION of the
+  // locked plan (fires only when the target needs titanium), and plan-directed
+  // crafting uses a relaxed luxury floor so the plan's own chain isn't starved.
+  "titaniumNeededSoon",
+  "titaniumRouteHint",
+  "forPlanChain",
+  // Producer prerequisite: build the producer of a needed-but-unproduced,
+  // uncraftable resource (Oil Well before a Calciner that needs oil).
+  "producerBuildingsFor",
+  "productionDemand",
+  "producerPrereqBoost",
+  // The reservation-backed planner now also covers the late game (space
+  // programs + Chronoforge/Void structures), via the game's own controllers.
+  "spaceMetas",
+  "timeMetas",
+  "scaledStackablePrices",
+  "VAL_BASED_KINDS",
+  "SpaceProgramBtnController",
+  "ChronoforgeBtnController",
 ];
 
 const missing = required.filter((token) => !source.includes(token));
