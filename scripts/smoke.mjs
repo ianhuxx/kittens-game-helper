@@ -1354,6 +1354,43 @@ check("Test D4: science storage unlock commits to one building, ignoring an equa
 vaultA.unlocked = false; vaultB.unlocked = false; // do not leak into later sprint tests
 
 /* ---------------------------------------------------------------------
+ * Test D5 — wood-vs-catnip pathway is read LIVE.  bestWoodJob must compare the
+ * CURRENT per-kitten wood rate against refining a farmer's CURRENT (in-season)
+ * catnip into wood — folding in the live season/weather multiplier and the live
+ * craft-ratio bonus — not baked-in base modifiers.  Earlier code used the base
+ * modifier, ignored the [+50%]/-75% season swing, and dropped the refine bonus.
+ * ------------------------------------------------------------------- */
+const realGetResProduction = village.getResProduction;
+const realWeatherMod = calendar.getWeatherMod;
+const realWoodPerTick = perTick.wood;
+const realWoodCraftRatio = craftRatios.wood;
+job("woodcutter").value = 1;
+job("farmer").value = 1;
+perTick.wood = 0; // neutralise productionFor noise so woodBase (30/s) dominates the max()
+// woodPerCutter = getResProduction().wood (6) * tps (5) / 1 = 30 wood/s, season-independent.
+village.getResProduction = () => ({ wood: 6, catnip: 1000, minerals: 1, science: 1, manpower: 0.5 });
+craftRatios.wood = 0;
+// Winter (−75%): 1000*5*0.25/100 = 12.5 wood-via-refine/farmer < 30 → woodcutter.
+calendar.getWeatherMod = () => -0.75;
+check("Test D5: winter catnip slump makes WOODCUTTER the economical wood source", dbg.bestWoodJob()?.name === "woodcutter");
+// Spring (+50%): 1000*5*1.5/100 = 75 > 30 → farmer.  Same board, only the live
+// season changed — proves the season multiplier is actually read, not assumed.
+calendar.getWeatherMod = () => 0.5;
+check("Test D5: spring catnip boom flips the economical wood source to FARMER", dbg.bestWoodJob()?.name === "farmer");
+// Craft-ratio sensitivity (neutral season): C=400 → 400*5/100 = 20 < 30 without the
+// refine bonus (woodcutter), but a +100% craft ratio yields 40 > 30 (farmer).
+village.getResProduction = () => ({ wood: 6, catnip: 400, minerals: 1, science: 1, manpower: 0.5 });
+calendar.getWeatherMod = () => 0;
+craftRatios.wood = 0;
+check("Test D5: without the refine craft bonus woodcutter stays economical", dbg.bestWoodJob()?.name === "woodcutter");
+craftRatios.wood = 1.0; // +100% wood per refine
+check("Test D5: live craft-ratio bonus is folded into the refine yield (farmer wins)", dbg.bestWoodJob()?.name === "farmer");
+village.getResProduction = realGetResProduction;
+calendar.getWeatherMod = realWeatherMod;
+perTick.wood = realWoodPerTick;
+craftRatios.wood = realWoodCraftRatio;
+
+/* ---------------------------------------------------------------------
  * Test E — Job balancer follows the Acoustics chain (Hunters > Priests)
  * ------------------------------------------------------------------- */
 setupAcoustics();

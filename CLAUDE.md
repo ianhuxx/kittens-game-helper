@@ -38,6 +38,26 @@ No external libraries, no Kitten Scientists bridge. Irreversible actions
 (reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate
 list and must stay that way.
 
+### 4. Read every rate LIVE — never bake in base numbers
+
+Production, conversion and marginal-per-kitten math must read the game's CURRENT
+state, not a baked-in base modifier:
+
+- Per-resource rates go through `productionFor` (→ `game.getResourcePerTick`, cross-
+  checked against the observed resource-bar delta), so seasonal modifiers,
+  processing buildings and reassignment are all reflected.
+- Marginal per-kitten output uses live `village.getResProduction()` ÷ staffed count
+  (production is linear in count, so average == marginal); the base `job.modifiers`
+  rate is a fallback only when a job is unstaffed.
+- Catnip output MUST be multiplied by the live season/weather modifier
+  (`catnipWeatherMultiplier` → `calendar.getWeatherMod`, the "[+50%]" badge) — it is
+  applied above village output, so `getResProduction` omits it.
+- The catnip→wood (and any) conversion yields `1 + craftRatioFor(name)` per craft,
+  not 1 — fold the live craft-ratio bonus into pathway comparisons.
+- `bestWoodJob` is the canonical example: it weighs a live woodcutter's wood/s
+  (incl. Lumber-Mill woodRatio) against refining a farmer's in-season catnip,
+  bonus-adjusted. Test D5 pins this; if you touch it, keep the comparison live.
+
 ## Strategic planner — selection invariants
 
 `selectStrategicTarget` chooses a target through ordered layers (highest wins).
