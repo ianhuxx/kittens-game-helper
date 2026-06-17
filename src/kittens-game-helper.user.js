@@ -2699,7 +2699,7 @@
     return candidates
       // Native safety guard: irreversible/permanent actions (reset, transcend,
       // sacrifice, shatter, time-skip, adore) can never become a plan target.
-      .filter((c) => c.meta && !isDeniedKey(c.meta.name))
+      .filter((c) => c.meta && !isDeniedKey(c.meta.name) && !isNoopPolicyCandidate(c))
       .map((c) => {
         const evaluation = evaluate(c.kind, c.meta, resources);
         const withEvaluation = { ...c, ...evaluation };
@@ -2719,6 +2719,7 @@
   const STRATEGIC_LAYERS = {
     researchSprint: "Research sprint",
     hardUnlock: "Hard unlock / milestone",
+    scienceStorageUnlock: "Science storage unlock",
     storage: "Storage blocker",
     production: "Production bottleneck",
     housing: "Housing / population",
@@ -3042,6 +3043,43 @@
     return { sprint: null, deferred, actionable };
   };
 
+
+
+  const scienceStorageGain = (candidate) => {
+    if (!candidate) return 0;
+    const profile = candidateEffectProfile(candidate.kind, candidate.meta);
+    return Math.max(0, (profile.max && profile.max.science) || 0) + Math.max(0, (profile.ratio && profile.ratio.science) || 0) * Math.max(1, resMaxOf(resourceMap(), "science"));
+  };
+
+  const scienceStorageUnlockCandidate = (candidate, resources) => {
+    if (!candidate || candidate.kind === "policy") return false;
+    if (candidate.kind === "research" && candidate.meta && !finalScienceFitsCap(candidate.meta, resources)) return false;
+    const profile = candidateEffectProfile(candidate.kind, candidate.meta);
+    if (((profile.max && profile.max.science) || 0) > 0 || ((profile.ratio && profile.ratio.science) || 0) > 0) return true;
+    const text = effectText(candidate.meta);
+    return /scienceMax|scienceMaxRatio|science storage|science cap|observatory|academy|library/i.test(text);
+  };
+
+  const bestScienceStorageUnlock = (candidates, resources, deferred, goalKey) => {
+    const blockers = (deferred || [])
+      .filter((item) => item && item.kind === "storage" && item.candidate && item.candidate.kind === "research")
+      .map((item) => item.candidate)
+      .sort((a, b) => gatewayValue(b.meta) - gatewayValue(a.meta) || researchScienceCost(a.meta) - researchScienceCost(b.meta));
+    if (!blockers.length || !isNearResourceCap(resources, "science")) return null;
+    if (goalKey !== "balanced") return null;
+    const blocked = blockers[0];
+    const need = Math.max(0, researchScienceCost(blocked.meta) - resMaxOf(resources, "science"));
+    const options = candidates
+      .filter((candidate) => targetId(candidate) !== targetId(blocked))
+      .filter((candidate) => scienceStorageUnlockCandidate(candidate, resources))
+      .filter((candidate) => !directStorageBlockers(candidate.kind, candidate.meta, resources).length)
+      .map((candidate) => ({ candidate, gain: scienceStorageGain(candidate), wait: waitSecondsForCandidate(candidate, resources) }))
+      .filter((item) => isFinite(item.wait));
+    if (!options.length) return null;
+    options.sort((a, b) => (b.gain - a.gain) || ((b.candidate.score || 0) - (a.candidate.score || 0)) || (a.wait - b.wait));
+    return { target: options[0].candidate, blocked, need };
+  };
+
   const classifyCandidateLayer = (candidate, resources, goalKey) => {
     if (!candidate) return STRATEGIC_LAYERS.economy;
     if (candidate.kind === "research" || candidate.kind === "upgrade") {
@@ -3105,7 +3143,24 @@
       };
     }
 
-    // No sprint: fall back to the mature ROI scorer (storage / production /
+    const scienceUnlock = bestScienceStorageUnlock(candidates, resources, deferred, goalKey);
+    if (scienceUnlock && scienceUnlock.target) {
+      const target = scienceUnlock.target;
+      return {
+        candidates,
+        target,
+        layer: STRATEGIC_LAYERS.scienceStorageUnlock,
+        reason: `${labelOf(scienceUnlock.blocked.meta)} is storage-blocked; adding ${fmt(scienceUnlock.need)} science storage`,
+        protectedChain: candidateCraftChainResources(target),
+        scienceStorageBlocker: scienceUnlock,
+        rejectedTopCandidates: [
+          { target: scienceUnlock.blocked, reason: `storage-blocked: need +${fmt(scienceUnlock.need)} science storage` },
+          ...candidates.filter((candidate) => isLongProject(candidate, resources, goalKey)).slice(0, 2).map((candidate) => ({ target: candidate, reason: `deferred until ${labelOf(scienceUnlock.blocked.meta)} fits science storage` })),
+        ],
+      };
+    }
+
+    // No sprint/storage-unlock: fall back to the mature ROI scorer (storage / production /
     // housing / economy / long project), which already raises storage blockers
     // and producer prerequisites by pressure.
     const target = candidates[0] || null;
@@ -3910,8 +3965,11 @@
       const target = getTargetCached(resources, goalKey);
       if (!target) return "🎯 Focus: scanning";
       const layer = (lastStrategicDecision && lastStrategicDecision.layer) || STRATEGIC_LAYERS.economy;
+      const storageBlocker = lastStrategicDecision && lastStrategicDecision.scienceStorageBlocker;
       const needs = planNeedSummary(resources, target);
-      const needLine = target.affordable ? "ready now" : needs.join(", ") || target.missing || "prerequisites";
+      const needLine = storageBlocker
+        ? `+${fmt(storageBlocker.need)} science storage (${labelOf(storageBlocker.blocked.meta)} is storage-blocked)`
+        : target.affordable ? "ready now" : needs.join(", ") || target.missing || "prerequisites";
       return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}\nNeed: ${needLine}`;
     } catch (error) {
       return "🎯 Focus: —";
@@ -3942,6 +4000,13 @@
         if (jobPlanText) parts.push(jobPlanText.replace(/^Jobs:\s*/, "Jobs: "));
         if (jobSuppressText) parts.push(jobSuppressText);
         return parts.join(" · ");
+      }
+      if (decision && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock && decision.scienceStorageBlocker) {
+        const blocker = decision.scienceStorageBlocker;
+        const eta = formatEta(waitSecondsForCandidate(target, resources));
+        const rejected = (decision.rejectedTopCandidates || []).filter((item) => item && item.target).slice(0, 3);
+        const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
+        return `${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${rejectNote}`;
       }
       // Economy details: state + ETA + reservation + deferrals (unchanged shape).
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
@@ -5160,6 +5225,13 @@
 
   const policyOpen = (meta) => isOpen(meta) && meta.blocked !== true && meta.disabled !== true;
 
+  const isSocialismPolicy = (meta) => {
+    const id = `${(meta && meta.name) || ""} ${labelOf(meta)}`.toLowerCase();
+    return /\bsocialism\b/.test(id);
+  };
+
+  const isNoopPolicyCandidate = (candidate) => candidate && candidate.kind === "policy" && isSocialismPolicy(candidate.meta);
+
   // A policy with an empty `blocks` list forecloses nothing — buying it can
   // never lock you out of another choice, so it's safe to automate. Exclusive
   // policies (liberty vs tradition, monarchy vs republic …) stay manual.
@@ -5167,7 +5239,7 @@
 
   const autoPolicyChoice = (resources, goalKey) => {
     for (const meta of policyMetas()) {
-      if (!policyOpen(meta) || policyIsExclusive(meta)) continue;
+      if (!policyOpen(meta) || policyIsExclusive(meta) || isSocialismPolicy(meta)) continue;
       const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resources) };
       if (candidate.affordable) return candidate;
     }
@@ -5212,7 +5284,7 @@
 
   // Only EXCLUSIVE policies appear here — the executor auto-buys the rest.
   const availablePolicyChoices = (resources, goalKey) => policyMetas()
-    .filter((meta) => policyOpen(meta) && policyIsExclusive(meta))
+    .filter((meta) => policyOpen(meta) && policyIsExclusive(meta) && !isSocialismPolicy(meta))
     .map((meta) => ({ kind: "policy", meta, ...evaluate("policy", meta, resources), score: policyScore(meta, resources, goalKey) }))
     .sort((a, b) => b.score - a.score);
 
