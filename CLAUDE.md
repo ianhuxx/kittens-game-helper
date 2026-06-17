@@ -57,14 +57,20 @@ Long project               Temple, Ziggurat, religion/space/time structures
 
 Key invariants (see comments in the source for the why):
 
-- **Science storage unlock outranks long projects.** When science is capped and
-  the *next valuable, near-term* research is storage-blocked (its science price
-  exceeds science max but is within `SCIENCE_UNLOCK_REACH`× the cap), the planner
-  targets the best actionable cap-growth building (Library / Academy / Observatory
-  / any `scienceMax`-style effect) — never the storage-blocked tech directly, and
-  never a Temple. "Valuable" means the tech actually unlocks content
-  (`gatewayValue > 0`); a filler tech can't anchor a storage sprint. If no such
-  near-term tech is blocked, or no cap-growth candidate is actionable, the layer
+- **Science storage unlock outranks long projects, and its trigger is UNIVERSAL.**
+  It is goal-independent AND science-VALUE-independent: the only condition is
+  structural — the *next valuable research* (cheapest open, unresearched,
+  content-unlocking tech) cannot fit the science cap (cost > science max, but
+  within `SCIENCE_UNLOCK_REACH`× the cap). When that holds, science will climb to
+  the cap and stall there until storage grows, so the planner targets the best
+  actionable cap-growth building (Library / Academy / Observatory / any
+  `scienceMax`-style effect) — never the blocked tech directly, never a Temple —
+  *no matter how much science is currently banked*. Do NOT gate this on
+  "science is near cap": that made the plan flicker back to Temple the moment
+  science dropped below the cap mid-build. "Valuable" means the tech actually
+  unlocks content (`gatewayValue > 0`); a filler tech can't anchor a storage
+  sprint. If the next valuable tech already fits the cap (just research it), is
+  too far above the cap, or no cap-growth candidate is actionable, the layer
   yields and normal scoring (eventually a long project) resumes.
 - **Structural layers own the plan directly.** A live research sprint and a
   science-storage unlock both bypass the economy target-lock, so a half-saved

@@ -1277,6 +1277,35 @@ for (const d2Goal of ["balanced", "speedrun"]) {
 }
 
 /* ---------------------------------------------------------------------
+ * Test D3 — v2.1.3 live regression: science storage unlock must be VALUE-
+ * independent.  Science is only ~50% of cap (NOT near cap) but the next valuable
+ * tech (Electricity) still can't fit the cap, so storage must STILL be the plan.
+ * The old `isNearResourceCap` trigger flickered back to Temple the moment science
+ * dropped below the cap mid-build, releasing Observatory's reserved iron.  Both
+ * goals are asserted, and Temple is made fully affordable to prove it can't win.
+ * ------------------------------------------------------------------- */
+for (const d3Goal of ["balanced", "speedrun"]) {
+  setupAcoustics();
+  storage.set("kgh.goal", d3Goal);
+  dbg.forceActiveTarget(null);
+  acoustics.researched = true;       // Electricity is the next valuable research.
+  electricity.researched = false;
+  res("science").value = 32940; res("science").maxValue = 65850; // ~50% of cap → NOT near cap
+  res("compedium").value = 28;
+  res("wood").value = 2000; res("wood").maxValue = 5000;
+  res("beam").value = 30;
+  res("gold").value = 980; res("gold").maxValue = 1650; // Temple FULLY affordable
+  res("slab").value = 30; res("plate").value = 20; res("manuscript").value = 250;
+  fakeNow += 25000;
+  const d3Decision = dbg.selectStrategicTarget(d3Goal);
+  const d3Plan = dbg.planText(d3Goal);
+  const d3Now = dbg.nowText(d3Goal);
+  check(`Test D3 [${d3Goal}]: cap-blocked next tech keeps Science storage unlock even with science below cap`, d3Decision.layer === "Science storage unlock");
+  check(`Test D3 [${d3Goal}]: target is a cap-growth building, not the fully-affordable Temple`, d3Decision.target?.meta?.name !== "temple" && /library|academy|observatory/i.test(d3Decision.target?.meta?.name || ""));
+  check(`Test D3 [${d3Goal}]: panel + Now never fall back to Temple while the cap blocks Electricity`, !/Focus: Temple/i.test(d3Plan) && !/Temple/i.test(d3Now));
+}
+
+/* ---------------------------------------------------------------------
  * Test E — Job balancer follows the Acoustics chain (Hunters > Priests)
  * ------------------------------------------------------------------- */
 setupAcoustics();
