@@ -1246,29 +1246,35 @@ check("Test D: no Compendium crafted FOR Electricity (only Acoustics chain runs)
 
 
 /* ---------------------------------------------------------------------
- * Test D2 — exact v2.1.2 live issue: capped science, Electricity cannot fit
+ * Test D2 — exact v2.1.2 live issue: capped science, Electricity cannot fit.
+ * The Science-storage-unlock layer is a GOAL-INDEPENDENT invariant, so it must
+ * fire identically in balanced AND speedrun.  The live regression was speedrun-
+ * only (the layer used to be gated to balanced), so both goals are asserted here.
  * ------------------------------------------------------------------- */
-setupAcoustics();
-dbg.forceActiveTarget(null);
-acoustics.researched = true; // Electricity is the next meaningful research.
-electricity.researched = false;
-res("science").value = 65640; res("science").maxValue = 65640;
-res("compedium").value = 20; // compendium shortage exists, but must not be crafted yet for Electricity.
-res("wood").value = 2000; res("wood").maxValue = 5000;
-res("beam").value = 30;
-res("gold").value = 98; res("gold").maxValue = 500; // Temple affordable/nearly affordable.
-res("slab").value = 25; res("plate").value = 15; res("manuscript").value = 10;
 const academy = { name: "academy", label: "Academy", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 1000 }, { name: "beam", val: 25 }], effects: { scienceMax: 1000, scienceRatio: 0.1 } };
 if (!buildings.some((b) => b.name === "academy")) buildings.push(academy);
-fakeNow += 25000;
-const d2Decision = dbg.selectStrategicTarget("balanced");
-const d2Plan = dbg.planText("balanced");
-const d2Details = dbg.detailsText("balanced");
-const d2Now = dbg.nowText("balanced");
-check("Test D2: Electricity cap-block creates Science storage unlock layer", d2Decision.layer === "Science storage unlock");
-check("Test D2: planner chooses science storage candidate, not Temple", d2Decision.target?.meta?.name !== "temple" && /library|academy|observatory/i.test(d2Decision.target?.meta?.name || ""));
-check("Test D2: panel reports Electricity is storage-blocked and exact storage need", /Electricity is storage-blocked/i.test(d2Plan) && /\+5\.[0-9]+K science storage/i.test(d2Plan));
-check("Test D2: Now action builds storage unlock, not Temple or compendium for Electricity", !/Temple|Compendium for Electricity/i.test(`${d2Now} ${d2Details}`));
+for (const d2Goal of ["balanced", "speedrun"]) {
+  setupAcoustics();
+  storage.set("kgh.goal", d2Goal);
+  dbg.forceActiveTarget(null);
+  acoustics.researched = true; // Electricity is the next meaningful research.
+  electricity.researched = false;
+  res("science").value = 65640; res("science").maxValue = 65640;
+  res("compedium").value = 20; // compendium shortage exists, but must not be crafted yet for Electricity.
+  res("wood").value = 2000; res("wood").maxValue = 5000;
+  res("beam").value = 30;
+  res("gold").value = 98; res("gold").maxValue = 500; // Temple affordable/nearly affordable.
+  res("slab").value = 25; res("plate").value = 15; res("manuscript").value = 10;
+  fakeNow += 25000;
+  const d2Decision = dbg.selectStrategicTarget(d2Goal);
+  const d2Plan = dbg.planText(d2Goal);
+  const d2Details = dbg.detailsText(d2Goal);
+  const d2Now = dbg.nowText(d2Goal);
+  check(`Test D2 [${d2Goal}]: Electricity cap-block creates Science storage unlock layer`, d2Decision.layer === "Science storage unlock");
+  check(`Test D2 [${d2Goal}]: planner chooses science storage candidate, not Temple`, d2Decision.target?.meta?.name !== "temple" && /library|academy|observatory/i.test(d2Decision.target?.meta?.name || ""));
+  check(`Test D2 [${d2Goal}]: panel reports Electricity is storage-blocked and exact storage need`, /Electricity is storage-blocked/i.test(d2Plan) && /\+5\.[0-9]+K science storage/i.test(d2Plan));
+  check(`Test D2 [${d2Goal}]: Now action builds storage unlock, not Temple or compendium for Electricity`, !/Temple|Compendium for Electricity/i.test(`${d2Now} ${d2Details}`));
+}
 
 /* ---------------------------------------------------------------------
  * Test E — Job balancer follows the Acoustics chain (Hunters > Priests)

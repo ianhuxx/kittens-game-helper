@@ -81,6 +81,16 @@ const required = [
   "researchSprintJobNeeds",
   "Research sprint",
   "STRATEGIC_LAYERS",
+  // Science-storage unlock layer: when science is capped and the next valuable
+  // tech is storage-blocked, grow science storage (Library/Academy/Observatory)
+  // instead of letting Temple / a long project win — goal-INDEPENDENT.
+  "Science storage unlock",
+  "bestScienceStorageUnlock",
+  "scienceStorageUnlockCandidate",
+  "SCIENCE_UNLOCK_REACH",
+  // Socialism (and any other no-op policy) must never influence planning.
+  "isNoopPolicyCandidate",
+  "isSocialismPolicy",
   // The plan should include a rough completion estimate.
   "formatEta",
   "ETA",
@@ -184,6 +194,17 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
+// Version consistency: @version, HELPER_VERSION and package.json must always
+// agree.  Every change is expected to bump the version (see CLAUDE.md), so a
+// mismatch here usually means a bump was forgotten in one of the three places.
+const metaVersion = (source.match(/@version\s+([0-9]+\.[0-9]+\.[0-9]+)/) || [])[1];
+const constVersion = (source.match(/HELPER_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/) || [])[1];
+const pkg = JSON.parse(await readFile(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+if (!metaVersion || !constVersion || metaVersion !== constVersion || metaVersion !== pkg.version) {
+  console.error(`✗ Version mismatch — @version=${metaVersion}, HELPER_VERSION=${constVersion}, package.json=${pkg.version} (all three must match; bump every update).`);
+  process.exit(1);
+}
+
 // Strip the // ==UserScript== metadata block, then compile the body. Compiling
 // (not running) catches syntax errors without needing browser globals.
 const body = source.replace(/\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==/, "");
@@ -194,4 +215,4 @@ try {
   process.exit(1);
 }
 
-console.log("✓ Userscript parses, is fully native (no Kitten Scientists), and the reset-safety guard is intact.");
+console.log(`✓ Userscript parses, is fully native (no Kitten Scientists), reset-safety guard intact, version ${pkg.version} consistent.`);
