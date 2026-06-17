@@ -75,6 +75,14 @@ Key invariants (see comments in the source for the why):
 - **Structural layers own the plan directly.** A live research sprint and a
   science-storage unlock both bypass the economy target-lock, so a half-saved
   Temple can never hold the plan hostage.
+- **The science-storage unlock COMMITS to one building (no flicker).** The game
+  often doesn't expose a building's `scienceMax`/`scienceRatio` until
+  `calculateEffects` runs, so `scienceStorageGain` ties at 0 and the secondary
+  score/wait keys wobble tick-to-tick. Because this layer bypasses the lock, that
+  wobble used to flip the plan between Library and Observatory every tick. The
+  layer remembers its pick (`activeScienceUnlockId`) and keeps it until it leaves
+  the option set or a rival grows the cap >20% more — so it commits instead of
+  oscillating.
 - **Storage-blocked banks never become craft targets.** A tech whose final
   science price can't fit storage is deferred, not crafted toward (no compendiums
   for Electricity until the final cost fits).
