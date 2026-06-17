@@ -120,3 +120,4 @@ Key invariants (see comments in the source for the why):
   for Electricity until the final cost fits).
 - **No-op policies are excluded from planning** (`isNoopPolicyCandidate`, e.g.
   Socialism) — they are never gathered as candidates, auto-bought, or advised.
+- **Any non-target spender must evaluate expanded spend impact against the active target ledger.** Direct price checks are insufficient: surplus buys, cap relief, policies, diplomacy, trade, overflow crafting and other spenders must compare their direct costs plus crafted/raw chain impact against `buildTargetLedger()`/`violatesTargetLock()` so a ship/scaffold/plate/slab-style buy cannot consume the material chain being saved for the active focus.

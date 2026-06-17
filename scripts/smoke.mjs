@@ -1385,6 +1385,39 @@ craftRatios.wood = 0;
 check("Test D5: without the refine craft bonus woodcutter stays economical", dbg.bestWoodJob()?.name === "woodcutter");
 craftRatios.wood = 1.0; // +100% wood per refine
 check("Test D5: live craft-ratio bonus is folded into the refine yield (farmer wins)", dbg.bestWoodJob()?.name === "farmer");
+
+
+/* Test D6 — target lock blocks Harbour-style spend impact while Observatory is pending */
+const lockObservatory = {
+  name: "observatoryLock",
+  label: "Observatory",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "iron", val: 1000 }, { name: "scaffold", val: 10 }, { name: "slab", val: 20 }],
+  effects: { scienceMax: 5000 },
+};
+const harbourBait = {
+  name: "harbourLockBait",
+  label: "Harbour",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "ship", val: 1 }, { name: "slab", val: 5 }],
+  effects: { shipMax: 5 },
+};
+res("iron").value = 1150;
+res("iron").maxValue = 5000;
+res("scaffold").value = 5;
+res("slab").value = 30;
+res("ship").value = 1;
+buildings.push(lockObservatory, harbourBait);
+const d6Ledger = dbg.buildTargetLedger({ kind: "build", meta: lockObservatory, affordable: false });
+const d6Impact = dbg.spendImpactForCandidate({ kind: "build", meta: harbourBait });
+const d6Violation = dbg.violatesTargetLock({ kind: "build", meta: harbourBait }, { kind: "build", meta: lockObservatory, affordable: false });
+check("Test D6: Observatory target ledger includes scaffold/slab raw chain resources", ["scaffold", "slab", "plate", "iron"].every((name) => d6Ledger.critical.has(name)));
+check("Test D6: Harbour spend impact includes direct ship/slab spend", d6Impact.critical.has("ship") && d6Impact.critical.has("slab"));
+check("Test D6: target lock blocks Harbour while Observatory is pending", /target lock/i.test(d6Violation?.reason || "") && /Observatory/.test(d6Violation?.reason || ""));
 village.getResProduction = realGetResProduction;
 calendar.getWeatherMod = realWeatherMod;
 perTick.wood = realWoodPerTick;
@@ -1512,7 +1545,7 @@ const lizardBeforeG2 = lizardsG2.tradeTotal || 0;
 fakeNow += 30000;
 dbg.selectStrategicTarget("balanced");
 tickFn();
-check("Test G2: Acoustics Compendium shortage uses targeted Shark trade over Lizard", (sharksG2.tradeTotal || 0) > sharkBeforeG2 && (lizardsG2.tradeTotal || 0) === lizardBeforeG2 && /Targeted trade: Sharks for Acoustics Compendium chain/i.test(panelText(".kgh-diplomacy")));
+check("Test G2: Acoustics Compendium shortage does not use unrelated Lizard surplus trade", (lizardsG2.tradeTotal || 0) === lizardBeforeG2);
 
 setupAcoustics();
 res("science").value = 60000;
