@@ -60,20 +60,32 @@ state, not a baked-in base modifier:
 
 ## Strategic planner — selection invariants
 
-`selectStrategicTarget` chooses a target through ordered layers (highest wins).
-These are GOAL-INDEPENDENT unless noted — balanced, speedrun and milestone goals
-share the same structural priority so a fix in one mode can't regress another:
+There is a SINGLE autopilot — no user-facing goal modes or priority dropdown
+(v2.2.0). The `goalKey` plumbing still exists internally and the test suite
+exercises it with several keys, but real play always runs the one neutral goal
+(`balanced` via `getGoal()`), so layers are GOAL-INDEPENDENT in practice. The
+panel exposes a **manual build queue** instead of modes.
+
+`selectStrategicTarget` chooses a target through ordered layers (highest wins):
 
 ```
+Manual queue               ← the player's queued pick, when its front item is actionable
 Research sprint            persistent cross-tick contract to assemble a buyable tech
 Hard unlock / milestone    a tech/upgrade that opens new content or the goal path
-Science storage unlock     ← science is capped AND the next valuable tech is storage-blocked
+Science storage unlock     ← science cap blocks the next valuable tech
 Storage blocker            a resource cap is actively wasting income
 Production bottleneck       a needed resource has no production/craft path
 Housing / population
 Economy / normal growth     the general ROI scorer
 Long project               Temple, Ziggurat, religion/space/time structures
 ```
+
+- **The manual queue overrides everything when actionable.** `pickQueuedTarget`
+  returns the front-most queued item that resolves to a reachable candidate
+  (`solveCraftChain().reachable`); blocked/locked items are skipped so a bad pick
+  can never stall the bot, and completed items (`queueItemDone`) auto-remove. It
+  bypasses the economy target-lock like the other structural layers. The queue is
+  persisted under `kgh.queue` as `[{ id: "kind:name", val }]`.
 
 Key invariants (see comments in the source for the why):
 

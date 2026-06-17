@@ -1424,6 +1424,41 @@ perTick.wood = realWoodPerTick;
 craftRatios.wood = realWoodCraftRatio;
 
 /* ---------------------------------------------------------------------
+ * Test Q — manual build queue (v2.2.0 single-autopilot rework).  The player's
+ * queued pick overrides the autopilot (even an in-progress research sprint) when
+ * it is actionable; a cap-blocked/locked queued item is SKIPPED so the queue can
+ * never stall the bot; completed items auto-remove.
+ * ------------------------------------------------------------------- */
+setupAcoustics(); // caps science → autopilot would otherwise start an Acoustics sprint
+dbg.forceActiveTarget(null);
+dbg.queueClear();
+const queueMine = buildings.find((b) => b.name === "mine");
+queueMine.unlocked = true; queueMine.prices = [{ name: "wood", val: 100 }];
+res("wood").value = 5000; res("wood").maxValue = 88720;
+dbg.queueAdd("build:mine", queueMine.val);
+const qDecision = dbg.selectStrategicTarget("balanced");
+check("Test Q: queued building overrides the autopilot (Manual queue layer)", qDecision.layer === "Manual queue" && qDecision.target?.meta?.name === "mine");
+
+// A cap-blocked research queued in front is skipped; the next actionable item wins.
+acoustics.researched = true; electricity.researched = false;
+res("science").value = 65640; res("science").maxValue = 65640; // Electricity (71250) is cap-blocked
+dbg.queueClear();
+dbg.queueAdd("research:electricity", 0);
+dbg.queueAdd("build:mine", queueMine.val);
+const qBlocked = dbg.selectStrategicTarget("balanced");
+check("Test Q: a cap-blocked queued tech is skipped, next actionable item wins", qBlocked.layer === "Manual queue" && qBlocked.target?.meta?.name === "mine");
+
+// Completed items auto-remove from the stored queue.
+dbg.queueClear();
+electricity.researched = true;
+dbg.queueAdd("research:electricity", 0);
+dbg.queueAdd("build:mine", queueMine.val);
+dbg.selectStrategicTarget("balanced");
+check("Test Q: completed queued items auto-remove", !dbg.queue().some((item) => item.id === "research:electricity"));
+dbg.queueClear();
+electricity.researched = false;
+
+/* ---------------------------------------------------------------------
  * Test E — Job balancer follows the Acoustics chain (Hunters > Priests)
  * ------------------------------------------------------------------- */
 setupAcoustics();

@@ -88,6 +88,12 @@ const required = [
   "bestScienceStorageUnlock",
   "scienceStorageUnlockCandidate",
   "SCIENCE_UNLOCK_REACH",
+  // Single-autopilot rework: one autopilot + a persistent manual build queue
+  // that overrides the planner when its front item is actionable.
+  "Manual queue",
+  "pickQueuedTarget",
+  "renderQueueControl",
+  "kgh-queue-list",
   // Socialism (and any other no-op policy) must never influence planning.
   "isNoopPolicyCandidate",
   "isSocialismPolicy",

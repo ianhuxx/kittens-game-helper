@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.7
+// @version      2.2.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.1.7";
+  const HELPER_VERSION = "2.2.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -133,6 +133,51 @@
   const getPriority = () => {
     const stored = localStorage.getItem(PRIORITY_KEY);
     return PRIORITIES[stored] ? stored : DEFAULT_PRIORITY;
+  };
+
+  /* --------------------------- manual build queue ---------------------------
+   * The single autopilot picks the best next action on its own, but the player
+   * can force specific buildings / research / workshop upgrades to the FRONT of
+   * the plan from the panel.  The queue is an ordered list of { id, val } where
+   * id is the planner's own `${kind}:${name}` targetId and val is meta.val at
+   * enqueue time, so a building counts as DONE once one more has been built. The
+   * planner consumes the front-most ACTIONABLE item (see pickQueuedTarget); a
+   * blocked/unreachable item is skipped so a bad pick can never stall the bot.
+   */
+  const QUEUE_KEY = "kgh.queue";
+  const readQueue = () => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+      return Array.isArray(raw) ? raw.filter((item) => item && typeof item.id === "string") : [];
+    } catch (error) {
+      return [];
+    }
+  };
+  const writeQueue = (queue) => {
+    try {
+      localStorage.setItem(QUEUE_KEY, JSON.stringify(queue.slice(0, 24)));
+    } catch (error) {
+      /* storage unavailable — queue is best-effort */
+    }
+  };
+  const queueHas = (id) => readQueue().some((item) => item.id === id);
+  const queueAdd = (id, val) => {
+    if (!id || queueHas(id)) return;
+    const queue = readQueue();
+    queue.push({ id, val: isFinite(val) ? Number(val) : 0 });
+    writeQueue(queue);
+  };
+  const queueRemove = (id) => writeQueue(readQueue().filter((item) => item.id !== id));
+  const queueMove = (id, dir) => {
+    const queue = readQueue();
+    const i = queue.findIndex((item) => item.id === id);
+    if (i < 0) return;
+    const j = i + (dir < 0 ? -1 : 1);
+    if (j < 0 || j >= queue.length) return;
+    const tmp = queue[i];
+    queue[i] = queue[j];
+    queue[j] = tmp;
+    writeQueue(queue);
   };
 
   const metaText = (meta) => `${meta.name || ""} ${meta.label || ""} ${meta.title || ""}`.toLowerCase();
@@ -2744,6 +2789,7 @@
   // spending science on Compendium (which drops science below cap) does NOT hand
   // the plan back to generic scoring / Temple.
   const STRATEGIC_LAYERS = {
+    manualQueue: "Manual queue",
     researchSprint: "Research sprint",
     hardUnlock: "Hard unlock / milestone",
     scienceStorageUnlock: "Science storage unlock",
@@ -3153,6 +3199,58 @@
     return { target: chosen.candidate, blocked, need };
   };
 
+  // Resolve the front-most ACTIONABLE manual-queue item to a strategic target.
+  // Completed items (researched / one more built) are dropped from storage; an
+  // item that isn't currently a reachable candidate (still locked, or storage-
+  // blocked) is skipped so the queue can never stall the bot — the next workable
+  // item, or the autopilot, takes over.  Returns { candidate, solver } or null.
+  // Resolve a queued targetId to its live game meta even when it is no longer a
+  // candidate (e.g. a researched tech drops out of the open list) — needed so a
+  // completed item can be detected and removed.
+  const lookupMetaById = (id) => {
+    const [kind, name] = String(id).split(":");
+    try {
+      if (kind === "research") return techByName(name);
+      if (kind === "build") return buildingByName(name);
+      if (kind === "upgrade") return (window.gamePage.workshop.upgrades || []).find((u) => u.name === name) || null;
+      if (kind === "religion") return religionUpgrades().find((u) => u.name === name) || null;
+      if (kind === "space") return spaceMetas().find((m) => m.name === name) || null;
+      if (kind === "time") return timeMetas().find((m) => m.name === name) || null;
+    } catch (error) {
+      /* meta not available */
+    }
+    return null;
+  };
+
+  const queueItemDone = (item) => {
+    const [kind] = String(item.id).split(":");
+    const meta = lookupMetaById(item.id);
+    if (!meta) return false; // unknown / not yet unlocked → keep it queued
+    if (kind === "research" || kind === "upgrade" || kind === "policy") return !!meta.researched;
+    if (kind === "religion") return religionUpgradePurchased(meta);
+    return (Number(meta.val) || 0) > (Number(item.val) || 0); // one more built
+  };
+
+  const pickQueuedTarget = (candidates, resources) => {
+    const queue = readQueue();
+    if (!queue.length) return null;
+    let chosen = null;
+    let changed = false;
+    const remaining = [];
+    for (const item of queue) {
+      if (queueItemDone(item)) { changed = true; continue; } // drop finished item, advance
+      remaining.push(item);
+      if (chosen) continue;
+      const candidate = findCandidateById(candidates, item.id);
+      if (candidate) {
+        const solver = solveCraftChain(resources, candidate);
+        if (solver.reachable) chosen = { candidate, solver }; // first actionable item wins
+      }
+    }
+    if (changed) writeQueue(remaining);
+    return chosen;
+  };
+
   const classifyCandidateLayer = (candidate, resources, goalKey) => {
     if (!candidate) return STRATEGIC_LAYERS.economy;
     if (candidate.kind === "research" || candidate.kind === "upgrade") {
@@ -3199,6 +3297,25 @@
    */
   const selectStrategicTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
+
+    // Manual queue wins outright when its front item is actionable — the player's
+    // explicit pick (Magneto, a workshop upgrade, a specific tech) outranks the
+    // autopilot.  A blocked/locked queue item is skipped inside pickQueuedTarget,
+    // so this never stalls the bot; it just falls through to autopilot below.
+    const queued = pickQueuedTarget(candidates, resources);
+    if (queued && queued.candidate) {
+      const protectedChain = queued.solver.protectedChain && queued.solver.protectedChain.size
+        ? queued.solver.protectedChain : candidateCraftChainResources(queued.candidate);
+      return {
+        candidates,
+        target: queued.candidate,
+        layer: STRATEGIC_LAYERS.manualQueue,
+        reason: `manual queue: ${labelOf(queued.candidate.meta)}`,
+        protectedChain,
+        rejectedTopCandidates: [],
+      };
+    }
+
     const { sprint, deferred } = planResearchSprint(candidates, resources, goalKey);
 
     if (sprint && sprint.candidate) {
@@ -3350,7 +3467,8 @@
     // research sprint is its own cross-tick contract (validated in
     // planResearchSprint), and a science-storage unlock outranks every long
     // project while a valuable tech is cap-blocked.  Return that target directly.
-    if (decision.layer === STRATEGIC_LAYERS.researchSprint ||
+    if (decision.layer === STRATEGIC_LAYERS.manualQueue ||
+        decision.layer === STRATEGIC_LAYERS.researchSprint ||
         decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock) {
       activeTarget = null;
       return preferred;
@@ -3473,6 +3591,17 @@
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
+    }
+
+    // Science-storage unlock: while we build the cap-growth building, keep
+    // scholars refilling science toward the cap-blocked tech, so it becomes
+    // buyable the instant the cap opens.  Without this, science sits at the OLD
+    // cap with scholars idle, the tech never turns affordable, and the unlock
+    // never completes on its own (the "no scholar / no science / I buy it myself"
+    // loop).  Suppressed only when science is genuinely at the cap (anti-waste).
+    if (lastStrategicDecision && lastStrategicDecision.scienceStorageBlocker &&
+        jobByName("scholar") && !isNearResourceCap(resources, "science")) {
+      scoreNeed(needs, "science", 8);
     }
 
     // Lookahead: the next few runner-up candidates also pull a little weight,
@@ -3598,17 +3727,19 @@
     // scholars at 0 the instant science caps, even mid research-sprint).
     const cappedZeroJobs = new Set();
 
+    // Wood demand goes ALL-IN on the single most economical source (after food is
+    // covered by the farmer/starvation needs).  If refining a farmer's catnip wins
+    // the live comparison, woodcutters drop out of the wood need entirely (the
+    // net-wood starvation guard below still re-staffs them in an emergency);
+    // otherwise woodcutters take the whole wood demand and farmers stay on food.
+    const woodViaFarmer = (needs.wood || 0) > 0 && ((bestWoodJob() || {}).name === "farmer");
+
     for (const job of jobs) {
       const produced = jobResourceFor(job);
       const needKey = produced === "catpower" ? "manpower" : produced;
       let weight = needs[needKey] || 0;
-      if (job.name === "woodcutter" && needs.wood > 0) weight = Math.max(weight, needs.wood);
-      if (job.name === "farmer" && needs.wood > 0 && bestWoodJob() && bestWoodJob().name === "farmer") {
-        weight = Math.max(weight, needs.wood + 1);
-      }
-      if (job.name === "woodcutter" && bestWoodJob() && bestWoodJob().name === "farmer") {
-        weight = Math.max(Math.min(weight, 0.8), Math.min(needs.wood || 0, 0.8));
-      }
+      if (job.name === "woodcutter" && (needs.wood || 0) > 0 && !woodViaFarmer) weight = Math.max(weight, needs.wood);
+      if (job.name === "farmer" && woodViaFarmer) weight = Math.max(weight, needs.wood + 1);
       // Universal anti-waste rule: stop staffing a job whose output bank is
       // essentially full — unless the economy still wants it (hunting keeps
       // luxuries/mood up even when catpower is high).
@@ -4099,6 +4230,21 @@
     }
   };
 
+  // "12 Scaffold" — the craft label with the number still needed (deficit folded
+  // through the craft-ratio bonus), so the panel shows how much is being made.
+  const craftQtyText = (resources, name) => {
+    const craft = craftByName(name);
+    if (!craft) return resTitle(resources, name);
+    const need = (() => {
+      // How many of this craft the current target still needs.
+      const target = lastStrategicDecision && lastStrategicDecision.target;
+      const cost = target ? pricesFor(target.kind, target.meta).find((c) => c && c.name === name) : null;
+      const deficit = cost ? cost.val - resValueOf(resources, name) : 0;
+      return deficit > 0 ? Math.max(1, Math.ceil(deficit / Math.max(1, 1 + craftRatioFor(name)))) : 0;
+    })();
+    return `${need > 0 ? fmt(need) + " " : ""}${craftLabel(name)}`;
+  };
+
   const getNowAction = (resources, goalKey) => {
     const target = getTargetCached(resources, goalKey);
     if (!target) return "scanning…";
@@ -4110,7 +4256,7 @@
       const label = labelOf(target.meta);
       const step = decision.sprint.currentStep;
       if (step && HUNTABLE_RESOURCES.has(step)) return `hunt for ${resTitle(resources, step)} for ${label} chain`;
-      if (step && craftByName(step)) return `craft ${craftLabel(step)} for ${label} chain`;
+      if (step && craftByName(step)) return `craft ${craftQtyText(resources, step)} for ${label} chain`;
       if (step && CAP_DRAIN_RESOURCES.has(step)) return `wait/refill ${resTitle(resources, step)} for ${label} chain`;
       // No craftable step short → only the cap-drain banks remain to refill.
       const shortBank = pricesFor(target.kind, target.meta).find((c) => c && c.name && CAP_DRAIN_RESOURCES.has(c.name) && resValueOf(resources, c.name) < c.val);
@@ -4120,7 +4266,14 @@
     const titaniumHint = titaniumRouteHint(resources, goalKey);
     if (titaniumHint) return `titanium path: ${titaniumHint}`;
     const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
-    if (craftable) return `craft ${craftLabel(craftable.name)} for ${labelOf(target.meta)}`;
+    if (craftable) {
+      // Surface the immediate actionable step (e.g. Beam before Scaffold) and how
+      // many to craft, so the panel shows what is actually being converted.
+      const step = deepestActionableStep(resources, craftable.name);
+      if (HUNTABLE_RESOURCES.has(step)) return `hunt for ${resTitle(resources, step)} for ${labelOf(target.meta)}`;
+      const via = step !== craftable.name && craftByName(step) ? ` (via ${craftLabel(step)})` : "";
+      return `craft ${craftQtyText(resources, craftable.name)}${via} for ${labelOf(target.meta)}`;
+    }
     return `gather ${target.missing || "prerequisites"} (reserved)`;
   };
 
@@ -5536,6 +5689,65 @@
   let policyApplyEl;
   let nowEl;
   let noteEl;
+  let queueSelectEl;
+  let queueAddEl;
+  let queueListEl;
+
+  // Human label for a queued targetId ("build:magneto" → "🏗 Magneto"), resolved
+  // against the live candidate when possible so it shows the game's own name.
+  const KIND_QUEUE_ICON = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", space: "🚀", time: "⏳", policy: "📜" };
+  const queueItemLabel = (id, candidates) => {
+    const candidate = findCandidateById(candidates || [], id);
+    const [kind, name] = id.split(":");
+    const icon = KIND_QUEUE_ICON[kind] || "🎯";
+    return `${icon} ${candidate ? labelOf(candidate.meta) : name}`;
+  };
+
+  // Populate the "add to queue" picker with the buyable/open candidates not
+  // already queued, and render the current queue with reorder/remove controls.
+  const renderQueueControl = (resources, goalKey) => {
+    if (!queueSelectEl || !queueListEl) return;
+    const candidates = getCandidatesCached(resources, goalKey);
+    const queued = new Set(readQueue().map((item) => item.id));
+    const current = queueSelectEl.value;
+    const pickable = candidates
+      .filter((c) => ["build", "research", "upgrade", "religion", "space", "time"].includes(c.kind))
+      .filter((c) => !queued.has(targetId(c)) && !targetComplete(c))
+      .slice(0, 60);
+    queueSelectEl.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = pickable.length ? "Add to build queue…" : "Nothing new to queue";
+    queueSelectEl.appendChild(placeholder);
+    for (const c of pickable) {
+      const option = document.createElement("option");
+      option.value = targetId(c);
+      option.textContent = `${queueItemLabel(targetId(c), candidates)}${c.affordable ? " — ready" : ""}`;
+      queueSelectEl.appendChild(option);
+    }
+    const options = queueSelectEl.options ? [...queueSelectEl.options] : [];
+    if (options.some((o) => o.value === current)) queueSelectEl.value = current;
+
+    const queue = readQueue();
+    queueListEl.innerHTML = "";
+    queue.forEach((item, index) => {
+      const row = document.createElement("div");
+      row.className = "kgh-row";
+      row.style.cssText = "gap:3px;align-items:center;justify-content:space-between";
+      const label = document.createElement("span");
+      label.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      label.textContent = `${index + 1}. ${queueItemLabel(item.id, candidates)}`;
+      const controls = document.createElement("span");
+      controls.style.cssText = "white-space:nowrap;flex:0 0 auto";
+      controls.innerHTML =
+        `<button type="button" class="kgh-hbtn" data-id="${item.id}" data-action="up" title="Move up">▲</button>` +
+        `<button type="button" class="kgh-hbtn" data-id="${item.id}" data-action="down" title="Move down">▼</button>` +
+        `<button type="button" class="kgh-hbtn" data-id="${item.id}" data-action="remove" title="Remove">✕</button>`;
+      row.appendChild(label);
+      row.appendChild(controls);
+      queueListEl.appendChild(row);
+    });
+  };
 
   const renderPolicyControl = (resources, goalKey) => {
     if (!policyEl) return;
@@ -5631,6 +5843,7 @@
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
+      renderQueueControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
       lastTickAt = Date.now();
     } catch (error) {
@@ -5689,14 +5902,11 @@
       '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
       '<div class="kgh-body" style="display:grid;gap:5px">',
       '<div class="kgh-row"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer">Autopilot: ON</button></div>',
-      '<select class="kgh-goal" aria-label="goal" style="width:100%">',
-      // Goal options come straight from GOALS so the dropdown, the planner and
-      // the progress line can never drift apart.
-      ...Object.entries(GOALS).map(([key, goal]) => `<option value="${key}">🏁 ${goal.label}</option>`),
-      "</select>",
-      '<select class="kgh-priority" aria-label="manual priority" style="width:100%">',
-      ...Object.entries(PRIORITIES).map(([key, priority]) => `<option value="${key}">🎚 ${priority.label}</option>`),
-      "</select>",
+      // Single autopilot — no goal modes.  The manual build queue lets you force
+      // specific buildings / research / workshop upgrades to the front of the plan.
+      '<div class="kgh-row" style="gap:4px"><select class="kgh-queue-select kgh-grow" aria-label="add to build queue" style="min-width:0"></select>',
+      '<button type="button" class="kgh-queue-add" style="cursor:pointer" title="Force this to the front of the plan">＋ Queue</button></div>',
+      '<div class="kgh-queue-list" style="display:grid;gap:2px"></div>',
       '<small class="kgh-status" style="color:#9fd0ff">…</small>',
       '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
       '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
@@ -5725,11 +5935,11 @@
       "</div>",
     ].join("");
 
-    const select = box.querySelector("select");
-    const goalSelect = box.querySelector(".kgh-goal");
     const toggleBtn = box.querySelector(".kgh-autopilot");
-    const prioritySelect = box.querySelector(".kgh-priority");
     const minBtn = box.querySelector(".kgh-min");
+    queueSelectEl = box.querySelector(".kgh-queue-select");
+    queueAddEl = box.querySelector(".kgh-queue-add");
+    queueListEl = box.querySelector(".kgh-queue-list");
     const body = box.querySelector(".kgh-body");
     statusEl = box.querySelector(".kgh-status");
     goalEl = box.querySelector(".kgh-goal-line");
@@ -5763,18 +5973,25 @@
       applyProfile();
     });
     syncToggle();
-    goalSelect.value = getGoal();
-    goalSelect.addEventListener("change", () => {
-      localStorage.setItem(GOAL_KEY, goalSelect.value);
+    // Manual build queue: add the selected candidate, then re-plan immediately.
+    queueAddEl.addEventListener("click", () => {
+      const id = queueSelectEl && queueSelectEl.value;
+      if (!id) return;
+      const candidate = findCandidateById(getCandidatesCached(resourceMap(), getGoal()), id);
+      queueAdd(id, candidate ? (Number(candidate.meta.val) || 0) : 0);
       activeTarget = null;
-      activeSprint = null; // a manual goal change is an explicit priority change
       tick();
     });
-    prioritySelect.value = getPriority();
-    prioritySelect.addEventListener("change", () => {
-      localStorage.setItem(PRIORITY_KEY, prioritySelect.value);
+    // Delegated controls for the queue rows (▲ up, ▼ down, ✕ remove).
+    queueListEl.addEventListener("click", (event) => {
+      const btn = event.target && event.target.closest ? event.target.closest("button[data-id]") : null;
+      if (!btn) return;
+      const id = btn.getAttribute("data-id");
+      const action = btn.getAttribute("data-action");
+      if (action === "up") queueMove(id, -1);
+      else if (action === "down") queueMove(id, 1);
+      else if (action === "remove") queueRemove(id);
       activeTarget = null;
-      activeSprint = null;
       tick();
     });
     policyApplyEl.addEventListener("click", () => {
@@ -5834,6 +6051,10 @@
     bestWoodJob() {
       return bestWoodJob();
     },
+    queue: () => readQueue(),
+    queueAdd: (id, val) => queueAdd(id, val),
+    queueRemove: (id) => queueRemove(id),
+    queueClear: () => writeQueue([]),
     forceActiveTarget(candidate) {
       // A debug/manual target override resets ALL locks so the planner starts
       // from a clean state (mirrors an explicit player priority change).
