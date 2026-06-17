@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.1
+// @version      2.1.2
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.1.0";
+  const HELPER_VERSION = "2.1.2";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -665,20 +665,10 @@
         .sort((a, b) => b.score - a.score)[0];
       if (targeted && !shouldSaveForExplorers(resources, goalKey)) {
         const race = targeted.race;
-        const before = resourceMap();
-        diplomacy.tradeAll(race);
-        const after = resourceMap();
+        const measured = withActionResourceDeltas(() => diplomacy.tradeAll(race), tradeDeltaNamesForRace(race, targeted.prices));
         lastTradeAt = Date.now();
         diplomacyPlanText = `Targeted trade: ${race.title || race.name || "partner"} for ${labelOf(target.meta)} Compendium chain`;
-        const gains = targeted.goods.map(({ name }) => {
-          const delta = resourceValue(after, name) - resourceValue(before, name);
-          return delta > 0 ? `+${fmt(delta)} ${resTitle(after, name)}` : null;
-        }).filter(Boolean).join(", ");
-        const costs = targeted.prices.map((price) => {
-          const delta = resourceValue(after, price.name) - resourceValue(before, price.name);
-          return delta < 0 ? `${fmt(delta)} ${resTitle(after, price.name)}` : null;
-        }).filter(Boolean).join(", ");
-        pushLog(`🤝 ${race.title || race.name || "partner"} trade: ${gains || `targeted ${labelOf(target.meta)} chain`}${costs ? ` (${costs})` : ""}`);
+        pushLog(`🤝 ${race.title || race.name || "partner"} trade: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}`);
         return;
       }
       if ((reserved.manpower || 0) > 0 || (reserved.gold || 0) > 0) return; // plan owns these
@@ -699,9 +689,9 @@
         }
       }
       if (best) {
-        diplomacy.tradeAll(best);
+        const measured = withActionResourceDeltas(() => diplomacy.tradeAll(best), tradeDeltaNamesForRace(best));
         lastTradeAt = Date.now();
-        pushLog(`🤝 traded surplus catpower with ${best.title || best.name || "a partner"}`);
+        pushLog(`🤝 ${best.title || best.name || "partner"} trade: ${measured.suffix}; reason surplus catpower near cap`);
       }
     } catch (error) {
       /* ignore trade failures */
@@ -1041,10 +1031,11 @@
     }
     if (units <= 0) return false;
 
-    if (craftUnits(name, units)) {
+    const measured = withActionResourceDeltas(() => craftUnits(name, units));
+    if (measured.result) {
       craftPlanText = `Craft: made ${fmt(units * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
       if (Date.now() - lastCraftLog > 15000) {
-        pushLog(`🧰 ${craftPlanText}`);
+        pushLog(`🧰 ${craftPlanText}: ${measured.suffix}${target ? `; reason ${labelOf(target.meta)} chain` : ""}`);
         lastCraftLog = Date.now();
       }
       return units >= wantUnits;
@@ -1165,10 +1156,11 @@
         return;
       }
       const units = Math.max(1, Math.min(best.maxUnits, best.score >= 100 ? Math.ceil(best.maxUnits * 0.5) : Math.ceil(best.maxUnits * 0.2)));
-      if (craftUnits(best.name, units)) {
+      const measured = withActionResourceDeltas(() => craftUnits(best.name, units));
+      if (measured.result) {
         overflowPlanText = `Overflow: converted surplus into ${craftLabel(best.name)}`;
         if (Date.now() - lastOverflowLog > 20000) {
-          pushLog(`📦 ${overflowPlanText}`);
+          pushLog(`📦 ${overflowPlanText}: ${measured.suffix}; reason overflow/capped storage`);
           lastOverflowLog = Date.now();
         }
       }
@@ -3724,11 +3716,12 @@
         threshold = Math.max(threshold, Math.min(cp.maxValue * 0.95, exploreCost + huntCost));
       }
       if (cp.value >= threshold) {
-        village.huntAll();
+        const measured = withActionResourceDeltas(() => village.huntAll(), new Set(["manpower", "furs", "ivory"]));
         if (Date.now() - lastHuntLog > 30000) {
           const chainLabel = sprint && sprint.candidate ? labelOf(sprint.candidate.meta) : "research";
-          const reason = chainHuntNeed ? ` for furs for ${chainLabel} chain` : economyNeed > 0.5 ? " for luxuries/mood" : "";
-          pushLog(`🏹 sent hunters${reason}`);
+          const reason = chainHuntNeed ? `furs for ${chainLabel} chain` : economyNeed > 0.5 ? "luxuries/mood" : "catpower near cap";
+          const legacyPhrase = chainHuntNeed ? `; sent hunters for furs for ${chainLabel} chain` : "";
+          pushLog(`🏹 hunting: ${measured.suffix}; reason ${reason}${legacyPhrase}`);
           lastHuntLog = Date.now();
         }
       }
@@ -4800,13 +4793,11 @@
       return false;
     }
     const batch = zebraTradeBatchSize(resources, reserved, goalKey, prices);
-    const titaniumBefore = resourceValue(resources, "titanium");
-    if (tradeWithRace(zebras, batch)) {
-      const gained = Math.max(0, resourceValue(resourceMap(), "titanium") - titaniumBefore);
+    const measured = withActionResourceDeltas(() => tradeWithRace(zebras, batch), tradeDeltaNamesForRace(zebras, prices));
+    if (measured.result) {
       const batchNote = batch > 1 ? `×${batch}` : "";
-      const gainNote = gained > 0 ? ` (+${fmt(gained)} Ti)` : "";
-      diplomacyPlanText = `Diplomacy: traded with Zebras${batchNote} for titanium path${gainNote} · ${odds}`;
-      pushLog(`🦓 ${diplomacyPlanText}`);
+      diplomacyPlanText = `Diplomacy: traded with Zebras${batchNote} for titanium path · ${odds}`;
+      pushLog(`🦓 Zebras trade${batchNote ? ` ${batchNote}` : ""}: ${measured.suffix}; reason titanium path`);
       return true;
     }
     return false;
@@ -4882,20 +4873,11 @@
     const best = options[0];
     if (!best) return false;
     const batch = Math.max(1, Math.min(best.affordable, 10));
-    const before = resourceMap();
-    if (!tradeWithRace(best.race, batch)) return false;
-    const after = resourceMap();
-    const gains = best.goods.map(({ name }) => {
-      const delta = resourceValue(after, name) - resourceValue(before, name);
-      return delta > 0 ? `+${fmt(delta)} ${resTitle(after, name)}` : null;
-    }).filter(Boolean).join(", ");
-    const costs = best.prices.map((price) => {
-      const delta = resourceValue(after, price.name) - resourceValue(before, price.name);
-      return delta < 0 ? `${fmt(delta)} ${resTitle(after, price.name)}` : null;
-    }).filter(Boolean).join(", ");
+    const measured = withActionResourceDeltas(() => tradeWithRace(best.race, batch), tradeDeltaNamesForRace(best.race, best.prices));
+    if (!measured.result) return false;
     const raceName = best.race.title || best.race.name || "civilization";
     diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} Compendium chain`;
-    pushLog(`🤝 ${raceName} trade: ${gains || "target-chain goods"}${costs ? ` (${costs})` : ""}`);
+    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}`);
     return true;
   };
 
@@ -4908,9 +4890,10 @@
       .sort((a, b) => (a.race.embassyLevel || 0) - (b.race.embassyLevel || 0));
     const next = races[0];
     if (!next) return false;
-    if (buyEmbassyForRace(next.race)) {
+    const measured = withActionResourceDeltas(() => buyEmbassyForRace(next.race), new Set(next.prices.map((price) => price.name)));
+    if (measured.result) {
       diplomacyPlanText = `Diplomacy: built embassy with ${next.race.title || next.race.name} (level ${next.race.embassyLevel || 1})`;
-      pushLog(`🤝 ${diplomacyPlanText}`);
+      pushLog(`🏛 embassy with ${next.race.title || next.race.name}: ${measured.spent || "cost paid"}; level ${next.race.embassyLevel || 1}; reason diplomacy`);
       return true;
     }
     return false;
@@ -4999,6 +4982,49 @@
     renderLog();
   };
 
+  // Recent-action logging is action-scoped, not tick-scoped: every automation
+  // click/craft/trade/hunt takes a resource snapshot immediately before and
+  // after that exact operation.  This prevents same-tick side effects (hunters,
+  // embassies, overflow crafts, job changes, normal production) from being
+  // merged into one misleading "trade" line.
+  const resourceSnapshot = () => resourceMap();
+
+  const resourceDeltasBetween = (before, after, names = null) => {
+    const wanted = names ? new Set([...names].filter(Boolean)) : null;
+    const seen = new Set([...(before ? before.keys() : []), ...(after ? after.keys() : [])]);
+    return [...seen]
+      .filter((name) => !wanted || wanted.has(name))
+      .map((name) => ({ name, delta: resourceValue(after, name) - resourceValue(before, name) }))
+      .filter(({ delta }) => Math.abs(delta) > 0.0001);
+  };
+
+  const formatResourceDeltaList = (resources, deltas, sign) => deltas
+    .filter(({ delta }) => sign > 0 ? delta > 0 : delta < 0)
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+    .slice(0, 6)
+    .map(({ name, delta }) => formatDelta(resources, name, delta))
+    .join(", ");
+
+  const formatActionDeltas = (before, after, names = null) => {
+    const deltas = resourceDeltasBetween(before, after, names);
+    const gained = formatResourceDeltaList(after, deltas, 1);
+    const spent = formatResourceDeltaList(after, deltas, -1);
+    return { deltas, gained, spent, suffix: `${gained || "no resource gain"}${spent ? ` (${spent})` : ""}` };
+  };
+
+  const tradeDeltaNamesForRace = (race, prices = null) => new Set([
+    ...((prices || tradePricesForRace(race)).map((price) => price && price.name)),
+    ...(((race && race.sells) || []).map((sell) => sell && sell.name)),
+    ...(((race && race.buys) || []).map((buy) => buy && buy.name)),
+  ].filter(Boolean));
+
+  const withActionResourceDeltas = (action, names = null) => {
+    const before = resourceSnapshot();
+    const result = action();
+    const after = resourceSnapshot();
+    return { result, before, after, ...formatActionDeltas(before, after, names) };
+  };
+
 
   const diplomacyRaces = (game) => {
     try {
@@ -5036,60 +5062,13 @@
         pushLog(`🤝 embassy with ${race.title || race.name || "civilization"} → ${now.embassyLevel}`);
       }
       if (seeded && now.tradeCount != null && before.tradeCount != null && now.tradeCount > before.tradeCount) {
-        pushLog(`🤝 trade with ${race.title || race.name || "civilization"} (${now.tradeCount})`);
+        pushLog(`📋 cycle summary: ${race.title || race.name || "civilization"} trade counter → ${now.tradeCount} (resource deltas not action-scoped)`);
       }
       prev.race[key] = now;
     }
   };
 
-  const TRADE_LOOT_RESOURCES = new Set([
-    "wood", "minerals", "iron", "coal", "gold", "titanium", "uranium",
-    "furs", "ivory", "spice", "unicorns", "starchart", "blueprint", "parchment", "manuscript", "compedium",
-    "beam", "slab", "plate", "steel", "gear", "scaffold", "ship",
-  ]);
-
-  const TRADE_SPEND_RESOURCES = new Set(["gold", "manpower", "catpower", "culture"]);
-
   const formatDelta = (resources, name, amount) => `${amount > 0 ? "+" : ""}${fmt(amount)} ${resTitle(resources, name)}`;
-
-  const resourceDeltaLooksLikeTradeLoot = (resources, name, amount) => {
-    if (amount <= 0 || !TRADE_LOOT_RESOURCES.has(name)) return false;
-    const produced = Math.max(0, productionFor(name));
-    return amount >= Math.max(1, produced * 3);
-  };
-
-  const trackTradeResourceDeltas = () => {
-    const resources = resourceMap();
-    const deltas = [];
-    for (const res of resources.values()) {
-      if (!res || !res.name || !isFinite(res.value)) continue;
-      const before = prev.resource[res.name];
-      if (seeded && isFinite(before)) {
-        const delta = res.value - before;
-        if (Math.abs(delta) > 0.0001) deltas.push({ name: res.name, delta });
-      }
-      prev.resource[res.name] = res.value;
-    }
-    if (!seeded || !deltas.length) return;
-
-    const spent = deltas
-      .filter(({ name, delta }) => delta < 0 && TRADE_SPEND_RESOURCES.has(name === "catpower" ? "manpower" : name))
-      .filter(({ name, delta }) => Math.abs(delta) >= (name === "manpower" || name === "catpower" ? 5 : 1));
-    const loot = deltas
-      .filter(({ name, delta }) => resourceDeltaLooksLikeTradeLoot(resources, name, delta))
-      .sort((a, b) => b.delta - a.delta);
-
-    if (!spent.length || !loot.length) return;
-    const spentCatpowerOnly = spent.every(({ name }) => name === "manpower" || name === "catpower");
-    const huntLootOnly = loot.every(({ name }) => name === "furs" || name === "ivory");
-    const lootText = loot.slice(0, 4).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
-    const spendText = spent.slice(0, 3).map(({ name, delta }) => formatDelta(resources, name, delta)).join(", ");
-    if (spentCatpowerOnly && huntLootOnly) {
-      pushLog(`🏹 hunting: ${lootText}${spendText ? ` (${spendText})` : ""}`);
-      return;
-    }
-    pushLog(`🤝 trade: ${lootText}${spendText ? ` (${spendText})` : ""}`);
-  };
 
   // Detect what changed in game state and log it (no dependency on KS/game log
   // message formats — we just diff building counts and researched flags).
@@ -5119,7 +5098,6 @@
         prev.upgrade[u.name] = !!u.researched;
       }
       trackDiplomacyActionDeltas(game);
-      trackTradeResourceDeltas();
       seeded = true;
     } catch (error) {
       /* ignore */

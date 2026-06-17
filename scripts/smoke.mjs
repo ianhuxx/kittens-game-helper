@@ -726,7 +726,7 @@ res("spice").value += 70;
 res("scaffold").value += 1;
 tickFn();
 check("recent actions: embassy level changes are logged", /embassy with Lizards/.test(logText()));
-check("recent actions: external trade resource swings are logged", /trade: .*Spice/.test(logText()) && /Gold/.test(logText()));
+check("recent actions: external trade counter is labeled as a cycle summary, not fake resource trade", /cycle summary: Lizards trade counter/i.test(logText()) && !/🤝 trade: .*Spice/i.test(logText()));
 
 /* New content awareness — fresh unlocks must be noticed, logged and replanned */
 fakeNow += 25000;
