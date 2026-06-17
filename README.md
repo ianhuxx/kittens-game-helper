@@ -73,28 +73,34 @@ The bottom-right box is a live dashboard:
 - **Recent actions:** a running log of what it actually built / researched / upgraded /
   traded / praised, kept across the session so you can see it working.
 
-## Pick a goal
+## One autopilot — no modes
 
-The goal dropdown steers the planner toward a destination you choose. A goal is one of
-two shapes — and neither relies on keyword lists; relevance is computed from live game
-data:
+There are **no goal modes or priority dropdowns**. A single autopilot always picks the
+most valuable reachable step from one universal scoring framework (see below), keeps the
+whole economy alive, and chases gateway techs on its own. Nothing to configure.
 
-- **Milestone goals** (e.g. **Reach Space — race to Rocketry**) name a target tech. The
-  planner walks the tech tree, treats every unresearched prerequisite as goal-relevant,
-  and the **🏁 goal line** shows honest progress: `4/9 techs (44%) · next: Astronomy
-  (need 12.00K science)`. Anything that produces or stores a resource the next goal
-  techs still need also gets pulled forward.
-- **Emphasis goals** (**Industry — max resource production**, **Population — more
-  kittens, happier kittens**) multiply effect *categories*. Each candidate's parsed
-  effects are matched against the emphasis — a building with production effects counts
-  for Industry whatever it's called — and the goal line says what's being favored.
+## Manual build queue (override the autopilot)
 
-**Balanced** (the default) grows everything and still chases gateway techs. Whatever the
-goal, autopilot keeps the whole economy alive so you never stall on a single branch.
+When you want something specific built next — a Magneto, a workshop upgrade, a particular
+tech — add it to the **manual build queue** in the panel:
+
+- Pick it from the **“Add to build queue…”** dropdown (it lists the buildings, research
+  and upgrades currently open) and press **＋ Queue**.
+- The queue shows your items with **▲ / ▼** to reorder and **✕** to remove. It's saved
+  between sessions.
+- The front-most **actionable** queued item becomes the plan and overrides the autopilot
+  (even an in-progress research sprint). The helper reserves its resources, crafts its
+  chain, and buys it the moment it's affordable.
+- A queued item that can't be acted on yet (still locked, or its science price can't fit
+  your cap) is **skipped**, not stalled — the next workable item, or the autopilot, takes
+  over. Finished items drop off automatically.
+
+So the autopilot handles the steady grind, and the queue is your steering wheel for
+anything you want prioritised.
 
 ## Minimal UI
 
-The helper bar has one button in its header:
+The helper bar header has one button:
 
 - **– / +** — minimizes the helper bar down to just its title, and restores it. The
   choice is remembered between sessions.
