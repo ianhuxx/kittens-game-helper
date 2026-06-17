@@ -1277,6 +1277,83 @@ for (const d2Goal of ["balanced", "speedrun"]) {
 }
 
 /* ---------------------------------------------------------------------
+ * Test D3 — v2.1.3 live regression: science storage unlock must be VALUE-
+ * independent.  Science is only ~50% of cap (NOT near cap) but the next valuable
+ * tech (Electricity) still can't fit the cap, so storage must STILL be the plan.
+ * The old `isNearResourceCap` trigger flickered back to Temple the moment science
+ * dropped below the cap mid-build, releasing Observatory's reserved iron.  Both
+ * goals are asserted, and Temple is made fully affordable to prove it can't win.
+ * ------------------------------------------------------------------- */
+for (const d3Goal of ["balanced", "speedrun"]) {
+  setupAcoustics();
+  storage.set("kgh.goal", d3Goal);
+  dbg.forceActiveTarget(null);
+  acoustics.researched = true;       // Electricity is the next valuable research.
+  electricity.researched = false;
+  res("science").value = 32940; res("science").maxValue = 65850; // ~50% of cap → NOT near cap
+  res("compedium").value = 28;
+  res("wood").value = 2000; res("wood").maxValue = 5000;
+  res("beam").value = 30;
+  res("gold").value = 980; res("gold").maxValue = 1650; // Temple FULLY affordable
+  res("slab").value = 30; res("plate").value = 20; res("manuscript").value = 250;
+  fakeNow += 25000;
+  const d3Decision = dbg.selectStrategicTarget(d3Goal);
+  const d3Plan = dbg.planText(d3Goal);
+  const d3Now = dbg.nowText(d3Goal);
+  check(`Test D3 [${d3Goal}]: cap-blocked next tech keeps Science storage unlock even with science below cap`, d3Decision.layer === "Science storage unlock");
+  check(`Test D3 [${d3Goal}]: target is a cap-growth building, not the fully-affordable Temple`, d3Decision.target?.meta?.name !== "temple" && /library|academy|observatory/i.test(d3Decision.target?.meta?.name || ""));
+  check(`Test D3 [${d3Goal}]: panel + Now never fall back to Temple while the cap blocks Electricity`, !/Focus: Temple/i.test(d3Plan) && !/Temple/i.test(d3Now));
+}
+
+/* ---------------------------------------------------------------------
+ * Test D4 — v2.1.4 live regression: the science storage unlock must COMMIT to
+ * one cap-growth building.  In the live game scienceStorageGain ties (the game
+ * doesn't expose scienceMax until calculateEffects), so the secondary score/wait
+ * keys decide and wobble tick-to-tick — the plan flickered between Library and
+ * Observatory ("library chain" then "Observatory chain").  Here we commit to one
+ * building, then reveal an EQUAL-gain rival that out-scores it; stickiness must
+ * hold the committed pick instead of switching (which would resume the flicker).
+ * Academy is disabled so the two equal-gain rivals are the top options.
+ * ------------------------------------------------------------------- */
+// Build a clean two-rival setup that is robust to the building state accumulated
+// by earlier tests: disable every existing cap-growth building, then add two
+// EQUAL-gain rivals with uniquely-reserved names (only the first unlocked first).
+for (const b of buildings) { if (b.effects && (b.effects.scienceMax || b.effects.scienceRatio)) b.unlocked = false; }
+const ensureBld = (name, effects, prices) => {
+  let b = buildings.find((x) => x.name === name);
+  if (!b) { b = { name, label: name }; buildings.push(b); }
+  Object.assign(b, { effects, prices, val: 0, on: 0 });
+  return b;
+};
+const vaultA = ensureBld("scienceVaultA", { scienceMax: 500 }, [{ name: "wood", val: 1200 }]);
+const vaultB = ensureBld("scienceVaultB", { scienceMax: 500 }, [{ name: "minerals", val: 1200 }]);
+vaultA.unlocked = true; vaultB.unlocked = false;
+setupAcoustics();
+storage.set("kgh.goal", "speedrun");
+dbg.forceActiveTarget(null);
+acoustics.researched = true;
+electricity.researched = false;
+res("science").value = 65850; res("science").maxValue = 65850;
+res("wood").value = 1300; res("wood").maxValue = 5000;
+res("minerals").value = 1300; res("minerals").maxValue = 5000;
+fakeNow += 25000;
+// Phase 1: only vaultA is a cap-growth option → it becomes the committed pick.
+const d4Committed = dbg.targetId(dbg.selectStrategicTarget("speedrun").target);
+// Phase 2: reveal the equal-gain vaultB.  Stickiness must hold vaultA across ticks
+// even as the score/wait tiebreak flips (no >20% gain improvement to switch on).
+vaultB.unlocked = true;
+let d4Stable = true;
+for (let i = 0; i < 8; i += 1) {
+  fakeNow += 30000;
+  res("wood").value = i % 2 ? 800 : 5000;
+  res("minerals").value = i % 2 ? 5000 : 800;
+  const d4Id = dbg.targetId(dbg.selectStrategicTarget("speedrun").target);
+  d4Stable = d4Stable && d4Id === d4Committed;
+}
+check("Test D4: science storage unlock commits to one building, ignoring an equal-gain rival", d4Stable && /scienceVaultA/i.test(d4Committed || ""));
+vaultA.unlocked = false; vaultB.unlocked = false; // do not leak into later sprint tests
+
+/* ---------------------------------------------------------------------
  * Test E — Job balancer follows the Acoustics chain (Hunters > Priests)
  * ------------------------------------------------------------------- */
 setupAcoustics();

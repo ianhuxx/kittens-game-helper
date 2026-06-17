@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.3
+// @version      2.1.5
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.1.3";
+  const HELPER_VERSION = "2.1.5";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3066,44 +3066,64 @@
   // ahead of real economy growth, so those fall back to normal scoring instead.
   const SCIENCE_UNLOCK_REACH = 2;
 
-  // Science-storage unlock is a GOAL-INDEPENDENT invariant (balanced, speedrun,
-  // milestone — all the same): when science is capped and the NEXT valuable
-  // research is storage-blocked (its science price exceeds science max), we grow
+  // Science-storage unlock is a UNIVERSAL invariant — goal-independent (balanced,
+  // speedrun, milestone) AND science-VALUE-independent.  The trigger is purely
+  // structural: the NEXT valuable research (cheapest open, unresearched, content-
+  // unlocking tech) cannot fit the science CAP.  When that holds, science will
+  // climb to the cap and stall there forever until storage grows, so we grow
   // science storage instead of (a) targeting that research directly or (b) letting
-  // any long project such as Temple win.  We anchor on the nearest VALUABLE
-  // near-term storage-blocked tech (one that actually unlocks content and sits
-  // within reach of the cap), then pick the best actionable cap-growth candidate
+  // any long project such as Temple win — regardless of how much science is banked
+  // right now.  This is the fix for the regression where the plan flickered back to
+  // Temple the moment science dropped below the cap mid-build (releasing the
+  // reserved Observatory inputs).  We pick the best actionable cap-growth candidate
   // (Library / Academy / Observatory / any scienceMax-style effect).  Returns null
-  // when no valuable near-term tech is blocked OR nothing actionable can grow the
-  // cap — exactly the "unless no science-storage candidate is actionable" escape,
+  // when the next valuable tech already fits the cap (just research it), when it is
+  // too far above the cap to be a near-term sprint, or when nothing actionable can
+  // grow the cap — the "unless no science-storage candidate is actionable" escape,
   // after which normal scoring (and eventually a long project) may resume.
-  const bestScienceStorageUnlock = (candidates, resources, deferred) => {
-    if (!isNearResourceCap(resources, "science")) return null;
+  // Sticky cap-growth choice.  The game frequently doesn't expose a building's
+  // scienceMax/scienceRatio until calculateEffects runs, so scienceStorageGain can
+  // tie at 0 and the secondary score/wait keys wobble tick-to-tick — which made the
+  // plan flicker between e.g. Library and Observatory.  We remember the chosen
+  // building and keep it until it leaves the option set or a rival is clearly
+  // better, so the planner commits instead of oscillating.
+  let activeScienceUnlockId = null;
+
+  const bestScienceStorageUnlock = (candidates, resources) => {
     const max = resMaxOf(resources, "science");
-    const blocked = (deferred || [])
-      .filter((item) => item && item.kind === "storage" && item.candidate && item.candidate.kind === "research")
-      .map((item) => item.candidate)
-      // Valuable = actually unlocks content; a filler tech with no unlocks (no
-      // gateway value) must never anchor a storage sprint.
-      .filter((candidate) => gatewayValue(candidate.meta) > 0)
-      // Near-term = within ~SCIENCE_UNLOCK_REACH x the current science cap.
-      .filter((candidate) => {
-        const cost = researchScienceCost(candidate.meta);
-        return cost > 0 && max > 0 && cost <= max * SCIENCE_UNLOCK_REACH;
-      })
-      // The nearest such tech (smallest overflow) is the one we are unlocking next.
-      .sort((a, b) => researchScienceCost(a.meta) - researchScienceCost(b.meta) || gatewayValue(b.meta) - gatewayValue(a.meta))[0];
-    if (!blocked) return null;
-    const need = Math.max(0, researchScienceCost(blocked.meta) - max);
+    if (max <= 0) { activeScienceUnlockId = null; return null; }
+    // The next valuable research = cheapest open, unresearched, content-unlocking
+    // tech.  A filler tech with no unlocks (no gateway value) must never anchor a
+    // storage sprint, so it is excluded here.
+    const next = candidates
+      .filter((c) => c.kind === "research" && c.meta && isOpen(c.meta) && gatewayValue(c.meta) > 0)
+      .map((c) => ({ c, cost: researchScienceCost(c.meta) }))
+      .filter((item) => item.cost > 0)
+      .sort((a, b) => a.cost - b.cost)[0];
+    // The next valuable tech is missing, already fits the cap (just research it),
+    // or is too far above the cap to be a near-term sprint → not a storage problem.
+    if (!next || next.cost <= max || next.cost > max * SCIENCE_UNLOCK_REACH) {
+      activeScienceUnlockId = null;
+      return null;
+    }
+    const blocked = next.c;
+    const need = Math.max(0, next.cost - max);
     const options = candidates
       .filter((candidate) => targetId(candidate) !== targetId(blocked))
       .filter((candidate) => scienceStorageUnlockCandidate(candidate, resources))
       .filter((candidate) => !directStorageBlockers(candidate.kind, candidate.meta, resources).length)
       .map((candidate) => ({ candidate, gain: scienceStorageGain(candidate), wait: waitSecondsForCandidate(candidate, resources) }))
       .filter((item) => isFinite(item.wait));
-    if (!options.length) return null;
+    if (!options.length) { activeScienceUnlockId = null; return null; }
     options.sort((a, b) => (b.gain - a.gain) || ((b.candidate.score || 0) - (a.candidate.score || 0)) || (a.wait - b.wait));
-    return { target: options[0].candidate, blocked, need };
+    // Commit to the prior choice while it is still a valid option; only switch when
+    // a rival actually grows the cap meaningfully more (>20% gain).  When gains tie
+    // at 0 this always keeps the prior pick, killing the Library↔Observatory flicker.
+    const best = options[0];
+    const prior = activeScienceUnlockId && options.find((o) => targetId(o.candidate) === activeScienceUnlockId);
+    const chosen = prior && !(best.gain > 0 && best.gain > prior.gain * 1.2) ? prior : best;
+    activeScienceUnlockId = targetId(chosen.candidate);
+    return { target: chosen.candidate, blocked, need };
   };
 
   const classifyCandidateLayer = (candidate, resources, goalKey) => {
@@ -3169,7 +3189,7 @@
       };
     }
 
-    const scienceUnlock = bestScienceStorageUnlock(candidates, resources, deferred);
+    const scienceUnlock = bestScienceStorageUnlock(candidates, resources);
     if (scienceUnlock && scienceUnlock.target) {
       const target = scienceUnlock.target;
       return {
@@ -5730,9 +5750,10 @@
       return solveCraftChain(resourceMap(), candidate);
     },
     forceActiveTarget(candidate) {
-      // A debug/manual target override resets BOTH locks so the planner starts
+      // A debug/manual target override resets ALL locks so the planner starts
       // from a clean state (mirrors an explicit player priority change).
       activeSprint = null;
+      activeScienceUnlockId = null;
       activeTarget = candidate ? {
         id: targetId(candidate),
         startedAt: Date.now() - getTargetLockMinMs() - 1000,
