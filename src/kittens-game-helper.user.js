@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.2
+// @version      2.1.3
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.1.2";
+  const HELPER_VERSION = "2.1.3";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3060,15 +3060,41 @@
     return /scienceMax|scienceMaxRatio|science storage|science cap|observatory|academy|library/i.test(text);
   };
 
-  const bestScienceStorageUnlock = (candidates, resources, deferred, goalKey) => {
-    const blockers = (deferred || [])
+  // The next blocked tech counts as a near-term storage "sprint" only when it can
+  // be reached by at most ~doubling the current science cap.  A tech far above the
+  // cap (e.g. 4x) is a long storage grind — forcing it would spam endless Libraries
+  // ahead of real economy growth, so those fall back to normal scoring instead.
+  const SCIENCE_UNLOCK_REACH = 2;
+
+  // Science-storage unlock is a GOAL-INDEPENDENT invariant (balanced, speedrun,
+  // milestone — all the same): when science is capped and the NEXT valuable
+  // research is storage-blocked (its science price exceeds science max), we grow
+  // science storage instead of (a) targeting that research directly or (b) letting
+  // any long project such as Temple win.  We anchor on the nearest VALUABLE
+  // near-term storage-blocked tech (one that actually unlocks content and sits
+  // within reach of the cap), then pick the best actionable cap-growth candidate
+  // (Library / Academy / Observatory / any scienceMax-style effect).  Returns null
+  // when no valuable near-term tech is blocked OR nothing actionable can grow the
+  // cap — exactly the "unless no science-storage candidate is actionable" escape,
+  // after which normal scoring (and eventually a long project) may resume.
+  const bestScienceStorageUnlock = (candidates, resources, deferred) => {
+    if (!isNearResourceCap(resources, "science")) return null;
+    const max = resMaxOf(resources, "science");
+    const blocked = (deferred || [])
       .filter((item) => item && item.kind === "storage" && item.candidate && item.candidate.kind === "research")
       .map((item) => item.candidate)
-      .sort((a, b) => gatewayValue(b.meta) - gatewayValue(a.meta) || researchScienceCost(a.meta) - researchScienceCost(b.meta));
-    if (!blockers.length || !isNearResourceCap(resources, "science")) return null;
-    if (goalKey !== "balanced") return null;
-    const blocked = blockers[0];
-    const need = Math.max(0, researchScienceCost(blocked.meta) - resMaxOf(resources, "science"));
+      // Valuable = actually unlocks content; a filler tech with no unlocks (no
+      // gateway value) must never anchor a storage sprint.
+      .filter((candidate) => gatewayValue(candidate.meta) > 0)
+      // Near-term = within ~SCIENCE_UNLOCK_REACH x the current science cap.
+      .filter((candidate) => {
+        const cost = researchScienceCost(candidate.meta);
+        return cost > 0 && max > 0 && cost <= max * SCIENCE_UNLOCK_REACH;
+      })
+      // The nearest such tech (smallest overflow) is the one we are unlocking next.
+      .sort((a, b) => researchScienceCost(a.meta) - researchScienceCost(b.meta) || gatewayValue(b.meta) - gatewayValue(a.meta))[0];
+    if (!blocked) return null;
+    const need = Math.max(0, researchScienceCost(blocked.meta) - max);
     const options = candidates
       .filter((candidate) => targetId(candidate) !== targetId(blocked))
       .filter((candidate) => scienceStorageUnlockCandidate(candidate, resources))
@@ -3143,7 +3169,7 @@
       };
     }
 
-    const scienceUnlock = bestScienceStorageUnlock(candidates, resources, deferred, goalKey);
+    const scienceUnlock = bestScienceStorageUnlock(candidates, resources, deferred);
     if (scienceUnlock && scienceUnlock.target) {
       const target = scienceUnlock.target;
       return {
@@ -3272,10 +3298,13 @@
     const preferred = decision.target || candidates[0] || null;
     const now = Date.now();
 
-    // A valid research sprint IS the lock — the contract persists across ticks
-    // (validated in planResearchSprint), so the economy target lock must not
-    // fight it.  Return the sprint candidate directly.
-    if (decision.layer === STRATEGIC_LAYERS.researchSprint) {
+    // Structural override layers OWN the plan directly and must never be held
+    // back by a stale economy target lock (e.g. a half-saved Temple): a valid
+    // research sprint is its own cross-tick contract (validated in
+    // planResearchSprint), and a science-storage unlock outranks every long
+    // project while a valuable tech is cap-blocked.  Return that target directly.
+    if (decision.layer === STRATEGIC_LAYERS.researchSprint ||
+        decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock) {
       activeTarget = null;
       return preferred;
     }
