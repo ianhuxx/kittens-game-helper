@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.5
+// @version      2.1.6
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.1.5";
+  const HELPER_VERSION = "2.1.6";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1215,39 +1215,74 @@
     return null;
   };
 
+  // Live catnip production multiplier from the current season + weather — the
+  // "[+50%]" badge in the resource bar (spring +50%, winter −75%, ±15% for
+  // warm/cold).  getResProduction() returns GROSS village catnip WITHOUT this
+  // modifier (the game applies it in calcResourcePerTick), so the wood-vs-farm
+  // trade must fold it in or it silently uses an out-of-season rate.  getWeatherMod
+  // returns the additive delta the badge shows, so the multiplier is 1 + delta.
+  // Falls back to 1 when the calendar isn't available.
+  const catnipWeatherMultiplier = () => {
+    try {
+      const cal = window.gamePage && window.gamePage.calendar;
+      if (!cal || typeof cal.getWeatherMod !== "function") return 1;
+      const mod = cal.getWeatherMod();
+      const mult = isFinite(mod) ? 1 + mod : 1;
+      return mult > 0 ? mult : 1;
+    } catch (error) {
+      return 1;
+    }
+  };
+
   const jobMarginalProductionPerSecond = (job, resourceName) => {
     if (!job || !resourceName) return null;
     const key = resourceName === "catpower" ? "manpower" : resourceName;
     try {
-      if (job.modifiers && isFinite(job.modifiers[key])) return job.modifiers[key] * ticksPerSecond();
       const count = Math.max(0, Number(job.value) || 0);
-      if (count > 0) {
-        const prod = window.gamePage.village && window.gamePage.village.getResProduction
-          ? window.gamePage.village.getResProduction()
-          : {};
-        const total = prod && prod[key];
-        if (isFinite(total)) return (total * ticksPerSecond()) / count;
+      // Prefer the LIVE figure: the game's CURRENT village production for this
+      // resource divided by the staffed count.  Production is linear in kitten
+      // count, so the average equals the marginal, and this already reflects live
+      // happiness, leader and production-ratio bonuses — not a baked-in base rate.
+      const village = window.gamePage && window.gamePage.village;
+      if (count > 0 && village && typeof village.getResProduction === "function") {
+        const prod = village.getResProduction() || {};
+        const total = prod[key];
+        if (isFinite(total) && total > 0) return (total * ticksPerSecond()) / count;
       }
+      // Unstaffed (or no live signal yet): fall back to the base per-tick modifier.
+      if (job.modifiers && isFinite(job.modifiers[key])) return job.modifiers[key] * ticksPerSecond();
     } catch (error) {
       /* no stable marginal signal for this job yet */
     }
     return null;
   };
 
-  // Pathway math: to get more WOOD, is it better to add a Woodcutter (direct) or
-  // a Farmer (catnip, which we refine into wood)? Compare wood-per-kitten of each.
+  // Pathway math: to get more WOOD, is it better to add a Woodcutter (direct) or a
+  // Farmer (catnip, which we refine into wood)?  Everything here is read LIVE so the
+  // answer tracks the current board, not baked-in base rates:
+  //   • woodPerCutter — live per-cutter village output, lifted to the true wood rate
+  //     so global wood ratios (Lumber Mills etc., applied above village output) count.
+  //   • catnipPerFarmer — live per-farmer village output × the current season/weather
+  //     catnip multiplier (spring boosts, winter guts the farm→wood route).
+  //   • the refine yields (1 + craftRatio) wood per 100 catnip, not 1.
   const bestWoodJob = () => {
     try {
       const cutter = jobByName("woodcutter");
       const farmer = jobByName("farmer");
       if (!cutter) return farmer;
       if (!farmer) return cutter;
-      const woodPerCutter = jobMarginalProductionPerSecond(cutter, "wood");
-      const catnipPerFarmer = jobMarginalProductionPerSecond(farmer, "catnip");
-      if (woodPerCutter == null || catnipPerFarmer == null) return cutter; // not enough data → direct
+      const woodBase = jobMarginalProductionPerSecond(cutter, "wood");
+      const catnipBase = jobMarginalProductionPerSecond(farmer, "catnip");
+      if (woodBase == null || catnipBase == null) return cutter; // not enough live data → direct
+      // The true live wood/s (productionFor → getResourcePerTick) folds in Lumber
+      // Mills and every other woodRatio applied above raw village output; per cutter
+      // that is the fuller marginal.  max() so a noisy/low sample can't penalise it.
+      const cutterCount = Math.max(1, Number(cutter.value) || 0);
+      const woodPerCutter = Math.max(woodBase, productionFor("wood") / cutterCount);
+      const catnipPerFarmer = catnipBase * catnipWeatherMultiplier();
       const refineCost = woodCatnipCost();
       if (!(refineCost > 0)) return cutter;
-      const woodViaRefine = catnipPerFarmer / refineCost;
+      const woodViaRefine = (catnipPerFarmer / refineCost) * (1 + craftRatioFor("wood"));
       return woodViaRefine > woodPerCutter ? farmer : cutter;
     } catch (error) {
       return jobByName("woodcutter");
@@ -5748,6 +5783,9 @@
     },
     solveChain(candidate) {
       return solveCraftChain(resourceMap(), candidate);
+    },
+    bestWoodJob() {
+      return bestWoodJob();
     },
     forceActiveTarget(candidate) {
       // A debug/manual target override resets ALL locks so the planner starts
