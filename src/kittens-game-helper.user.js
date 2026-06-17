@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.1.6
+// @version      2.1.7
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.1.6";
+  const HELPER_VERSION = "2.1.7";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -487,21 +487,13 @@
   };
 
 
-  const TARGET_TRADE_CHAIN = new Set(["parchment", "manuscript", "compedium", "compendium"]);
   let stickyTargetChainReserve = { until: 0, names: new Set(), label: "" };
 
   const activeTargetChainResources = (target, resources) => {
     const names = new Set();
     if (!target || target.affordable) return names;
-    for (const cost of pricesFor(target.kind, target.meta)) {
-      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-      const have = ((getRes(resources || resourceMap(), cost.name) || {}).value) || 0;
-      if (have >= cost.val) continue;
-      if (TARGET_TRADE_CHAIN.has(cost.name)) {
-        craftChainOutputsFor(cost.name, names);
-        names.add(cost.name);
-      }
-    }
+    const ledger = buildTargetLedger(target, resources || resourceMap());
+    for (const name of ledger.critical) names.add(name);
     return names;
   };
 
@@ -667,7 +659,7 @@
         const race = targeted.race;
         const measured = withActionResourceDeltas(() => diplomacy.tradeAll(race), tradeDeltaNamesForRace(race, targeted.prices));
         lastTradeAt = Date.now();
-        diplomacyPlanText = `Targeted trade: ${race.title || race.name || "partner"} for ${labelOf(target.meta)} Compendium chain`;
+        diplomacyPlanText = `Targeted trade: ${race.title || race.name || "partner"} for ${labelOf(target.meta)} ${targetTradeChainLabel(target, resources)}`;
         pushLog(`🤝 ${race.title || race.name || "partner"} trade: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}`);
         return;
       }
@@ -4144,7 +4136,7 @@
       (!target || targetId(candidate) !== targetId(target)) &&
       !buyBenched(targetId(candidate)) &&
       candidateSpendsAny(candidate, capped) &&
-      respectsReservations(candidate, reserved, resources));
+      respectsReservations(candidate, reserved, resources, buildTargetLedger(target, resources)));
   };
 
   const purchaseComplete = (candidate, initialVal) => {
@@ -4354,48 +4346,92 @@
   // buys (the classic "plan says Library, a Mine gets built" failure).
   // Costs above a storage cap are NOT reserved: saving can never reach those,
   // the storage planner handles them instead.
-  const reservedNeedsFor = (target, resources) => {
-    const reserved = {};
-    if (!target || target.affordable) return reserved;
-    // For a research sprint we protect the CRAFT chain (Compendium/Manuscript/
-    // Parchment/Furs), not the cap-drain banks: science/culture are spent and
-    // refilled continuously, and over-reserving them would block chain
-    // accelerators (e.g. a Printing Press that produces manuscripts).  We only
-    // reserve a cap-drain bank once it is near cap (about to complete the buy).
-    const isSprintTarget = target.kind === "research" && activeSprint && activeSprint.candidate &&
-      targetId(target) === activeSprint.id;
+  const addLedgerNeed = (ledger, name, amount = 0) => {
+    if (!name) return;
+    ledger.critical.add(name);
+    if (amount > 0) ledger.reserved[name] = Math.max(ledger.reserved[name] || 0, amount);
+  };
+
+  const addCraftClosureToLedger = (ledger, name, amount, resources, depth = 0) => {
+    if (!name || depth > 6) return;
+    addLedgerNeed(ledger, name, amount);
+    const craft = craftByName(name);
+    if (!craft) return;
+    const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
+    if (!prices.length) return;
+    const baseUnits = Math.max(1, Math.ceil(Math.max(0, amount || 1) / Math.max(1, 1 + craftRatioFor(name))));
+    for (const price of prices) {
+      addLedgerNeed(ledger, price.name, price.val * baseUnits);
+      addCraftClosureToLedger(ledger, price.name, price.val * baseUnits, resources, depth + 1);
+    }
+  };
+
+  const buildTargetLedger = (target, resources) => {
+    const ledger = { target, reserved: {}, missing: {}, direct: {}, crafted: new Set(), critical: new Set() };
+    if (!target || target.affordable) return ledger;
+    const isSprintTarget = target.kind === "research" && activeSprint && activeSprint.candidate && targetId(target) === activeSprint.id;
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       if (isSprintTarget && CAP_DRAIN_RESOURCES.has(cost.name) && !isNearResourceCap(resources, cost.name)) continue;
       const res = getRes(resources, cost.name);
       if (res && res.maxValue > 0 && cost.val > res.maxValue) continue;
-      reserved[cost.name] = Math.max(reserved[cost.name] || 0, cost.val);
       const have = (res && res.value) || 0;
-      // Costs the crafting loop must assemble (no direct production) also hold
-      // their raw chain, or competitors drain the wood meant for beams. Costs
-      // that produce on their own (wood, minerals…) reserve only themselves.
-      if (have < cost.val && craftByName(cost.name) && rawProductionForNeed(cost.name) <= 0) {
-        const raw = rawPathRequirements(cost.name, cost.val - have);
-        for (const [name, amount] of Object.entries(raw)) {
-          const rawRes = getRes(resources, name);
-          if (rawRes && rawRes.maxValue > 0 && amount > rawRes.maxValue) continue;
-          reserved[name] = (reserved[name] || 0) + amount;
-        }
+      const missing = Math.max(0, cost.val - have);
+      ledger.direct[cost.name] = Math.max(ledger.direct[cost.name] || 0, cost.val);
+      ledger.missing[cost.name] = Math.max(ledger.missing[cost.name] || 0, missing);
+      addLedgerNeed(ledger, cost.name, cost.val);
+      if (craftByName(cost.name)) {
+        ledger.crafted.add(cost.name);
+        addCraftClosureToLedger(ledger, cost.name, Math.max(1, missing || cost.val), resources);
+        const raw = rawPathRequirements(cost.name, Math.max(1, missing || cost.val));
+        for (const [name, amount] of Object.entries(raw)) addLedgerNeed(ledger, name, amount);
       }
     }
-    return reserved;
+    return ledger;
   };
 
-  const respectsReservations = (candidate, reserved, resources) => {
-    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+  const reservedNeedsFor = (target, resources) => buildTargetLedger(target, resources).reserved;
+
+  const spendImpactForPrices = (prices, resources) => {
+    const impact = {};
+    const critical = new Set();
+    const add = (name, amount = 0) => {
+      if (!name) return;
+      critical.add(name);
+      impact[name] = (impact[name] || 0) + Math.max(0, amount || 0);
+    };
+    for (const cost of prices || []) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-      const hold = reserved[cost.name] || (cost.name === "catpower" ? reserved.manpower || 0 : 0);
-      if (hold <= 0) continue;
-      const stock = ((getRes(resources, cost.name) || {}).value) || 0;
-      if (stock - cost.val < hold) return false;
+      add(cost.name, cost.val);
+      if (craftByName(cost.name)) {
+        for (const name of craftChainOutputsFor(cost.name)) critical.add(name);
+        const raw = rawPathRequirements(cost.name, Math.max(1, cost.val));
+        for (const [name, amount] of Object.entries(raw)) add(name, amount);
+      }
     }
-    return true;
+    return { impact, critical };
   };
+
+  const spendImpactForCandidate = (candidate, resources) => spendImpactForPrices(pricesFor(candidate.kind, candidate.meta), resources);
+
+  const targetLockViolationForPrices = (prices, ledger, resources) => {
+    if (!ledger || !ledger.target || !ledger.critical || !ledger.critical.size) return null;
+    const spend = spendImpactForPrices(prices, resources);
+    const overlaps = [...spend.critical].filter((name) => ledger.critical.has(name));
+    if (!overlaps.length) return null;
+    for (const [name, amount] of Object.entries(spend.impact)) {
+      const hold = ledger.reserved[name] || (name === "catpower" ? ledger.reserved.manpower || 0 : 0);
+      if (hold > 0) {
+        const stock = resourceValue(resources, name);
+        if (stock - amount < hold) return { names: overlaps, reason: `target lock — spends ${overlaps.slice(0, 6).join("/")} chain reserved for ${labelOf(ledger.target.meta)}` };
+      }
+    }
+    return { names: overlaps, reason: `target lock — spends ${overlaps.slice(0, 6).join("/")} chain reserved for ${labelOf(ledger.target.meta)}` };
+  };
+
+  const violatesTargetLock = (candidate, ledger, resources) => targetLockViolationForPrices(pricesFor(candidate.kind, candidate.meta), ledger, resources);
+
+  const respectsReservations = (candidate, reserved, resources, ledger = null) => !violatesTargetLock(candidate, ledger, resources) && pricesRespectReservations(pricesFor(candidate.kind, candidate.meta), reserved, resources);
 
   // Purchases that keep silently failing (controller/API mismatch for that one
   // item) get benched so the plan and the surplus buyer can move on.
@@ -4449,7 +4485,8 @@
         return;
       }
 
-      const reserved = reservedNeedsFor(target, resources);
+      const ledger = buildTargetLedger(target, resources);
+      const reserved = ledger.reserved;
       const capRelief = findCapReliefPurchase(resources, goalKey, target, reserved);
       if (capRelief && !sprint) {
         lastAutoBuy = now;
@@ -4466,7 +4503,7 @@
 
       if (!sprint) {
         const policy = autoPolicyChoice(resources, goalKey);
-        if (policy && !buyBenched(targetId(policy))) {
+        if (policy && !buyBenched(targetId(policy)) && !violatesTargetLock(policy, ledger, resources)) {
           lastAutoBuy = now;
           if (buyCandidate(policy)) {
             pushLog(`📜 policy ${labelOf(policy.meta)} (blocks nothing)`);
@@ -4483,7 +4520,7 @@
         candidate.affordable &&
         (!target || targetId(candidate) !== targetId(target)) &&
         !buyBenched(targetId(candidate)) &&
-        respectsReservations(candidate, reserved, resources));
+        respectsReservations(candidate, reserved, resources, ledger));
       if (!ready) {
         const held = Object.keys(reserved);
         const sprintTag = sprint ? " · 🚀 sprint holding surplus" : "";
@@ -4962,38 +4999,48 @@
 
   const targetTradeChainDemand = (target, resources) => {
     const demand = {};
-    if (!target || target.affordable) return demand;
+    if (!target) return demand;
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-      if (!TARGET_TRADE_CHAIN.has(cost.name)) continue;
       const have = resourceValue(resources, cost.name);
-      const missing = Math.max(0, cost.val - have - craftablePotential(cost.name));
-      if (missing <= 0 && have >= cost.val) continue;
-      demand[cost.name] = Math.max(demand[cost.name] || 0, Math.max(1, cost.val - have));
-      for (const name of craftChainOutputsFor(cost.name)) demand[name] = Math.max(demand[name] || 0, 1);
+      const missing = Math.max(0, cost.val - have);
+      if (missing <= 0 && !craftByName(cost.name)) continue;
+      demand[cost.name] = Math.max(demand[cost.name] || 0, Math.max(1, missing || cost.val));
+      if (craftByName(cost.name)) {
+        for (const name of craftChainOutputsFor(cost.name)) demand[name] = Math.max(demand[name] || 0, 1);
+        const raw = rawPathRequirements(cost.name, Math.max(1, missing || cost.val));
+        for (const [name, amount] of Object.entries(raw)) demand[name] = Math.max(demand[name] || 0, amount || 1);
+      }
     }
     return demand;
   };
 
   const targetTradeYieldValue = (demand, sellName, amount) => {
     if (!amount || amount <= 0) return 0;
-    if (demand.compedium && sellName === "compedium") return amount;
-    if (demand.compedium && sellName === "compendium") return amount;
-    if (demand.compedium && sellName === "manuscript") return amount / 50;
-    if (demand.compedium && sellName === "parchment") return amount / (50 * 25);
-    if (demand.compedium && sellName === "furs") return amount / (50 * 25 * 175);
-    if (demand.manuscript && sellName === "manuscript") return amount / 50;
-    if (demand.manuscript && sellName === "parchment") return amount / (50 * 25);
-    if (demand.parchment && sellName === "parchment") return amount / (50 * 25);
-    return 0;
+    if ((demand.compedium || demand.compendium) && (sellName === "compedium" || sellName === "compendium")) return amount;
+    if ((demand.compedium || demand.compendium) && sellName === "manuscript") return amount / 50;
+    if ((demand.compedium || demand.compendium || demand.manuscript) && sellName === "parchment") return amount / (50 * 25);
+    if ((demand.compedium || demand.compendium || demand.manuscript || demand.parchment) && sellName === "furs") return amount / (50 * 25 * 175);
+    if (!demand[sellName]) return 0;
+    return amount / Math.max(1, demand[sellName]);
+  };
+
+
+  const targetTradeChainLabel = (target, resources) => {
+    const demand = targetTradeChainDemand(target, resources);
+    if (demand.compedium || demand.compendium || demand.manuscript || demand.parchment) return "Compendium chain";
+    const priority = ["wood", "scaffold", "ship", "plate", "slab", "steel", "beam"];
+    const hit = priority.find((name) => demand[name] > 0);
+    return hit ? `${resTitle(resources, hit)}/${labelOf(target.meta)} chain` : "material chain";
   };
 
   const targetTradeScore = (race, target, resources, reserved) => {
     const demand = targetTradeChainDemand(target, resources);
     if (!Object.keys(demand).length) return null;
     const prices = tradePricesForRace(race);
-    if (!prices.length || !pricesRespectReservations(prices, reserved, resources)) return null;
-    const affordable = affordableTradeCount(prices, reserved, resources);
+    const ledger = buildTargetLedger(target, resources);
+    if (!prices.length || targetLockViolationForPrices(prices, ledger, resources)) return null;
+    const affordable = affordableTradeCount(prices, {}, resources);
     if (affordable <= 0) return null;
     let value = 0;
     const goods = [];
@@ -5025,7 +5072,7 @@
     const measured = withActionResourceDeltas(() => tradeWithRace(best.race, batch), tradeDeltaNamesForRace(best.race, best.prices));
     if (!measured.result) return false;
     const raceName = best.race.title || best.race.name || "civilization";
-    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} Compendium chain`;
+    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${targetTradeChainLabel(target, resources)}`;
     pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}`);
     return true;
   };
@@ -5799,6 +5846,10 @@
       } : null;
     },
     targetId,
+    buildTargetLedger(target) { return buildTargetLedger(target, resourceMap()); },
+    spendImpactForCandidate(candidate) { return spendImpactForCandidate(candidate, resourceMap()); },
+    violatesTargetLock(candidate, target) { return violatesTargetLock(candidate, buildTargetLedger(target, resourceMap()), resourceMap()); },
+    targetTradeScore(race, target) { return targetTradeScore(race, target, resourceMap(), reservedNeedsFor(target, resourceMap())); },
   };
 
   /* ------------------------------- bootstrap -------------------------------- */
