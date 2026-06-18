@@ -1588,6 +1588,127 @@ check("Test H: ALLOW_RAW_METADATA_BUY_FALLBACK is false by default", /const ALLO
 check("Test H: raw metadata buy is gated behind the (disabled) debug flag", /if \(ALLOW_RAW_METADATA_BUY_FALLBACK\)[\s\S]{0,80}buyViaRawMetadata/.test(source));
 check("Test H: normal play never mutates meta.researched/val via a raw fallback", !/meta\.researched = true;[\s\S]{0,40}rawPayPrices/.test(source));
 
+/* ---------------------------------------------------------------------
+ * Test I — v2.3.0 Autopilot OFF: a flipped toggle must stop EVERY action.
+ * Before v2.3.0 the OFF state only re-skinned the button — every spender
+ * (buys, crafts, trades, hunts, festivals, leader, jobs) still ran each
+ * tick.  The tick now hard-gates on isAutopilotOn and reports paused state.
+ * ------------------------------------------------------------------- */
+acoustics.researched = false; // make the planner want to do something
+electricity.researched = false;
+// Re-seed a juicy board: lots of resources, cheap targets ready.
+res("wood").value = 50000; res("wood").maxValue = 100000;
+res("minerals").value = 50000; res("minerals").maxValue = 100000;
+res("science").value = 60000; res("science").maxValue = 60000;
+res("compedium").value = 200; res("manuscript").value = 200;
+res("manpower").value = 1500; res("manpower").maxValue = 1500; // near cap, would invite a hunt
+res("furs").value = 0; res("ivory").value = 0;
+res("faith").value = 100; res("faith").maxValue = 100; // would invite a praise
+const huntBeforeI = res("furs").value;
+const praiseBeforeI = praiseCalls;
+const buildingValsBeforeI = buildings.map((b) => b.val).join("|");
+const techsBeforeI = techs.map((t) => !!t.researched).join("|");
+const jobsBeforeI = jobs.map((j) => j.value).join("|");
+const tradeBeforeI = tradeCalls;
+storage.set("kgh.autopilot", "0"); // flip OFF
+dbg.forceActiveTarget(null);
+fakeNow += 60000;
+tickFn();
+fakeNow += 60000;
+tickFn();
+check("Test I: autopilot OFF runs no buys (building counts unchanged)", buildings.map((b) => b.val).join("|") === buildingValsBeforeI);
+check("Test I: autopilot OFF runs no research (tech flags unchanged)", techs.map((t) => !!t.researched).join("|") === techsBeforeI);
+check("Test I: autopilot OFF does not hunt, praise or trade", res("furs").value === huntBeforeI && praiseCalls === praiseBeforeI && tradeCalls === tradeBeforeI);
+check("Test I: autopilot OFF does not rebalance jobs", jobs.map((j) => j.value).join("|") === jobsBeforeI);
+check("Test I: panel plan line reports OFF", /Autopilot OFF/i.test(panelText(".kgh-plan")) && /paused/i.test(panelText(".kgh-now")));
+storage.set("kgh.autopilot", "1"); // flip back ON for any further checks
+
+/* ---------------------------------------------------------------------
+ * Test J — v2.3.0 storage-unlock blocked-tech chain protection: while the
+ * planner is growing science storage so a cap-blocked tech (Electricity)
+ * can fit, the cap-blocked tech's craft-chain resources (compendium etc.)
+ * must be protected from overflow-craft conversion into blueprint.
+ * Previously this only happened during an explicit Research sprint — but
+ * the storage-unlock layer left compendium up for grabs and the overflow
+ * crafter melted it into blueprint.
+ * ------------------------------------------------------------------- */
+storage.set("kgh.goal", "balanced");
+dbg.forceActiveTarget(null);
+// Re-enable storage-growing buildings (earlier tests turned them off).
+for (const name of ["library", "academy"]) {
+  const b = buildings.find((bb) => bb.name === name);
+  if (b) b.unlocked = true;
+}
+// Reset every tech, then enable just Acoustics-researched + Electricity-blocked.
+for (const tech of techs) tech.researched = (tech !== electricity);
+acoustics.researched = true; electricity.researched = false;
+// Cap science so Electricity (71250) does not fit (cap 65640) → storage unlock.
+res("science").value = 65640; res("science").maxValue = 65640;
+res("compedium").value = 80; // user's "lots of compendium" scenario
+res("blueprint").value = 0;
+res("manuscript").value = 0; res("parchment").value = 0;
+res("wood").value = 2000; res("wood").maxValue = 5000;
+res("beam").value = 30;
+res("minerals").value = 1300; res("minerals").maxValue = 5000;
+fakeNow += 60000;
+const jDecision = dbg.selectStrategicTarget("balanced");
+const jCompendiumBefore = res("compedium").value;
+const jBlueprintBefore = res("blueprint").value;
+tickFn();
+check("Test J: storage-unlock layer is active for Electricity", jDecision.layer === "Science storage unlock");
+check("Test J: compendium reserved during storage unlock (NOT converted to blueprint)", res("compedium").value >= jCompendiumBefore && res("blueprint").value === jBlueprintBefore);
+
+/* ---------------------------------------------------------------------
+ * Test K — v2.3.0 resource-snapshot bug: action delta lines must report
+ * what actually changed, not "no resource gain" for every action.  The
+ * snapshot used to return the live-reference resource map (before/after
+ * both reading the same `.value`), so withActionResourceDeltas always
+ * computed a zero delta even when hunters returned furs.
+ * ------------------------------------------------------------------- */
+electricity.researched = true; // de-target the storage unlock
+storage.set("kgh.autopilot", "1");
+dbg.forceActiveTarget(null);
+res("manpower").value = 1500; res("manpower").maxValue = 1500;
+res("furs").value = 0; res("ivory").value = 0;
+res("titanium").value = 100; res("titanium").maxValue = 200;
+diplomacy.races.forEach((r) => { r.unlocked = true; r.hidden = false; });
+// Clear the log so the new hunt entry is the topmost line — older entries
+// are PREPENDED so we can't slice() to filter them out.
+storage.set("kgh.log", "[]");
+const fursBeforeK = res("furs").value;
+fakeNow += 120000; // clear the auto-hunt 30s throttle from prior ticks
+tickFn();
+const logAfterK = logText();
+check("Test K: hunt actually grants furs (sanity)", res("furs").value > fursBeforeK);
+// Parse the JSON-encoded log so we can inspect individual entries.
+const parsedLog = JSON.parse(logAfterK || "[]");
+const huntEntries = parsedLog.filter((entry) => /🏹 hunting:/i.test(entry));
+const huntHasGain = huntEntries.some((entry) => /\+\s*\d/i.test(entry) && !/no resource gain/i.test(entry));
+if (!huntHasGain) {
+  console.error("DEBUG Test K — hunt entries:", huntEntries);
+  console.error("DEBUG Test K — furs after:", res("furs").value, "before:", fursBeforeK);
+  console.error("DEBUG Test K — manpower:", res("manpower").value);
+}
+check("Test K: hunt log reports the resource gain (snapshot captures value, not reference)", huntHasGain);
+
+/* ---------------------------------------------------------------------
+ * Test L — v2.3.0 action log capacity: visible + stored caps are bigger
+ * so a debugging session can scroll back through more decisions.
+ * ------------------------------------------------------------------- */
+check("Test L: log display limit raised above the old 12-line window", /LOG_DISPLAY_LIMIT\s*=\s*([4-9]\d|1\d{2,})/.test(source));
+check("Test L: log storage cap raised above the old 50-entry buffer", /LOG_STORAGE_LIMIT\s*=\s*([1-9]\d{2,})/.test(source));
+check("Test L: panel ships a 'Copy' button for the action log", /kgh-log-copy/.test(source));
+
+/* ---------------------------------------------------------------------
+ * Test M — v2.3.0 trade payoff includes season + embassy bonuses so the
+ * planner SCORES trades the way they actually play out (Summer Furs are
+ * worth more than Winter Furs).  This is a unit-level check on the
+ * exposed pieces; the wider scoring still runs through targetTradeScore.
+ * ------------------------------------------------------------------- */
+check("Test M: tradeSellExpected hook accepts a race so embassy bonus applies", /tradeSellExpected = \(sell, race = null\)/.test(source));
+check("Test M: trade scoring reads current calendar season", /currentTradeSeasonName/.test(source));
+check("Test M: trade scoring folds embassy level into expected yield", /tradeEmbassyBonus/.test(source));
+
 // Tear down the Acoustics scenario so the suite leaves a clean tree.
 electricity.researched = true;
 acoustics.researched = true;
