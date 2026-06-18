@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.4.1
+// @version      2.4.2
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.4.1";
+  const HELPER_VERSION = "2.4.2";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -715,6 +715,22 @@
       const target = getTargetCached(resources, goalKey);
       const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
       refreshStickyTargetChainReserve(target, resources);
+      const zebras = races.find((race) => race.name === "zebras");
+      if (zebras && (targetMissingResource(target, resources, "titanium") || titaniumDemandAmount(resources, goalKey) > 0) && !shouldSaveForExplorers(resources, goalKey)) {
+        const prices = tradePricesForRace(zebras);
+        if (prices.length && canPayPrices(prices) && pricesRespectReservations(prices, reserved, resources)) {
+          const amt = Math.max(1, affordableTradeCount(prices, reserved, resources));
+          const measured = withActionResourceDeltas(() => {
+            if (typeof diplomacy.tradeMultiple === "function") return diplomacy.tradeMultiple(zebras, amt);
+            return diplomacy.tradeAll(zebras);
+          }, tradeDeltaNamesForRace(zebras, prices));
+          lastTradeAt = Date.now();
+          diplomacyPlanText = `Trade executed: expected titanium ETA improved for ${labelOf(target.meta)}`;
+          pushLog(`🤝 Trade executed: ${measured.suffix}; expected titanium ETA improved for ${labelOf(target.meta)}`);
+          return;
+        }
+        diplomacyPlanText = (reserved.manpower || reserved.gold) ? "Trade skipped: catpower/gold below reserve." : "Trade skipped: Zebra trade costs unavailable.";
+      }
       const targeted = races
         .map((race) => targetTradeScore(race, target, resources, reserved))
         .filter((item) => item && item.score > 0.0005)
@@ -1192,7 +1208,10 @@
         const activeReserve = target && !target.affordable;
         const helpsTarget = targetNeedsResource(target, name) || craftOutputHelpsTarget(target, name, resources);
         const safeWoodOverflow = name === "wood" && !targetNeedsResource(target, "catnip") && wouldWasteResource(resources, "catnip");
-        if (activeReserve && !helpsTarget && !safeWoodOverflow) continue;
+        const safeCultureOverflow = ["parchment", "manuscript", "compedium", "blueprint"].includes(name) &&
+          wouldWasteResource(resources, "culture") &&
+          prices.every((price) => !((reservedNeedsFor(target, resources)[price.name] || 0) > 0 && resourceValue(resources, price.name) <= reservedNeedsFor(target, resources)[price.name]));
+        if (activeReserve && !helpsTarget && !safeWoodOverflow && !safeCultureOverflow) continue;
         if (!hotInputs.length && !helpsTarget) continue;
         let maxUnits = Number.MAX_VALUE;
         for (const price of prices) {
@@ -1200,6 +1219,11 @@
           const value = (input && input.value) || 0;
           const reserve = overflowInputFloor(target, resources, price.name, name);
           maxUnits = Math.min(maxUnits, Math.floor(Math.max(0, value - reserve) / price.val));
+          if (value - reserve <= 0 && (reservedNeedsFor(target, resources)[price.name] || 0) > 0 && Date.now() - lastOverflowLog > 20000) {
+            const sources = buildReservationLedger(target, resources).sources[price.name] || [];
+            pushLog(`📦 Overflow skipped: ${resTitle(resources, price.name)} reserved for ${sources[0] || "active plan"}.`);
+            lastOverflowLog = Date.now();
+          }
         }
         if (!isFinite(maxUnits) || maxUnits < 1) continue;
         const targetBoost = targetNeedsResource(target, name) || craftOutputHelpsTarget(target, name, resources) ? 100 : 0;
@@ -1384,9 +1408,9 @@
   };
   const LUXURY_RESOURCES = ["furs", "ivory", "spice"];
   const HELPER_TICK_MS = 2000;
-  const JOB_REBALANCE_MIN_MS = 20000;
-  const JOB_WEIGHT_SMOOTHING = 0.35;
-  const JOB_COUNT_DEADBAND_RATIO = 0.08;
+  const JOB_REBALANCE_MIN_MS = 45000;
+  const JOB_WEIGHT_SMOOTHING = 0.2;
+  const JOB_COUNT_DEADBAND_RATIO = 0.12;
   const CLIMB_PUSH_WEIGHT = 10;
   let smoothedJobWeights = {};
   let lastJobRun = 0;
@@ -2416,6 +2440,9 @@
   // but do not resume until it climbs back above RESUME.
   const PROCESSOR_STARVE_RATIO = 0.08;
   const PROCESSOR_RESUME_RATIO = 0.22;
+  const PROCESSOR_MIN_RUN_MS = 20000;
+  const PROCESSOR_MIN_PAUSE_MS = 20000;
+  const processorTransitions = {};
 
   const refreshAfterProcessorChange = () => {
     try {
@@ -2514,6 +2541,11 @@
     const wasStarvePaused = pausedProcessors[name] && pausedProcessors[name].reason === "starve";
     const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
     const usefulOutputs = outputs.filter((output) => needed.has(output));
+    const healthyInputs = inputs.length && inputs.every((input) => resRatio(resources, input, 1) >= 0.85 || productionFor(input) > 0);
+    const wantedOutputs = outputs.some((output) => !resCapped(resources, output) || needed.has(output));
+    if (full > 0 && (meta.on || 0) <= 0 && healthyInputs && wantedOutputs) {
+      return { on: full, reason: "run", detail: "healthy inputs" };
+    }
 
     // (a) Plan conflict — the converter eats a resource the focused plan is
     // short on OR has RESERVED (and isn't abundantly above that reservation)
@@ -2581,17 +2613,30 @@
         const name = meta.name;
         const currentOn = Math.max(0, meta.on || 0);
         const state = desiredProcessorState(meta, resources, missing, needed, reserved);
+        const transition = processorTransitions[name] || { state: currentOn > 0 ? "run" : "pause", at: 0 };
+        const desiredMode = state.on > 0 ? "run" : "pause";
+        if (transition.at > 0 && transition.state !== desiredMode) {
+          const min = transition.state === "run" ? PROCESSOR_MIN_RUN_MS : PROCESSOR_MIN_PAUSE_MS;
+          if (Date.now() - transition.at < min) {
+            processingPlanText = `Processing: holding ${labelOf(meta)} ${transition.state === "run" ? "running" : "paused"} (cooldown)`;
+            continue;
+          }
+        }
 
         if (state.on <= 0) {
           if (currentOn > 0) {
             pausedProcessors[name] = { on: currentOn, label: labelOf(meta), reason: state.reason };
-            if (setProcessorOn(meta, 0)) changed.push(`paused ${labelOf(meta)}${state.detail ? ` (${state.detail})` : ""}`);
+            if (setProcessorOn(meta, 0)) {
+              processorTransitions[name] = { state: "pause", at: Date.now() };
+              changed.push(`paused ${labelOf(meta)}${state.detail ? ` (${state.detail})` : ""}`);
+            }
           } else if (pausedProcessors[name]) {
             // Keep remembering why it is off so hysteresis/reporting hold.
             pausedProcessors[name].reason = state.reason;
           }
         } else if (currentOn < state.on) {
           if (setProcessorOn(meta, state.on)) {
+            processorTransitions[name] = { state: "run", at: Date.now() };
             changed.push(pausedProcessors[name] ? `resumed ${labelOf(meta)}` : `started ${labelOf(meta)}`);
           }
           delete pausedProcessors[name];
@@ -2611,6 +2656,24 @@
       } else {
         const paused = Object.values(pausedProcessors).map((item) => item.label).filter(Boolean);
         processingPlanText = paused.length ? `Processing: paused ${paused.join(", ")}` : "Processing: converters running";
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  const keepHealthyConvertersStable = (resources) => {
+    try {
+      for (const meta of converterBuildings()) {
+        if (!hasOnToggle(meta) || (meta.on || 0) > 0) continue;
+        const profile = processingProfileFor(meta);
+        const inputs = (profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[meta.name] || []).filter((name) => getRes(resources, name));
+        const outputs = (profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[meta.name] || []).filter((name) => getRes(resources, name));
+        if (!inputs.length || !outputs.length) continue;
+        if (inputs.every((name) => resRatio(resources, name, 1) >= 0.85) && outputs.some((name) => !resCapped(resources, name))) {
+          const transition = processorTransitions[meta.name];
+          if (!transition || Date.now() - transition.at >= PROCESSOR_MIN_PAUSE_MS) setProcessorOn(meta, meta.val || 0);
+        }
       }
     } catch (error) {
       /* ignore */
@@ -3208,15 +3271,29 @@
       .map((candidate) => ({ candidate, gain: scienceStorageGain(candidate), wait: waitSecondsForCandidate(candidate, resources) }))
       .filter((item) => isFinite(item.wait));
     if (!options.length) { activeScienceUnlockId = null; return null; }
-    options.sort((a, b) => (b.gain - a.gain) || ((b.candidate.score || 0) - (a.candidate.score || 0)) || (a.wait - b.wait));
+    // Rank storage fixes by the actual storage problem, not generic ROI: prefer
+    // cheap/immediate cap gain per limiting-resource ETA, with a penalty for
+    // transitive craft chains that collide with the manual queue. This makes a
+    // close Library keep winning over a flashy Observatory/Bio Lab/Temple unless
+    // the latter is materially faster.
+    const queueLedger = manualQueueReservationLedger(resources);
+    for (const option of options) {
+      const ledger = buildTargetLedger(option.candidate, resources);
+      const conflict = Object.keys(ledger.reserved).some((name) => (queueLedger.reserved[name] || 0) > 0) ? 1 : 0;
+      const eta = Math.max(1, option.wait);
+      option.planScore = (option.gain || scienceStorageGain(option.candidate) || 1) / eta /
+        (1 + Object.keys(ledger.reserved).length * 0.04 + conflict * 0.75);
+    }
+    options.sort((a, b) => (b.planScore - a.planScore) || (a.wait - b.wait) || (b.gain - a.gain) || ((b.candidate.score || 0) - (a.candidate.score || 0)));
     // Commit to the prior choice while it is still a valid option; only switch when
-    // a rival actually grows the cap meaningfully more (>20% gain).  When gains tie
-    // at 0 this always keeps the prior pick, killing the Library↔Observatory flicker.
+    // a rival actually improves the storage ETA/score by a meaningful hysteresis
+    // margin.  When gains tie at 0 this always keeps the prior pick, killing the
+    // Library↔Observatory flicker.
     const best = options[0];
     const prior = activeScienceUnlockId && options.find((o) => targetId(o.candidate) === activeScienceUnlockId);
-    const chosen = prior && !(best.gain > 0 && best.gain > prior.gain * 1.2) ? prior : best;
+    const chosen = prior && !(best.gain > prior.gain * 1.2 && best.planScore > prior.planScore * 1.25 && best.wait < prior.wait * 0.75) ? prior : best;
     activeScienceUnlockId = targetId(chosen.candidate);
-    return { target: chosen.candidate, blocked, need };
+    return { target: chosen.candidate, blocked, need, options: options.slice(0, 3) };
   };
 
   // Resolve the front-most ACTIONABLE manual-queue item to a strategic target.
@@ -3403,6 +3480,8 @@
   };
 
   const TARGET_LOCK_MAX_MS = 360000;
+  const PLAN_HYSTERESIS_MULT = 1.25;
+  const ActivePlan = "ActivePlan";
   const getTargetLockMinMs = () => {
     if (isEarlyGame()) return TARGET_LOCK_MIN_EARLY_MS;
     if (isMidGame()) return TARGET_LOCK_MIN_MID_MS;
@@ -3410,6 +3489,7 @@
   };
   const TARGET_READY_GRACE_MS = 20000;
   let activeTarget = null;
+  let activePlanDebug = { reason: "none", rejected: [], blocked: "" };
 
   const targetId = (candidate) => candidate && candidate.meta ? `${candidate.kind}:${candidate.meta.name || labelOf(candidate.meta)}` : "";
 
@@ -3423,6 +3503,29 @@
       return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
     }
     return false;
+  };
+
+  const targetImpossible = (candidate, resources) => {
+    if (!candidate || !candidate.meta) return true;
+    if (!isOpen(candidate.meta) && candidate.kind !== "build") return true;
+    const solver = solveCraftChain(resources, candidate);
+    return !!solver.hardBlocked;
+  };
+
+  const targetProgressSignature = (candidate, resources) => {
+    if (!candidate) return "";
+    return pricesFor(candidate.kind, candidate.meta)
+      .map((cost) => `${cost.name}:${Math.floor(Math.min(cost.val || 0, resValueOf(resources, cost.name)))}`)
+      .join("|");
+  };
+
+  const switchRejected = (from, to, why) => {
+    activePlanDebug.rejected = [{ target: to, reason: why }];
+    if (Date.now() - (activePlanDebug.lastRejectLog || 0) > 20000) {
+      const pct = to && from && from.score ? Math.round((((to.score || 0) / Math.max(1, from.score)) - 1) * 100) : 0;
+      pushLog(`🔒 Plan switch rejected: ${to ? labelOf(to.meta) : "none"} score better by only ${Math.max(0, pct)}%, below hysteresis threshold (${why})`);
+      activePlanDebug.lastRejectLog = Date.now();
+    }
   };
 
   /* --------------------------- new-unlock watching --------------------------- */
@@ -3496,50 +3599,83 @@
       pushLog(`🧠 plan layer → ${decision.layer || "?"}: ${label}${reasonExtra}`);
     }
 
-    // Structural override layers OWN the plan directly and must never be held
-    // back by a stale economy target lock (e.g. a half-saved Temple): a valid
-    // research sprint is its own cross-tick contract (validated in
-    // planResearchSprint), and a science-storage unlock outranks every long
-    // project while a valuable tech is cap-blocked.  Return that target directly.
-    if (decision.layer === STRATEGIC_LAYERS.manualQueue ||
-        decision.layer === STRATEGIC_LAYERS.researchSprint ||
-        decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock) {
-      activeTarget = null;
-      return preferred;
-    }
-
-    // Non-sprint economy lock: makes ordinary plans (Library, Mine, …) PUSH
-    // THROUGH. The executor reserves the locked target's resources and buys it
-    // the moment it is ready, so the lock only breaks on completion, a storage
-    // block, a long timeout, a far-cheaper research, or a much better rival.
+    // ActivePlan lock: every layer, including science-storage and manual queue,
+    // gets the same cross-tick contract.  Structural layers may START a plan, but
+    // may not oscillate Library/Bio Lab/Observatory/Temple every tick unless the
+    // target completed, became impossible, stopped progressing for the timeout,
+    // the user changed queue priority, or a real emergency wins.
     if (activeTarget) {
       const locked = findCandidateById(candidates, activeTarget.id);
       const age = now - activeTarget.startedAt;
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
       const preferredWait = preferred ? waitSecondsForCandidate(preferred, resources) : Number.POSITIVE_INFINITY;
+      const progress = locked ? targetProgressSignature(locked, resources) : "";
+      if (progress && progress !== activeTarget.lastProgressSignature) {
+        activeTarget.lastProgressSignature = progress;
+        activeTarget.lastProgressAt = now;
+      }
+      const noProgress = now - (activeTarget.lastProgressAt || activeTarget.startedAt) > TARGET_LOCK_MAX_MS;
+      const manualQueueChanged = activeTarget.queueSignature !== JSON.stringify(readQueue());
+      const emergency = resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0;
+      const impossible = locked && targetImpossible(locked, resources);
+      const completed = locked && targetComplete(locked);
+      const same = locked && preferred && targetId(locked) === targetId(preferred);
+      const structuralLayerTakeover = preferred && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock &&
+        activeTarget.layer !== STRATEGIC_LAYERS.scienceStorageUnlock;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
-      const muchBetter = preferred && locked && age >= getTargetLockMinMs() && preferred.score > locked.score * 1.3 + 8;
+      const scoreBetter = preferred && locked && (preferred.score || 0) > (locked.score || 0) * PLAN_HYSTERESIS_MULT + 8;
+      const etaBetter = preferredWait < lockedWait * 0.75;
+      const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
-      if (!locked || targetComplete(locked) || age > TARGET_LOCK_MAX_MS || lockedIsStaleStorage ||
-          lockedIsStorageBlocked || nearTechBreak) {
+      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || age > TARGET_LOCK_MAX_MS ||
+          lockedIsStaleStorage || lockedIsStorageBlocked || nearTechBreak) {
+        const reason = !locked ? "target unavailable" : completed ? "target completed" : impossible ? "target impossible" :
+          noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
+          structuralLayerTakeover ? "science storage emergency" :
+          emergency ? "emergency" : "lock timeout";
+        pushLog(`🔓 Plan switch accepted: ${reason}`);
         activeTarget = null;
-      } else if (!muchBetter) {
+      } else if (!same && !muchBetter) {
+        switchRejected(locked, preferred, `locked ${labelOf(locked.meta)} age ${formatEta(age / 1000)}`);
         lastStrategicDecision.target = locked;
+        lastStrategicDecision.layer = activeTarget.layer || decision.layer;
+        activePlanDebug.reason = activeTarget.reason || decision.reason || "locked";
+        return locked;
+      } else if (same || age < getTargetLockMinMs()) {
+        lastStrategicDecision.target = locked;
+        activePlanDebug.reason = activeTarget.reason || decision.reason || "locked";
         return locked;
       } else {
+        pushLog(`🔓 Plan switch accepted: ${preferred ? labelOf(preferred.meta) : "none"} beat ${labelOf(locked.meta)} by hysteresis`);
         activeTarget = null;
       }
     }
 
+    // ActivePlan lock makes ordinary plans (Library, Mine, …) PUSH
+    // THROUGH. The executor reserves the locked target's resources and buys it
+    // the moment it is ready, so the lock only breaks on completion, a storage
+    // block, a long timeout, a far-cheaper research, or a much better rival.
     if (preferred) {
       activeTarget = {
         id: targetId(preferred),
         startedAt: now,
+        lastProgressAt: now,
+        lastProgressSignature: targetProgressSignature(preferred, resources),
         initialVal: VAL_BASED_KINDS.has(preferred.kind) ? preferred.meta.val || 0 : 0,
         layer: decision.layer,
+        reason: decision.reason,
+        queueSignature: JSON.stringify(readQueue()),
       };
+      const reserved = reservedNeedsFor(preferred, resources);
+      const deficits = Object.entries(reserved)
+        .map(([name, amount]) => [name, Math.max(0, amount - resValueOf(resources, name))])
+        .filter(([, amount]) => amount > 0)
+        .slice(0, 4)
+        .map(([name, amount]) => `${resTitle(resources, name)} ${fmt(amount)}`)
+        .join(", ");
+      pushLog(`🔒 Plan locked: ${labelOf(preferred.meta)} for ${decision.layer}; remaining deficits: ${deficits || "none"}`);
     }
     return preferred;
   };
@@ -3835,6 +3971,14 @@
     const woodcutterJob = jobByName("woodcutter");
     if (woodcutterJob && netWoodPerSecond < 0 && resRatio(resources, "wood") < 0.5) {
       weights.woodcutter = Math.max(weights.woodcutter || 0, 8 + Math.min(20, -netWoodPerSecond));
+    }
+    // Wood bottleneck hysteresis: when the active plan needs wood and catnip is
+    // safely positive, keep a direct wood-production path staffed.  Do not flip
+    // Woodcutters to 0 while also refining catnip into wood unless food safety
+    // actually requires it.
+    const activeNeedsWood = !!(target && !target.affordable && targetClimbNeeds(target, resources).wood);
+    if (woodcutterJob && activeNeedsWood && productionFor("catnip") > 0 && resRatio(resources, "catnip") > 0.25) {
+      weights.woodcutter = Math.max(weights.woodcutter || 0, 6);
     }
     if (!Object.values(weights).some((w) => w > 0)) {
       const fallback = bestWoodJob() || jobByName("woodcutter") || jobByName("farmer") || jobs[0];
@@ -4257,9 +4401,22 @@
       const target = getTargetCached(resources, goalKey);
       if (!target) return "";
       const decision = lastStrategicDecision;
+      const lockAge = activeTarget && activeTarget.id === targetId(target) ? formatEta((Date.now() - activeTarget.startedAt) / 1000) : "unlocked";
+      const lockText = `ActivePlan: ${labelOf(target.meta)} · lock ${lockAge} · reason ${activePlanDebug.reason || (decision && decision.reason) || "selected"}`;
+      const reserveLedger = buildReservationLedger(target, resources);
+      const reserveBySource = Object.entries(reserveLedger.reserved).slice(0, 5)
+        .map(([name, amount]) => `${resTitle(resources, name)} ${fmt(amount)} (${(reserveLedger.sources[name] || ["active plan"])[0]})`)
+        .join("; ");
+      const topSource = (decision && decision.candidates || getCandidatesCached(resources, goalKey))
+        .filter((candidate) => !(decision && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock && isLongProject(candidate, resources, goalKey)));
+      const topCandidates = topSource.slice(0, 3)
+        .map((candidate) => `${labelOf(candidate.meta)} score ${fmt(candidate.score || 0)} ETA ${formatEta(waitSecondsForCandidate(candidate, resources))}`)
+        .join("; ");
+      const baseDebug = `${lockText} · Target score ${fmt(target.score || 0)} ETA ${formatEta(waitSecondsForCandidate(target, resources))} · Top candidates: ${topCandidates || "none"} · Reservations: ${reserveBySource || "none"} · Next: ${getNowAction(resources, goalKey)}`;
       // Research-sprint details: protected chain + deferrals + job drivers.
       if (decision && decision.layer === STRATEGIC_LAYERS.researchSprint && decision.sprint) {
         const parts = [];
+        parts.push(baseDebug);
         const chain = protectedChainLabels(resources, decision.protectedChain);
         if (chain.length) parts.push(`Protected chain: ${chain.join(" → ")}`);
         for (const item of (decision.rejectedTopCandidates || []).filter((i) => i && i.target).slice(0, 4)) {
@@ -4272,9 +4429,10 @@
       if (decision && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock && decision.scienceStorageBlocker) {
         const blocker = decision.scienceStorageBlocker;
         const eta = formatEta(waitSecondsForCandidate(target, resources));
-        const rejected = (decision.rejectedTopCandidates || []).filter((item) => item && item.target).slice(0, 3);
+        const rejected = (decision.rejectedTopCandidates || [])
+          .filter((item) => item && item.target && !isLongProject(item.target, resources, goalKey)).slice(0, 3);
         const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
-        return `${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${rejectNote}`;
+        return `${baseDebug} · ${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${rejectNote}`;
       }
       // Economy details: state + ETA + reservation + deferrals (unchanged shape).
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
@@ -4285,7 +4443,7 @@
       const rejected = (decision && decision.rejectedTopCandidates || []).filter((item) => item && item.target).slice(0, 3);
       const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
       const titaniumHint = titaniumRouteHint(resources, goalKey);
-      return `${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
+      return `${baseDebug} · ${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
     } catch (error) {
       return "";
     }
@@ -4604,7 +4762,56 @@
     return ledger;
   };
 
-  const reservedNeedsFor = (target, resources) => buildTargetLedger(target, resources).reserved;
+  const mergeLedger = (into, ledger, source = "active plan") => {
+    for (const [name, amount] of Object.entries((ledger && ledger.reserved) || {})) {
+      into.reserved[name] = Math.max(into.reserved[name] || 0, amount);
+      (into.sources[name] || (into.sources[name] = [])).push(source);
+    }
+    for (const name of (ledger && ledger.critical) || []) into.critical.add(name);
+    return into;
+  };
+
+  const manualQueueReservationLedger = (resources) => {
+    const out = { reserved: {}, critical: new Set(), sources: {} };
+    for (const item of readQueue()) {
+      if (queueItemDone(item)) continue;
+      const meta = lookupMetaById(item.id);
+      const [kind] = String(item.id).split(":");
+      if (!meta) continue;
+      const candidate = { kind, meta, affordable: false };
+      mergeLedger(out, buildTargetLedger(candidate, resources), `manual queue ${labelOf(meta)}`);
+    }
+    return out;
+  };
+
+  const survivalReservationLedger = (resources) => {
+    const out = { reserved: {}, critical: new Set(), sources: {} };
+    const catnip = getRes(resources, "catnip");
+    if (catnip) {
+      const floor = craftReserveFor(resources, "catnip");
+      out.reserved.catnip = Math.max(out.reserved.catnip || 0, floor);
+      out.critical.add("catnip");
+      out.sources.catnip = ["survival"];
+    }
+    const cp = getRes(resources, "manpower") || getRes(resources, "catpower");
+    if (cp) {
+      const floor = craftReserveFor(resources, "manpower");
+      out.reserved.manpower = Math.max(out.reserved.manpower || 0, floor);
+      out.critical.add("manpower");
+      out.sources.manpower = ["survival"];
+    }
+    return out;
+  };
+
+  const buildReservationLedger = (target, resources) => {
+    const out = { target, reserved: {}, critical: new Set(), sources: {} };
+    mergeLedger(out, buildTargetLedger(target, resources), target ? `active plan ${labelOf(target.meta)}` : "active plan");
+    mergeLedger(out, manualQueueReservationLedger(resources), "manual queue");
+    mergeLedger(out, survivalReservationLedger(resources), "survival");
+    return out;
+  };
+
+  const reservedNeedsFor = (target, resources) => buildReservationLedger(target, resources).reserved;
 
   // Resources the active target still needs to bank MORE of, where the needed
   // amount fits under the cap (so saving toward it is actually possible).  These
@@ -6120,6 +6327,7 @@
       maybeObserveStars();
       refineSurplusCatnip();
       optimizeProcessing(resources, goal);
+      keepHealthyConvertersStable(resources);
       craftTowardTarget(resources, goal);
       craftDiplomacyPrerequisites(resources, goal);
       // Crafting or trade can turn a plan affordable immediately. Re-read and
