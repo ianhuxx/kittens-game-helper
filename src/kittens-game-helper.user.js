@@ -3544,11 +3544,21 @@
       .join("|");
   };
 
-  const switchRejected = (from, to, why) => {
+  const switchRejected = (from, to, why, details = {}) => {
     activePlanDebug.rejected = [{ target: to, reason: why }];
     if (Date.now() - (activePlanDebug.lastRejectLog || 0) > 20000) {
       const pct = to && from && from.score ? Math.round((((to.score || 0) / Math.max(1, from.score)) - 1) * 100) : 0;
-      pushLog(`🔒 Plan switch rejected: ${to ? labelOf(to.meta) : "none"} score better by only ${Math.max(0, pct)}%, below hysteresis threshold (${why})`);
+      const neededPct = Math.round((PLAN_HYSTERESIS_MULT - 1) * 100);
+      const blockers = [];
+      if (details.age != null && details.minAge != null && details.age < details.minAge) {
+        blockers.push(`lock age ${formatEta(details.age / 1000)} < ${formatEta(details.minAge / 1000)} minimum`);
+      }
+      if (details.scoreBetter === false) blockers.push(`score gain ${Math.max(0, pct)}% < ${neededPct}% threshold`);
+      if (details.etaBetter === false && isFinite(details.lockedWait || Number.NaN) && isFinite(details.preferredWait || Number.NaN)) {
+        blockers.push(`ETA ${formatEta(details.preferredWait)} is not 25% faster than ${formatEta(details.lockedWait)}`);
+      }
+      const whyText = blockers.length ? blockers.join("; ") : why;
+      pushLog(`🔒 Plan switch rejected: ${to ? labelOf(to.meta) : "none"} score better by ${Math.max(0, pct)}% but switch requirements were not met (${whyText})`);
       activePlanDebug.lastRejectLog = Date.now();
     }
   };
@@ -3675,7 +3685,14 @@
         if (impossible && locked) rejectedTargets.set(targetId(locked), { reason: feasibility.reason || reason, at: now });
         activeTarget = null;
       } else if (!same && !muchBetter) {
-        switchRejected(locked, preferred, `locked ${labelOf(locked.meta)} age ${formatEta(age / 1000)}`);
+        switchRejected(locked, preferred, `locked ${labelOf(locked.meta)} age ${formatEta(age / 1000)}`, {
+          age,
+          minAge: getTargetLockMinMs(),
+          scoreBetter,
+          etaBetter,
+          lockedWait,
+          preferredWait,
+        });
         lastStrategicDecision.target = locked;
         lastStrategicDecision.layer = activeTarget.layer || decision.layer;
         activePlanDebug.reason = activeTarget.reason || decision.reason || "locked";
