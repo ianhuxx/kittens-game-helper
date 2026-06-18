@@ -1351,6 +1351,16 @@ for (let i = 0; i < 8; i += 1) {
   d4Stable = d4Stable && d4Id === d4Committed;
 }
 check("Test D4: science storage unlock commits to one building, ignoring an equal-gain rival", d4Stable && /scienceVaultA/i.test(d4Committed || ""));
+
+/*
+ * Test D4b — plan-switch score gain uses fractional units consistently. A
+ * candidate that is 61% better must satisfy the 25% hysteresis threshold; the
+ * old logic effectively compared a fractional gain with a percent threshold (or
+ * a hidden absolute score add-on) and could log impossible math like 61% < 25%.
+ */
+const d4bLocked = { kind: "build", score: 100, meta: { name: "bioLab", label: "Bio Lab" } };
+const d4bPreferred = { kind: "build", score: 161, meta: { name: "library", label: "Library" } };
+check("Test D4b: 61% candidate score gain passes the 25% plan-switch threshold", dbg.candidateScoreGain(d4bLocked, d4bPreferred) > 0.60 && dbg.candidateMeetsSwitchScoreGain(d4bLocked, d4bPreferred));
 vaultA.unlocked = false; vaultB.unlocked = false; // do not leak into later sprint tests
 
 /* ---------------------------------------------------------------------
