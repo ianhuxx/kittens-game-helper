@@ -4266,7 +4266,19 @@
       const r = resources.get(name);
       const cap = liveCapFor(resources, name);
       if (r && cap > 0 && r.value >= cap * 0.99) {
-        const fix = name === "manpower" ? "send hunters" : "build more storage / spend it";
+        const storageBlocker = lastStrategicDecision && lastStrategicDecision.scienceStorageBlocker;
+        const storageTarget = lastStrategicDecision && lastStrategicDecision.target;
+        const activeStorageMeta = name === "science" && activeTarget
+          ? lookupMetaById(activeTarget.id)
+          : null;
+        const activeStorageFix = activeStorageMeta && scienceStorageUnlockCandidate({ kind: String(activeTarget.id).split(":")[0], meta: activeStorageMeta }, resources)
+          ? activeStorageMeta
+          : null;
+        const capFixMeta = storageBlocker && storageTarget ? storageTarget.meta : activeStorageFix;
+        const storageFix = name === "science" && capFixMeta
+          ? `building ${labelOf(capFixMeta)} to raise the cap`
+          : "build more storage / spend it";
+        const fix = name === "manpower" ? "send hunters" : storageFix;
         const rate = productionFor(name);
         return `${r.title || name} is capped (${fmt(r.value)}/${fmt(cap)}, ${rate >= 0 ? "+" : ""}${fmt(rate)}/s live) — ${fix}`;
       }
@@ -6649,6 +6661,15 @@
       resetTickCache();
       const resources = resourceMap();
       return getPlanLine(resources, goalKey);
+    },
+    bottleneckText(goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
+      const resources = resourceMap();
+      const decision = selectStrategicTarget(resources, goalKey);
+      lastStrategicDecision = decision;
+      tickCache.candidates = decision.candidates;
+      return getBottleneck(resources);
     },
     detailsText(goalKey = getGoal()) {
       resetTickCache();

@@ -1844,7 +1844,7 @@ library.unlocked = true;
 library.prices = [{ name: "wood", val: 95440 }];
 buildings.find((b) => b.name === "mine").prices = [{ name: "wood", val: 999999 }];
 library.val = 10; library.on = 10;
-res("science").value = 80740; res("science").maxValue = 81560; perTick.science = 0;
+res("science").value = 81560; res("science").maxValue = 81560; perTick.science = 0;
 res("wood").value = 13610; res("wood").maxValue = 143950; perTick.wood = 19; // 95/s
 res("catnip").value = 157930; res("catnip").maxValue = 311830; perTick.catnip = 283.8; // 1419/s
 res("minerals").value = 7680; res("minerals").maxValue = 193180; perTick.minerals = 11.586;
@@ -1865,6 +1865,7 @@ const r242NewLogs = r242Logs.slice(0, Math.max(0, r242Logs.length - r242LogsBefo
 const r242ImpossibleLogs = r242NewLogs.filter((line) => /Plan switch accepted: target impossible/.test(line));
 const r242PlanLocks = r242NewLogs.filter((line) => /Plan locked: Library/.test(line));
 const r242Now = r242InitialNow || dbg.nowText("balanced");
+const r242Bottleneck = dbg.bottleneckText("balanced");
 check("Test Q: Library is classified BLOCKED/PRODUCIBLE, not IMPOSSIBLE, with missing wood", r242Library?.meta?.name === "library" && r242Feasible.status === "BLOCKED/PRODUCIBLE");
 check("Test Q: missing Library wood remains reachable through production/refine chunks", r242Solve.reachable && !r242Solve.hardBlocked);
 check("Test Q: full transitive Refine Catnip cost is not a hard Library reservation", !r242Ledger.reserved.catnip || r242Ledger.reserved.catnip < 1000000);
@@ -1872,6 +1873,7 @@ check("Test Q: optional trade/hunt catpower does not leak into Library hard defi
 check("Test Q: no false target-impossible unlocks are emitted over 30 cycles", r242ImpossibleLogs.length === 0);
 check("Test Q: plan lock logging is de-duplicated rather than spammed", r242PlanLocks.length <= 2 && JSON.parse(storage.get("kgh.log") || "[]").length >= r242LogsBefore);
 check("Test Q: current action accumulates wood/refines safe chunks, not a giant upfront catnip craft", /accumulate Wood|refine only surplus|safe Refine Catnip chunk/i.test(r242Now) && !/craft 8[0-9].*Refine Catnip/i.test(r242Now));
+check("Test Q: capped science bottleneck explains the active storage target is the cap fix", /science is capped.*building .* to raise the cap/i.test(r242Bottleneck));
 techs.splice(techs.indexOf(industrialization), 1);
 
 // Tear down the Acoustics scenario so the suite leaves a clean tree.
