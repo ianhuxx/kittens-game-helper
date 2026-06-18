@@ -1709,6 +1709,60 @@ check("Test M: tradeSellExpected hook accepts a race so embassy bonus applies", 
 check("Test M: trade scoring reads current calendar season", /currentTradeSeasonName/.test(source));
 check("Test M: trade scoring folds embassy level into expected yield", /tradeEmbassyBonus/.test(source));
 
+/* ---------------------------------------------------------------------
+ * Test N — v2.4.0 trade-vs-craft pathway analysis: the planner can
+ * SECONDS-cost each demand resource via crafting and via the best
+ * trade partner, then prefer whichever is faster.  The hard gate
+ * also skips a trade entirely when crafting is materially faster
+ * for every demand resource that race could sell us.
+ * ------------------------------------------------------------------- */
+setupAcoustics();
+storage.set("kgh.goal", "balanced");
+dbg.forceActiveTarget(null);
+acoustics.researched = false;
+electricity.researched = true;
+res("science").value = 60000; res("science").maxValue = 80000;
+res("compedium").value = 14;
+res("manuscript").value = 0;
+res("parchment").value = 0;
+res("furs").value = 30;
+res("manpower").value = 800; res("manpower").maxValue = 3225;
+res("gold").value = 100; res("gold").maxValue = 500;
+res("iron").value = 1000; res("iron").maxValue = 5000;
+// Make production rates explicit so the comparison is deterministic.
+perTick.manpower = 4;   // 20/s catpower
+perTick.gold = 0.2;     // 1/s gold
+perTick.iron = 1;       // 5/s iron
+perTick.furs = 0.01;    // glacial: 0.05/s furs → craft path is the bottleneck
+perTick.parchment = 0;
+perTick.manuscript = 0;
+perTick.science = 0.5;  // 2.5/s science
+perTick.culture = 0.2;
+const nTarget = { kind: "research", meta: acoustics, affordable: false };
+const nPaths = dbg.targetPathwayAnalysis(nTarget);
+const compRow = nPaths.find((row) => row.name === "compedium");
+check("Test N: pathway analysis identifies the compendium demand for Acoustics", !!compRow && compRow.amount > 0);
+check("Test N: craft path seconds are computed for compendium", compRow && isFinite(compRow.craftSeconds) && compRow.craftSeconds > 0);
+check("Test N: a winner (trade or craft) is reported per demand resource", compRow && (compRow.winner === "trade" || compRow.winner === "craft"));
+const sharks = diplomacy.races.find((race) => race.name === "sharks");
+const sharkTradeSecs = dbg.tradePathSecondsFor(sharks, "compedium", compRow.amount);
+const sharkSpeed = dbg.tradeSpeedMultiplierFor(sharks, nTarget);
+check("Test N: trade path seconds for sharks are computed via funded batch cost", isFinite(sharkTradeSecs) && sharkTradeSecs > 0);
+check("Test N: speed multiplier reflects craft vs trade ratio (clamped 0.25–4)", isFinite(sharkSpeed) && sharkSpeed >= 0.25 && sharkSpeed <= 4);
+
+// Make trading dominate: faster trade fuel AND slower craft chain.
+perTick.furs = -0.001; // crafting is structurally impossible without hunting
+res("manpower").value = 3000; // plenty of catpower already in the bank
+res("gold").value = 500;
+res("iron").value = 5000;
+const nPathsTradeFast = dbg.targetPathwayAnalysis(nTarget);
+const compRowFast = nPathsTradeFast.find((row) => row.name === "compedium");
+check("Test N: when craft chain is structurally blocked, trade wins", compRowFast && compRowFast.winner === "trade");
+
+// Restore production rates so later tests are not perturbed by these tweaks.
+perTick.manpower = 12; perTick.gold = 0.01; perTick.iron = 0.05;
+perTick.furs = 0.5; perTick.science = 0.2; perTick.culture = 0.2;
+
 // Tear down the Acoustics scenario so the suite leaves a clean tree.
 electricity.researched = true;
 acoustics.researched = true;
