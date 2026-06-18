@@ -1764,19 +1764,16 @@ perTick.manpower = 12; perTick.gold = 0.01; perTick.iron = 0.05;
 perTick.furs = 0.5; perTick.science = 0.2; perTick.culture = 0.2;
 
 /* ---------------------------------------------------------------------
- * Test P — "last few science" stall (v2.4.1).  A research tech in the manual
- * queue whose science cost lands BETWEEN 94% and 100% of the science cap must
- * keep scholars staffed to finish, not hard-zero them at the 0.94 anti-waste
- * line and stall a few units short forever.  Live v2.4.0: Biology cost 80.75K,
- * the science cap was 82.03K, science sat at 77.22K (94.1%) and Scholar held at
- * 0, so the last 3.53K science never came.
+ * Test P — v2.4.1 "last few science" stall. A manual-queue research tech
+ * whose science cost lands BETWEEN 94% and 100% of cap must keep scholars
+ * staffed to finish instead of hard-zeroing them at the anti-waste line.
  * ------------------------------------------------------------------- */
 const biology = {
   name: "biology",
   label: "Biology",
   unlocked: true,
   researched: false,
-  prices: [{ name: "science", val: 5900 }], // fits the 6000 cap, above the 5700 banked
+  prices: [{ name: "science", val: 5900 }],
   unlocks: {},
 };
 techs.push(biology);
@@ -1788,7 +1785,7 @@ dbg.forceActiveTarget(null);
 dbg.queueClear();
 dbg.queueAdd("research:biology", 0);
 // Science at 95% of cap — above the 0.94 anti-waste line but below Biology's
-// cost, which itself fits the cap.  Everything else is comfortable so nothing
+// cost, which itself fits the cap. Everything else is comfortable so nothing
 // but the bug could keep scholars at zero.
 res("science").value = 5700; res("science").maxValue = 6000;
 res("catnip").value = 3500; res("catnip").maxValue = 5000; perTick.catnip = 4;
@@ -1797,7 +1794,7 @@ res("minerals").value = 800; res("minerals").maxValue = 1000;
 res("culture").value = 5000; res("culture").maxValue = 12000;
 res("faith").value = 10; res("faith").maxValue = 100;
 for (const j of jobs) j.value = 0;
-job("farmer").value = 8; // a prior split that must yield to the science push
+job("farmer").value = 8;
 village.getKittens = () => 8;
 village.getFreeKittens = () => 0;
 const pDecision = dbg.selectStrategicTarget("balanced");
@@ -1809,11 +1806,10 @@ check("Test P: scholars are staffed to push the last few science (not hard-zeroe
 // Sanity: a capped science bank with NO target needing it still zeroes scholars.
 dbg.queueClear();
 biology.researched = true;
-res("science").value = 6000; res("science").maxValue = 6000; // fully capped, nothing wants it
+res("science").value = 6000; res("science").maxValue = 6000;
 dbg.forceActiveTarget(null);
 for (let i = 0; i < 4; i += 1) { fakeNow += 40000; tickFn(); }
 check("Test P: a truly capped science bank with no target need still suppresses scholars", job("scholar").value === 0);
-// Tear down so the suite leaves a clean tree.
 techs.splice(techs.indexOf(biology), 1);
 dbg.queueClear();
 res("science").value = 60000; res("science").maxValue = 80000;

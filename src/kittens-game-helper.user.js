@@ -1387,10 +1387,6 @@
   const JOB_REBALANCE_MIN_MS = 20000;
   const JOB_WEIGHT_SMOOTHING = 0.35;
   const JOB_COUNT_DEADBAND_RATIO = 0.08;
-  // Firm job weight given to a resource the active target still needs to bank
-  // more of when it has climbed past the >0.94 cap anti-waste line — strong
-  // enough to win the final push so the plan finishes instead of stalling a few
-  // units short (the "last few science" stall).
   const CLIMB_PUSH_WEIGHT = 10;
   let smoothedJobWeights = {};
   let lastJobRun = 0;
@@ -3597,9 +3593,7 @@
     if (resRatio(resources, "wood") < 0.3) scoreNeed(needs, "wood", 4 * (0.3 - resRatio(resources, "wood")) / 0.3);
 
     // Anti-waste: never staff a capped bank (keeps scholars off full science) —
-    // unless the sprint still needs to bank MORE of it within the cap (the final
-    // push to a science cost that fits, e.g. ≥98.5% of cap, where the ledger
-    // starts reserving the cap-drain resource).
+    // unless the sprint still needs to bank MORE of it within the cap.
     const climbNeeds = targetClimbNeeds(target, resources);
     for (const name of ["science", "faith", "culture"]) {
       if (climbNeeds[name]) continue;
@@ -3717,8 +3711,7 @@
     // Final-push exception: a resource the active target still needs to bank
     // MORE of (and that fits the cap) must NOT be cut by the cap anti-waste
     // rules below — otherwise a tech/building whose cost lands between 94% and
-    // 100% of the cap stalls a few units short forever (the "last few science"
-    // stall: Biology cost 80.75K, science cap 82.03K, scholars quit at 77K).
+    // 100% of the cap stalls a few units short forever.
     const climbNeeds = targetClimbNeeds(target, resources);
     for (const name of ["science", "faith", "culture", "manpower"]) {
       if (name === "manpower" && huntingEconomyNeed(resources) > 0.5) continue;
@@ -3729,9 +3722,6 @@
       if (climbNeeds[name]) continue;
       if (resRatio(resources, name) > 0.96) needs[name] = Math.min(needs[name] || 0, 0.25);
     }
-    // In the near-cap stretch where anti-waste would otherwise starve the
-    // producing job, give each still-needed target resource a firm weight so the
-    // plan finishes climbing instead of crawling (or stalling on) the last units.
     for (const name of Object.keys(climbNeeds)) {
       if (resRatio(resources, name) > 0.9) {
         const key = name === "catpower" ? "manpower" : name;
@@ -4621,11 +4611,9 @@
   // must be exempt from the >0.94 cap anti-waste rule: when a tech/building cost
   // lands between 94% and 100% of the cap, the producing job (scholars for a
   // science tech) otherwise gets hard-zeroed a few units short and the plan
-  // stalls forever — the "last few science" stall (live v2.4.0: Biology cost
-  // 80.75K, the science cap was 82.03K, so scholars quit at 77.22K / 94% and
-  // science never finished climbing).  Returns name → value-to-reach.  Storage-
-  // blocked costs are not in the ledger's reserved set, so a cap-blocked tech
-  // never triggers this (the storage-unlock layer owns that case instead).
+  // stalls forever.  Storage-blocked costs are not in the ledger's reserved set,
+  // so a cap-blocked tech never triggers this (the storage-unlock layer owns that
+  // case instead).
   const targetClimbNeeds = (target, resources) => {
     const climb = {};
     if (!target || target.affordable) return climb;
@@ -4634,8 +4622,8 @@
       const res = getRes(resources, name);
       if (!res) continue;
       const cap = res.maxValue || 0;
-      if (cap > 0 && amount > cap) continue;     // can't fit — storage planner's job
-      if ((res.value || 0) >= amount) continue;  // already banked enough
+      if (cap > 0 && amount > cap) continue;
+      if ((res.value || 0) >= amount) continue;
       climb[name] = amount;
     }
     return climb;
