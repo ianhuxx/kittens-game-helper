@@ -1,2 +1,0 @@
-export function htmlToText(input:string):string{return (input||'').replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/&nbsp;|&#160;/gi,' ').replace(/&amp;/gi,'&').replace(/\u00a0/g,' ').replace(/[ \t]+/g,' ').replace(/\n\s+/g,'\n').trim()}
-export function compactText(input:string):string{return htmlToText(input).replace(/\r/g,'').replace(/\n{3,}/g,'\n\n')}
