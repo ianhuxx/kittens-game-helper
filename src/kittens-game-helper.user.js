@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.3.0
+// @version      2.4.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.3.0";
+  const HELPER_VERSION = "2.4.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -5259,6 +5259,127 @@
     return hit ? `${resTitle(resources, hit)}/${labelOf(target.meta)} chain` : "material chain";
   };
 
+  // ─── v2.4 cost-benefit: trade-vs-craft pathway timing ──────────────────────
+  // Per-second production rate.  productionFor() already folds in the live
+  // bar delta and conversion-aware getResourcePerTick, so this is a single
+  // accurate clock-rate for each resource.  Catpower aliases to manpower.
+  const productionRateFor = (name) => productionFor(name);
+
+  // How long until we passively accumulate `amount` of `name`, starting from
+  // the current stock — used for both "how long until enough catpower to fund
+  // a trade batch" and "how long until enough furs to craft a manuscript".
+  // Returns Infinity when there is no positive production (the path is
+  // structurally blocked, not just slow).
+  const secondsToAccumulate = (name, amount, resources) => {
+    const have = resourceValue(resources, name);
+    const deficit = Math.max(0, amount - have);
+    if (deficit <= 0) return 0;
+    const rate = productionRateFor(name);
+    if (!isFinite(rate) || rate <= 0) return Number.POSITIVE_INFINITY;
+    return deficit / rate;
+  };
+
+  // Wall-clock seconds to assemble `amount` of `name` by CRAFTING — i.e. by
+  // producing every leaf raw input the recipe chain ultimately needs and
+  // letting whichever is slowest gate the rest.  Direct (uncrafted) demand
+  // is its own cost.
+  const craftPathSecondsFor = (name, amount, resources) => {
+    if (amount <= 0) return 0;
+    if (!craftByName(name)) return secondsToAccumulate(name, amount, resources);
+    const raw = rawPathRequirements(name, amount);
+    let worst = 0;
+    for (const [rawName, rawAmount] of Object.entries(raw)) {
+      const sec = secondsToAccumulate(rawName, rawAmount, resources);
+      if (sec > worst) worst = sec;
+    }
+    return worst;
+  };
+
+  // Wall-clock seconds to deliver `amount` of `sellName` from `race` by
+  // TRADING — i.e. by funding the trade-price batch (catpower + gold + any
+  // goods the race buys) often enough to expect `amount` of the sale.
+  // Chance, season and embassy bonuses already feed into tradeSellExpected.
+  const tradePathSecondsFor = (race, sellName, amount, resources) => {
+    if (!race || amount <= 0) return Number.POSITIVE_INFINITY;
+    const sell = (race.sells || []).find((s) => s && s.name === sellName);
+    if (!sell) return Number.POSITIVE_INFINITY;
+    const yieldPerTrade = tradeSellExpected(sell, race);
+    if (yieldPerTrade <= 0) return Number.POSITIVE_INFINITY;
+    const tradesNeeded = amount / yieldPerTrade;
+    const prices = tradePricesForRace(race);
+    if (!prices.length) return Number.POSITIVE_INFINITY;
+    let worst = 0;
+    for (const price of prices) {
+      if (!price || !isFinite(price.val) || price.val <= 0) continue;
+      const total = price.val * tradesNeeded;
+      const sec = secondsToAccumulate(price.name, total, resources);
+      if (sec > worst) worst = sec;
+    }
+    return worst;
+  };
+
+  // For each demand resource in the chain, pick the FASTER of crafting it
+  // directly (or producing it from leaf inputs) and trading for it.  The
+  // result drives both the scoring boost in targetTradeScore and the
+  // diplomacy panel text so the player can SEE the comparison.
+  const analyzeTargetDemandPaths = (target, resources) => {
+    const demand = targetTradeChainDemand(target, resources);
+    const analysis = [];
+    if (!target || !Object.keys(demand).length) return analysis;
+    const races = unlockedRaces();
+    for (const [name, amount] of Object.entries(demand)) {
+      if (!name || !(amount > 0)) continue;
+      // Only score demand resources that are an output of some race's `sells`
+      // OR are directly craftable; otherwise the comparison is meaningless.
+      const sellerOptions = races
+        .map((race) => ({ race, seconds: tradePathSecondsFor(race, name, amount, resources) }))
+        .filter((opt) => isFinite(opt.seconds))
+        .sort((a, b) => a.seconds - b.seconds);
+      const craftSeconds = craftPathSecondsFor(name, amount, resources);
+      const bestTrade = sellerOptions[0] || null;
+      const tradeSeconds = bestTrade ? bestTrade.seconds : Number.POSITIVE_INFINITY;
+      let winner = "craft";
+      if (isFinite(tradeSeconds) && tradeSeconds * 1.1 < craftSeconds) winner = "trade";
+      else if (!isFinite(craftSeconds) && isFinite(tradeSeconds)) winner = "trade";
+      analysis.push({ name, amount, craftSeconds, tradeSeconds, bestTrade, winner });
+    }
+    return analysis;
+  };
+
+  // Cache the pathway analysis per tick so the panel text, the scoring boost
+  // and the gate decision all read the same numbers (and the work runs once).
+  const targetPathwayAnalysis = (target, resources) => {
+    if (!target || !tickCache) return analyzeTargetDemandPaths(target, resources);
+    if (!tickCache.pathways) tickCache.pathways = new Map();
+    const key = targetId(target) || "__no_target__";
+    if (!tickCache.pathways.has(key)) tickCache.pathways.set(key, analyzeTargetDemandPaths(target, resources));
+    return tickCache.pathways.get(key);
+  };
+
+  // Trade-vs-craft speed ratio for a specific race: weighted average of the
+  // demand resources THIS race covers.  >1 means trading this race is faster
+  // than crafting; <1 means crafting wins.  Used as a multiplier on the
+  // chain-demand value so the SCORE actually reflects "how much faster?".
+  const tradeSpeedMultiplierFor = (race, target, resources) => {
+    const analysis = targetPathwayAnalysis(target, resources);
+    if (!analysis.length || !race || !race.sells) return 1;
+    const sellNames = new Set(race.sells.map((s) => s && s.name).filter(Boolean));
+    const relevant = analysis.filter((row) => sellNames.has(row.name));
+    if (!relevant.length) return 1;
+    let cumulative = 0;
+    let weights = 0;
+    for (const row of relevant) {
+      const tradeSecs = tradePathSecondsFor(race, row.name, row.amount, resources);
+      if (!isFinite(tradeSecs) || tradeSecs <= 0) continue;
+      const craftSecs = row.craftSeconds;
+      // Speed ratio: how much faster trade is than craft (clamped 0.25–4).
+      const ratio = isFinite(craftSecs) && craftSecs > 0 ? craftSecs / tradeSecs : 1.5;
+      cumulative += Math.max(0.25, Math.min(4, ratio));
+      weights += 1;
+    }
+    return weights > 0 ? cumulative / weights : 1;
+  };
+
   const targetTradeScore = (race, target, resources, reserved) => {
     const demand = targetTradeChainDemand(target, resources);
     if (!Object.keys(demand).length) return null;
@@ -5283,7 +5404,12 @@
       const cap = ((getRes(resources, price.name) || {}).maxValue) || 0;
       return cap > 0 && stock / cap < 0.15;
     }) ? 0.25 : 0;
-    return { race, prices, affordable, goods, score: value - scarcePenalty, value };
+    // Multiply by the trade-vs-craft speed ratio so the planner picks the
+    // partner whose path is ACTUALLY faster, not just the one with the most
+    // chain coverage on paper.  When crafting is faster the multiplier is
+    // <1 and the trade slides down the ranking (or below the 0.0005 floor).
+    const speedMultiplier = tradeSpeedMultiplierFor(race, target, resources);
+    return { race, prices, affordable, goods, score: (value - scarcePenalty) * speedMultiplier, value, speedMultiplier };
   };
 
   const maybeTradeForTargetChain = (resources, reserved, goalKey, target) => {
@@ -5293,12 +5419,27 @@
       .sort((a, b) => b.score - a.score);
     const best = options[0];
     if (!best) return false;
+    // Hard gate: if crafting is materially faster for EVERY demand resource
+    // this race could sell us, do not waste catpower/gold on the trade —
+    // just let the craft chain run.  The trade-vs-craft analysis already
+    // honored chance/season/embassy bonuses, so this is honest about
+    // expected wall-clock time, not just raw chain coverage.
+    const analysis = targetPathwayAnalysis(target, resources);
+    const racesSellNames = new Set((best.race.sells || []).map((s) => s && s.name).filter(Boolean));
+    const relevant = analysis.filter((row) => racesSellNames.has(row.name));
+    const craftEverywhereFaster = relevant.length > 0 && relevant.every((row) => isFinite(row.craftSeconds) && row.craftSeconds * 1.5 < row.tradeSeconds);
+    if (craftEverywhereFaster) {
+      const raceName = best.race.title || best.race.name || "civilization";
+      diplomacyPlanText = `Diplomacy: skipping ${raceName} trade — crafting ${targetTradeChainLabel(target, resources)} is faster (${relevant.map((r) => `${resTitle(resources, r.name)} craft ${formatEta(r.craftSeconds)} vs trade ${formatEta(r.tradeSeconds)}`).slice(0, 2).join("; ")})`;
+      return false;
+    }
     const batch = Math.max(1, Math.min(best.affordable, 10));
     const measured = withActionResourceDeltas(() => tradeWithRace(best.race, batch), tradeDeltaNamesForRace(best.race, best.prices));
     if (!measured.result) return false;
     const raceName = best.race.title || best.race.name || "civilization";
-    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${targetTradeChainLabel(target, resources)}`;
-    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}`);
+    const speedBlurb = relevant.length ? ` · path ${formatEta(relevant[0].tradeSeconds)} trade vs ${formatEta(relevant[0].craftSeconds)} craft for ${resTitle(resources, relevant[0].name)}` : "";
+    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${targetTradeChainLabel(target, resources)}${speedBlurb}`;
+    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}${speedBlurb}`);
     return true;
   };
 
@@ -6222,6 +6363,10 @@
     spendImpactForCandidate(candidate) { return spendImpactForCandidate(candidate, resourceMap()); },
     violatesTargetLock(candidate, target) { return violatesTargetLock(candidate, buildTargetLedger(target, resourceMap()), resourceMap()); },
     targetTradeScore(race, target) { return targetTradeScore(race, target, resourceMap(), reservedNeedsFor(target, resourceMap())); },
+    targetPathwayAnalysis(target) { return targetPathwayAnalysis(target, resourceMap()); },
+    craftPathSecondsFor(name, amount) { return craftPathSecondsFor(name, amount, resourceMap()); },
+    tradePathSecondsFor(race, sellName, amount) { return tradePathSecondsFor(race, sellName, amount, resourceMap()); },
+    tradeSpeedMultiplierFor(race, target) { return tradeSpeedMultiplierFor(race, target, resourceMap()); },
   };
 
   /* ------------------------------- bootstrap -------------------------------- */
