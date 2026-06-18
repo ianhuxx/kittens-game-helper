@@ -1,0 +1,1 @@
+import React from'react';export function Filters(){return <div className="filters"><input placeholder="Search issuer or campaign"/><select><option>All managers</option><option>Saba</option><option>Bulldog</option></select><select><option>All campaigns</option><option>tender</option><option>board</option></select></div>}
