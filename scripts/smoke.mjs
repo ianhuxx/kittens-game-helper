@@ -1436,8 +1436,8 @@ const queueMine = buildings.find((b) => b.name === "mine");
 queueMine.unlocked = true; queueMine.prices = [{ name: "wood", val: 100 }];
 res("wood").value = 5000; res("wood").maxValue = 88720;
 dbg.queueAdd("build:mine", queueMine.val);
-const qDecision = dbg.selectStrategicTarget("balanced");
-check("Test Q: queued building overrides the autopilot (Manual queue layer)", qDecision.layer === "Manual queue" && qDecision.target?.meta?.name === "mine");
+const q42Decision = dbg.selectStrategicTarget("balanced");
+check("Test Q: queued building overrides the autopilot (Manual queue layer)", q42Decision.layer === "Manual queue" && q42Decision.target?.meta?.name === "mine");
 
 // A cap-blocked research queued in front is skipped; the next actionable item wins.
 acoustics.researched = true; electricity.researched = false;
@@ -1814,6 +1814,65 @@ techs.splice(techs.indexOf(biology), 1);
 dbg.queueClear();
 res("science").value = 60000; res("science").maxValue = 80000;
 perTick.catnip = -0.4; perTick.wood = 0.4;
+
+
+
+/* ---------------------------------------------------------------------
+ * Test Q — v2.4.2 false-impossible Library lock loop regression. Wood is
+ * directly producible even though it also has a Refine Catnip craft button;
+ * the planner must not expand the whole missing wood deficit into an upfront
+ * catnip storage requirement or leak optional catpower/trade costs into the
+ * Library hard deficits.
+ * ------------------------------------------------------------------- */
+storage.set("kgh.goal", "balanced");
+storage.set("kgh.autopilot", "1");
+storage.set("kgh.log", "[]");
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+for (const t of techs) t.researched = true;
+const industrialization = {
+  name: "industrialization",
+  label: "Industrialization",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 100000 }],
+  unlocks: {},
+};
+techs.push(industrialization);
+const library = buildings.find((b) => b.name === "library");
+library.unlocked = true;
+library.prices = [{ name: "wood", val: 95440 }];
+buildings.find((b) => b.name === "mine").prices = [{ name: "wood", val: 999999 }];
+library.val = 10; library.on = 10;
+res("science").value = 80740; res("science").maxValue = 81560; perTick.science = 0;
+res("wood").value = 13610; res("wood").maxValue = 143950; perTick.wood = 19; // 95/s
+res("catnip").value = 157930; res("catnip").maxValue = 311830; perTick.catnip = 283.8; // 1419/s
+res("minerals").value = 7680; res("minerals").maxValue = 193180; perTick.minerals = 11.586;
+res("manpower").value = 0; res("manpower").maxValue = 3875; perTick.manpower = 0;
+res("gold").value = 0; res("gold").maxValue = 500; perTick.gold = 0;
+fakeNow += 370000;
+const r242Decision = dbg.selectStrategicTarget("balanced");
+const r242Library = dbg.candidateById("build:library", "balanced") || r242Decision.target;
+const r242Feasible = dbg.classifyTargetFeasibility(r242Library);
+const r242Ledger = dbg.buildTargetLedger(r242Library);
+const r242Solve = dbg.solveChain(r242Library);
+dbg.forceActiveTarget(r242Library);
+const r242InitialNow = dbg.nowText("balanced");
+const r242LogsBefore = JSON.parse(storage.get("kgh.log") || "[]").length;
+for (let i = 0; i < 30; i += 1) { fakeNow += 1000; tickFn(); }
+const r242Logs = JSON.parse(storage.get("kgh.log") || "[]");
+const r242NewLogs = r242Logs.slice(0, Math.max(0, r242Logs.length - r242LogsBefore));
+const r242ImpossibleLogs = r242NewLogs.filter((line) => /Plan switch accepted: target impossible/.test(line));
+const r242PlanLocks = r242NewLogs.filter((line) => /Plan locked: Library/.test(line));
+const r242Now = r242InitialNow || dbg.nowText("balanced");
+check("Test Q: Library is classified BLOCKED/PRODUCIBLE, not IMPOSSIBLE, with missing wood", r242Library?.meta?.name === "library" && r242Feasible.status === "BLOCKED/PRODUCIBLE");
+check("Test Q: missing Library wood remains reachable through production/refine chunks", r242Solve.reachable && !r242Solve.hardBlocked);
+check("Test Q: full transitive Refine Catnip cost is not a hard Library reservation", !r242Ledger.reserved.catnip || r242Ledger.reserved.catnip < 1000000);
+check("Test Q: optional trade/hunt catpower does not leak into Library hard deficits", !r242Ledger.reserved.manpower && !r242Ledger.reserved.catpower);
+check("Test Q: no false target-impossible unlocks are emitted over 30 cycles", r242ImpossibleLogs.length === 0);
+check("Test Q: plan lock logging is de-duplicated rather than spammed", r242PlanLocks.length <= 2 && JSON.parse(storage.get("kgh.log") || "[]").length >= r242LogsBefore);
+check("Test Q: current action accumulates wood/refines safe chunks, not a giant upfront catnip craft", /accumulate Wood|refine only surplus|safe Refine Catnip chunk/i.test(r242Now) && !/craft 8[0-9].*Refine Catnip/i.test(r242Now));
+techs.splice(techs.indexOf(industrialization), 1);
 
 // Tear down the Acoustics scenario so the suite leaves a clean tree.
 electricity.researched = true;
