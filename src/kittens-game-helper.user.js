@@ -3928,6 +3928,29 @@
       needs.minerals = Math.max(needs.minerals || 0, mineralSubNeed * 0.7);
     }
 
+    // Treat an about-to-expire festival as part of the same planning chain as
+    // buys/crafts: if Drama unlocked festivals and the current festival buffer
+    // is low, jobs should see the missing catpower/culture/parchment before the
+    // holdFestival executor runs.  The executor still respects target reserves,
+    // so this nudges production without stealing a locked build/research chain.
+    try {
+      const game = window.gamePage;
+      const calendar = game && game.calendar;
+      const drama = game && game.science && game.science.get && game.science.get("drama");
+      const buffer = calendar && (calendar.daysPerSeason || 100);
+      if (drama && drama.researched && calendar && (calendar.festivalDays || 0) <= buffer) {
+        const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
+        for (const cost of FESTIVAL_COST) {
+          const have = resValueOf(resources, cost.name);
+          if ((reserved[cost.name] || 0) <= 0 && have < cost.val) {
+            scoreNeed(needs, cost.name === "manpower" ? "manpower" : cost.name, Math.min(4, (cost.val - have) / Math.max(cost.val, 1) * 4));
+          }
+        }
+      }
+    } catch (error) {
+      /* festival pressure is advisory only */
+    }
+
     if (!Object.values(needs).some((v) => v > 0)) {
       scoreNeed(needs, "wood", resRatio(resources, "wood") < 0.95 ? 2 : 0);
       scoreNeed(needs, "minerals", resRatio(resources, "minerals") < 0.95 ? 2 : 0);
@@ -6038,7 +6061,12 @@
   /* -------------------------- leader specialization -------------------------- */
 
   const LEADER_RECHECK_MS = 90000;
+  const LEADER_CONTEXT_RECHECK_MS = 15000;
+  const LEADER_SCORE_GAIN_THRESHOLD = 140;
+  const PROMOTION_LEADER_GAIN_THRESHOLD = 260;
   let lastLeaderCheck = 0;
+  let lastLeaderContext = "";
+  let lastLeaderDecisionLog = 0;
   let leaderPlanText = "Leader: waiting…";
 
   const desiredLeaderTraits = (goalKey, resources) => {
@@ -6181,38 +6209,75 @@
     return false;
   };
 
+  const leaderOpportunity = (goalKey, resources) => {
+    const village = window.gamePage.village;
+    if (!village || !village.sim || !Array.isArray(village.sim.kittens)) return null;
+    const target = getTargetCached(resources, goalKey);
+    const { needs } = resourceNeeds(goalKey, resources);
+    const bestNeed = Object.entries(needs).filter(([, weight]) => weight > 0).sort((a, b) => b[1] - a[1])[0];
+    const bottleneck = bestNeed ? bestNeed[0] : "balanced";
+    const targetJob = bestNeed ? (RES_JOB[bestNeed[0]] || bestNeed[0]) : "engineer";
+    const traits = desiredLeaderTraits(goalKey, resources);
+    const kittens = village.sim.kittens.filter((kitten) => kitten && kitten.trait && kitten.trait.name && kitten.trait.name !== "none");
+    const targetLabel = target ? labelOf(target.meta) : GOALS[goalKey].label;
+    let best = null;
+    for (const trait of traits) {
+      for (const kitten of kittens) {
+        if (!kitten.trait || kitten.trait.name !== trait) continue;
+        const score = kittenScore(kitten, trait, targetJob);
+        if (!best || score > best.score) best = { kitten, trait, score };
+      }
+      if (best && best.trait === trait) break;
+    }
+    const current = village.leader || null;
+    const currentTrait = current && current.trait && current.trait.name;
+    const currentScore = currentTrait ? kittenScore(current, currentTrait, targetJob) : 0;
+    const gain = best ? best.score - currentScore : 0;
+    const climbNeeds = targetClimbNeeds(target, resources);
+    const stuckNearCap = !!Object.keys(climbNeeds).find((name) => resRatio(resources, name) > 0.88 && resValueOf(resources, name) < (reservedNeedsFor(target, resources)[name] || 0));
+    const context = `${target ? `${target.kind}:${target.meta && target.meta.name || ""}` : `goal:${goalKey}`}:${bottleneck}`;
+    return { target, targetLabel, needs, bottleneck, targetJob, traits, best, current, currentTrait, currentScore, gain, context, stuckNearCap };
+  };
+
+  const maybeLogLeaderDecision = (text, minMs = 60000) => {
+    const now = Date.now();
+    if (now - lastLeaderDecisionLog < minMs) return;
+    lastLeaderDecisionLog = now;
+    pushLog(text);
+  };
+
   const maybeSelectLeader = (goalKey, resources) => {
     try {
       const now = Date.now();
-      if (now - lastLeaderCheck < LEADER_RECHECK_MS) return;
-      lastLeaderCheck = now;
       const village = window.gamePage.village;
-      if (!village || typeof village.makeLeader !== "function" || !village.sim || !Array.isArray(village.sim.kittens)) return;
-      const kittens = village.sim.kittens.filter((kitten) => kitten && kitten.trait && kitten.trait.name && kitten.trait.name !== "none");
-      if (!kittens.length) return;
-      const traits = desiredLeaderTraits(goalKey, resources);
-      const { needs } = resourceNeeds(goalKey, resources);
-      const bestNeed = Object.entries(needs).sort((a, b) => b[1] - a[1])[0];
-      const targetJob = bestNeed ? (RES_JOB[bestNeed[0]] || bestNeed[0]) : "engineer";
-      let best = null;
-      for (const trait of traits) {
-        const candidate = kittens
-          .filter((kitten) => kitten.trait && kitten.trait.name === trait)
-          .sort((a, b) => kittenScore(b, trait, targetJob) - kittenScore(a, trait, targetJob))[0];
-        if (candidate) {
-          best = { kitten: candidate, trait };
-          break;
-        }
+      if (!village || typeof village.makeLeader !== "function") return false;
+      const opportunity = leaderOpportunity(goalKey, resources);
+      if (!opportunity || !opportunity.best) return false;
+      const contextChanged = opportunity.context !== lastLeaderContext;
+      const minDelay = contextChanged || opportunity.stuckNearCap ? LEADER_CONTEXT_RECHECK_MS : LEADER_RECHECK_MS;
+      if (now - lastLeaderCheck < minDelay) return false;
+      lastLeaderCheck = now;
+      lastLeaderContext = opportunity.context;
+
+      const reason = `${opportunity.targetLabel}; bottleneck ${opportunity.bottleneck}; job ${opportunity.targetJob}`;
+      if (opportunity.best.kitten.isLeader) {
+        leaderPlanText = `Leader: ${opportunity.best.kitten.trait.title || opportunity.best.trait} (${opportunity.best.kitten.name || "kitten"}) for ${reason}`;
+        maybeLogLeaderDecision(`👑 leader kept: ${opportunity.best.kitten.name || "kitten"}/${opportunity.best.trait} already best for ${reason}`, 90000);
+        return false;
       }
-      if (!best || best.kitten.isLeader) {
-        if (village.leader) leaderPlanText = `Leader: ${village.leader.trait.title || village.leader.trait.name} (${village.leader.name || "kitten"})`;
-        return;
+      if (opportunity.gain < LEADER_SCORE_GAIN_THRESHOLD && !opportunity.stuckNearCap) {
+        const currentName = opportunity.current ? (opportunity.current.name || "current leader") : "none";
+        leaderPlanText = `Leader: ${currentName}; skipped swap for ${reason} (gain ${fmt(opportunity.gain)})`;
+        maybeLogLeaderDecision(`👑 leader skipped: best ${opportunity.best.kitten.name || "kitten"}/${opportunity.best.trait} gain ${fmt(opportunity.gain)} too small for ${reason}`, 90000);
+        return false;
       }
-      village.makeLeader(best.kitten);
-      leaderPlanText = `Leader: ${best.kitten.trait.title || best.trait} (${best.kitten.name || "kitten"})`;
-      pushLog(`👑 ${leaderPlanText}`);
+      village.makeLeader(opportunity.best.kitten);
+      if (typeof village.updateResourceProduction === "function") village.updateResourceProduction();
+      leaderPlanText = `Leader: ${opportunity.best.kitten.trait.title || opportunity.best.trait} (${opportunity.best.kitten.name || "kitten"}) for ${reason}`;
+      pushLog(`👑 leader set: ${opportunity.best.kitten.name || "kitten"}/${opportunity.best.trait}; ${reason}; score +${fmt(opportunity.gain)}`);
+      return true;
     } catch (error) {
-      /* ignore */
+      return false;
     }
   };
 
@@ -6221,17 +6286,32 @@
   // overflow band is left alone for trade and gold-priced builds.
   let nextPromoteAttempt = 0;
 
-  const maybePromoteKittens = (resources) => {
+  const maybePromoteKittens = (resources, goalKey = getGoal()) => {
     try {
       const village = window.gamePage.village;
       const gold = getRes(resources, "gold");
-      if (!village || !gold || !(gold.maxValue > 0)) return;
+      if (!village || !gold || !(gold.maxValue > 0)) return false;
       const now = Date.now();
-      if (gold.value < gold.maxValue * 0.92 || now < nextPromoteAttempt) return;
+      if (now < nextPromoteAttempt) return false;
+      const target = getTargetCached(resources, goalKey);
+      const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
+      const reserveGold = reserved.gold || 0;
+      const overflowGold = gold.value >= gold.maxValue * 0.92;
+      const opportunity = leaderOpportunity(goalKey, resources);
+      const leaderGain = opportunity && opportunity.best ? opportunity.gain : 0;
+      const reserveSafe = reserveGold <= 0 || gold.value - reserveGold > gold.maxValue * 0.08;
+      if (!reserveSafe) {
+        nextPromoteAttempt = now + 60000;
+        maybeLogLeaderDecision(`🎖 promotion skipped: gold reserved for ${target ? labelOf(target.meta) : "active plan"}`, 90000);
+        return false;
+      }
+      if (!overflowGold && leaderGain < PROMOTION_LEADER_GAIN_THRESHOLD) return false;
       const before = gold.value;
       try {
         if (typeof village.promoteKittens === "function") {
           village.promoteKittens();
+        } else if (opportunity && opportunity.best && village.sim && typeof village.sim.promote === "function") {
+          village.sim.promote(opportunity.best.kitten, (opportunity.best.kitten.rank || 0) + 1);
         } else if (village.leader && village.sim && typeof village.sim.promote === "function") {
           village.sim.promote(village.leader, (village.leader.rank || 0) + 1);
         }
@@ -6239,13 +6319,16 @@
         /* promotion API mismatch — skip */
       }
       if (gold.value < before - 1) {
-        nextPromoteAttempt = now + 30000;
-        pushLog("🎖 promoted kittens (gold was capping)");
-      } else {
-        nextPromoteAttempt = now + 300000; // nobody promotable (exp/gold) — back off
+        nextPromoteAttempt = now + (overflowGold ? 30000 : 180000);
+        const why = overflowGold ? "gold was capping" : `leader gain ${fmt(leaderGain)} for ${opportunity ? opportunity.targetLabel : "active plan"}`;
+        pushLog(`🎖 promoted kittens (${why})`);
+        return true;
       }
+      nextPromoteAttempt = now + 300000; // nobody promotable (exp/gold) — back off
+      maybeLogLeaderDecision(`🎖 promotion skipped: no promotable kitten for ${opportunity ? opportunity.targetLabel : "active plan"}`, 120000);
+      return false;
     } catch (error) {
-      /* ignore */
+      return false;
     }
   };
 
@@ -6431,9 +6514,15 @@
       manageTrade(resources, goal);
       resetTickCache();
       resources = resourceMap();
+      if (maybePromoteKittens(resources, goal)) {
+        resetTickCache();
+        resources = resourceMap();
+      }
+      if (maybeSelectLeader(goal, resources)) {
+        resetTickCache();
+        resources = resourceMap();
+      }
       balanceJobs(goal, resources);
-      maybeSelectLeader(goal, resources);
-      maybePromoteKittens(resources);
       autoHunt(resources);
       maybeHoldFestival(resources);
       trackActions();
