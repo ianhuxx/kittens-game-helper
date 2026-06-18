@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.2.0
+// @version      2.3.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.2.0";
+  const HELPER_VERSION = "2.3.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -542,8 +542,27 @@
     return names;
   };
 
+  // When the science-storage-unlock layer is in play (we're growing the science
+  // cap so a blocked tech like Biology can fit), ALSO reserve the blocked
+  // tech's crafted-chain resources (compendium / manuscript / parchment / furs).
+  // Without this, the active target is Library/Academy whose own chain is
+  // wood/beam — so the overflow crafter cheerfully melts the player's hard-won
+  // compendium stock into blueprint while we wait for the cap to grow.  The
+  // research-sprint layer already protects them directly (its target IS the
+  // blocked tech), so this only adds protection during the storage-unlock layer.
+  const blockedTechChainAdditions = (resources) => {
+    const decision = lastStrategicDecision;
+    if (!decision || decision.layer !== STRATEGIC_LAYERS.scienceStorageUnlock) return null;
+    const blocker = decision.scienceStorageBlocker;
+    const blocked = blocker && blocker.blocked;
+    if (!blocked) return null;
+    return activeTargetChainResources(blocked, resources);
+  };
+
   const refreshStickyTargetChainReserve = (target, resources) => {
     const names = activeTargetChainResources(target, resources);
+    const blockedExtras = blockedTechChainAdditions(resources);
+    if (blockedExtras) for (const name of blockedExtras) names.add(name);
     if (names.size) {
       stickyTargetChainReserve = { until: Date.now() + 120000, names, label: labelOf(target.meta) };
     }
@@ -3454,6 +3473,12 @@
     }
   };
 
+  // The last-logged plan summary is reused across ticks so a change in either
+  // the active strategic layer OR the target itself is pushed to the action log
+  // exactly once — giving the player a per-decision breadcrumb to debug "why is
+  // the plan suddenly X?" without flooding the log every tick.
+  let lastLoggedPlanSummary = "";
+
   const chooseWorkTarget = (resources, goalKey) => {
     const decision = selectStrategicTarget(resources, goalKey);
     lastStrategicDecision = decision;
@@ -3461,6 +3486,14 @@
     const candidates = decision.candidates;
     const preferred = decision.target || candidates[0] || null;
     const now = Date.now();
+    const summary = `${decision.layer || "?"}::${targetId(preferred) || "(none)"}`;
+    if (summary !== lastLoggedPlanSummary) {
+      lastLoggedPlanSummary = summary;
+      const label = preferred && preferred.meta ? labelOf(preferred.meta) : "no target";
+      const reasonExtra = decision.scienceStorageBlocker && decision.scienceStorageBlocker.blocked
+        ? ` (cap-blocked: ${labelOf(decision.scienceStorageBlocker.blocked.meta)})` : "";
+      pushLog(`🧠 plan layer → ${decision.layer || "?"}: ${label}${reasonExtra}`);
+    }
 
     // Structural override layers OWN the plan directly and must never be held
     // back by a stale economy target lock (e.g. a half-saved Temple): a valid
@@ -5143,11 +5176,50 @@
   };
 
 
-  const tradeSellExpected = (sell) => {
+  // Live season name read from the game's calendar.  Used to fold the per-sell
+  // season multiplier into the expected yield, which the game already applies
+  // when tradeAll() actually fires — so our scoring lines up with reality
+  // (a Winter Furs trade IS worth less than a Summer one).
+  const currentTradeSeasonName = () => {
+    try {
+      const cal = window.gamePage && window.gamePage.calendar;
+      if (!cal) return null;
+      if (typeof cal.getCurSeason === "function") {
+        const s = cal.getCurSeason();
+        if (s && s.name) return s.name;
+      }
+      if (Array.isArray(cal.seasons) && isFinite(cal.season)) {
+        const s = cal.seasons[cal.season];
+        if (s && s.name) return s.name;
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return null;
+  };
+
+  const tradeSeasonMultiplier = (sell) => {
+    const season = currentTradeSeasonName();
+    if (!season || !sell || !sell.seasons || typeof sell.seasons !== "object") return 1;
+    const m = sell.seasons[season];
+    return isFinite(m) && m > 0 ? m : 1;
+  };
+
+  // Generic embassy-level bonus.  The game applies this internally; we add a
+  // small stand-in (~1% per level, capped at +25%) so the planner SCORES
+  // partners we've invested in higher when they tie with newer civs.
+  const tradeEmbassyBonus = (race) => {
+    const level = race && isFinite(race.embassyLevel) ? race.embassyLevel : 0;
+    return 1 + Math.min(0.25, Math.max(0, level) * 0.01);
+  };
+
+  const tradeSellExpected = (sell, race = null) => {
     if (!sell || !sell.name) return 0;
     const amount = isFinite(sell.value) ? sell.value : (isFinite(sell.val) ? sell.val : 0);
     const chance = isFinite(sell.chance) ? sell.chance / 100 : 1;
-    return Math.max(0, amount * Math.max(0, Math.min(1, chance || 0)));
+    const seasonMult = tradeSeasonMultiplier(sell);
+    const embassyMult = race ? tradeEmbassyBonus(race) : 1;
+    return Math.max(0, amount * Math.max(0, Math.min(1, chance || 0)) * seasonMult * embassyMult);
   };
 
   const targetTradeChainDemand = (target, resources) => {
@@ -5198,7 +5270,7 @@
     let value = 0;
     const goods = [];
     for (const sell of race.sells || []) {
-      const expected = tradeSellExpected(sell);
+      const expected = tradeSellExpected(sell, race);
       const contribution = targetTradeYieldValue(demand, sell.name, expected);
       if (contribution > 0) {
         value += contribution;
@@ -5315,14 +5387,20 @@
   let seeded = false;
   let logBox;
 
+  // Bigger log buffer + bigger visible window so a debugging session can
+  // scroll back through several minutes of decisions (v2.3.0): the player
+  // can copy/paste the panel log to debug "why did the bot just do X?".
+  const LOG_DISPLAY_LIMIT = 80;
+  const LOG_STORAGE_LIMIT = 300;
+
   const renderLog = () => {
-    if (logBox) logBox.textContent = actionLog.slice(0, 12).join("\n") || "(waiting…)";
+    if (logBox) logBox.textContent = actionLog.slice(0, LOG_DISPLAY_LIMIT).join("\n") || "(waiting…)";
   };
 
   const pushLog = (text) => {
     const time = new Date().toLocaleTimeString();
     actionLog.unshift(`${time}  ${text}`);
-    actionLog = actionLog.slice(0, 50);
+    actionLog = actionLog.slice(0, LOG_STORAGE_LIMIT);
     try {
       localStorage.setItem(LOG_KEY, JSON.stringify(actionLog));
     } catch (error) {
@@ -5336,14 +5414,40 @@
   // after that exact operation.  This prevents same-tick side effects (hunters,
   // embassies, overflow crafts, job changes, normal production) from being
   // merged into one misleading "trade" line.
-  const resourceSnapshot = () => resourceMap();
+  //
+  // CRITICAL: the snapshot must capture NUMERIC values, not references.  The
+  // live resourceMap() stores references to the game's `res` objects whose
+  // `.value` mutates in place — so a before/after that both read `res.value`
+  // would always be equal (delta == 0), and the log would always say
+  // "no resource gain".  Snapping to a name→value Map fixes that.
+  const resourceSnapshot = () => {
+    const snap = new Map();
+    try {
+      const pool = window.gamePage && window.gamePage.resPool;
+      if (pool && Array.isArray(pool.resources)) {
+        for (const res of pool.resources) {
+          if (res && res.name) snap.set(res.name, Number(res.value) || 0);
+        }
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return snap;
+  };
+
+  const snapValue = (snap, name) => {
+    if (!snap) return 0;
+    if (snap.has(name)) return snap.get(name) || 0;
+    if (name === "catpower" && snap.has("manpower")) return snap.get("manpower") || 0;
+    return 0;
+  };
 
   const resourceDeltasBetween = (before, after, names = null) => {
     const wanted = names ? new Set([...names].filter(Boolean)) : null;
     const seen = new Set([...(before ? before.keys() : []), ...(after ? after.keys() : [])]);
     return [...seen]
       .filter((name) => !wanted || wanted.has(name))
-      .map((name) => ({ name, delta: resourceValue(after, name) - resourceValue(before, name) }))
+      .map((name) => ({ name, delta: snapValue(after, name) - snapValue(before, name) }))
       .filter(({ delta }) => Math.abs(delta) > 0.0001);
   };
 
@@ -5356,8 +5460,9 @@
 
   const formatActionDeltas = (before, after, names = null) => {
     const deltas = resourceDeltasBetween(before, after, names);
-    const gained = formatResourceDeltaList(after, deltas, 1);
-    const spent = formatResourceDeltaList(after, deltas, -1);
+    const liveRes = resourceMap();
+    const gained = formatResourceDeltaList(liveRes, deltas, 1);
+    const spent = formatResourceDeltaList(liveRes, deltas, -1);
     return { deltas, gained, spent, suffix: `${gained || "no resource gain"}${spent ? ` (${spent})` : ""}` };
   };
 
@@ -5782,9 +5887,39 @@
   let lastTickAt = 0;
   const helperRunning = () => lastTickAt > 0 && Date.now() - lastTickAt < 15000;
 
+  const renderOffPanel = () => {
+    const OFF_MSG = "Autopilot OFF — toggle ON to resume";
+    if (statusEl) statusEl.textContent = "Helper: autopilot OFF — no actions";
+    if (planEl) planEl.textContent = `⏸ ${OFF_MSG}`;
+    if (nowEl) nowEl.textContent = "🎯 Now: paused (autopilot off)";
+    if (bottleneckEl) bottleneckEl.textContent = "";
+    if (scienceEl) scienceEl.textContent = "";
+    if (noteEl) noteEl.textContent = "";
+    if (jobsEl) jobsEl.textContent = "";
+    if (buyEl) buyEl.textContent = "";
+    if (resetEl) resetEl.textContent = "";
+    if (leaderEl) leaderEl.textContent = "";
+    if (craftEl) craftEl.textContent = "";
+    if (processingEl) processingEl.textContent = "";
+    if (reserveStatusEl) reserveStatusEl.textContent = "";
+    if (religionEl) religionEl.textContent = "";
+    if (diplomacyEl) diplomacyEl.textContent = "";
+    if (policyEl) policyEl.textContent = "";
+    if (goalEl) { goalEl.textContent = ""; goalEl.style.display = "none"; }
+  };
+
   const tick = () => {
     try {
       resetTickCache();
+      // Autopilot OFF means the helper takes NO actions — no buys, crafts,
+      // trades, hunts, job moves, leader changes, festivals, praise, policies
+      // or queue execution.  The panel just shows the OFF state and the log
+      // history so the player can decide when to flip it back on.  This is
+      // the single gate: every spender is reached through this tick.
+      if (!isAutopilotOn()) {
+        renderOffPanel();
+        return;
+      }
       sampleResourceTelemetry();
       let resources = resourceMap();
       const goal = getGoal();
@@ -5929,14 +6064,15 @@
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
       '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
       '</div></details>',
-      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px">Recent actions:</div>',
-      '<pre class="kgh-log" style="margin:0;max-height:78px;white-space:pre-wrap;' +
+      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px;display:flex;justify-content:space-between;align-items:center"><span>Recent actions:</span><button type="button" class="kgh-hbtn kgh-log-copy" title="Copy the recent action log for debugging">Copy</button></div>',
+      '<pre class="kgh-log" style="margin:0;max-height:260px;white-space:pre-wrap;' +
         'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
       "</div>",
     ].join("");
 
     const toggleBtn = box.querySelector(".kgh-autopilot");
     const minBtn = box.querySelector(".kgh-min");
+    const logCopyBtn = box.querySelector(".kgh-log-copy");
     queueSelectEl = box.querySelector(".kgh-queue-select");
     queueAddEl = box.querySelector(".kgh-queue-add");
     queueListEl = box.querySelector(".kgh-queue-list");
@@ -5971,8 +6107,23 @@
       localStorage.setItem(STORAGE_KEY, next);
       syncToggle();
       applyProfile();
+      tick();
     });
     syncToggle();
+    if (logCopyBtn) {
+      logCopyBtn.addEventListener("click", () => {
+        try {
+          const text = actionLog.slice(0, LOG_DISPLAY_LIMIT).join("\n");
+          if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text);
+            logCopyBtn.textContent = "Copied";
+            setTimeout(() => { logCopyBtn.textContent = "Copy"; }, 1500);
+          }
+        } catch (error) {
+          /* clipboard may be restricted; user can select manually */
+        }
+      });
+    }
     // Manual build queue: add the selected candidate, then re-plan immediately.
     queueAddEl.addEventListener("click", () => {
       const id = queueSelectEl && queueSelectEl.value;
