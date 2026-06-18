@@ -3497,6 +3497,7 @@
 
   const TARGET_LOCK_MAX_MS = 360000;
   const PLAN_HYSTERESIS_MULT = 1.25;
+  const PLAN_SCORE_GAIN_THRESHOLD = PLAN_HYSTERESIS_MULT - 1;
   const ActivePlan = "ActivePlan";
   const getTargetLockMinMs = () => {
     if (isEarlyGame()) return TARGET_LOCK_MIN_EARLY_MS;
@@ -3508,6 +3509,13 @@
   let activePlanDebug = { reason: "none", rejected: [], blocked: "" };
 
   const targetId = (candidate) => candidate && candidate.meta ? `${candidate.kind}:${candidate.meta.name || labelOf(candidate.meta)}` : "";
+
+  const candidateScoreGain = (from, to) => {
+    if (!from || !to || !isFinite(from.score || Number.NaN) || (from.score || 0) <= 0) return 0;
+    return ((to.score || 0) / Math.max(1, from.score)) - 1;
+  };
+
+  const candidateMeetsSwitchScoreGain = (from, to) => candidateScoreGain(from, to) >= PLAN_SCORE_GAIN_THRESHOLD;
 
   const findCandidateById = (candidates, id) => candidates.find((candidate) => targetId(candidate) === id) || null;
 
@@ -3547,13 +3555,14 @@
   const switchRejected = (from, to, why, details = {}) => {
     activePlanDebug.rejected = [{ target: to, reason: why }];
     if (Date.now() - (activePlanDebug.lastRejectLog || 0) > 20000) {
-      const pct = to && from && from.score ? Math.round((((to.score || 0) / Math.max(1, from.score)) - 1) * 100) : 0;
-      const neededPct = Math.round((PLAN_HYSTERESIS_MULT - 1) * 100);
+      const scoreGain = details.scoreGain != null ? details.scoreGain : candidateScoreGain(from, to);
+      const pct = Math.round(scoreGain * 100);
+      const neededPct = Math.round(PLAN_SCORE_GAIN_THRESHOLD * 100);
       const blockers = [];
       if (details.age != null && details.minAge != null && details.age < details.minAge) {
         blockers.push(`lock age ${formatEta(details.age / 1000)} < ${formatEta(details.minAge / 1000)} minimum`);
       }
-      if (details.scoreBetter === false) blockers.push(`score gain ${Math.max(0, pct)}% < ${neededPct}% threshold`);
+      if (details.scoreBetter === false && scoreGain < PLAN_SCORE_GAIN_THRESHOLD) blockers.push(`score gain ${Math.max(0, pct)}% < ${neededPct}% threshold`);
       if (details.etaBetter === false && isFinite(details.lockedWait || Number.NaN) && isFinite(details.preferredWait || Number.NaN)) {
         blockers.push(`ETA ${formatEta(details.preferredWait)} is not 25% faster than ${formatEta(details.lockedWait)}`);
       }
@@ -3671,7 +3680,8 @@
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
-      const scoreBetter = preferred && locked && (preferred.score || 0) > (locked.score || 0) * PLAN_HYSTERESIS_MULT + 8;
+      const scoreGain = preferred && locked ? candidateScoreGain(locked, preferred) : 0;
+      const scoreBetter = preferred && locked && candidateMeetsSwitchScoreGain(locked, preferred);
       const etaBetter = preferredWait < lockedWait * 0.75;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
@@ -3689,6 +3699,7 @@
           age,
           minAge: getTargetLockMinMs(),
           scoreBetter,
+          scoreGain,
           etaBetter,
           lockedWait,
           preferredWait,
@@ -6807,6 +6818,8 @@
       } : null;
     },
     targetId,
+    candidateScoreGain,
+    candidateMeetsSwitchScoreGain,
     buildTargetLedger(target) { return buildTargetLedger(target, resourceMap()); },
     spendImpactForCandidate(candidate) { return spendImpactForCandidate(candidate, resourceMap()); },
     violatesTargetLock(candidate, target) { return violatesTargetLock(candidate, buildTargetLedger(target, resourceMap()), resourceMap()); },
