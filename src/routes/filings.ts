@@ -1,2 +1,0 @@
-import type{Env}from'../types';import{json}from'../lib/db';
-export async function filingDetail(env:Env,id:string){const filing=await env.DB.prepare('select * from filings where id=?').bind(id).first<any>();if(!filing)return json({error:'not found'},404);const event=await env.DB.prepare('select * from activism_events where filing_id=?').bind(id).first();const issuer=filing.issuer_id?await env.DB.prepare('select * from issuers where id=?').bind(filing.issuer_id).first():null;return json({filing,event,issuer})}

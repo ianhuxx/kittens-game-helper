@@ -1,9 +1,0 @@
-SC 13D
-Subject Company: Example Income Fund
-Subject Company CIK: 0009990001
-Title of Class: Common Shares
-CUSIP: 123456789
-Item 4. Purpose of Transaction
-The Reporting Person acquired shares because the fund trades at a discount to net asset value and may seek a self-tender offer.
-Item 5. Interest in Securities of the Issuer
-The Reporting Person beneficially owns 1,234,567 shares, representing 6.4% of the class.

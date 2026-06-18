@@ -1,2 +1,0 @@
-import type{Env}from'../types';import{json}from'../lib/db';import{isAuthed,unauthorized}from'../lib/auth';
-export async function addWatchlist(req:Request,env:Env){if(!isAuthed(req,env))return unauthorized();const b:any=await req.json().catch(()=>({}));await env.DB.prepare('insert into watchlist(issuer_id,ticker,name,reason,priority) values(?,?,?,?,?)').bind(b.issuer_id||null,b.ticker||null,b.name||null,b.reason||null,b.priority||0).run();return json({ok:true},201)}
