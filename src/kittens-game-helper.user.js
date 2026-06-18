@@ -775,6 +775,9 @@
   // Candidate gathering, target choice and storage-pressure scans are expensive
   // (storage pressure alone walks every meta) and were being recomputed by every
   // consumer each tick — sometimes disagreeing mid-tick. Compute once, share.
+  let plannerCycleId = 0;
+  let activePlanSnapshot = { cycleId: -1, target: undefined };
+
   let tickCache = {
     resources: null,
     production: Object.create(null),
@@ -863,7 +866,12 @@
   };
 
   const getTargetCached = (resources, goalKey) => {
+    if (activePlanSnapshot.cycleId === plannerCycleId && activePlanSnapshot.target !== undefined) {
+      tickCache.target = activePlanSnapshot.target;
+      return activePlanSnapshot.target;
+    }
     if (tickCache.target === undefined) tickCache.target = chooseWorkTarget(resources, goalKey);
+    activePlanSnapshot = { cycleId: plannerCycleId, target: tickCache.target };
     return tickCache.target;
   };
 
@@ -2943,6 +2951,13 @@
     if (deficit <= 0) return { reachable: true, eta: 0, chain };
 
     const craft = craftByName(name);
+    // Some raw resources (notably wood via Refine Catnip) are also exposed as
+    // workshop crafts.  Treat their full deficit as a time/producible bottleneck
+    // instead of requiring enough input storage to craft the entire missing
+    // amount in one batch.  Only one incremental craft step must fit.
+    if (prod > 0 && rawWorkNeedName(name) === name) {
+      return { reachable: true, eta: deficit / prod, chain };
+    }
     if (craft) {
       const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
       if (!prices.length) return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no priced craft path for ${name}`, chain };
@@ -2953,7 +2968,8 @@
         if (inputCap > 0 && price.val > inputCap) {
           return { reachable: false, perStepCapBlocked: true, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, price.name)} cap below one ${craftLabel(name)} craft`, chain };
         }
-        const child = capDrainReachabilityFor(resources, price.name, price.val * units, depth + 1, new Set([...stack, name]));
+        const childAmount = rawWorkNeedName(name) === name ? price.val : price.val * units;
+        const child = capDrainReachabilityFor(resources, price.name, childAmount, depth + 1, new Set([...stack, name]));
         for (const item of child.chain || []) chain.add(item);
         if (!child.reachable) return { ...child, chain };
         eta = Math.max(eta, child.eta || 0);
@@ -3505,12 +3521,21 @@
     return false;
   };
 
-  const targetImpossible = (candidate, resources) => {
-    if (!candidate || !candidate.meta) return true;
-    if (!isOpen(candidate.meta) && candidate.kind !== "build") return true;
+  const FEASIBILITY = { READY: "READY", BLOCKED_PRODUCIBLE: "BLOCKED/PRODUCIBLE", IMPOSSIBLE: "IMPOSSIBLE" };
+
+  const classifyTargetFeasibility = (candidate, resources) => {
+    if (!candidate || !candidate.meta) return { status: FEASIBILITY.IMPOSSIBLE, reason: "missing target" };
+    if (!isOpen(candidate.meta) && candidate.kind !== "build") return { status: FEASIBILITY.IMPOSSIBLE, reason: "target unavailable" };
     const solver = solveCraftChain(resources, candidate);
-    return !!solver.hardBlocked;
+    if (solver.hardBlocked) {
+      const hard = (solver.blockers || []).find((b) => b.kind === "finalCap" || b.kind === "stepCap" || b.kind === "unreachable");
+      return { status: FEASIBILITY.IMPOSSIBLE, reason: hard ? hard.text || hard.kind : "hard blocked", solver };
+    }
+    const missing = pricesFor(candidate.kind, candidate.meta).some((cost) => cost && cost.name && cost.val > resValueOf(resources, cost.name));
+    return { status: missing ? FEASIBILITY.BLOCKED_PRODUCIBLE : FEASIBILITY.READY, reason: missing ? "waiting on producible resources" : "ready", solver };
   };
+
+  const targetImpossible = (candidate, resources) => classifyTargetFeasibility(candidate, resources).status === FEASIBILITY.IMPOSSIBLE;
 
   const targetProgressSignature = (candidate, resources) => {
     if (!candidate) return "";
@@ -3582,6 +3607,16 @@
   // exactly once — giving the player a per-decision breadcrumb to debug "why is
   // the plan suddenly X?" without flooding the log every tick.
   let lastLoggedPlanSummary = "";
+  const rejectedTargets = new Map();
+  const PLAN_REJECT_COOLDOWN_MS = 30000;
+  const logThrottle = Object.create(null);
+
+  const pushPlanLog = (text, throttleMs = 15000) => {
+    const now = Date.now();
+    if (now - (logThrottle[text] || 0) < throttleMs) return;
+    logThrottle[text] = now;
+    pushLog(text);
+  };
 
   const chooseWorkTarget = (resources, goalKey) => {
     const decision = selectStrategicTarget(resources, goalKey);
@@ -3617,7 +3652,8 @@
       const noProgress = now - (activeTarget.lastProgressAt || activeTarget.startedAt) > TARGET_LOCK_MAX_MS;
       const manualQueueChanged = activeTarget.queueSignature !== JSON.stringify(readQueue());
       const emergency = resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0;
-      const impossible = locked && targetImpossible(locked, resources);
+      const feasibility = locked ? classifyTargetFeasibility(locked, resources) : { status: FEASIBILITY.IMPOSSIBLE };
+      const impossible = locked && feasibility.status === FEASIBILITY.IMPOSSIBLE;
       const completed = locked && targetComplete(locked);
       const same = locked && preferred && targetId(locked) === targetId(preferred);
       const structuralLayerTakeover = preferred && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock &&
@@ -3635,7 +3671,8 @@
           noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
           structuralLayerTakeover ? "science storage emergency" :
           emergency ? "emergency" : "lock timeout";
-        pushLog(`🔓 Plan switch accepted: ${reason}`);
+        pushPlanLog(`🔓 Plan switch accepted: ${reason}`, 20000);
+        if (impossible && locked) rejectedTargets.set(targetId(locked), { reason: feasibility.reason || reason, at: now });
         activeTarget = null;
       } else if (!same && !muchBetter) {
         switchRejected(locked, preferred, `locked ${labelOf(locked.meta)} age ${formatEta(age / 1000)}`);
@@ -3648,7 +3685,7 @@
         activePlanDebug.reason = activeTarget.reason || decision.reason || "locked";
         return locked;
       } else {
-        pushLog(`🔓 Plan switch accepted: ${preferred ? labelOf(preferred.meta) : "none"} beat ${labelOf(locked.meta)} by hysteresis`);
+        pushPlanLog(`🔓 Plan switch accepted: ${preferred ? labelOf(preferred.meta) : "none"} beat ${labelOf(locked.meta)} by hysteresis`, 20000);
         activeTarget = null;
       }
     }
@@ -3658,6 +3695,11 @@
     // the moment it is ready, so the lock only breaks on completion, a storage
     // block, a long timeout, a far-cheaper research, or a much better rival.
     if (preferred) {
+      const rejected = rejectedTargets.get(targetId(preferred));
+      if (rejected && now - rejected.at < PLAN_REJECT_COOLDOWN_MS) {
+        activePlanDebug.rejected = [{ target: preferred, reason: `recently rejected: ${rejected.reason}` }];
+        return null;
+      }
       activeTarget = {
         id: targetId(preferred),
         startedAt: now,
@@ -3668,14 +3710,14 @@
         reason: decision.reason,
         queueSignature: JSON.stringify(readQueue()),
       };
-      const reserved = reservedNeedsFor(preferred, resources);
+      const reserved = buildTargetLedger(preferred, resources).reserved;
       const deficits = Object.entries(reserved)
         .map(([name, amount]) => [name, Math.max(0, amount - resValueOf(resources, name))])
         .filter(([, amount]) => amount > 0)
         .slice(0, 4)
         .map(([name, amount]) => `${resTitle(resources, name)} ${fmt(amount)}`)
         .join(", ");
-      pushLog(`🔒 Plan locked: ${labelOf(preferred.meta)} for ${decision.layer}; remaining deficits: ${deficits || "none"}`);
+      pushPlanLog(`🔒 Plan locked: ${labelOf(preferred.meta)} for ${decision.layer}; remaining deficits: ${deficits || "none"}`, 20000);
     }
     return preferred;
   };
@@ -4484,7 +4526,8 @@
     }
     const titaniumHint = titaniumRouteHint(resources, goalKey);
     if (titaniumHint) return `titanium path: ${titaniumHint}`;
-    const craftable = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0) && craftByName(cost.name));
+    const directShort = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name && cost.val > ((getRes(resources, cost.name) || {}).value || 0));
+    const craftable = directShort && craftByName(directShort.name) && rawWorkNeedName(directShort.name) !== directShort.name ? directShort : null;
     if (craftable) {
       // Surface the immediate actionable step (e.g. Beam before Scaffold) and how
       // many to craft, so the panel shows what is actually being converted.
@@ -4492,6 +4535,11 @@
       if (HUNTABLE_RESOURCES.has(step)) return `hunt for ${resTitle(resources, step)} for ${labelOf(target.meta)}`;
       const via = step !== craftable.name && craftByName(step) ? ` (via ${craftLabel(step)})` : "";
       return `craft ${craftQtyText(resources, craftable.name)}${via} for ${labelOf(target.meta)}`;
+    }
+    if (directShort && rawWorkNeedName(directShort.name) === directShort.name) {
+      const safe = craftByName(directShort.name) ? craftablePotential(directShort.name) : 0;
+      const chunk = safe > 0 ? `; safe ${craftLabel(directShort.name)} chunk available: ${fmt(safe)} ${resTitle(resources, directShort.name)}` : "; refine only surplus above reserve";
+      return `accumulate ${resTitle(resources, directShort.name)} for ${labelOf(target.meta)}${chunk}`;
     }
     return `gather ${target.missing || "prerequisites"} (reserved)`;
   };
@@ -4752,7 +4800,7 @@
       ledger.direct[cost.name] = Math.max(ledger.direct[cost.name] || 0, cost.val);
       ledger.missing[cost.name] = Math.max(ledger.missing[cost.name] || 0, missing);
       addLedgerNeed(ledger, cost.name, cost.val);
-      if (craftByName(cost.name)) {
+      if (craftByName(cost.name) && rawWorkNeedName(cost.name) !== cost.name) {
         ledger.crafted.add(cost.name);
         addCraftClosureToLedger(ledger, cost.name, Math.max(1, missing || cost.val), resources);
         const raw = rawPathRequirements(cost.name, Math.max(1, missing || cost.val));
@@ -6309,6 +6357,8 @@
 
   const tick = () => {
     try {
+      plannerCycleId += 1;
+      activePlanSnapshot = { cycleId: plannerCycleId, target: undefined };
       resetTickCache();
       // Autopilot OFF means the helper takes NO actions — no buys, crafts,
       // trades, hunts, job moves, leader changes, festivals, praise, policies
@@ -6567,6 +6617,7 @@
 
   window.__kghDebug = {
     selectStrategicTarget(goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
       resetTickCache();
       const resources = resourceMap();
       const decision = selectStrategicTarget(resources, goalKey);
@@ -6599,8 +6650,16 @@
     solveChain(candidate) {
       return solveCraftChain(resourceMap(), candidate);
     },
+    classifyTargetFeasibility(candidate) {
+      return classifyTargetFeasibility(candidate, resourceMap());
+    },
     bestWoodJob() {
       return bestWoodJob();
+    },
+    candidateById(id, goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
+      return findCandidateById(getCandidatesCached(resourceMap(), goalKey), id);
     },
     queue: () => readQueue(),
     queueAdd: (id, val) => queueAdd(id, val),
@@ -6613,8 +6672,11 @@
       activeScienceUnlockId = null;
       activeTarget = candidate ? {
         id: targetId(candidate),
-        startedAt: Date.now() - getTargetLockMinMs() - 1000,
+        startedAt: Date.now(),
+        lastProgressAt: Date.now(),
+        lastProgressSignature: targetProgressSignature(candidate, resourceMap()),
         initialVal: VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0,
+        queueSignature: JSON.stringify(readQueue()),
       } : null;
     },
     targetId,
