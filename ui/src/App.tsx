@@ -1,0 +1,3 @@
+import React,{useEffect,useState}from'react';import{createRoot}from'react-dom/client';import{Layout}from'./components/Layout';import{EventCard}from'./components/EventCard';import{EventTable}from'./components/EventTable';import{Filters}from'./components/Filters';import'./style.css';
+export default function App(){const[events,setEvents]=useState<any[]>([]);useEffect(()=>{fetch('/api/dashboard/today').then(r=>r.json()).then((d:any)=>setEvents(d.events||[]))},[]);return <Layout><Filters/><section><h2>Must Review Today</h2><div className="grid">{events.filter(e=>e.score>=80).map(e=><EventCard key={e.id} event={e}/>)}</div></section><section><h2>Ranked idea inbox</h2><EventTable events={events}/></section></Layout>}
+createRoot(document.getElementById('root')!).render(<App/>);

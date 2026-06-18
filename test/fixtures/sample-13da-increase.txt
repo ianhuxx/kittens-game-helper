@@ -1,0 +1,7 @@
+SC 13D/A
+Subject Company: Example Opportunity Trust
+CUSIP: 987654321
+Prior ownership: 8.5%
+ITEM 4. PURPOSE OF TRANSACTION
+The filer may nominate trustees and nominees for election to the board.
+ITEM 5. Current ownership: 12.1% and 2,000,000 shares.

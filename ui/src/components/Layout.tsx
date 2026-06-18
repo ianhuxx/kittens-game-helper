@@ -1,0 +1,1 @@
+import React from'react';export function Layout({children}:{children:React.ReactNode}){return <><header><h1>Activist CEF Tracker</h1><nav><a>Today</a><a>High Priority</a><a>Saba</a><a>Bulldog</a><a>Watchlist</a><a>Admin</a></nav></header><main>{children}</main></>}

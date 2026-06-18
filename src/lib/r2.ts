@@ -1,0 +1,1 @@
+export const r2Keys={raw:(c:string,a:string)=>`raw/sec/${c}/${a}/primary.html`,submission:(c:string,a:string)=>`raw/sec/${c}/${a}/submission.json`,text:(c:string,a:string)=>`extracted/sec/${c}/${a}/text.txt`,item4:(c:string,a:string)=>`extracted/sec/${c}/${a}/item4.txt`};
