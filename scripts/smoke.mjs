@@ -981,7 +981,6 @@ res("titanium").value = 0;
 // the bot must NOT force-adopt the Zebra policy or run the titanium/Zebra path —
 // global titanium scarcity alone is not a reason to act. (This is the regression
 // guard for "saving for X but doing Zebra trading underneath".)
-dbg.forceActiveTarget(null); // isolate from the earlier titanium-stage lock; this scenario re-picks from a clean slate
 fakeNow += 25000;
 tickFn();
 check("coherence: a non-titanium plan does NOT trigger Zebra policy adoption or the titanium path", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === false && !/titanium path|Zebra/i.test(panelText(".kgh-now")));

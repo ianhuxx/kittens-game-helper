@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.4.5
+// @version      2.4.6
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.4.5";
+  const HELPER_VERSION = "2.4.6";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3185,6 +3185,13 @@
     const deferred = [];
     for (const candidate of candidates) {
       if (candidate.kind !== "research" || !candidate.meta || candidate.meta.researched || !isOpen(candidate.meta)) continue;
+      // A filler tech with no unlocks (no gateway value) must never anchor a
+      // multi-tick sprint — otherwise, when science sits near the cap, a cheap
+      // dead-end tech can hijack the sprint ahead of a manuscript-gated gateway
+      // tech (e.g. Trivia over Astronomy on the way to Rocketry). Cheap filler is
+      // still bought through normal economy scoring; it just can't own the plan.
+      // This mirrors the same guard in the science-storage-unlock layer.
+      if (gatewayValue(candidate.meta) <= 0) continue;
       if (!finalScienceFitsCap(candidate.meta, resources)) {
         deferred.push({ candidate, reason: scienceStorageReason(candidate.meta, resources), kind: "storage" });
         continue;
