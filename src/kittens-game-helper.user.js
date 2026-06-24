@@ -3366,16 +3366,50 @@
   const scienceStorageGain = (candidate) => {
     if (!candidate) return 0;
     const profile = candidateEffectProfile(candidate.kind, candidate.meta);
-    return Math.max(0, (profile.max && profile.max.science) || 0) + Math.max(0, (profile.ratio && profile.ratio.science) || 0) * Math.max(1, resMaxOf(resourceMap(), "science"));
+    const direct = Math.max(0, (profile.max && profile.max.science) || 0);
+    // Data Centers also lift the Compendium-derived ceiling.  Only its usable
+    // headroom can raise the current resource cap; scienceRatio is production
+    // and deliberately contributes nothing here.
+    const live = liveMetaView(candidate.meta) || candidate.meta || {};
+    const compendiumCeiling = Math.max(0, (((live.effects || {}).scienceMaxCompendia) || 0));
+    const usableCompendiumHeadroom = Math.max(0, resValueOf(resourceMap(), "compedium") * 10 - resMaxOf(resourceMap(), "science"));
+    return direct + Math.min(compendiumCeiling, usableCompendiumHeadroom);
   };
 
   const scienceStorageUnlockCandidate = (candidate, resources) => {
     if (!candidate || candidate.kind === "policy") return false;
     if (candidate.kind === "research" && candidate.meta && !finalScienceFitsCap(candidate.meta, resources)) return false;
-    const profile = candidateEffectProfile(candidate.kind, candidate.meta);
-    if (((profile.max && profile.max.science) || 0) > 0 || ((profile.ratio && profile.ratio.science) || 0) > 0) return true;
-    const text = effectText(candidate.meta);
-    return /scienceMax|scienceMaxRatio|science storage|science cap|observatory|academy|library/i.test(text);
+    return scienceStorageGain(candidate) > 0;
+  };
+
+  const projectScienceClosure = (candidate, need, resources) => {
+    const gain = scienceStorageGain(candidate);
+    if (!(gain > 0) || !(need > 0)) return { reachable: false, gain, copies: 0, projectedGain: 0, closure: 0, eta: Number.POSITIVE_INFINITY, prices: [] };
+    const copies = Math.min(100, Math.max(1, Math.ceil(need / gain)));
+    const ratio = Math.max(1, Number((liveMetaView(candidate.meta) || candidate.meta || {}).priceRatio) || 1);
+    const firstPrices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && price.val > 0);
+    const totals = new Map();
+    for (let copy = 0; copy < copies; copy += 1) {
+      const mult = Math.pow(ratio, copy);
+      for (const price of firstPrices) totals.set(price.name, (totals.get(price.name) || 0) + price.val * mult);
+    }
+    let eta = 0;
+    let reachable = firstPrices.length > 0;
+    for (const [name, amount] of totals) {
+      const reach = capDrainReachabilityFor(resources, name, amount);
+      if (!reach.reachable) reachable = false;
+      eta = Math.max(eta, reach.eta || 0);
+    }
+    const projectedGain = gain * copies;
+    return {
+      reachable,
+      gain,
+      copies,
+      projectedGain,
+      closure: Math.min(1, projectedGain / need),
+      eta: reachable ? eta : Number.POSITIVE_INFINITY,
+      prices: [...totals].map(([name, val]) => ({ name, val })),
+    };
   };
 
   // The next blocked tech counts as a near-term storage "sprint" only when it can
@@ -3406,10 +3440,15 @@
   // building and keep it until it leaves the option set or a rival is clearly
   // better, so the planner commits instead of oscillating.
   let activeScienceUnlockId = null;
+  let activeScienceUnlockContext = null;
+  const scienceUnlockOptionId = (candidate) => {
+    const raw = candidate && rawBuildingFor(candidate.meta);
+    return `${targetId(candidate)}@${raw && isFinite(raw.stage) ? raw.stage : 0}`;
+  };
 
   const bestScienceStorageUnlock = (candidates, resources) => {
     const max = resMaxOf(resources, "science");
-    if (max <= 0) { activeScienceUnlockId = null; return null; }
+    if (max <= 0) { activeScienceUnlockId = null; activeScienceUnlockContext = null; return null; }
     // The next valuable research = cheapest open, unresearched, content-unlocking
     // tech.  A filler tech with no unlocks (no gateway value) must never anchor a
     // storage sprint, so it is excluded here.
@@ -3422,17 +3461,21 @@
     // or is too far above the cap to be a near-term sprint → not a storage problem.
     if (!next || next.cost <= max || next.cost > max * SCIENCE_UNLOCK_REACH) {
       activeScienceUnlockId = null;
+      activeScienceUnlockContext = null;
       return null;
     }
     const blocked = next.c;
     const need = Math.max(0, next.cost - max);
+    const blockerContext = targetId(blocked);
+    if (activeScienceUnlockContext && activeScienceUnlockContext !== blockerContext) activeScienceUnlockId = null;
+    activeScienceUnlockContext = blockerContext;
     const options = candidates
       .filter((candidate) => targetId(candidate) !== targetId(blocked))
       .filter((candidate) => scienceStorageUnlockCandidate(candidate, resources))
       .filter((candidate) => !directStorageBlockers(candidate.kind, candidate.meta, resources).length)
-      .map((candidate) => ({ candidate, gain: scienceStorageGain(candidate), wait: waitSecondsForCandidate(candidate, resources) }))
-      .filter((item) => isFinite(item.wait));
-    if (!options.length) { activeScienceUnlockId = null; return null; }
+      .map((candidate) => ({ candidate, ...projectScienceClosure(candidate, need, resources), wait: waitSecondsForCandidate(candidate, resources) }))
+      .filter((item) => item.reachable && isFinite(item.eta));
+    if (!options.length) { activeScienceUnlockId = null; activeScienceUnlockContext = null; return null; }
     // Rank storage fixes by the actual storage problem, not generic ROI: prefer
     // cheap/immediate cap gain per limiting-resource ETA, with a penalty for
     // transitive craft chains that collide with the manual queue. This makes a
@@ -3442,19 +3485,21 @@
     for (const option of options) {
       const ledger = buildTargetLedger(option.candidate, resources);
       const conflict = Object.keys(ledger.reserved).some((name) => (queueLedger.reserved[name] || 0) > 0) ? 1 : 0;
-      const eta = Math.max(1, option.wait);
-      option.planScore = (option.gain || scienceStorageGain(option.candidate) || 1) / eta /
+      const eta = Math.max(1, option.eta);
+      const work = eta + option.copies * 0.25;
+      option.planScore = option.closure / Math.max(1, work) /
         (1 + Object.keys(ledger.reserved).length * 0.04 + conflict * 0.75);
     }
-    options.sort((a, b) => (b.planScore - a.planScore) || (a.wait - b.wait) || (b.gain - a.gain) || ((b.candidate.score || 0) - (a.candidate.score || 0)));
+    options.sort((a, b) => (b.closure - a.closure) || (b.planScore - a.planScore) || (a.eta - b.eta) || (a.copies - b.copies) || (b.gain - a.gain) || ((b.candidate.score || 0) - (a.candidate.score || 0)));
     // Commit to the prior choice while it is still a valid option; only switch when
     // a rival actually improves the storage ETA/score by a meaningful hysteresis
     // margin.  When gains tie at 0 this always keeps the prior pick, killing the
     // Library↔Observatory flicker.
     const best = options[0];
-    const prior = activeScienceUnlockId && options.find((o) => targetId(o.candidate) === activeScienceUnlockId);
-    const chosen = prior && !(best.gain > prior.gain * 1.2 && best.planScore > prior.planScore * 1.25 && best.wait < prior.wait * 0.75) ? prior : best;
-    activeScienceUnlockId = targetId(chosen.candidate);
+    const prior = activeScienceUnlockId && options.find((o) => scienceUnlockOptionId(o.candidate) === activeScienceUnlockId);
+    const chosen = prior && !(best.closure > prior.closure + 0.2 ||
+      (best.closure >= prior.closure && best.planScore > prior.planScore * 1.25 && best.eta < prior.eta * 0.8)) ? prior : best;
+    activeScienceUnlockId = scienceUnlockOptionId(chosen.candidate);
     return { target: chosen.candidate, blocked, need, options: options.slice(0, 3) };
   };
 
@@ -4746,7 +4791,10 @@
         const rejected = (decision.rejectedTopCandidates || [])
           .filter((item) => item && item.target && !isLongProject(item.target, resources, goalKey)).slice(0, 3);
         const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
-        return `${phaseDebug} · ${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${rejectNote}`;
+        const optionNote = (blocker.options || []).length
+          ? ` · Cap options: ${blocker.options.map((option) => `${labelOf(option.candidate.meta)} +${fmt(option.gain)}/copy ×${option.copies} = ${Math.round(option.closure * 100)}% closure, ETA ${formatEta(option.eta)}${targetId(option.candidate) === targetId(target) ? " (chosen)" : " (slower/incomplete)"}`).join("; ")}`
+          : "";
+        return `${phaseDebug} · ${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${optionNote}${rejectNote}`;
       }
       // Economy details: state + ETA + reservation + deferrals (unchanged shape).
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
@@ -7033,6 +7081,7 @@
       // from a clean state (mirrors an explicit player priority change).
       activeSprint = null;
       activeScienceUnlockId = null;
+      activeScienceUnlockContext = null;
       activeTarget = candidate ? {
         id: targetId(candidate),
         startedAt: Date.now(),
@@ -7072,6 +7121,22 @@
     bootstrapResourceCandidate() {
       resetTickCache();
       return bootstrapResourceCandidate(resourceMap());
+    },
+    scienceStorageGain(candidate) {
+      resetTickCache();
+      return scienceStorageGain(candidate);
+    },
+    scienceStorageUnlockCandidate(candidate) {
+      resetTickCache();
+      return scienceStorageUnlockCandidate(candidate, resourceMap());
+    },
+    projectScienceClosure(candidate, need) {
+      resetTickCache();
+      return projectScienceClosure(candidate, need, resourceMap());
+    },
+    bestScienceStorageUnlock(candidates) {
+      resetTickCache();
+      return bestScienceStorageUnlock(candidates, resourceMap());
     },
   };
 

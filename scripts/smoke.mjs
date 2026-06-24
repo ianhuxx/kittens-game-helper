@@ -2046,6 +2046,43 @@ buildings.splice(buildings.indexOf(hiddenSmartBuilding), 1);
 crafts.splice(crafts.indexOf(smartcreteCraft), 1);
 resources.splice(resources.indexOf(smartcrete), 1);
 
+/* =====================================================================
+ * REGRESSION — direct science-cap evidence and full-deficit projection
+ * =================================================================== */
+const ratioOnlyScience = { kind: "build", meta: { name: "ratioOnlyScience", label: "Science Lab", effects: { scienceRatio: 1 } } };
+const namedStorageBait = { kind: "build", meta: { name: "namedStorageBait", label: "Library", effects: {}, description: "science storage" } };
+check("Test V: scienceRatio is production and adds zero science storage", dbg.scienceStorageGain?.(ratioOnlyScience) === 0);
+check("Test V: names/descriptions cannot qualify a zero-gain cap option", dbg.scienceStorageUnlockCandidate?.(namedStorageBait) === false);
+
+const capBlockTech = {
+  name: "capBlockTech",
+  label: "Advanced Biochemistry",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 145000 }],
+  unlocks: { tech: ["futureCapTech"] },
+};
+const weakTempleV = { name: "weakTempleV", label: "Temple", unlocked: true, val: 0, on: 0, prices: [{ name: "gold", val: 1 }], priceRatio: 1, effects: { scienceMax: 500 } };
+const ratioAcademyV = { name: "ratioAcademyV", label: "Academy", unlocked: true, val: 0, on: 0, prices: [{ name: "minerals", val: 100 }], priceRatio: 1, effects: { scienceMax: 4000, scienceRatio: 1 } };
+const directVaultV = { name: "directVaultV", label: "Data Center", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 1000 }], priceRatio: 1, effects: { scienceMax: 10000 } };
+buildings.push(weakTempleV, ratioAcademyV, directVaultV);
+const savedScienceV = { value: res("science").value, maxValue: res("science").maxValue };
+res("science").value = 105000;
+res("science").maxValue = 105000;
+const capCandidatesV = [
+  { kind: "research", meta: capBlockTech, affordable: false, progress: 0.72, score: 50 },
+  ...[weakTempleV, ratioAcademyV, directVaultV].map((meta) => ({ kind: "build", meta, affordable: true, progress: 1, score: 10 })),
+];
+const capDecisionV = dbg.bestScienceStorageUnlock?.(capCandidatesV);
+const directProjectionV = capDecisionV?.options?.find((option) => option.candidate?.meta?.name === "directVaultV");
+check("Test V: 40K cap deficit chooses the fastest direct full-closure option", capDecisionV?.target?.meta?.name === "directVaultV");
+check("Test V: cap diagnostics project repeated copies through full closure", directProjectionV?.copies === 4 && directProjectionV?.closure >= 1 && Number.isFinite(directProjectionV?.eta));
+buildings.splice(buildings.indexOf(weakTempleV), 1);
+buildings.splice(buildings.indexOf(ratioAcademyV), 1);
+buildings.splice(buildings.indexOf(directVaultV), 1);
+res("science").value = savedScienceV.value;
+res("science").maxValue = savedScienceV.maxValue;
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

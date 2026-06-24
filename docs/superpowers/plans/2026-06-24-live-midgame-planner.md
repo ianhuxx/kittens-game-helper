@@ -119,29 +119,29 @@ git commit -m "fix: phase research chains and bootstrap crafts"
 - Modify: `src/kittens-game-helper.user.js` near science storage selection and automation details
 - Test: `scripts/smoke.mjs`
 
-- [ ] **Step 1: Write failing cap-projection tests**
+- [x] **Step 1: Write failing cap-projection tests**
 
 Model a 105K cap, a 145K valuable research, Temple with zero or weak live `scienceMax`, Data Center/Observatory/Academy alternatives, and dynamic price ratios. Assert name text cannot qualify, `scienceRatio` adds zero storage, options project enough repeated copies to close 40K, the fastest full closure wins, sticky state resets on blocker/stage change, and diagnostics include every option's gain/copies/closure/ETA/rejection.
 
-- [ ] **Step 2: Run smoke and verify RED**
+- [x] **Step 2: Run smoke and verify RED**
 
 Run: `npm.cmd run smoke`
 
 Expected: FAIL because current gain includes `scienceRatio`, text fallback qualifies candidates, and ranking sees one copy only.
 
-- [ ] **Step 3: Implement capacity evidence and projection**
+- [x] **Step 3: Implement capacity evidence and projection**
 
 Replace `scienceStorageUnlockCandidate` fallback matching with `scienceStorageGain(candidate) > 0`. Count live `scienceMax`; handle `scienceMaxCompendia` only up to current Compendium-derived usable headroom. Add cumulative projected prices and `projectScienceClosure(candidate, need, resources)` with bounded copies, reachability, total ETA, closure ratio, and conflict penalty.
 
 Scope sticky key to `${blockedTech}:${targetId}:${activeStage}` and allow a full-closure option to replace a weak sticky choice whenever projected closure/payback is materially better.
 
-- [ ] **Step 4: Re-run smoke and verify GREEN**
+- [x] **Step 4: Re-run smoke and verify GREEN**
 
 Run: `npm.cmd run smoke`
 
 Expected: cap projection checks and all existing D2-D4 checks PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/kittens-game-helper.user.js scripts/smoke.mjs
