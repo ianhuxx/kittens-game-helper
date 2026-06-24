@@ -2133,6 +2133,65 @@ village.maxKittens = savedMaxKittensW;
 village.happiness = savedHappinessW;
 if (savedResetCountW === undefined) delete gamePage.totalResets; else gamePage.totalResets = savedResetCountW;
 
+/* =====================================================================
+ * REGRESSION — opportunity-costed, controller-owned stage transitions
+ * =================================================================== */
+const stageEconomyX = {
+  name: "stageEconomyX",
+  unlocked: true,
+  stage: 0,
+  val: 4,
+  on: 4,
+  priceRatio: 1.1,
+  stages: [
+    { label: "Old Archive", prices: [{ name: "wood", val: 100 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "Data Center X", prices: [{ name: "wood", val: 1000 }], effects: { scienceMax: 1000 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+const stageBadX = {
+  name: "stageBadX",
+  unlocked: true,
+  stage: 0,
+  val: 4,
+  on: 4,
+  priceRatio: 1.1,
+  stages: [
+    { label: "Efficient Plant", prices: [{ name: "wood", val: 100 }], effects: { scienceMax: 1000 }, stageUnlocked: true },
+    { label: "Wasteful Plant", prices: [{ name: "wood", val: 1000 }], effects: { scienceMax: 10, energyConsumption: 50 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageEconomyX, stageBadX);
+res("wood").value = Math.max(res("wood").value, 5000);
+res("wood").maxValue = Math.max(res("wood").maxValue, 10000);
+const stageAnalysisX = dbg.stageTransitionAnalysis?.(stageEconomyX, 1);
+check("Test X: transition analysis reports refund and rebuild-to-parity opportunity costs", stageAnalysisX?.refund?.wood > 0 && stageAnalysisX?.rebuild?.wood >= 1000 && stageAnalysisX?.parityCount >= 1 && Number.isFinite(stageAnalysisX?.payback));
+check("Test X: materially better stage is actionable", stageAnalysisX?.actionable === true);
+const stageCandidateX = dbg.stageTransitionCandidate?.(stageEconomyX, 1);
+check("Test X: transition ledger reserves net rebuild inputs", (dbg.buildTargetLedger(stageCandidateX).reserved.wood || 0) > 0);
+const badStageAnalysisX = dbg.stageTransitionAnalysis?.(stageBadX, 1);
+check("Test X: uneconomic stage transition is rejected with a reason", badStageAnalysisX?.actionable === false && /utility|payback|safety|worse/i.test(badStageAnalysisX?.reason || ""));
+
+let stageControllerCallsX = 0;
+context.classes = context.classes || {};
+context.classes.ui = context.classes.ui || {};
+context.classes.ui.btn = context.classes.ui.btn || {};
+context.classes.ui.btn.StagingBldBtnController = class {
+  constructor(game) { this.game = game; }
+  fetchModel(options) { return { options, metadata: buildings.find((building) => building.name === options.building) }; }
+  deltagrade(model, delta) {
+    stageControllerCallsX += 1;
+    model.metadata.stage += delta;
+    model.metadata.val = 0;
+    model.metadata.on = 0;
+  }
+};
+const stageExecutedX = dbg.executeStageTransitionCandidate?.(stageCandidateX);
+check("Test X: stage change uses the staging controller and starts rebuild continuation", stageExecutedX === true && stageControllerCallsX === 1 && stageEconomyX.stage === 1 && dbg.pendingStageRebuild?.()?.buildingName === "stageEconomyX");
+buildings.splice(buildings.indexOf(stageEconomyX), 1);
+buildings.splice(buildings.indexOf(stageBadX), 1);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

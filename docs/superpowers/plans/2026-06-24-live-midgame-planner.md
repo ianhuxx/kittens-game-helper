@@ -193,27 +193,27 @@ git commit -m "feat: balance expansion and festival upkeep"
 - Modify: `src/kittens-game-helper.user.js` near candidate gathering/scoring, reservations, controller execution, and debug details
 - Test: `scripts/smoke.mjs`
 
-- [ ] **Step 1: Write failing transition-analysis tests**
+- [x] **Step 1: Write failing transition-analysis tests**
 
 Create two-stage buildings with owned copies, live price ratios, 50% refunds, changed storage/production/energy effects, and unlocked adjacent stages. Assert analysis reports refund, rebuild-to-parity count/cost, temporary lost utility, payback, post-cap safety, and rejection reason. Assert an uneconomic change is rejected, an economic upgrade/downgrade becomes the active plan, its rebuild inputs are reserved, and cooldown prevents oscillation.
 
-- [ ] **Step 2: Run smoke and verify RED**
+- [x] **Step 2: Run smoke and verify RED**
 
 Run: `npm.cmd run smoke`
 
 Expected: FAIL because `stage` candidates and transition accounting do not exist.
 
-- [ ] **Step 3: Implement transition analysis**
+- [x] **Step 3: Implement transition analysis**
 
 Add pure helpers for active/adjacent stage views, scaled stage prices, cumulative current-stage 50% refundable proceeds, target rebuild costs, per-unit economic utility, parity count, cap safety, and payback. Use live price-ratio/cost-reduction effects where available and expose conservative estimates when an effect cannot be simulated safely.
 
 Generate adjacent unlocked `stage` candidates only when rebuild is reachable, net resources plus guaranteed refund cover safety buffers, target utility is materially better for current pressure, and payback fits the planning horizon.
 
-- [ ] **Step 4: Implement transition execution and rebuild continuation**
+- [x] **Step 4: Implement transition execution and rebuild continuation**
 
 Support `stage` in IDs, prices, completion, reservations, display, and `buyCandidate`. Invoke `StagingBldBtnController.deltagrade(model, delta)` only. Store `pendingStageRebuild` with target building/stage/count; on following ticks return the live build candidate until parity is restored. Clear it on completion/invalidation and enforce cooldown/hysteresis.
 
-- [ ] **Step 5: Re-run smoke and verify GREEN**
+- [x] **Step 5: Re-run smoke and verify GREEN**
 
 Run: `npm.cmd run smoke`
 

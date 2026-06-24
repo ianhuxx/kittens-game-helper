@@ -3106,6 +3106,8 @@
     resourceBootstrap: "Resource bootstrap",
     expansion: "Expansion checkpoint",
     festival: "Festival maintenance",
+    stageTransition: "Building stage transition",
+    stageRebuild: "Stage rebuild",
     hardUnlock: "Hard unlock / milestone",
     scienceStorageUnlock: "Science storage unlock",
     storage: "Storage blocker",
@@ -3659,6 +3661,239 @@
     return options.length ? options[0].candidate : null;
   };
 
+  /* ---------------- opportunity-costed staged-building transitions --------- */
+
+  const STAGE_PAYBACK_HORIZON_SECONDS = 6 * 60 * 60;
+  const STAGE_COOLDOWN_MS = 10 * 60 * 1000;
+  const stageCooldownUntil = Object.create(null);
+  let pendingStageRebuild = null;
+
+  const profileFromEffects = (effects) => {
+    const profile = emptyEffectProfile();
+    for (const [key, value] of Object.entries(effects || {})) parseEffectEntry(profile, key, value);
+    return profile;
+  };
+
+  const stageMetaView = (raw, stage) => {
+    if (!raw || !Array.isArray(raw.stages) || !raw.stages.length) return liveMetaView(raw) || raw;
+    const bounded = Math.max(0, Math.min(raw.stages.length - 1, Number(stage) || 0));
+    if (bounded === (Number(raw.stage) || 0)) return liveMetaView(raw, bounded);
+    // Calculate the alternate stage on a clone so dynamic values (notably Data
+    // Center scienceMax) are visible without changing the live save.
+    const clone = {
+      ...raw,
+      stage: bounded,
+      val: 0,
+      on: 0,
+      effects: { ...(raw.effects || {}) },
+      stages: raw.stages.map((item) => ({ ...item, effects: { ...((item && item.effects) || {}) } })),
+    };
+    try {
+      if (typeof raw.calculateEffects === "function") raw.calculateEffects(clone, window.gamePage);
+    } catch (error) {
+      /* static stage metadata remains usable */
+    }
+    return { ...clone, ...(clone.stages[bounded] || {}), stage: bounded };
+  };
+
+  const stageUnitUtility = (view, resources) => {
+    const profile = profileFromEffects((view && view.effects) || {});
+    let utility = 0;
+    for (const [name, amount] of Object.entries(profile.max || {})) {
+      const cap = Math.max(1, resMaxOf(resources, name));
+      const pressure = resRatio(resources, name, 0);
+      utility += Math.max(0, amount) / cap * (8 + pressure * 24);
+    }
+    for (const [name, amount] of Object.entries(profile.perTick || {})) {
+      const perSecond = amount * ticksPerSecond();
+      const current = Math.abs(productionFor(name));
+      utility += perSecond > 0 ? perSecond / Math.max(0.01, current + perSecond) * 12 : perSecond / Math.max(0.01, current - perSecond) * 8;
+    }
+    for (const [name, amount] of Object.entries(profile.ratio || {})) {
+      if (amount > 0 && productionFor(name) > 0) utility += Math.min(2, amount) * 8;
+    }
+    utility += Math.max(0, profile.housing || 0) * 8;
+    utility += Math.max(0, profile.happiness || 0) * 5;
+    const effects = (view && view.effects) || {};
+    utility -= Math.max(0, effects.energyConsumption || 0) * 0.8;
+    for (const [key, value] of Object.entries(effects)) {
+      if (/PerTickCon$/i.test(key) && value < 0) utility -= Math.min(10, Math.abs(value) * ticksPerSecond());
+    }
+    return Math.max(0.0001, utility);
+  };
+
+  const addPriceMap = (map, name, amount) => {
+    if (!name || !(amount > 0)) return;
+    map[name] = (map[name] || 0) + amount;
+  };
+
+  const cumulativeStagePrices = (raw, stage, count) => {
+    const view = stageMetaView(raw, stage) || {};
+    const ratio = Math.max(1, Number(view.priceRatio || raw.priceRatio) || 1);
+    const totals = {};
+    for (let index = 0; index < Math.max(0, count); index += 1) {
+      const mult = Math.pow(ratio, index);
+      for (const price of view.prices || []) addPriceMap(totals, price.name, price.val * mult);
+    }
+    return totals;
+  };
+
+  const refundableStagePrices = (raw, stage, count) => {
+    const invested = cumulativeStagePrices(raw, stage, count);
+    const refund = {};
+    for (const [name, amount] of Object.entries(invested)) {
+      const res = getRes(resourceMap(), name);
+      let refundable = true;
+      try { if (res && typeof res.isRefundable === "function") refundable = !!res.isRefundable(window.gamePage); } catch (error) { /* assume normal resource */ }
+      if (refundable) refund[name] = amount * 0.5;
+    }
+    return refund;
+  };
+
+  const stageTransitionAnalysis = (raw, toStage, resources = resourceMap()) => {
+    if (!raw || !Array.isArray(raw.stages)) return { actionable: false, reason: "not a staged building" };
+    const fromStage = Math.max(0, Number(raw.stage) || 0);
+    const targetStage = Math.max(0, Math.min(raw.stages.length - 1, Number(toStage) || 0));
+    if (targetStage === fromStage) return { actionable: false, reason: "already on target stage" };
+    const targetStageMeta = raw.stages[targetStage];
+    if (!targetStageMeta || targetStageMeta.stageUnlocked === false) return { actionable: false, reason: "target stage locked" };
+    const currentView = stageMetaView(raw, fromStage);
+    const targetView = stageMetaView(raw, targetStage);
+    const owned = Math.max(0, Number(raw.val) || 0);
+    const active = Math.max(0, Number(raw.on) || owned);
+    const currentUnitUtility = stageUnitUtility(currentView, resources);
+    const targetUnitUtility = stageUnitUtility(targetView, resources);
+    const currentUtility = currentUnitUtility * active;
+    const maxParity = Math.max(1, owned * 10 || 10);
+    const parityCount = Math.min(maxParity, Math.max(1, Math.ceil(currentUtility / Math.max(0.0001, targetUnitUtility))));
+    const targetUtility = targetUnitUtility * parityCount;
+    const refund = refundableStagePrices(raw, fromStage, owned);
+    const rebuild = cumulativeStagePrices(raw, targetStage, parityCount);
+    // The game sells the old stack before rebuilding. Only the part of each
+    // refund that fits in the live bank is guaranteed to survive that moment;
+    // treat overflow as lost rather than optimistically funding the rebuild.
+    const usableRefund = {};
+    const refundLoss = {};
+    for (const [name, amount] of Object.entries(refund)) {
+      const cap = resMaxOf(resources, name);
+      const headroom = cap > 0 ? Math.max(0, cap - resValueOf(resources, name)) : amount;
+      usableRefund[name] = Math.min(amount, headroom);
+      if (amount > usableRefund[name]) refundLoss[name] = amount - usableRefund[name];
+    }
+    const net = {};
+    for (const name of new Set([...Object.keys(rebuild), ...Object.keys(usableRefund)])) {
+      net[name] = Math.max(0, (rebuild[name] || 0) - (usableRefund[name] || 0));
+      if (!(net[name] > 0)) delete net[name];
+    }
+    let reachable = true;
+    let eta = 0;
+    for (const [name, amount] of Object.entries(net)) {
+      const reach = capDrainReachabilityFor(resources, name, amount);
+      if (!reach.reachable) reachable = false;
+      eta = Math.max(eta, reach.eta || 0);
+    }
+    const currentProfile = profileFromEffects((currentView && currentView.effects) || {});
+    const targetProfile = profileFromEffects((targetView && targetView.effects) || {});
+    const safetyVetoes = [];
+    for (const name of new Set([...Object.keys(currentProfile.max || {}), ...Object.keys(targetProfile.max || {})])) {
+      const lostCapacity = Math.max(0, (currentProfile.max[name] || 0) * owned - (targetProfile.max[name] || 0) * parityCount);
+      const postCap = Math.max(0, resMaxOf(resources, name) - lostCapacity);
+      if (lostCapacity > 0 && resValueOf(resources, name) > postCap * 0.98) safetyVetoes.push(`${resTitle(resources, name)} would exceed post-transition cap`);
+    }
+    const incrementalUtility = targetUtility - currentUtility;
+    const lostUtility = currentUtility * Math.max(0, eta);
+    const payback = incrementalUtility > 0 ? eta + lostUtility / incrementalUtility : Number.POSITIVE_INFINITY;
+    const materiallyBetter = targetUtility > currentUtility * 1.05;
+    const actionable = owned > 0 && reachable && !safetyVetoes.length && materiallyBetter && payback <= STAGE_PAYBACK_HORIZON_SECONDS;
+    const reason = actionable ? `utility +${Math.round((targetUtility / Math.max(0.0001, currentUtility) - 1) * 100)}%, payback ${formatEta(payback)}`
+      : safetyVetoes.length ? `safety veto: ${safetyVetoes[0]}`
+        : (!reachable ? "rebuild chain unreachable" : !materiallyBetter ? "target stage utility is worse after rebuild" : `payback ${formatEta(payback)} exceeds planning horizon`);
+    return {
+      actionable, reason, raw, fromStage, toStage: targetStage, fromLabel: currentView.label || raw.name,
+      toLabel: targetView.label || raw.name, owned, active, currentUnitUtility, targetUnitUtility,
+      currentUtility, targetUtility, parityCount, refund, usableRefund, refundLoss, rebuild, net, eta, lostUtility,
+      incrementalUtility, payback, safetyVetoes, targetEffects: { ...((targetView && targetView.effects) || {}) },
+    };
+  };
+
+  const stageTransitionCandidate = (raw, toStage, resources = resourceMap()) => {
+    const analysis = stageTransitionAnalysis(raw, toStage, resources);
+    if (!analysis.actionable) return null;
+    const prices = Object.entries(analysis.net).map(([name, val]) => ({ name, val }));
+    const meta = {
+      name: `stage-${raw.name}-${analysis.fromStage}-to-${analysis.toStage}`,
+      label: `${analysis.toStage > analysis.fromStage ? "Upgrade" : "Downgrade"} ${analysis.fromLabel} → ${analysis.toLabel}`,
+      prices,
+      effects: analysis.targetEffects,
+      building: raw,
+      buildingName: raw.name,
+      delta: analysis.toStage - analysis.fromStage,
+      analysis,
+      unlocked: true,
+    };
+    return { kind: "stage", weight: 5, meta, ...evaluate("stage", meta, resources), score: 60 + Math.min(40, analysis.incrementalUtility) };
+  };
+
+  const bestStageTransition = (resources = resourceMap()) => {
+    const options = [];
+    for (const raw of buildingMetas()) {
+      if (!raw || !Array.isArray(raw.stages) || !(raw.val > 0) || (stageCooldownUntil[raw.name] || 0) > Date.now()) continue;
+      const stage = Math.max(0, Number(raw.stage) || 0);
+      for (const toStage of [stage - 1, stage + 1]) {
+        if (toStage < 0 || toStage >= raw.stages.length) continue;
+        const candidate = stageTransitionCandidate(raw, toStage, resources);
+        if (candidate) options.push(candidate);
+      }
+    }
+    options.sort((a, b) => (b.meta.analysis.incrementalUtility / Math.max(1, b.meta.analysis.payback + 1)) -
+      (a.meta.analysis.incrementalUtility / Math.max(1, a.meta.analysis.payback + 1)));
+    return options[0] || null;
+  };
+
+  const pendingStageRebuildCandidate = (candidates, resources) => {
+    if (!pendingStageRebuild) return null;
+    const raw = buildingMetas().find((building) => building && building.name === pendingStageRebuild.buildingName);
+    if (!raw || (Number(raw.stage) || 0) !== pendingStageRebuild.stage) {
+      pendingStageRebuild = null;
+      return null;
+    }
+    if ((raw.val || 0) >= pendingStageRebuild.targetCount) {
+      pendingStageRebuild = null;
+      return null;
+    }
+    const candidate = candidates.find((item) => item.kind === "build" && item.meta === raw) ||
+      { kind: "build", weight: 5, meta: raw, ...evaluate("build", raw, resources), score: 100 };
+    candidate._stageRebuild = { ...pendingStageRebuild };
+    return candidate;
+  };
+
+  const executeStageTransitionCandidate = (candidate) => {
+    if (!candidate || candidate.kind !== "stage" || !candidate.meta || !candidate.meta.building) return false;
+    const raw = candidate.meta.building;
+    const beforeStage = Number(raw.stage) || 0;
+    const Controller = getGlobalPath(["classes", "ui", "btn", "StagingBldBtnController"]);
+    if (typeof Controller !== "function") return false;
+    try {
+      const controller = new Controller(window.gamePage);
+      const opts = { building: raw.name, controller };
+      const model = controller.fetchModel(opts);
+      if (!model || typeof controller.deltagrade !== "function") return false;
+      controller.deltagrade(model, candidate.meta.delta);
+      if ((Number(raw.stage) || 0) === beforeStage) return false;
+      pendingStageRebuild = {
+        buildingName: raw.name,
+        stage: Number(raw.stage) || 0,
+        targetCount: candidate.meta.analysis.parityCount,
+        startedAt: Date.now(),
+        analysis: candidate.meta.analysis,
+      };
+      stageCooldownUntil[raw.name] = Date.now() + STAGE_COOLDOWN_MS;
+      return true;
+    } catch (error) {
+      return false;
+    }
+  };
+
   // Resolve the front-most ACTIONABLE manual-queue item to a strategic target.
   // Completed items (researched / one more built) are dropped from storage; an
   // item that isn't currently a reachable candidate (still locked, or storage-
@@ -3758,6 +3993,23 @@
   const selectStrategicTarget = (resources, goalKey) => {
     const candidates = gatherCandidates(resources, goalKey);
 
+    // A stage switch sells the old stack before the replacement stack can be
+    // rebuilt. Treat that rebuild as one atomic planning contract: it outranks
+    // every new project and keeps the full net rebuild bill reserved until
+    // effect parity is restored.
+    const stageRebuild = pendingStageRebuildCandidate(candidates, resources);
+    if (stageRebuild) {
+      return {
+        candidates: [stageRebuild, ...candidates.filter((candidate) => targetId(candidate) !== targetId(stageRebuild))],
+        target: stageRebuild,
+        layer: STRATEGIC_LAYERS.stageRebuild,
+        reason: `rebuilding ${labelOf(stageRebuild.meta)} ${stageRebuild.meta.val || 0}/${stageRebuild._stageRebuild.targetCount} after stage change`,
+        protectedChain: candidateCraftChainResources(stageRebuild),
+        stageRebuild: stageRebuild._stageRebuild,
+        rejectedTopCandidates: candidates.slice(0, 2).map((target) => ({ target, reason: "deferred until stage-change effect parity is restored" })),
+      };
+    }
+
     // Manual queue wins outright when its front item is actionable — the player's
     // explicit pick (Magneto, a workshop upgrade, a specific tech) outranks the
     // autopilot.  A blocked/locked queue item is skipped inside pickQueuedTarget,
@@ -3850,6 +4102,20 @@
         protectedChain: candidateCraftChainResources(target),
         festival,
         rejectedTopCandidates: candidates.slice(0, 2).map((candidate) => ({ target: candidate, reason: "festival maintenance has faster economy-wide payback" })),
+      };
+    }
+
+    const stageTarget = bestStageTransition(resources);
+    if (stageTarget) {
+      const analysis = stageTarget.meta.analysis;
+      return {
+        candidates: [stageTarget, ...candidates],
+        target: stageTarget,
+        layer: STRATEGIC_LAYERS.stageTransition,
+        reason: `${analysis.fromLabel} to ${analysis.toLabel}: ${analysis.reason}; rebuild ${analysis.parityCount} for effect parity`,
+        protectedChain: candidateCraftChainResources(stageTarget),
+        stageTransition: analysis,
+        rejectedTopCandidates: candidates.slice(0, 2).map((target) => ({ target, reason: "stage transition has a shorter opportunity-cost-adjusted payback" })),
       };
     }
 
@@ -4856,9 +5122,10 @@
     space: "SPACE PROGRAM",
     time: "TIME STRUCTURE",
     festival: "FESTIVAL",
+    stage: "BUILDING STAGE",
   };
 
-  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳", festival: "🎉" };
+  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳", festival: "🎉", stage: "⇄" };
 
   const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase()}`;
 
@@ -4946,6 +5213,15 @@
           ? ` · Cap options: ${blocker.options.map((option) => `${labelOf(option.candidate.meta)} +${fmt(option.gain)}/copy ×${option.copies} = ${Math.round(option.closure * 100)}% closure, ETA ${formatEta(option.eta)}${targetId(option.candidate) === targetId(target) ? " (chosen)" : " (slower/incomplete)"}`).join("; ")}`
           : "";
         return `${phaseDebug} · ${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${optionNote}${rejectNote}`;
+      }
+      if (decision && decision.layer === STRATEGIC_LAYERS.stageTransition && decision.stageTransition) {
+        const stage = decision.stageTransition;
+        const prices = (map) => Object.entries(map || {}).map(([name, amount]) => `${resTitle(resources, name)} ${fmt(amount)}`).join("+") || "none";
+        const lostRefund = Object.keys(stage.refundLoss || {}).length ? ` (overflow loss ${prices(stage.refundLoss)})` : "";
+        return `${phaseDebug} · Stage analysis: ${stage.fromLabel} → ${stage.toLabel} · refund ${prices(stage.usableRefund)} usable${lostRefund} · parity rebuild ${stage.parityCount} costing ${prices(stage.rebuild)} · net reserve ${prices(stage.net)} · downtime opportunity cost ${fmt(stage.lostUtility)} utility-seconds · payback ${formatEta(stage.payback)} · safety ${stage.safetyVetoes.length ? stage.safetyVetoes.join("; ") : "passed"}`;
+      }
+      if (decision && decision.layer === STRATEGIC_LAYERS.stageRebuild && decision.stageRebuild) {
+        return `${phaseDebug} · Stage rebuild continuation: ${labelOf(target.meta)} ${target.meta.val || 0}/${decision.stageRebuild.targetCount} · all rebuild inputs remain reserved until effect parity is restored`;
       }
       // Economy details: state + ETA + reservation + deferrals (unchanged shape).
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
@@ -5226,6 +5502,11 @@
       if (bought) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
       return bought;
     }
+    if (candidate && candidate.kind === "stage") {
+      const changed = executeStageTransitionCandidate(candidate);
+      if (changed) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
+      return changed;
+    }
     const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
     for (const attempt of purchaseAttemptsFor(candidate)) {
       try {
@@ -5268,7 +5549,10 @@
 
   const buildTargetLedger = (target, resources) => {
     const ledger = { target, reserved: {}, missing: {}, direct: {}, crafted: new Set(), critical: new Set() };
-    if (!target || target.affordable) return ledger;
+    // Stage changes are two-step transactions (sell, then rebuild), so their
+    // entire net bill remains reserved even when today's stock can cover it.
+    // Ordinary affordable targets are bought immediately and need no ledger.
+    if (!target || (target.affordable && target.kind !== "stage")) return ledger;
     const isSprintTarget = target.kind === "research" && activeSprint && activeSprint.candidate && targetId(target) === activeSprint.id;
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
@@ -7319,6 +7603,20 @@
       festivalOpportunity(resourceMap());
       return festivalPlanText;
     },
+    stageTransitionAnalysis(raw, toStage) {
+      resetTickCache();
+      return stageTransitionAnalysis(raw, toStage, resourceMap());
+    },
+    stageTransitionCandidate(raw, toStage) {
+      resetTickCache();
+      return stageTransitionCandidate(raw, toStage, resourceMap());
+    },
+    bestStageTransition() {
+      resetTickCache();
+      return bestStageTransition(resourceMap());
+    },
+    executeStageTransitionCandidate,
+    pendingStageRebuild: () => pendingStageRebuild,
   };
 
   /* ------------------------------- bootstrap -------------------------------- */
