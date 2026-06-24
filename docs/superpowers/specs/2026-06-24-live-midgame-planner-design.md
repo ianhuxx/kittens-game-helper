@@ -18,6 +18,12 @@ Research sprints are intentionally persistent, but a new sprint can repeatedly s
 
 Festivals currently run as a late tick side action with fixed costs. The gate only rejects a festival when any same-name resource is reserved; it does not verify that paying the full festival price leaves the reserved quantity intact. Festival state is also absent from the persistent panel, so a held or blocked festival is easy to miss. Because a festival adds happiness and doubles kitten arrival rate, it should be valued as timed economy maintenance rather than an invisible convenience action.
 
+The unlock watcher currently sees open buildings, research, upgrades, and religion items, but it does not see newly unlocked resources or workshop crafts. Hidden-but-unlockable buildings can require the player to hold a fraction of a newly craftable resource before the game exposes them. Without a generic bootstrap path, new content can remain invisible to the planner until the player manually crafts the first Concrete, Tanker, or future resource.
+
+The Robotics-style research chain exposes a separate phase bug. Robotics needs both a final science bank and Blueprints, while crafting Blueprints and their Compendia also consumes science. The current direct-input guard permanently reserves the final 140K science before the 80 Blueprints exist. With a science cap only slightly above 140K, no Blueprint craft can ever fit in the unreserved remainder, so science appears to stop immediately below Robotics. Removing the reserve entirely would cause the opposite failure: repeatedly draining the final bank without clearly preserving the research contract.
+
+Observed production telemetry averages resource-bar deltas across helper actions and capped periods. A craft, trade, purchase, or cap clip can therefore look like continuous negative or zero production and override the game's ticker API. This can misdirect ETAs, job allocation, and the explanation shown to the player.
+
 The existing test suite passes before changes. This establishes a green baseline rather than hiding an existing failure.
 
 ## Architecture
@@ -97,10 +103,43 @@ Festival execution uses the live festival button/controller when available so Ki
 
 The panel reports `Festival: active — <duration>`, `Festival: saving — <missing resources>`, or `Festival: deferred — <opportunity-cost/reservation reason>` so festival behavior is continuously observable rather than visible only in the action log.
 
-### 6. Reservation and safety invariants
+### 6. Generic resource and craft bootstrap
+
+Extend live unlock discovery to resources and workshop crafts. Identity and display always come from current game objects: internal IDs such as `concrate` remain controller keys, while the panel uses the live resource/craft title such as `Concrete`.
+
+For each hidden-but-unlockable building or stage, inspect its live prices and `unlockRatio`. If an unlocked craft can produce a missing threshold resource, create a `Resource bootstrap` candidate for the smallest amount that can reveal that downstream content. Also permit a one-unit probe for a genuinely fresh craft when the live metadata names downstream buildings, stages, upgrades, crafts, or storage effects that are not yet observable.
+
+Bootstrap candidates use the normal recursive craft solver, ETA model, and target ledger. They never blindly craft every unlocked item, never rely on a hard-coded resource list, and never consume an active plan reservation. Once the output exists or the downstream content opens, the bootstrap completes and normal scoring evaluates the new candidates.
+
+The unlock watcher logs new resource/craft labels, clears stale candidate/effect/resource-name caches, and breaks the target lock only when the newcomer changes reachable planning options.
+
+### 7. Phase-aware research chains
+
+Split a research contract into explicit phases derived from its live prices:
+
+1. **Intermediate phase:** create all missing craftable direct costs. The active target may spend a shared direct bank, such as science, through its own intermediate chain. Side actions still see that bank as target-owned and cannot spend it.
+2. **Final-bank phase:** after craftable direct costs are complete, reserve and refill the final non-craftable prices.
+3. **Purchase phase:** buy immediately when every direct price is present.
+
+The target-owned craft allowance is narrow: it applies only when the craft output is itself a missing direct price of the same target, only for the calculated number of units, and only through the solver's protected chain. It ends as soon as the intermediate requirement is met. This lets Robotics cycle science into exactly the required Blueprints, then accumulate and preserve 140K science, without allowing overflow crafting, festivals, trades, upgrades, or surplus purchases to drain that bank.
+
+The UI reports the phase and expected bank cycling explicitly, for example: `Phase: craft 80 Blueprints (science cycles into intermediates), then refill 140K Science for Robotics`.
+
+### 8. Authoritative ticker and telemetry reads
+
+Use `game.getResourcePerTick(name, true)` as the authoritative continuous production rate when available. Resource-bar telemetry remains an independent cross-check, but it may replace the API value only when:
+
+- the sample window is below the cap and not clipped;
+- no discrete helper action changed that resource during the window;
+- the observed and API rates have compatible direction and a tight relative tolerance.
+
+Every wrapped action marks changed resources as telemetry discontinuities and restarts their sample windows. Successful controller purchases and unwrapped game actions do the same through before/after snapshots. A capped flat bar is reported as `capped` rather than zero production, and a target-owned craft drain is reported as a discrete transfer rather than negative ticker production.
+
+### 9. Reservation and safety invariants
 
 - Every purchase, craft, trade, policy, upgrade, stage transition, and downgrade checks the active target ledger.
 - Festival payment checks its complete direct and crafted-resource spend against the same ledger; merely detecting a shared resource name is not sufficient.
+- Bootstrap crafting and phase-aware research crafting remain target-owned actions; every unrelated spender sees their protected resources as reserved.
 - Stage rebuild costs and their transitive raw inputs enter the same reservation ledger before transition.
 - No side action may consume current stock or expected refundable proceeds needed by the active plan.
 - Irreversible actions remain denied: reset, transcend, sacrifice, shatter, time-skip, and equivalents.
@@ -116,6 +155,9 @@ The compact panel continues to show Focus, Layer, and Need, using the current in
 - stage-transition refund, rebuild-to-parity cost, temporary lost utility, payback ETA, and safety vetoes;
 - population saturation, reset milestone distance, best housing option, and why research or expansion won;
 - festival remaining duration, live benefit/payback estimate, missing inputs, and reservation or opportunity-cost deferrals;
+- newly unlocked resource/craft candidates and the downstream threshold that justifies each bootstrap;
+- research phase, remaining intermediates, final-bank target, and intentional resource transfers into the target chain;
+- ticker API rate, uncontaminated observed rate, cap clipping, and ignored discrete-action deltas when they disagree;
 - reservation sources for transition and rebuild resources.
 
 Debug details are explanatory only and do not weaken reservation checks.
@@ -139,7 +181,12 @@ Regression scenarios will cover:
 11. An expired high-value festival becomes visible maintenance, is held through the game controller, and reports its active duration.
 12. A festival waits when its full payment would cross an active plan reservation, but can spend true surplus above the reservation.
 13. A festival with poor payback or no free housing is deferred with a visible reason instead of blindly consuming resources.
-14. All existing reservation, research sprint, irreversible-action, and simulation checks remain green.
+14. A newly unlocked live craft with a hidden downstream building threshold creates the minimum first resource generically and reveals the building without a name rule.
+15. Live `concrate` metadata is displayed as Concrete and invalidates stale resource/craft caches when it unlocks.
+16. Robotics with a cap just above 140K spends science only into its missing Blueprint/Compendium chain, completes 80 Blueprints, then preserves and refills the final 140K bank.
+17. An unrelated overflow craft, festival, trade, or upgrade cannot use Robotics' protected science during either phase.
+18. Capped science telemetry does not overwrite positive ticker production with zero, and discrete craft/purchase deltas do not become negative production.
+19. All existing reservation, research sprint, irreversible-action, and simulation checks remain green.
 
 Run `npm.cmd test` after focused red/green cycles. Bump all three version strings together from 2.4.6 to 2.5.0 because this adds planner behavior and staged-transition capability.
 
