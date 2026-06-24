@@ -1893,6 +1893,27 @@ techs.splice(techs.indexOf(electricity), 1);
 techs.splice(techs.indexOf(acoustics), 1);
 buildings.splice(buildings.indexOf(temple), 1);
 
+/* =====================================================================
+ * REGRESSION — reset-advisor karma estimate (v2.4.3)
+ *
+ * The old advisor showed `kittens - 35` "karma if reset now", overstating
+ * the actual karma gain ~8×. Karma kittens accrue in tiers and convert
+ * through karma = (√(1 + 8·kk/5) − 1)/2. Pin the documented examples so the
+ * estimate can never silently regress to the linear approximation.
+ * =================================================================== */
+gamePage.karmaKittens = 0; // fresh save: marginal karma == total for this run
+const karma100 = dbg.expectedResetKarma(100);
+const karma60 = dbg.expectedResetKarma(60);
+const karma35 = dbg.expectedResetKarma(35);
+check("Test R: 100 kittens bank 185 karma-kittens (65 + 40·3), not a flat 65", dbg.karmaKittensForRun(100) === 185);
+check("Test R: 100 kittens ≈ 8.1 karma via diminishing-returns root, not 65", Math.abs(karma100 - 8.105) < 0.05 && karma100 < 65);
+check("Test R: 60 kittens ≈ 2.7 karma, not the linear 25", Math.abs(karma60 - 2.702) < 0.05 && karma60 < 25);
+check("Test R: 35 kittens (no tier reached) yields 0 karma", karma35 === 0);
+gamePage.karmaKittens = 185; // already reset once at 100 kittens
+const karma100Marginal = dbg.expectedResetKarma(100);
+check("Test R: karma estimate is MARGINAL — a 2nd 100-kitten run adds less than the 1st", karma100Marginal > 0 && karma100Marginal < karma100);
+delete gamePage.karmaKittens;
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

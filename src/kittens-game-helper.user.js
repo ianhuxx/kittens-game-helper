@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.4.2
+// @version      2.4.3
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.4.2";
+  const HELPER_VERSION = "2.4.3";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -259,6 +259,38 @@
     try { return window.gamePage.paragonPoints || 0; } catch (error) { return 0; }
   };
 
+  // Karma gained on reset is NOT linear in kittens (the old `kittens - 35`
+  // estimate overstated it ~8×). The game banks "karma kittens" in tiers — a
+  // run of N kittens contributes (N-35) + (N-60)·3 + (N-100)·4 … — then converts
+  // the RUNNING cumulative total through a diminishing-returns root:
+  //   karma = (√(1 + 8·kk/5) − 1) / 2.
+  // So 100 kittens bank 65 + 40·3 = 185 kk → ≈8 karma, not 65; at 60 kittens
+  // it's 25 kk → ≈2.7 karma, not 25. We read the live cumulative `karmaKittens`
+  // so the figure shown is the MARGINAL karma this reset would actually add
+  // (golden rule #4 — read the rate live, never bake in a base number). Only the
+  // ≤100 tiers are encoded; the advisor only surfaces karma below 70 kittens,
+  // where higher tiers never apply.
+  const KARMA_KITTEN_TIERS = [
+    { over: 35, mult: 1 },
+    { over: 60, mult: 3 },
+    { over: 100, mult: 4 },
+  ];
+  const karmaKittensForRun = (kittens) => {
+    let kk = 0;
+    for (const tier of KARMA_KITTEN_TIERS) {
+      if (kittens > tier.over) kk += (kittens - tier.over) * tier.mult;
+    }
+    return kk;
+  };
+  const karmaScoreFor = (karmaKittens) => (karmaKittens > 0 ? (Math.sqrt(1 + (8 * karmaKittens) / 5) - 1) / 2 : 0);
+  const expectedResetKarma = (kittens) => {
+    const runKk = karmaKittensForRun(kittens);
+    if (runKk <= 0) return 0;
+    let banked = 0;
+    try { banked = window.gamePage.karmaKittens || 0; } catch (error) { /* fresh save / no prior karma */ }
+    return Math.max(0, karmaScoreFor(banked + runKk) - karmaScoreFor(banked));
+  };
+
   let resetAdvisorText = "♻ Reset advisor: tracking this run…";
 
   const computeResetAdvisor = () => {
@@ -288,7 +320,7 @@
 
       const runDays = Math.max(0.01, (now - runStart) / 86400000);
       const expectedParagon = Math.max(0, kittens - 70);
-      const expectedKarma = Math.max(0, kittens - 35);
+      const expectedKarma = expectedResetKarma(kittens);
       const paragonPerDay = expectedParagon / runDays;
       const nextMeta = METAPHYSICS_ORDER.find((item) => !metaphysicsResearched(item.name));
       const metaText = nextMeta
@@ -6793,6 +6825,12 @@
     },
     bestWoodJob() {
       return bestWoodJob();
+    },
+    expectedResetKarma(kittens) {
+      return expectedResetKarma(kittens);
+    },
+    karmaKittensForRun(kittens) {
+      return karmaKittensForRun(kittens);
     },
     candidateById(id, goalKey = getGoal()) {
       activePlanSnapshot = { cycleId: -1, target: undefined };
