@@ -454,6 +454,7 @@
 
   const pricesFor = (kind, meta) => {
     try {
+      if (kind === "bootstrap" || kind === "festival" || kind === "stage") return meta.prices || [];
       if (kind === "build" && window.gamePage.bld.getPrices) {
         return window.gamePage.bld.getPrices(meta.name) || meta.prices || [];
       }
@@ -1260,18 +1261,19 @@
   // minerals → slab when the focus itself is still reserving minerals.
   const overflowInputFloor = (target, resources, inputName, outputName, forPlanChain = false) => {
     let floor = craftFloorFor(resources, inputName, forPlanChain);
-    if (stickyReservesResource(inputName) && inputName !== outputName && !stickyReservesResource(outputName)) return Number.MAX_SAFE_INTEGER;
+    const ownedIntermediateSpend = targetOwnsIntermediateSpend(target, resources, inputName, outputName, forPlanChain);
+    if (!ownedIntermediateSpend && stickyReservesResource(inputName) && inputName !== outputName && !stickyReservesResource(outputName)) return Number.MAX_SAFE_INTEGER;
     if (!target) return floor;
 
     const chain = refreshStickyTargetChainReserve(target, resources);
-    if (chain.has(inputName) && inputName !== outputName && !chain.has(outputName)) return Number.MAX_SAFE_INTEGER;
+    if (!ownedIntermediateSpend && chain.has(inputName) && inputName !== outputName && !chain.has(outputName)) return Number.MAX_SAFE_INTEGER;
 
     // If the active target directly needs this input and is still short, no
     // lower-priority craft may consume it. This closes the Observatory trap:
     // crafting Plate for missing Scaffold must wait until the direct Iron bill
     // is already covered.
     const directInputCost = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name === inputName && isFinite(cost.val) && cost.val > 0);
-    if (directInputCost && inputName !== outputName) {
+    if (directInputCost && inputName !== outputName && !ownedIntermediateSpend) {
       const haveDirect = ((getRes(resources, inputName) || {}).value) || 0;
       if (haveDirect < directInputCost.val) return Number.MAX_SAFE_INTEGER;
     }
@@ -1284,7 +1286,7 @@
       const res = getRes(resources, cost.name);
       if (res && res.maxValue > 0 && cost.val > res.maxValue && !craftByName(cost.name)) continue;
 
-      if (cost.name === inputName) floor = Math.max(floor, cost.val);
+      if (cost.name === inputName && !ownedIntermediateSpend) floor = Math.max(floor, cost.val);
       if (cost.name === outputName) continue;
 
       const have = ((getRes(resources, cost.name) || {}).value) || 0;
@@ -2980,6 +2982,7 @@
   const STRATEGIC_LAYERS = {
     manualQueue: "Manual queue",
     researchSprint: "Research sprint",
+    resourceBootstrap: "Resource bootstrap",
     hardUnlock: "Hard unlock / milestone",
     scienceStorageUnlock: "Science storage unlock",
     storage: "Storage blocker",
@@ -3221,6 +3224,44 @@
     pricesFor("research", tech).some((cost) =>
       cost && cost.name && cost.val > 0 && craftByName(cost.name) && resValueOf(resources, cost.name) < cost.val);
 
+  // Research can require a final bank and intermediates that consume that same
+  // bank (Robotics: 140K science + 80 Blueprints, while Blueprints/Compendia
+  // consume science).  Treat this as an explicit sequence instead of trying to
+  // reserve the final bank and craft the intermediates simultaneously.
+  const researchTargetPhase = (target, resources = resourceMap()) => {
+    if (!target || target.kind !== "research" || !target.meta) {
+      return { phase: "purchase", craftCosts: [], finalCosts: [], sharedInputs: new Set(), explanation: "ready" };
+    }
+    const costs = pricesFor(target.kind, target.meta).filter((cost) => cost && cost.name && isFinite(cost.val) && cost.val > 0);
+    const craftCosts = costs.filter((cost) => craftByName(cost.name) && resValueOf(resources, cost.name) < cost.val);
+    const finalCosts = costs.filter((cost) => !craftByName(cost.name) && resValueOf(resources, cost.name) < cost.val);
+    const sharedInputs = new Set();
+    for (const craftCost of craftCosts) {
+      const raw = rawPathRequirements(craftCost.name, Math.max(0, craftCost.val - resValueOf(resources, craftCost.name)));
+      for (const finalCost of costs.filter((cost) => !craftByName(cost.name))) {
+        if ((raw[finalCost.name] || 0) > 0) sharedInputs.add(finalCost.name);
+      }
+    }
+    if (costs.every((cost) => resValueOf(resources, cost.name) >= cost.val)) {
+      return { phase: "purchase", craftCosts: [], finalCosts: [], sharedInputs, explanation: `${labelOf(target.meta)} ready to buy` };
+    }
+    if (craftCosts.length) {
+      const shown = craftCosts.slice(0, 2).map((cost) => `${fmt(cost.val - resValueOf(resources, cost.name))} ${craftLabel(cost.name)}`).join(" + ");
+      const transfer = sharedInputs.size ? ` (${[...sharedInputs].map((name) => resTitle(resources, name)).join("+")} cycles into intermediates)` : "";
+      return { phase: "intermediate", craftCosts, finalCosts, sharedInputs, explanation: `craft ${shown}${transfer}, then refill final bank` };
+    }
+    const shown = finalCosts.slice(0, 2).map((cost) => `${fmt(cost.val - resValueOf(resources, cost.name))} ${resTitle(resources, cost.name)}`).join(" + ");
+    return { phase: "final-bank", craftCosts: [], finalCosts, sharedInputs, explanation: `refill ${shown} for ${labelOf(target.meta)}` };
+  };
+
+  const targetOwnsIntermediateSpend = (target, resources, inputName, outputName, forPlanChain) => {
+    if (!forPlanChain || !target || target.kind !== "research" || !outputName) return false;
+    const phase = researchTargetPhase(target, resources);
+    return phase.phase === "intermediate" &&
+      phase.sharedInputs.has(inputName) &&
+      phase.craftCosts.some((cost) => cost.name === outputName && resValueOf(resources, outputName) < cost.val);
+  };
+
   // What can START a new sprint: science at/near cap, OR a clear actionable
   // craft-chain path.  (Cheap science-only techs go through normal scoring.)
   const sprintTriggered = (tech, resources) =>
@@ -3417,6 +3458,39 @@
     return { target: chosen.candidate, blocked, need, options: options.slice(0, 3) };
   };
 
+  // Some buildings stay hidden until the player owns a fraction of a newly
+  // craftable price resource.  Discover that requirement from live metadata
+  // instead of keeping a list of Concrete/Tanker/etc. special cases.
+  const bootstrapResourceCandidate = (resources = resourceMap()) => {
+    const options = [];
+    for (const raw of buildingMetas()) {
+      if (!raw || raw.unlocked !== false || !(raw.unlockable || raw.defaultUnlockable)) continue;
+      const live = liveMetaView(raw) || raw;
+      const ratio = isFinite(live.unlockRatio) ? Math.max(0, live.unlockRatio) : null;
+      if (ratio == null || ratio <= 0) continue;
+      for (const price of live.prices || raw.prices || []) {
+        if (!price || !price.name || !(price.val > 0) || !craftByName(price.name)) continue;
+        const targetAmount = Math.max(1, price.val * ratio);
+        const have = resValueOf(resources, price.name);
+        if (have >= targetAmount) continue;
+        const meta = {
+          name: `bootstrap-${price.name}-for-${raw.name}`,
+          label: `${craftLabel(price.name)} for ${labelOf(raw)}`,
+          prices: [{ name: price.name, val: targetAmount }],
+          outputName: price.name,
+          targetAmount,
+          downstreamName: raw.name,
+          downstreamLabel: labelOf(raw),
+        };
+        const candidate = { kind: "bootstrap", weight: 5, meta, ...evaluate("bootstrap", meta, resources), score: 100 };
+        const reach = capDrainReachabilityFor(resources, price.name, targetAmount);
+        if (reach.reachable) options.push({ candidate, eta: reach.eta || 0 });
+      }
+    }
+    options.sort((a, b) => a.eta - b.eta || a.candidate.meta.targetAmount - b.candidate.meta.targetAmount);
+    return options.length ? options[0].candidate : null;
+  };
+
   // Resolve the front-most ACTIONABLE manual-queue item to a strategic target.
   // Completed items (researched / one more built) are dropped from storage; an
   // item that isn't currently a reachable candidate (still locked, or storage-
@@ -3532,6 +3606,22 @@
         protectedChain,
         rejectedTopCandidates: [],
       };
+    }
+
+    // Keep an existing research contract stable, but let a newly exposed craft
+    // bootstrap downstream content before starting yet another sprint.
+    if (!activeSprint) {
+      const bootstrap = bootstrapResourceCandidate(resources);
+      if (bootstrap) {
+        return {
+          candidates: [bootstrap, ...candidates],
+          target: bootstrap,
+          layer: STRATEGIC_LAYERS.resourceBootstrap,
+          reason: `crafting ${fmt(bootstrap.meta.targetAmount)} ${craftLabel(bootstrap.meta.outputName)} reveals ${bootstrap.meta.downstreamLabel}`,
+          protectedChain: candidateCraftChainResources(bootstrap),
+          rejectedTopCandidates: candidates.slice(0, 2).map((target) => ({ target, reason: `deferred until ${bootstrap.meta.downstreamLabel} is revealed` })),
+        };
+      }
     }
 
     const { sprint, deferred } = planResearchSprint(candidates, resources, goalKey);
@@ -3713,9 +3803,19 @@
       }
       for (const u of religionUpgrades()) note("religion", u, religionUpgradeVisible(u));
       for (const b of buildingMetas()) note("build", b, !!b && b.unlocked !== false);
+      try {
+        for (const res of window.gamePage.resPool.resources || []) note("resource", { ...res, label: res.title || res.name }, !!res && res.unlocked !== false);
+        const crafts = window.gamePage.workshop && window.gamePage.workshop.crafts;
+        for (const craft of (Array.isArray(crafts) ? crafts : Object.values(crafts || {}))) {
+          note("craft", craft, !!craft && craft.unlocked !== false);
+        }
+      } catch (error) {
+        /* resources/crafts can still be booting */
+      }
       if (knownUnlockIds && fresh.length) {
         const now = Date.now();
         for (const item of fresh) noveltyUntil[item.id] = now + NOVELTY_MS;
+        resourceNamesCache = { count: -1, names: [] };
         activeTarget = null; // replan with the newcomers in the running
         const shown = fresh.slice(0, 3).map((item) => labelOf(item.meta)).join(", ");
         pushLog(`🆕 unlocked: ${shown}${fresh.length > 3 ? ` +${fresh.length - 3} more` : ""} — replanning`);
@@ -4592,7 +4692,9 @@
       const needLine = storageBlocker
         ? `+${fmt(storageBlocker.need)} science storage (${labelOf(storageBlocker.blocked.meta)} is storage-blocked)`
         : target.affordable ? "ready now" : needs.join(", ") || target.missing || "prerequisites";
-      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}\nNeed: ${needLine}`;
+      const phase = target.kind === "research" ? researchTargetPhase(target, resources) : null;
+      const phaseLine = phase && phase.phase !== "purchase" ? `\nPhase: ${phase.explanation}` : "";
+      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}${phaseLine}\nNeed: ${needLine}`;
     } catch (error) {
       return "🎯 Focus: —";
     }
@@ -4623,10 +4725,12 @@
         .map((candidate) => `${labelOf(candidate.meta)} score ${fmt(candidate.score || 0)} ETA ${formatEta(waitSecondsForCandidate(candidate, resources))}`)
         .join("; ");
       const baseDebug = `${lockText} · Target score ${fmt(target.score || 0)} ETA ${formatEta(waitSecondsForCandidate(target, resources))} · Top candidates: ${topCandidates || "none"} · Reservations: ${reserveBySource || "none"} · Next: ${getNowAction(resources, goalKey)}`;
+      const phase = target.kind === "research" ? researchTargetPhase(target, resources) : null;
+      const phaseDebug = phase && phase.phase !== "purchase" ? `${baseDebug} · Research phase ${phase.phase}: ${phase.explanation}` : baseDebug;
       // Research-sprint details: protected chain + deferrals + job drivers.
       if (decision && decision.layer === STRATEGIC_LAYERS.researchSprint && decision.sprint) {
         const parts = [];
-        parts.push(baseDebug);
+        parts.push(phaseDebug);
         const chain = protectedChainLabels(resources, decision.protectedChain);
         if (chain.length) parts.push(`Protected chain: ${chain.join(" → ")}`);
         for (const item of (decision.rejectedTopCandidates || []).filter((i) => i && i.target).slice(0, 4)) {
@@ -4642,7 +4746,7 @@
         const rejected = (decision.rejectedTopCandidates || [])
           .filter((item) => item && item.target && !isLongProject(item.target, resources, goalKey)).slice(0, 3);
         const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
-        return `${baseDebug} · ${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${rejectNote}`;
+        return `${phaseDebug} · ${labelOf(blocker.blocked.meta)} is storage-blocked · Need +${fmt(blocker.need)} science storage · Now ${target.affordable ? "buy" : "build"} ${labelOf(target.meta)} · ETA ${eta}${rejectNote}`;
       }
       // Economy details: state + ETA + reservation + deferrals (unchanged shape).
       const storageBlock = storageBlockerText(target.kind, target.meta, resources);
@@ -4653,7 +4757,7 @@
       const rejected = (decision && decision.rejectedTopCandidates || []).filter((item) => item && item.target).slice(0, 3);
       const rejectNote = rejected.length ? ` · deferred ${rejected.map((item) => `${labelOf(item.target.meta)} (${item.reason})`).join("; ")}` : "";
       const titaniumHint = titaniumRouteHint(resources, goalKey);
-      return `${baseDebug} · ${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
+      return `${phaseDebug} · ${focusLabel(target)} ${labelOf(target.meta)} · ${state} · ETA ${eta}${reserveNote}${rejectNote}${titaniumHint ? ` · titanium path: ${titaniumHint}` : ""}`;
     } catch (error) {
       return "";
     }
@@ -6960,6 +7064,14 @@
     productionFor(name) {
       resetTickCache();
       return productionFor(name);
+    },
+    researchTargetPhase(target) { return researchTargetPhase(target, resourceMap()); },
+    overflowInputFloor(target, inputName, outputName, forPlanChain = false) {
+      return overflowInputFloor(target, resourceMap(), inputName, outputName, forPlanChain);
+    },
+    bootstrapResourceCandidate() {
+      resetTickCache();
+      return bootstrapResourceCandidate(resourceMap());
     },
   };
 

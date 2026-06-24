@@ -1987,6 +1987,65 @@ check("Test T: a flat capped bar does not overwrite positive ticker production",
 resources.splice(resources.indexOf(tickerium), 1);
 delete perTick.tickerium;
 
+/* =====================================================================
+ * REGRESSION — phased Robotics science + generic resource bootstrap (v2.5.0)
+ * =================================================================== */
+const roboticsProbe = {
+  name: "roboticsProbe",
+  label: "Robotics",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 140000 }, { name: "blueprint", val: 80 }],
+  unlocks: { tech: ["aiProbe"], crafts: ["tankerProbe"] },
+};
+const roboticsCandidate = { kind: "research", meta: roboticsProbe, affordable: false };
+const savedBlueprintsT = res("blueprint").value;
+const savedCompendiaT = res("compedium").value;
+const savedScienceT = { value: res("science").value, maxValue: res("science").maxValue };
+res("blueprint").value = 0;
+res("compedium").value = 80 * 25;
+res("science").value = 145000;
+res("science").maxValue = 145000;
+let roboticsPhase = dbg.researchTargetPhase?.(roboticsCandidate);
+check("Test U: Robotics starts in an explicit intermediate phase", roboticsPhase?.phase === "intermediate" && /Blueprint/i.test(roboticsPhase.explanation || ""));
+const roboticsCraftFloor = dbg.overflowInputFloor?.(roboticsCandidate, "science", "blueprint", true);
+check("Test U: target-owned Blueprint crafting may cycle the shared science bank", Number.isFinite(roboticsCraftFloor) && roboticsCraftFloor < 140000);
+check("Test U: unrelated spenders still see Robotics science as reserved", (dbg.buildTargetLedger(roboticsCandidate).reserved.science || 0) >= 140000);
+res("blueprint").value = 80;
+res("science").value = 0;
+roboticsPhase = dbg.researchTargetPhase?.(roboticsCandidate);
+check("Test U: Robotics switches to final-bank phase after Blueprints complete", roboticsPhase?.phase === "final-bank");
+res("blueprint").value = savedBlueprintsT;
+res("compedium").value = savedCompendiaT;
+res("science").value = savedScienceT.value;
+res("science").maxValue = savedScienceT.maxValue;
+
+const smartcrete = R("smartcrete", 0, 0, "Smart Concrete");
+const smartcreteCraft = { name: "smartcrete", label: "Smart Concrete", unlocked: true, prices: [{ name: "minerals", val: 10 }] };
+const hiddenSmartBuilding = {
+  name: "smartArchive",
+  label: "Smart Archive",
+  unlocked: false,
+  unlockable: true,
+  unlockRatio: 0.1,
+  val: 0,
+  on: 0,
+  prices: [{ name: "smartcrete", val: 10 }],
+  effects: { scienceMax: 1000 },
+};
+resources.push(smartcrete);
+crafts.push(smartcreteCraft);
+buildings.push(hiddenSmartBuilding);
+const bootstrapProbe = dbg.bootstrapResourceCandidate?.();
+check("Test U: hidden live building threshold creates a generic Resource bootstrap", bootstrapProbe?.kind === "bootstrap" && bootstrapProbe.meta.outputName === "smartcrete" && bootstrapProbe.meta.targetAmount === 1);
+check("Test U: bootstrap uses the live craft/resource label", /Smart Concrete/.test(bootstrapProbe?.meta?.label || ""));
+dbg.forceActiveTarget(null);
+const bootstrapDecision = dbg.selectStrategicTarget("balanced");
+check("Test U: Resource bootstrap structurally outranks ordinary economy work", bootstrapDecision.layer === "Resource bootstrap" && bootstrapDecision.target?.meta?.outputName === "smartcrete");
+buildings.splice(buildings.indexOf(hiddenSmartBuilding), 1);
+crafts.splice(crafts.indexOf(smartcreteCraft), 1);
+resources.splice(resources.indexOf(smartcrete), 1);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

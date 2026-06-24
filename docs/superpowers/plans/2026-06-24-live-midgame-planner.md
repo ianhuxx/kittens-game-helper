@@ -64,21 +64,21 @@ git commit -m "fix: read live stages and ticker rates"
 - Modify: `src/kittens-game-helper.user.js` near craft solving, reservation ledger, unlock watcher, selector, and panel details
 - Test: `scripts/smoke.mjs`
 
-- [ ] **Step 1: Write failing Robotics phase tests**
+- [x] **Step 1: Write failing Robotics phase tests**
 
 Create a fake Robotics target costing 140K science and 80 Blueprints with a 145K cap. Give Blueprint/Compendium their live science-consuming recipes. Assert the decision exposes `intermediate` phase, target-owned crafting may spend science below 140K only toward missing Blueprint/Compendium units, unrelated overflow/festival/purchases cannot spend it, and phase changes to `final-bank` after 80 Blueprints.
 
-- [ ] **Step 2: Write failing live bootstrap tests**
+- [x] **Step 2: Write failing live bootstrap tests**
 
 Add a newly unlocked craft with a live label and a hidden `unlockable` building whose price and `unlockRatio` require one output. Assert the watcher sees the craft/resource, the selector returns `Resource bootstrap`, exactly the threshold amount is crafted, the live label is shown, and an active target reservation prevents the probe.
 
-- [ ] **Step 3: Run smoke and verify RED**
+- [x] **Step 3: Run smoke and verify RED**
 
 Run: `npm.cmd run smoke`
 
 Expected: FAIL because research has no phase model and resource/craft unlocks are not watched or planned.
 
-- [ ] **Step 4: Implement target phases**
+- [x] **Step 4: Implement target phases**
 
 Add `researchTargetPhase(target, resources)` returning:
 
@@ -90,7 +90,7 @@ In `overflowInputFloor`, allow a direct final bank to be spent only when `forPla
 
 Show phase and intentional transfer in plan/debug/current-action text.
 
-- [ ] **Step 5: Implement resource/craft discovery and bootstrap targets**
+- [x] **Step 5: Implement resource/craft discovery and bootstrap targets**
 
 Extend `watchNewUnlocks` with live resources (`unlocked !== false`) and unlocked workshop crafts. Clear resource-name/effect/candidate caches on changes. Add `bootstrapResourceCandidate(resources)` that scans hidden `unlockable` building live prices and `unlockRatio`, finds craftable deficits, and returns the smallest justified threshold as a pseudo candidate:
 
@@ -100,13 +100,13 @@ Extend `watchNewUnlocks` with live resources (`unlocked !== false`) and unlocked
 
 Support `bootstrap` in `pricesFor`, `targetId`, completion, selector, craft executor, and display. It is below manual queue/research continuation but above generic economy when it reveals reachable content.
 
-- [ ] **Step 6: Re-run smoke and verify GREEN**
+- [x] **Step 6: Re-run smoke and verify GREEN**
 
 Run: `npm.cmd run smoke`
 
 Expected: Robotics phases and generic bootstrap checks PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src/kittens-game-helper.user.js scripts/smoke.mjs
