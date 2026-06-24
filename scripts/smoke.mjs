@@ -1914,6 +1914,33 @@ const karma100Marginal = dbg.expectedResetKarma(100);
 check("Test R: karma estimate is MARGINAL — a 2nd 100-kitten run adds less than the 1st", karma100Marginal > 0 && karma100Marginal < karma100);
 delete gamePage.karmaKittens;
 
+/* =====================================================================
+ * REGRESSION — reset-advisor paragon efficiency + first-reset milestone (v2.4.4)
+ *
+ * Math Hacks frames reset value as paragon efficiency = (kittens − 70)/kittens;
+ * Monstrous Advice / Sagefault give the first-reset target (Concrete Huts +
+ * 130 kittens ≈ 60 paragon → Diplomacy + price-ratio metas). Pin both so the
+ * advisor keeps surfacing the numbers the guides actually optimise for.
+ * =================================================================== */
+const kittensArr = village.sim.kittens;
+const savedKittens = kittensArr.slice();
+const setKittens = (n) => { kittensArr.length = 0; for (let i = 0; i < n; i += 1) kittensArr.push({ name: `k${i}` }); };
+gamePage.totalResets = 0;
+setKittens(100);
+const adv100 = dbg.resetAdvisor();
+check("Test S: advisor reports 30% paragon-efficiency at 100 kittens ((100-70)/100)", /30% paragon-eff/.test(adv100));
+check("Test S: pre-first-reset advisor names the 130-kitten Concrete Huts milestone", /130\+ kittens/.test(adv100) && /Concrete Huts/.test(adv100));
+gamePage.totalResets = 3;
+setKittens(200);
+const adv200 = dbg.resetAdvisor();
+check("Test S: advisor reports 65% paragon-efficiency at 200 kittens ((200-70)/200)", /65% paragon-eff/.test(adv200));
+check("Test S: post-first-reset advisor drops the first-run milestone", !/130\+ kittens/.test(adv200));
+setKittens(40);
+const adv40 = dbg.resetAdvisor();
+check("Test S: sub-70 advisor still shows karma, not a negative efficiency", /karma if reset now/.test(adv40) && !/paragon-eff/.test(adv40));
+kittensArr.length = 0; for (const k of savedKittens) kittensArr.push(k);
+delete gamePage.totalResets;
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

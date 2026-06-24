@@ -1,6 +1,6 @@
 {
   "name": "kittens-game-helper",
-  "version": "2.4.3",
+  "version": "2.4.4",
   "description": "Self-contained one-click Kittens Game autopilot — no external library. Drives the game's own API directly with reservation-backed plan execution, recursive prerequisite planning, native crafting/trade/religion/festivals/star events, policy automation, leader/mood care and a next-action advisor. Continues your existing browser save; prestige resets stay off.",
   "private": true,
   "type": "module",

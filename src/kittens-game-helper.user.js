@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.4.3
+// @version      2.4.4
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.4.3";
+  const HELPER_VERSION = "2.4.4";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -322,16 +322,29 @@
       const expectedParagon = Math.max(0, kittens - 70);
       const expectedKarma = expectedResetKarma(kittens);
       const paragonPerDay = expectedParagon / runDays;
+      // Math Hacks: a reset banks (kittens − 70) paragon, so the fraction of the
+      // run's kittens that actually convert to paragon is (kittens − 70)/kittens.
+      // It rises steeply early and flattens hard later (500 vs 1000 kittens is
+      // only ~7%), which is exactly why the guide says reset once you can no
+      // longer keep up with arrivals rather than chasing the last few percent.
+      const paragonEfficiency = kittens > 70 ? (kittens - 70) / kittens : 0;
+      const effText = kittens >= 70 ? ` · ${Math.round(paragonEfficiency * 100)}% paragon-eff` : "";
       const nextMeta = METAPHYSICS_ORDER.find((item) => !metaphysicsResearched(item.name));
       const metaText = nextMeta
         ? ` · next meta: ${nextMeta.label} (${nextMeta.cost}P${paragon >= nextMeta.cost ? ", affordable" : ""})`
         : " · core metaphysics plan complete";
+      // Monstrous Advice / Sagefault: the first reset wants Concrete Huts + 130+
+      // kittens (≈60 paragon), enough to buy Diplomacy and the first price-ratio
+      // metas — the foundation every later run compounds on. Only surface this
+      // before the very first reset; afterward fall back to the paragon/day read.
       const advice = kittens < 70
         ? `push to 70+ kittens (${fmt(expectedKarma)} karma if reset now)`
-        : paragonPerDay < RESET_ADVISOR_MIN_PARAGON_PER_DAY
-          ? "slow paragon/day — consider a manual reset after checking your save"
-          : "healthy paragon/day — keep pushing";
-      resetAdvisorText = `♻ Reset: ${kittens} kittens · ${fmt(expectedParagon)}P now · ${fmt(paragonPerDay)}P/day · ${advice}${metaText}`;
+        : resetCount === 0 && kittens < 130
+          ? "first reset target: 130+ kittens with Concrete Huts (~60P → Diplomacy + price-ratio metas)"
+          : paragonPerDay < RESET_ADVISOR_MIN_PARAGON_PER_DAY
+            ? "slow paragon/day — consider a manual reset after checking your save"
+            : "healthy paragon/day — keep pushing";
+      resetAdvisorText = `♻ Reset: ${kittens} kittens · ${fmt(expectedParagon)}P now${effText} · ${fmt(paragonPerDay)}P/day · ${advice}${metaText}`;
     } catch (error) {
       resetAdvisorText = "♻ Reset advisor: unavailable";
     }
@@ -6831,6 +6844,10 @@
     },
     karmaKittensForRun(kittens) {
       return karmaKittensForRun(kittens);
+    },
+    resetAdvisor() {
+      computeResetAdvisor();
+      return resetAdvisorText;
     },
     candidateById(id, goalKey = getGoal()) {
       activePlanSnapshot = { cycleId: -1, target: undefined };
