@@ -69,6 +69,8 @@ The bottom-right box is a live dashboard:
 - **👑 Leader:** the currently selected leader trait/kitten chosen for the active bottleneck.
 - **🧰 Craft:** prerequisite crafting plus overflow conversions that prevent near-capped inputs from being wasted.
 - **☀ Religion / 🤝 Diplomacy:** what praise/upgrades and trade/explorers/embassies are doing.
+- **🎉 Festival:** whether the happiness/birth-rate layer is active, saving, deferred by
+  the active reservation, or waiting for Drama & Poetry.
 - **🎯 Now:** what it can build/buy right this second.
 - **Recent actions:** a running log of what it actually built / researched / upgraded /
   traded / praised, kept across the session so you can see it working.
@@ -130,9 +132,14 @@ affordable first. That cannot happen here:
 5. The plan stays locked until it completes, becomes storage-blocked, or a rival is *much*
    better — ordinary score wobble no longer flips it.
 
-Storage-blocked targets still redirect into storage: if **Theology** needs more science
-than your science cap, Libraries/Academies/Observatories get boosted until the cap can
-actually hold the price, and the ⚖/🧭 lines say so.
+Storage-blocked targets redirect only into measured storage: if **Biochemistry** or
+**Nuclear Fission** needs more science than the live cap, the helper reads every current
+building stage's actual `scienceMax`/usable compendium-cap effect, projects repeated
+price-scaled copies through the *whole* deficit, and chooses the fastest full closure.
+A Temple qualifies only when its live effects genuinely add usable science storage; a
+name, description, or `scienceRatio` production bonus cannot masquerade as cap growth.
+**More automation details** lists the alternatives, gain per copy, copies required,
+closure percentage, ETA, and why each slower/incomplete option lost.
 
 ### Research sprints (persistent unlock contracts)
 
@@ -154,6 +161,11 @@ the plan until the tech is researched or genuinely hard-blocked.
   capped or the tech costs faith, farmers at the catnip safety floor only. The compact
   panel shows `🎯 Focus / Layer: Research sprint / Need`; the protected chain, deferrals
   and job drivers live under **More automation details**.
+- Shared-bank research is explicitly phased. For **Robotics**, for example, the helper
+  may spend/refill science to assemble Blueprints first, then switches to a final-bank
+  phase that protects the completed intermediates and accumulates the 140K science
+  purchase price. Unrelated crafting, trade, and purchases never gain access to that
+  target-owned bank.
 
 ## New content is handled automatically
 
@@ -168,13 +180,24 @@ Nothing in the planner is a name list, so new game content never needs a code ch
 - **Live effects, not metadata placeholders.** Buildings whose real numbers only exist
   in their `calculateEffects` (the Observatory's science bonus, the Mint's output) are
   refreshed before scoring, so they are valued for what they actually do.
+- **Current building stages are first-class.** A transformed Library is displayed and
+  valued as its live **Data Center** stage; the same applies to Broadcast Towers,
+  Breweries, and future staged buildings. Labels, effects, prices, counts, and
+  processing behavior all come from the active stage.
+- **New resource recipes bootstrap themselves.** The unlock watcher includes resources
+  and workshop crafts. If live metadata says a hidden building/resource needs the first
+  unit of a newly craftable input, a generic Resource bootstrap target makes that unit
+  and reveals the downstream content—no per-resource patch is required.
 - **Converters are discovered, not listed.** Any owned building that both consumes and
   produces per-tick resources (smelter, calciner, mint, upgraded steamworks, and
   whatever the game adds next) is found from its effects and paused/resumed around the
   plan's reservations.
 - **Housing scales with need.** Huts/Log Houses/Mansions are worth little while beds are
-  free and surge when population growth is blocked, so housing is built exactly when it
-  matters.
+  free and surge when population growth is blocked. Before the first reset, full housing
+  creates an Expansion checkpoint toward the 130-kitten/Concrete Huts milestone; with
+  healthy bed headroom, fast research remains eligible. The reset advisor reports the
+  manual reset's marginal karma, paragon efficiency, and observed paragon/day—the helper
+  still never clicks reset itself.
 - **Exploration runs itself.** The explorer fee is read from the game's own trade tab,
   explorers go out as soon as the fee fits the plan's reservations, and auto-hunting
   holds enough catpower back that it can never starve "Send explorers." If titanium is
@@ -255,11 +278,24 @@ Everything Kitten Scientists used to cover is now done directly through the game
   **Praise the Sun** fires (converting the faith bank to worship) only when faith is near
   its cap *and* no faith upgrade is still being saved for, so it never burns the bank an
   upgrade needs.
-- **Festivals.** Once Drama & Poetry is researched, the helper holds a festival
-  (`village.holdFestival`) when it's affordable, its inputs aren't reserved, and the
-  current festival is nearly over — doubling birth rate and lifting happiness.
+- **Festivals.** Once Drama & Poetry is researched, Festival maintenance becomes a
+  visible economic layer. It reads the live price, housing headroom and happiness payoff,
+  holds/refills the festival when the return is worthwhile, and defers whenever even one
+  input is protected by the active reservation.
 - **Star events.** Astronomical events are claimed the instant they appear
   (`calendar.observeHandler`) for free science and starcharts.
+
+## Safe building stage changes
+
+Unlocked upgrades and downgrades are evaluated as real transactions, not free label
+swaps. Before using the game's own staging controller, the helper calculates the 50%
+sale refund, any refund lost to storage overflow, the price-scaled target-stage rebuild,
+the copy count required to restore current economic utility, temporary downtime cost,
+energy/consumption penalties, cap safety, and opportunity-cost-adjusted payback. A change
+must be materially better and repay within the planning horizon. After the switch, the
+rebuild is an atomic reservation-backed continuation until effect parity is restored;
+then a cooldown prevents upgrade/downgrade oscillation. All irreversible actions remain
+disabled.
 
 ## Leader selection & promotions
 

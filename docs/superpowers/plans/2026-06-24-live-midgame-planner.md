@@ -219,7 +219,7 @@ Run: `npm.cmd run smoke`
 
 Expected: transition accounting, controller, reservation, continuation, and stability checks PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add src/kittens-game-helper.user.js scripts/smoke.mjs
@@ -234,35 +234,35 @@ git commit -m "feat: plan safe building stage transitions"
 - Modify: `README.md`, `CLAUDE.md`
 - Test: `scripts/validate.mjs`, `scripts/smoke.mjs`, `scripts/simulate.mjs`
 
-- [ ] **Step 1: Update user documentation and version**
+- [x] **Step 1: Update user documentation and version**
 
 Bump all version strings from `2.4.6` to `2.5.0`. Document live staged labels, direct cap projection, research phases, resource bootstrap, expansion checkpoints, festival status, stage opportunity costs, and unchanged irreversible-action safety.
 
-- [ ] **Step 2: Run static/version validation**
+- [x] **Step 2: Run static/version validation**
 
 Run: `npm.cmd run validate`
 
 Expected: PASS with version 2.5.0 consistent.
 
-- [ ] **Step 3: Run behavioral smoke tests**
+- [x] **Step 3: Run behavioral smoke tests**
 
 Run: `npm.cmd run smoke`
 
 Expected: all old and new checks PASS.
 
-- [ ] **Step 4: Run multi-tick simulations**
+- [x] **Step 4: Run multi-tick simulations**
 
 Run: `npm.cmd run simulate`
 
 Expected: all scenarios progress with zero coherence violations.
 
-- [ ] **Step 5: Run the full suite fresh**
+- [x] **Step 5: Run the full suite fresh**
 
 Run: `npm.cmd test`
 
 Expected: validate, smoke, and simulate all PASS; compare with the captured zero-failure baseline.
 
-- [ ] **Step 6: Commit release changes**
+- [x] **Step 6: Commit release changes**
 
 ```powershell
 git add src/kittens-game-helper.user.js scripts/smoke.mjs scripts/simulate.mjs scripts/validate.mjs README.md CLAUDE.md package.json docs/superpowers/plans/2026-06-24-live-midgame-planner.md

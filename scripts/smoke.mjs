@@ -2145,7 +2145,7 @@ const stageEconomyX = {
   priceRatio: 1.1,
   stages: [
     { label: "Old Archive", prices: [{ name: "wood", val: 100 }], effects: { scienceMax: 100 }, stageUnlocked: true },
-    { label: "Data Center X", prices: [{ name: "wood", val: 1000 }], effects: { scienceMax: 1000 }, stageUnlocked: true },
+    { label: "Data Center X", prices: [{ name: "wood", val: 1000 }], effects: { scienceMax: 300 }, stageUnlocked: true },
   ],
   effects: {},
 };
@@ -2189,6 +2189,8 @@ context.classes.ui.btn.StagingBldBtnController = class {
 };
 const stageExecutedX = dbg.executeStageTransitionCandidate?.(stageCandidateX);
 check("Test X: stage change uses the staging controller and starts rebuild continuation", stageExecutedX === true && stageControllerCallsX === 1 && stageEconomyX.stage === 1 && dbg.pendingStageRebuild?.()?.buildingName === "stageEconomyX");
+const stageRebuildCandidateX = dbg.pendingStageRebuildCandidate?.();
+check("Test X: rebuild continuation reserves every remaining parity copy, not only the next copy", stageRebuildCandidateX?._stageRebuild?.targetCount >= 2 && stageRebuildCandidateX?._stageRebuild?.remainingPrices?.wood >= 2000 && (dbg.buildTargetLedger(stageRebuildCandidateX).reserved.wood || 0) >= 2000);
 buildings.splice(buildings.indexOf(stageEconomyX), 1);
 buildings.splice(buildings.indexOf(stageBadX), 1);
 

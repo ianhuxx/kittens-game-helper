@@ -69,10 +69,15 @@ panel exposes a **manual build queue** instead of modes.
 `selectStrategicTarget` chooses a target through ordered layers (highest wins):
 
 ```
+Stage rebuild              atomic continuation after a reversible stage change
 Manual queue               ← the player's queued pick, when its front item is actionable
+Expansion checkpoint       housing pressure / reset-efficiency population milestone
+Resource bootstrap         first live recipe unit needed to reveal new content
 Research sprint            persistent cross-tick contract to assemble a buyable tech
 Hard unlock / milestone    a tech/upgrade that opens new content or the goal path
 Science storage unlock     ← science cap blocks the next valuable tech
+Festival maintenance       live housing/happiness payoff, reservation-safe
+Building stage transition  reversible change with opportunity-costed rebuild parity
 Storage blocker            a resource cap is actively wasting income
 Production bottleneck       a needed resource has no production/craft path
 Housing / population
@@ -88,6 +93,11 @@ Long project               Temple, Ziggurat, religion/space/time structures
   persisted under `kgh.queue` as `[{ id: "kind:name", val }]`.
 
 Key invariants (see comments in the source for the why):
+
+- **All building reads use the active stage.** Keep raw metadata only as stable
+  controller identity. Labels, effects, prices, processing and scoring must use
+  `liveMetaView`; do not merge base and stage effects or infer current behavior
+  from the raw/base name.
 
 - **Science storage unlock outranks long projects, and its trigger is UNIVERSAL.**
   It is goal-independent AND science-VALUE-independent: the only condition is
@@ -115,6 +125,27 @@ Key invariants (see comments in the source for the why):
   layer remembers its pick (`activeScienceUnlockId`) and keeps it until it leaves
   the option set or a rival grows the cap >20% more — so it commits instead of
   oscillating.
+- **Science cap candidates must close the measured deficit.** `scienceRatio` is
+  production, not storage. Rank only positive live usable-cap effects, project
+  repeated price-scaled copies, prefer full closure over partial closure, and
+  expose every option's gain/copies/closure/ETA in diagnostics. Text/name matches
+  must never qualify an option.
+- **Shared-bank research is phased.** A tech such as Robotics may first spend and
+  refill science to make Blueprints, then enter a final-bank phase. Only the
+  active target may cycle its own cap-drain bank; every external spender still
+  sees the complete target ledger.
+- **Unlock discovery includes resources and crafts.** Generic bootstrap planning
+  reads live hidden-building prices/thresholds and makes the first required craft
+  unit without adding a resource-name rule.
+- **Stage changes are full transactions.** Evaluate adjacent unlocked stages using
+  the 50% refund, bank-limited usable refund, price-scaled parity rebuild,
+  downtime utility, energy/consumption penalties, cap safety and payback. Execute
+  only through `StagingBldBtnController.deltagrade`; then reserve and rebuild to
+  parity before any other plan, with cooldown/hysteresis preventing oscillation.
+- **Festivals and expansion are planning layers, not side effects.** Festival live
+  prices must respect the active ledger. Housing checkpoints should interrupt
+  research only under real population pressure / first-reset milestone pressure;
+  the reset itself remains advisory and permanently disabled.
 - **Storage-blocked banks never become craft targets.** A tech whose final
   science price can't fit storage is deferred, not crafted toward (no compendiums
   for Electricity until the final cost fits).

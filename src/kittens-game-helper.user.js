@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.4.6
+// @version      2.5.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.4.6";
+  const HELPER_VERSION = "2.5.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3727,15 +3727,59 @@
     map[name] = (map[name] || 0) + amount;
   };
 
+  const currentStagePriceModel = (raw) => {
+    const currentStage = Math.max(0, Number(raw && raw.stage) || 0);
+    const view = stageMetaView(raw, currentStage) || {};
+    const baseRatio = Math.max(1, Number(view.priceRatio || raw.priceRatio) || 1);
+    let liveRatio = baseRatio;
+    let livePrices = [];
+    try {
+      const bld = window.gamePage && window.gamePage.bld;
+      if (bld && typeof bld.getPriceRatio === "function") liveRatio = Math.max(1, Number(bld.getPriceRatio(raw.name)) || baseRatio);
+      if (bld && typeof bld.getPrices === "function") livePrices = bld.getPrices(raw.name) || [];
+    } catch (error) {
+      /* use conservative stage metadata */
+    }
+    const owned = Math.max(0, Number(raw && raw.val) || 0);
+    const modifiers = {};
+    for (const base of view.prices || []) {
+      const live = livePrices.find((price) => price && price.name === base.name);
+      const undiscounted = base.val * Math.pow(liveRatio, owned);
+      if (live && live.val >= 0 && undiscounted > 0) modifiers[base.name] = Math.max(0, live.val / undiscounted);
+    }
+    return { stage: currentStage, ratio: liveRatio, modifiers };
+  };
+
   const cumulativeStagePrices = (raw, stage, count) => {
     const view = stageMetaView(raw, stage) || {};
-    const ratio = Math.max(1, Number(view.priceRatio || raw.priceRatio) || 1);
+    const liveModel = currentStagePriceModel(raw);
+    // The live manager can calculate the active stage exactly. For an alternate
+    // stage, keep its metadata ratio (normally an upper bound after reductions)
+    // but carry across measured building/resource cost-reduction modifiers.
+    const ratio = stage === liveModel.stage
+      ? liveModel.ratio
+      : Math.max(1, Number(view.priceRatio || raw.priceRatio) || 1);
     const totals = {};
     for (let index = 0; index < Math.max(0, count); index += 1) {
       const mult = Math.pow(ratio, index);
-      for (const price of view.prices || []) addPriceMap(totals, price.name, price.val * mult);
+      for (const price of view.prices || []) {
+        const modifier = Object.prototype.hasOwnProperty.call(liveModel.modifiers, price.name) ? liveModel.modifiers[price.name] : 1;
+        addPriceMap(totals, price.name, price.val * mult * modifier);
+      }
     }
     return totals;
+  };
+
+  const remainingStagePrices = (raw, stage, targetCount) => {
+    const owned = Math.max(0, Number(raw && raw.val) || 0);
+    const throughTarget = cumulativeStagePrices(raw, stage, Math.max(owned, targetCount));
+    const alreadyOwned = cumulativeStagePrices(raw, stage, owned);
+    const remaining = {};
+    for (const name of new Set([...Object.keys(throughTarget), ...Object.keys(alreadyOwned)])) {
+      const amount = Math.max(0, (throughTarget[name] || 0) - (alreadyOwned[name] || 0));
+      if (amount > 0) remaining[name] = amount;
+    }
+    return remaining;
   };
 
   const refundableStagePrices = (raw, stage, count) => {
@@ -3863,7 +3907,10 @@
     }
     const candidate = candidates.find((item) => item.kind === "build" && item.meta === raw) ||
       { kind: "build", weight: 5, meta: raw, ...evaluate("build", raw, resources), score: 100 };
-    candidate._stageRebuild = { ...pendingStageRebuild };
+    candidate._stageRebuild = {
+      ...pendingStageRebuild,
+      remainingPrices: remainingStagePrices(raw, pendingStageRebuild.stage, pendingStageRebuild.targetCount),
+    };
     return candidate;
   };
 
@@ -5552,22 +5599,29 @@
     // Stage changes are two-step transactions (sell, then rebuild), so their
     // entire net bill remains reserved even when today's stock can cover it.
     // Ordinary affordable targets are bought immediately and need no ledger.
-    if (!target || (target.affordable && target.kind !== "stage")) return ledger;
+    if (!target || (target.affordable && target.kind !== "stage" && !target._stageRebuild)) return ledger;
     const isSprintTarget = target.kind === "research" && activeSprint && activeSprint.candidate && targetId(target) === activeSprint.id;
-    for (const cost of pricesFor(target.kind, target.meta)) {
+    const targetPrices = target._stageRebuild && target._stageRebuild.remainingPrices
+      ? Object.entries(target._stageRebuild.remainingPrices).map(([name, val]) => ({ name, val }))
+      : pricesFor(target.kind, target.meta);
+    for (const cost of targetPrices) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       if (isSprintTarget && CAP_DRAIN_RESOURCES.has(cost.name) && !isNearResourceCap(resources, cost.name)) continue;
       const res = getRes(resources, cost.name);
-      if (res && res.maxValue > 0 && cost.val > res.maxValue) continue;
+      if (res && res.maxValue > 0 && cost.val > res.maxValue && !target._stageRebuild) continue;
       const have = (res && res.value) || 0;
-      const missing = Math.max(0, cost.val - have);
-      ledger.direct[cost.name] = Math.max(ledger.direct[cost.name] || 0, cost.val);
+      // A multi-copy rebuild can cost more than one bank can hold. Reserve a
+      // full live bank in that case; each copy spends it down and the atomic
+      // continuation refills it without allowing any side spender through.
+      const reservable = target._stageRebuild && res && res.maxValue > 0 ? Math.min(cost.val, res.maxValue) : cost.val;
+      const missing = Math.max(0, reservable - have);
+      ledger.direct[cost.name] = Math.max(ledger.direct[cost.name] || 0, reservable);
       ledger.missing[cost.name] = Math.max(ledger.missing[cost.name] || 0, missing);
-      addLedgerNeed(ledger, cost.name, cost.val);
+      addLedgerNeed(ledger, cost.name, reservable);
       if (craftByName(cost.name) && rawWorkNeedName(cost.name) !== cost.name) {
         ledger.crafted.add(cost.name);
-        addCraftClosureToLedger(ledger, cost.name, Math.max(1, missing || cost.val), resources);
-        const raw = rawPathRequirements(cost.name, Math.max(1, missing || cost.val));
+        addCraftClosureToLedger(ledger, cost.name, Math.max(1, missing || reservable), resources);
+        const raw = rawPathRequirements(cost.name, Math.max(1, missing || reservable));
         for (const [name, amount] of Object.entries(raw)) addLedgerNeed(ledger, name, amount);
       }
     }
@@ -7614,6 +7668,11 @@
     bestStageTransition() {
       resetTickCache();
       return bestStageTransition(resourceMap());
+    },
+    pendingStageRebuildCandidate() {
+      resetTickCache();
+      const resources = resourceMap();
+      return pendingStageRebuildCandidate(gatherCandidates(resources, getGoal()), resources);
     },
     executeStageTransitionCandidate,
     pendingStageRebuild: () => pendingStageRebuild,
