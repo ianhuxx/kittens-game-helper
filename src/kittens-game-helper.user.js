@@ -456,7 +456,8 @@
     try {
       if (kind === "bootstrap" || kind === "festival" || kind === "stage") return meta.prices || [];
       if (kind === "build" && window.gamePage.bld.getPrices) {
-        return window.gamePage.bld.getPrices(meta.name) || meta.prices || [];
+        const livePrices = window.gamePage.bld.getPrices(meta.name);
+        return Array.isArray(livePrices) && livePrices.length ? livePrices : meta.prices || [];
       }
       if (kind === "space" || kind === "time") return scaledStackablePrices(meta);
       if ((kind === "research" || kind === "policy") && window.gamePage.science.getPrices) {
@@ -728,6 +729,90 @@
     { name: "parchment", val: 2500 },
   ];
 
+  let festivalPlanText = "Festival: waiting for Drama & Poetry";
+
+  const festivalPrices = () => {
+    try {
+      const button = window.gamePage && window.gamePage.villageTab && window.gamePage.villageTab.festivalBtn;
+      const model = button && button.model;
+      const prices = model && (model.prices || (model.controller && model.controller.getPrices && model.controller.getPrices(model)));
+      if (Array.isArray(prices) && prices.length) return prices.map((price) => ({ name: price.name, val: price.val }));
+    } catch (error) {
+      /* use the canonical live game price */
+    }
+    return FESTIVAL_COST.map((price) => ({ ...price }));
+  };
+
+  const festivalCanPay = (target = null, resources = resourceMap()) => {
+    const prices = festivalPrices();
+    if (!prices.every((cost) => resValueOf(resources, cost.name) >= cost.val)) return false;
+    if (!target || target.kind === "festival") return true;
+    const ledger = buildTargetLedger(target, resources);
+    return !targetLockViolationForPrices(prices, ledger, resources) && pricesRespectReservations(prices, ledger.reserved, resources);
+  };
+
+  const festivalOpportunity = (resources = resourceMap()) => {
+    try {
+      const game = window.gamePage;
+      const village = game && game.village;
+      const calendar = game && game.calendar;
+      const drama = game && game.science && game.science.get && game.science.get("drama");
+      if (!drama || !drama.researched || !village || !calendar) {
+        festivalPlanText = "Festival: locked until Drama & Poetry";
+        return { candidate: null, layer: STRATEGIC_LAYERS.festival, status: festivalPlanText };
+      }
+      const buffer = calendar.daysPerSeason || 100;
+      const remaining = Math.max(0, calendar.festivalDays || 0);
+      if (remaining > buffer) {
+        festivalPlanText = `Festival: active — ${fmt(remaining)} days remaining`;
+        return { candidate: null, layer: STRATEGIC_LAYERS.festival, active: true, remaining, status: festivalPlanText };
+      }
+      const max = village.maxKittens || (village.sim && village.sim.maxKittens) || 0;
+      const freeBeds = Math.max(0, max - villageKittens());
+      const happiness = currentHappinessRatio();
+      const happinessGain = 0.3 * (1 + Math.max(0, (game.getEffect && game.getEffect("festivalRatio")) || 0));
+      const useful = freeBeds > 0 || happiness < 1.3;
+      const meta = { name: "festival", label: "Festival", prices: festivalPrices(), effects: { happiness: happinessGain } };
+      const candidate = { kind: "festival", weight: 5, meta, ...evaluate("festival", meta, resources) };
+      const eta = waitSecondsForCandidate(candidate, resources);
+      const benefit = Math.max(0, 1.3 - happiness) * 30 + Math.min(20, freeBeds * 2) + happinessGain * 20;
+      candidate.score = benefit - (isFinite(eta) ? Math.log10(eta + 1) * 4 : 30);
+      if (!useful || candidate.score <= 0) {
+        festivalPlanText = `Festival: deferred — ${!useful ? "no housing/happiness payoff" : `payback too slow (${formatEta(eta)})`}`;
+        return { candidate: null, layer: STRATEGIC_LAYERS.festival, eta, benefit, status: festivalPlanText };
+      }
+      const missing = meta.prices.filter((cost) => resValueOf(resources, cost.name) < cost.val)
+        .map((cost) => `${fmt(cost.val - resValueOf(resources, cost.name))} ${resTitle(resources, cost.name)}`);
+      festivalPlanText = candidate.affordable ? "Festival: ready — happiness and kitten arrivals" : `Festival: saving — ${missing.slice(0, 3).join(", ")}`;
+      return { candidate, layer: STRATEGIC_LAYERS.festival, eta, benefit, freeBeds, happiness, status: festivalPlanText };
+    } catch (error) {
+      festivalPlanText = "Festival: unavailable";
+      return { candidate: null, layer: STRATEGIC_LAYERS.festival, status: festivalPlanText };
+    }
+  };
+
+  const buyFestivalCandidate = () => {
+    const game = window.gamePage;
+    const beforeDays = (game.calendar && game.calendar.festivalDays) || 0;
+    try {
+      const button = game.villageTab && game.villageTab.festivalBtn;
+      const model = button && button.model;
+      const controller = (button && button.controller) || (model && model.controller);
+      if (controller && model && typeof controller.buyItem === "function") {
+        const result = controller.buyItem(model, { boughtByQueue: true });
+        if ((result && result.itemBought) || ((game.calendar.festivalDays || 0) > beforeDays)) return true;
+      }
+    } catch (error) {
+      /* use the native manager fallback */
+    }
+    const prices = festivalPrices();
+    if (!canPayPrices(prices) || !game.village || typeof game.village.holdFestival !== "function") return false;
+    game.village.holdFestival(1);
+    if (game.resPool && typeof game.resPool.payPrices === "function") game.resPool.payPrices(prices);
+    else for (const cost of prices) game.resPool.addResEvent(cost.name, -cost.val);
+    return (game.calendar.festivalDays || 0) > beforeDays;
+  };
+
   const maybeHoldFestival = (resources) => {
     try {
       const game = window.gamePage;
@@ -736,17 +821,17 @@
       if (!village || !calendar || typeof village.holdFestival !== "function") return;
       const drama = game.science && game.science.get && game.science.get("drama");
       if (!drama || !drama.researched) return;
-      if (!FESTIVAL_COST.every((cost) => ((getRes(resources, cost.name) || {}).value || 0) >= cost.val)) return;
       const target = getTargetCached(resources, getGoal());
-      const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
-      if (FESTIVAL_COST.some((cost) => (reserved[cost.name] || 0) > 0)) return;
+      if (!festivalCanPay(target, resources)) {
+        festivalPlanText = `Festival: deferred — resources reserved for ${target ? labelOf(target.meta) : "active plan"}`;
+        return;
+      }
       const buffer = calendar.daysPerSeason || 100;
       if ((calendar.festivalDays || 0) > buffer) return;
-      village.holdFestival(1);
-      if (game.resPool && typeof game.resPool.addResEvent === "function") {
-        for (const cost of FESTIVAL_COST) game.resPool.addResEvent(cost.name, -cost.val);
+      if (buyFestivalCandidate()) {
+        festivalPlanText = `Festival: active — ${fmt(calendar.festivalDays || 0)} days remaining`;
+        pushLog("🎉 held a festival (happiness + birth rate up)");
       }
-      pushLog("🎉 held a festival (happiness + birth rate up)");
     } catch (error) {
       /* ignore festival failures */
     }
@@ -1787,6 +1872,42 @@
     return profile;
   };
 
+  const expansionPressure = () => {
+    try {
+      const game = window.gamePage;
+      const village = game.village;
+      const kittens = villageKittens();
+      const max = village.maxKittens || (village.sim && village.sim.maxKittens) || 0;
+      if (!(max > 0)) return { score: 0, kittens, max: 0, free: 0, saturation: 0, milestone: 0 };
+      const free = Math.max(0, max - kittens);
+      const saturation = Math.min(1, kittens / max);
+      const firstReset = (game.totalResets || 0) === 0;
+      const milestone = firstReset ? 130 : Math.max(70, kittens);
+      const milestoneGap = firstReset ? Math.max(0, milestone - kittens) / milestone : 0;
+      const cappedBoost = free <= 0 ? 1 : free <= 2 ? 0.75 : Math.max(0, 1 - free / Math.max(5, max * 0.15));
+      const score = Math.min(2, Math.pow(saturation, 3) * (0.7 + cappedBoost) * (firstReset && milestoneGap > 0 ? 1.35 : 1));
+      return { score, kittens, max, free, saturation, milestone, firstReset, milestoneGap };
+    } catch (error) {
+      return { score: 0, kittens: 0, max: 0, free: 0, saturation: 0, milestone: 0 };
+    }
+  };
+
+  const bestExpansionCheckpoint = (candidates, resources) => {
+    const pressure = expansionPressure();
+    if (pressure.score < 0.8) return null;
+    const options = candidates
+      .filter((candidate) => candidate && candidate.kind === "build")
+      .map((candidate) => {
+        const slots = Math.max(0, candidateEffectProfile(candidate.kind, candidate.meta).housing || 0);
+        const eta = waitSecondsForCandidate(candidate, resources);
+        const value = slots > 0 && isFinite(eta) ? pressure.score * slots * 20 / (1 + Math.log10(eta + 1)) : 0;
+        return { candidate, slots, eta, value };
+      })
+      .filter((option) => option.value > 0 && !directStorageBlockers(option.candidate.kind, option.candidate.meta, resources).length)
+      .sort((a, b) => b.value - a.value || a.eta - b.eta);
+    return options.length ? { ...options[0], pressure, options: options.slice(0, 3) } : null;
+  };
+
   const scaledEffectProfileFromEntries = (entries) => {
     const profile = emptyEffectProfile();
     for (const [key, value, scale] of entries) parseEffectEntry(profile, key, value * scale);
@@ -2451,7 +2572,7 @@
     for (const [name, amount] of Object.entries(profile.demand)) {
       if (amount < 0) value += Math.min(6, -amount * 10 * (0.35 + scarcityWeight(resources, name)));
     }
-    if (profile.housing > 0) value += TUNING.housingValue * (0.6 + housingSaturation() * 1.8);
+    if (profile.housing > 0) value += TUNING.housingValue * Math.max(1, profile.housing) * (0.6 + housingSaturation() * 1.8);
     if (profile.happiness > 0) {
       value += Math.min(TUNING.happinessScale, profile.happiness * (0.5 + Math.max(0, 1 - currentHappinessRatio()) * 4));
     }
@@ -2983,6 +3104,8 @@
     manualQueue: "Manual queue",
     researchSprint: "Research sprint",
     resourceBootstrap: "Resource bootstrap",
+    expansion: "Expansion checkpoint",
+    festival: "Festival maintenance",
     hardUnlock: "Hard unlock / milestone",
     scienceStorageUnlock: "Science storage unlock",
     storage: "Storage blocker",
@@ -3656,6 +3779,19 @@
     // Keep an existing research contract stable, but let a newly exposed craft
     // bootstrap downstream content before starting yet another sprint.
     if (!activeSprint) {
+      const expansion = bestExpansionCheckpoint(candidates, resources);
+      if (expansion) {
+        const target = expansion.candidate;
+        return {
+          candidates,
+          target,
+          layer: STRATEGIC_LAYERS.expansion,
+          reason: `population ${expansion.pressure.kittens}/${expansion.pressure.max}; +${fmt(expansion.slots)} slots advances ${expansion.pressure.firstReset ? `${expansion.pressure.milestone}-kitten first reset` : "population growth"}`,
+          protectedChain: candidateCraftChainResources(target),
+          expansion,
+          rejectedTopCandidates: candidates.filter((candidate) => candidate.kind === "research").slice(0, 2).map((candidate) => ({ target: candidate, reason: "deferred behind population-cap expansion" })),
+        };
+      }
       const bootstrap = bootstrapResourceCandidate(resources);
       if (bootstrap) {
         return {
@@ -3700,6 +3836,20 @@
           { target: scienceUnlock.blocked, reason: `storage-blocked: need +${fmt(scienceUnlock.need)} science storage` },
           ...candidates.filter((candidate) => isLongProject(candidate, resources, goalKey)).slice(0, 2).map((candidate) => ({ target: candidate, reason: `deferred until ${labelOf(scienceUnlock.blocked.meta)} fits science storage` })),
         ],
+      };
+    }
+
+    const festival = festivalOpportunity(resources);
+    if (festival && festival.candidate) {
+      const target = festival.candidate;
+      return {
+        candidates: [target, ...candidates],
+        target,
+        layer: STRATEGIC_LAYERS.festival,
+        reason: `festival payoff ${fmt(festival.benefit)}; happiness ${Math.round(festival.happiness * 100)}%; ${festival.freeBeds} free housing`,
+        protectedChain: candidateCraftChainResources(target),
+        festival,
+        rejectedTopCandidates: candidates.slice(0, 2).map((candidate) => ({ target: candidate, reason: "festival maintenance has faster economy-wide payback" })),
       };
     }
 
@@ -4705,9 +4855,10 @@
     policy: "POLICY",
     space: "SPACE PROGRAM",
     time: "TIME STRUCTURE",
+    festival: "FESTIVAL",
   };
 
-  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳" };
+  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳", festival: "🎉" };
 
   const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase()}`;
 
@@ -5070,6 +5221,11 @@
 
   const buyCandidate = (candidate) => {
     const before = resourceSnapshot();
+    if (candidate && candidate.kind === "festival") {
+      const bought = buyFestivalCandidate();
+      if (bought) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
+      return bought;
+    }
     const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
     for (const attempt of purchaseAttemptsFor(candidate)) {
       try {
@@ -6621,6 +6777,7 @@
   let processingEl;
   let reserveStatusEl;
   let religionEl;
+  let festivalEl;
   let diplomacyEl;
   let policyEl;
   let policySelectEl;
@@ -6736,6 +6893,7 @@
     if (processingEl) processingEl.textContent = "";
     if (reserveStatusEl) reserveStatusEl.textContent = "";
     if (religionEl) religionEl.textContent = "";
+    if (festivalEl) festivalEl.textContent = "";
     if (diplomacyEl) diplomacyEl.textContent = "";
     if (policyEl) policyEl.textContent = "";
     if (goalEl) { goalEl.textContent = ""; goalEl.style.display = "none"; }
@@ -6799,6 +6957,7 @@
       balanceJobs(goal, resources);
       autoHunt(resources);
       maybeHoldFestival(resources);
+      festivalOpportunity(resources);
       trackActions();
       if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
       if (goalEl) {
@@ -6818,6 +6977,7 @@
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (reserveStatusEl) reserveStatusEl.textContent = `🛡 ${reservePlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
+      if (festivalEl) festivalEl.textContent = `🎉 ${festivalPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
       renderQueueControl(resources, goal);
@@ -6900,6 +7060,7 @@
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
       '<small class="kgh-reserve" style="color:#9fd0ff">…</small>',
       '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
+      '<small class="kgh-festival" style="color:#ffd18f">…</small>',
       '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
       '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
@@ -6932,6 +7093,7 @@
     processingEl = box.querySelector(".kgh-processing");
     reserveStatusEl = box.querySelector(".kgh-reserve");
     religionEl = box.querySelector(".kgh-religion");
+    festivalEl = box.querySelector(".kgh-festival");
     diplomacyEl = box.querySelector(".kgh-diplomacy");
     policyEl = box.querySelector(".kgh-policy");
     policySelectEl = box.querySelector(".kgh-policy-select");
@@ -7137,6 +7299,25 @@
     bestScienceStorageUnlock(candidates) {
       resetTickCache();
       return bestScienceStorageUnlock(candidates, resourceMap());
+    },
+    expansionPressure,
+    bestExpansionCheckpoint(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return bestExpansionCheckpoint(gatherCandidates(resources, goalKey), resources);
+    },
+    festivalOpportunity() {
+      resetTickCache();
+      return festivalOpportunity(resourceMap());
+    },
+    festivalCanPay(target) {
+      resetTickCache();
+      return festivalCanPay(target, resourceMap());
+    },
+    festivalStatus() {
+      resetTickCache();
+      festivalOpportunity(resourceMap());
+      return festivalPlanText;
     },
   };
 

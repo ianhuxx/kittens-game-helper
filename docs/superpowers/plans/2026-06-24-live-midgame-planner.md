@@ -154,33 +154,33 @@ git commit -m "fix: project direct science cap closure"
 - Modify: `src/kittens-game-helper.user.js` near strategic layers, housing score, festival execution, panel creation/rendering
 - Test: `scripts/smoke.mjs`
 
-- [ ] **Step 1: Write failing expansion/festival tests**
+- [x] **Step 1: Write failing expansion/festival tests**
 
 Assert a near-full village below the first-reset milestone selects the best effect-derived `maxKittens` candidate before starting another lower-payoff research sprint, while research wins with housing headroom. Assert an expired high-payback festival becomes `Festival maintenance`, uses the live controller, appears as active/saving/deferred in the panel, spends true surplus, and cannot cross a target reservation.
 
-- [ ] **Step 2: Run smoke and verify RED**
+- [x] **Step 2: Run smoke and verify RED**
 
 Run: `npm.cmd run smoke`
 
 Expected: FAIL because research sprint structurally wins and festival is an invisible late side action.
 
-- [ ] **Step 3: Implement expansion pressure**
+- [x] **Step 3: Implement expansion pressure**
 
 Add `expansionPressure()` from kitten count/cap, free beds, reset count, first-reset distance, and arrival rate. Scale housing by actual slots. Add `bestExpansionCheckpoint` before starting a new sprint; keep a valid active sprint unless expansion is materially superior.
 
-- [ ] **Step 4: Implement festival candidate/status**
+- [x] **Step 4: Implement festival candidate/status**
 
 Build festival price from the rendered live model when available, otherwise the canonical live game cost. Estimate happiness-wide production gain, arrival benefit when free beds exist, duration, ETA, and payback. Add `festival` support to selection and execution. Call the live controller once; only use `holdFestival` plus exact payment as fallback. Check `targetLockViolationForPrices` and `pricesRespectReservations` against the full price.
 
 Add a persistent panel element and `festivalPlanText` with active duration, saving deficits, or deferral reason.
 
-- [ ] **Step 5: Re-run smoke and verify GREEN**
+- [x] **Step 5: Re-run smoke and verify GREEN**
 
 Run: `npm.cmd run smoke`
 
 Expected: expansion and festival checks PASS with old festival/reservation tests green.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add src/kittens-game-helper.user.js scripts/smoke.mjs

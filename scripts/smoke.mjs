@@ -2083,6 +2083,56 @@ buildings.splice(buildings.indexOf(directVaultV), 1);
 res("science").value = savedScienceV.value;
 res("science").maxValue = savedScienceV.maxValue;
 
+/* =====================================================================
+ * REGRESSION — reset-aware expansion checkpoints + visible festivals
+ * =================================================================== */
+const savedGetKittensW = village.getKittens;
+const savedMaxKittensW = village.maxKittens;
+const savedHappinessW = village.happiness;
+const savedResetCountW = gamePage.totalResets;
+const savedTechFlagsW = techs.map((tech) => [tech, tech.researched]);
+for (const tech of techs) tech.researched = true;
+const expansionTechW = { name: "expansionTechW", label: "Fresh Science", unlocked: true, researched: false, prices: [{ name: "science", val: 10000 }], unlocks: { tech: ["futureExpansionTechW"] } };
+const housingW = { name: "housingW", label: "Efficient Housing", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 100 }], effects: { maxKittens: 5 } };
+techs.push(expansionTechW);
+buildings.push(housingW);
+village.getKittens = () => 100;
+village.maxKittens = 100;
+gamePage.totalResets = 0;
+res("science").value = Math.min(res("science").maxValue, res("science").maxValue);
+dbg.forceActiveTarget(null);
+let expansionDecisionW = dbg.selectStrategicTarget("balanced");
+check("Test W: full pre-reset village chooses an Expansion checkpoint before another sprint", expansionDecisionW.layer === "Expansion checkpoint" && expansionDecisionW.target?.meta?.name === "housingW");
+village.maxKittens = 150;
+dbg.forceActiveTarget(null);
+expansionDecisionW = dbg.selectStrategicTarget("balanced");
+check("Test W: research remains eligible when housing has ample headroom", expansionDecisionW.layer !== "Expansion checkpoint");
+techs.splice(techs.indexOf(expansionTechW), 1);
+buildings.splice(buildings.indexOf(housingW), 1);
+for (const [tech, researched] of savedTechFlagsW) tech.researched = researched;
+
+let dramaW = techs.find((tech) => tech.name === "drama");
+if (!dramaW) { dramaW = { name: "drama", label: "Drama and Poetry", unlocked: true, researched: true, prices: [], unlocks: {} }; techs.push(dramaW); }
+const savedDramaW = dramaW.researched;
+dramaW.researched = true;
+village.getKittens = () => 50;
+village.maxKittens = 60;
+village.happiness = 0.8;
+calendar.festivalDays = 0;
+res("manpower").value = 1500;
+res("culture").value = 5000;
+res("parchment").value = 3000;
+const festivalOpportunityW = dbg.festivalOpportunity?.();
+check("Test W: expired high-value festival is a visible maintenance candidate", festivalOpportunityW?.candidate?.kind === "festival" && /Festival maintenance/i.test(festivalOpportunityW.layer || ""));
+const festivalGuardTargetW = { kind: "build", meta: { name: "festivalGuardW", label: "Festival Guard", prices: [{ name: "parchment", val: 5000 }] }, affordable: false };
+check("Test W: festival cannot cross an active target reservation", dbg.festivalCanPay?.(festivalGuardTargetW) === false);
+check("Test W: festival status explains the current action", /Festival:/i.test(dbg.festivalStatus?.() || ""));
+dramaW.researched = savedDramaW;
+village.getKittens = savedGetKittensW;
+village.maxKittens = savedMaxKittensW;
+village.happiness = savedHappinessW;
+if (savedResetCountW === undefined) delete gamePage.totalResets; else gamePage.totalResets = savedResetCountW;
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);
