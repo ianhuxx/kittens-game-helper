@@ -383,6 +383,29 @@
     return out;
   };
 
+  // Kittens Game keeps a stable raw building id in `buildingsData`, then overlays
+  // the active stage through BuildingMeta.getMeta().  Planner identity must stay
+  // raw (controllers buy by that id), while every read must use the same active
+  // label/effects/prices the player sees.
+  const rawBuildingFor = (meta) => {
+    if (!meta) return null;
+    try {
+      return buildingMetas().find((building) => building === meta || (building && building.name === meta.name)) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const liveMetaView = (meta, stageOverride = null) => {
+    const raw = rawBuildingFor(meta);
+    if (!raw) return meta;
+    refreshMetaEffects(raw);
+    if (!Array.isArray(raw.stages) || !raw.stages.length) return raw;
+    const requested = stageOverride == null ? Number(raw.stage) || 0 : Number(stageOverride) || 0;
+    const stage = Math.max(0, Math.min(raw.stages.length - 1, requested));
+    return { ...raw, ...(raw.stages[stage] || {}), stage };
+  };
+
   // Space programs and Chronoforge/Void structures are stackable buildings of
   // the SAME controller family as bonfire buildings, so the planner treats them
   // as extra "build"-style candidates (kinds "space"/"time"). This is what lets
@@ -451,7 +474,10 @@
   };
 
   const isOpen = (meta) => meta && meta.unlocked !== false && meta.researched !== true;
-  const labelOf = (meta) => meta.label || meta.title || meta.name || "?";
+  const labelOf = (meta) => {
+    const live = liveMetaView(meta) || meta;
+    return (live && (live.label || live.title || live.name)) || "?";
+  };
 
   const evaluate = (kind, meta, resources) => {
     const costs = pricesFor(kind, meta).filter(
@@ -876,6 +902,23 @@
     }
   };
 
+  // Discrete helper actions are not production.  Restart samples for every
+  // resource an action changed so a craft/trade/buy cannot become a bogus
+  // negative (or positive) ticker rate on the next planner pass.
+  const markTelemetryDiscontinuity = (deltas) => {
+    const now = Date.now();
+    for (const item of deltas || []) {
+      const name = item && (item.name === "catpower" ? "manpower" : item.name);
+      if (!name) continue;
+      const res = getRes(resourceMap(), name);
+      const entry = resourceTelemetry[name] || (resourceTelemetry[name] = { samples: [] });
+      entry.discontinuityAt = now;
+      entry.cap = liveResourceCap(res);
+      entry.title = (res && (res.title || res.name)) || name;
+      entry.samples = res && isFinite(res.value) ? [{ t: now, value: res.value, cap: entry.cap }] : [];
+    }
+  };
+
   const observedProductionFor = (name) => {
     const entry = resourceTelemetry[name === "catpower" ? "manpower" : name];
     if (!entry || entry.samples.length < 2) return null;
@@ -883,6 +926,10 @@
     const last = entry.samples[entry.samples.length - 1];
     const span = last.t - first.t;
     if (span < RESOURCE_TELEMETRY_MIN_SPAN_MS) return null;
+    // A capped resource bar is flat because production is clipped, not because
+    // its ticker is zero.  Likewise, do not bridge a known discrete action.
+    if (entry.samples.some((sample) => sample.cap > 0 && sample.value >= sample.cap * 0.985)) return null;
+    if (entry.discontinuityAt && entry.discontinuityAt >= first.t && entry.discontinuityAt <= last.t) return null;
     const delta = last.value - first.value;
     if (!isFinite(delta)) return null;
     return delta / (span / 1000);
@@ -1570,9 +1617,10 @@
   };
 
   const effectText = (meta) => {
-    const parts = [metaText(meta)];
+    const live = liveMetaView(meta) || meta;
+    const parts = [metaText(live)];
     for (const key of ["effects", "calculateEffects", "unlocks", "upgrades", "stages"]) {
-      const value = meta && meta[key];
+      const value = live && live[key];
       if (!value || typeof value !== "object") continue;
       try {
         parts.push(JSON.stringify(value));
@@ -1729,15 +1777,11 @@
   const metaEffectProfile = (meta) => {
     const profile = emptyEffectProfile();
     if (!meta || typeof meta !== "object") return profile;
+    const live = liveMetaView(meta) || meta;
     refreshMetaEffects(meta);
-    const sources = [];
-    if (meta.effects && typeof meta.effects === "object") sources.push(meta.effects);
-    if (Array.isArray(meta.stages) && isFinite(meta.stage) && meta.stages[meta.stage] && meta.stages[meta.stage].effects) {
-      sources.push(meta.stages[meta.stage].effects);
-    }
-    for (const effects of sources) {
-      for (const [key, value] of Object.entries(effects)) parseEffectEntry(profile, key, value);
-    }
+    const refreshed = liveMetaView(meta) || live;
+    const effects = refreshed.effects && typeof refreshed.effects === "object" ? refreshed.effects : {};
+    for (const [key, value] of Object.entries(effects)) parseEffectEntry(profile, key, value);
     return profile;
   };
 
@@ -1857,7 +1901,9 @@
         // worker reassignment and temporary effects before cached API fields
         // settle.  Large one-off jumps (trade/craft/build spends) are ignored
         // here by trusting the API when the sample wildly disagrees.
-        if (observed != null && Math.abs(observed - result) <= Math.max(25, Math.abs(result) * 3)) {
+        if (observed != null &&
+            (result === 0 || Math.sign(observed) === Math.sign(result)) &&
+            Math.abs(observed - result) <= Math.max(1, Math.abs(result) * 0.35)) {
           result = observed;
         }
         tickCache.production[resourceName] = result;
@@ -1866,7 +1912,9 @@
       const res = getRes(resourceMap(), resourceName);
       if (res && isFinite(res.perTickCached)) {
         result = res.perTickCached * ticksPerSecond();
-        if (observed != null && Math.abs(observed - result) <= Math.max(25, Math.abs(result) * 3)) {
+        if (observed != null &&
+            (result === 0 || Math.sign(observed) === Math.sign(result)) &&
+            Math.abs(observed - result) <= Math.max(1, Math.abs(result) * 0.35)) {
           result = observed;
         }
         tickCache.production[resourceName] = result;
@@ -1878,7 +1926,8 @@
     } catch (error) {
       result = 0;
     }
-    if (observed != null && (result === 0 || Math.abs(observed - result) <= Math.max(25, Math.abs(result) * 3))) {
+    if (observed != null && (result === 0 ||
+        (Math.sign(observed) === Math.sign(result) && Math.abs(observed - result) <= Math.max(1, Math.abs(result) * 0.35)))) {
       result = observed;
     }
     tickCache.production[resourceName] = result;
@@ -2432,7 +2481,7 @@
 
   const processingProfileFor = (meta) => {
     refreshMetaEffects(meta);
-    const effects = (meta && meta.effects) || {};
+    const effects = ((liveMetaView(meta) || meta) && (liveMetaView(meta) || meta).effects) || {};
     const inputs = [];
     const outputs = [];
     for (const [key, value] of Object.entries(effects)) {
@@ -4868,6 +4917,7 @@
   };
 
   const buyCandidate = (candidate) => {
+    const before = resourceSnapshot();
     const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
     for (const attempt of purchaseAttemptsFor(candidate)) {
       try {
@@ -4875,7 +4925,10 @@
       } catch (error) {
         /* try the next API shape */
       }
-      if (purchaseComplete(candidate, initialVal)) return true;
+      if (purchaseComplete(candidate, initialVal)) {
+        markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
+        return true;
+      }
     }
     return false;
   };
@@ -6042,7 +6095,9 @@
     const before = resourceSnapshot();
     const result = action();
     const after = resourceSnapshot();
-    return { result, before, after, ...formatActionDeltas(before, after, names) };
+    const formatted = formatActionDeltas(before, after, names);
+    markTelemetryDiscontinuity(formatted.deltas);
+    return { result, before, after, ...formatted };
   };
 
 
@@ -6894,6 +6949,18 @@
     craftPathSecondsFor(name, amount) { return craftPathSecondsFor(name, amount, resourceMap()); },
     tradePathSecondsFor(race, sellName, amount) { return tradePathSecondsFor(race, sellName, amount, resourceMap()); },
     tradeSpeedMultiplierFor(race, target) { return tradeSpeedMultiplierFor(race, target, resourceMap()); },
+    liveMetaView,
+    labelOf,
+    metaEffectProfile,
+    sampleResourceTelemetry,
+    clearResourceTelemetry(name) {
+      if (name) delete resourceTelemetry[name === "catpower" ? "manpower" : name];
+      else for (const key of Object.keys(resourceTelemetry)) delete resourceTelemetry[key];
+    },
+    productionFor(name) {
+      resetTickCache();
+      return productionFor(name);
+    },
   };
 
   /* ------------------------------- bootstrap -------------------------------- */

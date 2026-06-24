@@ -16,17 +16,17 @@
 - Modify: `src/kittens-game-helper.user.js` near `buildingMetas`, telemetry, `labelOf`, `metaEffectProfile`, and debug exports
 - Test: `scripts/smoke.mjs` after the current metadata/science regressions
 
-- [ ] **Step 1: Write failing active-stage and ticker tests**
+- [x] **Step 1: Write failing active-stage and ticker tests**
 
 Add staged fake buildings whose raw object is `library`/`amphitheatre` but whose active stages are Data Center/Broadcast Tower. Assert `dbg.liveMetaView(raw).label`, `dbg.labelOf(raw)`, `dbg.metaEffectProfile(raw)`, and current prices read only the active stage. Add a positive `getResourcePerTick("science")` with a flat capped bar and assert `dbg.productionFor("science")` stays positive rather than becoming zero.
 
-- [ ] **Step 2: Run the focused smoke suite and verify RED**
+- [x] **Step 2: Run the focused smoke suite and verify RED**
 
 Run: `npm.cmd run smoke`
 
 Expected: FAIL for missing `liveMetaView` export/current-stage labels and capped telemetry overriding the API rate.
 
-- [ ] **Step 3: Implement live views and telemetry eligibility**
+- [x] **Step 3: Implement live views and telemetry eligibility**
 
 Add:
 
@@ -45,13 +45,13 @@ Use `liveMetaView` in `labelOf`, effect parsing, processing reads, and staged pr
 
 Change observed telemetry to return metadata (`rate`, `clipped`, `eligible`) and accept it only below cap, after the minimum span, with no action discontinuity, same direction as the API rate, and tight tolerance. Add `markTelemetryDiscontinuity(deltas)` to reset samples changed by `withActionResourceDeltas` and successful buys.
 
-- [ ] **Step 4: Re-run smoke and verify GREEN**
+- [x] **Step 4: Re-run smoke and verify GREEN**
 
 Run: `npm.cmd run smoke`
 
 Expected: new active-stage/ticker checks PASS and existing checks remain green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/kittens-game-helper.user.js scripts/smoke.mjs

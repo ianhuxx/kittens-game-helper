@@ -1949,6 +1949,44 @@ check("Test S: sub-70 advisor still shows karma, not a negative efficiency", /ka
 kittensArr.length = 0; for (const k of savedKittens) kittensArr.push(k);
 delete gamePage.totalResets;
 
+/* =====================================================================
+ * REGRESSION — active staged metadata + uncontaminated ticker reads (v2.5.0)
+ *
+ * Bonfire metadata keeps the stable base id on the raw object while the game
+ * overlays the active stage's label/effects/prices.  The helper must show and
+ * score that live stage.  A capped resource bar is flat even while the game's
+ * ticker is positive, so telemetry must not replace the ticker with zero.
+ * =================================================================== */
+const liveStageProbe = {
+  name: "liveStageProbe",
+  unlocked: true,
+  val: 2,
+  on: 2,
+  stage: 1,
+  effects: { cultureMax: 1 },
+  stages: [
+    { label: "Library", prices: [{ name: "wood", val: 25 }], effects: { scienceMax: 250 } },
+    { label: "Data Center", prices: [{ name: "steel", val: 100 }], effects: { scienceMax: 750, energyConsumption: 2 } },
+  ],
+};
+buildings.push(liveStageProbe);
+const liveStageView = dbg.liveMetaView?.(liveStageProbe);
+const liveStageProfile = dbg.metaEffectProfile?.(liveStageProbe);
+check("Test T: staged building uses the current Data Center label", liveStageView?.label === "Data Center" && dbg.labelOf?.(liveStageProbe) === "Data Center");
+check("Test T: staged building profiles only the active stage effects", liveStageProfile?.max?.science === 750 && !liveStageProfile?.max?.culture);
+buildings.splice(buildings.indexOf(liveStageProbe), 1);
+
+const tickerium = { name: "tickerium", title: "Tickerium", value: 100, maxValue: 100, unlocked: true };
+resources.push(tickerium);
+perTick.tickerium = 2;
+dbg.clearResourceTelemetry?.("tickerium");
+dbg.sampleResourceTelemetry?.();
+fakeNow += 4000;
+dbg.sampleResourceTelemetry?.();
+check("Test T: a flat capped bar does not overwrite positive ticker production", dbg.productionFor?.("tickerium") === 10);
+resources.splice(resources.indexOf(tickerium), 1);
+delete perTick.tickerium;
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);
