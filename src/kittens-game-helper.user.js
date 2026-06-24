@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.4.4
+// @version      2.4.5
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.4.4";
+  const HELPER_VERSION = "2.4.5";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -770,11 +770,15 @@
             return diplomacy.tradeAll(zebras);
           }, tradeDeltaNamesForRace(zebras, prices));
           lastTradeAt = Date.now();
-          diplomacyPlanText = `Trade executed: expected titanium ETA improved for ${labelOf(target.meta)}`;
+          diplomacyPlanText = `Trade executed: expected titanium ETA improved for ${labelOf(target.meta)} · ${zebraTitaniumOddsText(resources, goalKey)}`;
           pushLog(`🤝 Trade executed: ${measured.suffix}; expected titanium ETA improved for ${labelOf(target.meta)}`);
           return;
         }
-        diplomacyPlanText = (reserved.manpower || reserved.gold) ? "Trade skipped: catpower/gold below reserve." : "Trade skipped: Zebra trade costs unavailable.";
+        // Keep the ship-fleet odds visible even when a trade is skipped/executed,
+        // so the panel always shows the Zebra titanium economics (ships → % × Ti,
+        // build-toward target), not just a terse executed/skipped status line.
+        const skipReason = (reserved.manpower || reserved.gold) ? "Trade skipped: catpower/gold below reserve." : "Trade skipped: Zebra trade costs unavailable.";
+        diplomacyPlanText = `${skipReason} · ${zebraTitaniumOddsText(resources, goalKey)}`;
       }
       const targeted = races
         .map((race) => targetTradeScore(race, target, resources, reserved))
