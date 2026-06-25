@@ -2103,6 +2103,21 @@ res("science").value = Math.min(res("science").maxValue, res("science").maxValue
 dbg.forceActiveTarget(null);
 let expansionDecisionW = dbg.selectStrategicTarget("balanced");
 check("Test W: full pre-reset village chooses an Expansion checkpoint before another sprint", expansionDecisionW.layer === "Expansion checkpoint" && expansionDecisionW.target?.meta?.name === "housingW");
+// Food gate: the SAME full village, but catnip is net-negative (food already
+// out, like the live -112/s starvation).  Expansion must stand down — buying
+// housing capacity it cannot feed (and the farmer→woodcutter / catnip→wood
+// grind that funds it) only deepens the starvation.  Once catnip is positive
+// again the expansion checkpoint re-qualifies (asserted by the check above).
+const savedCatnipPerTickW = perTick.catnip;
+const savedCatnipValW = res("catnip").value;
+perTick.catnip = -22; // ~-110/s, mirrors the live starvation rate
+res("catnip").value = 150; // pantry nearly empty
+dbg.forceActiveTarget(null);
+const starvedExpansionW = dbg.selectStrategicTarget("balanced");
+check("Test W: expansion stands down while catnip is net-negative (food already out)", starvedExpansionW.layer !== "Expansion checkpoint");
+perTick.catnip = savedCatnipPerTickW;
+res("catnip").value = savedCatnipValW;
+dbg.forceActiveTarget(null);
 village.maxKittens = 150;
 dbg.forceActiveTarget(null);
 expansionDecisionW = dbg.selectStrategicTarget("balanced");
