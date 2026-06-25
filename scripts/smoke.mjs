@@ -2394,6 +2394,76 @@ check("Test X: rebuild continuation reserves every remaining parity copy, not on
 buildings.splice(buildings.indexOf(stageEconomyX), 1);
 buildings.splice(buildings.indexOf(stageBadX), 1);
 
+/* =====================================================================
+ * REGRESSION — power/Wt is a first-class planner and toggle constraint
+ * =================================================================== */
+const savedPowerY = {
+  energyProd: gamePage.resPool.energyProd,
+  energyCons: gamePage.resPool.energyCons,
+  energyWinterProd: gamePage.resPool.energyWinterProd,
+};
+const savedScienceY = { value: res("science").value, maxValue: res("science").maxValue };
+const magnetoY = {
+  name: "magnetoY",
+  label: "Magneto Y",
+  unlocked: true,
+  val: 1,
+  on: 0,
+  prices: [{ name: "minerals", val: 10 }],
+  effects: { oilPerTickCon: -0.01, energyProduction: 5 },
+};
+const bioLabY = {
+  name: "bioLabY",
+  label: "Bio Lab Y",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "science", val: 500 }],
+  effects: { scienceMax: 25000, energyConsumption: 2 },
+};
+const factoryY = {
+  name: "factoryY",
+  label: "Factory Y",
+  unlocked: true,
+  val: 1,
+  on: 1,
+  prices: [{ name: "minerals", val: 10 }],
+  effects: { mineralsPerTickCon: -0.01, sciencePerTickProd: 0.01, energyConsumption: 3 },
+};
+resources.push(R("oil", 100, 1000, "Oil"));
+buildings.push(magnetoY, bioLabY, factoryY);
+gamePage.resPool.energyProd = 10;
+gamePage.resPool.energyCons = 15.5;
+gamePage.resPool.energyWinterProd = 8;
+res("science").value = 500;
+res("science").maxValue = 1000;
+const powerDecisionY = dbg.selectStrategicTarget("balanced");
+check("Test Y: negative Wt selects Power recovery / Magneto instead of Bio Lab", powerDecisionY.layer === "Power recovery" && powerDecisionY.target?.meta?.name === "magnetoY");
+const bioCandidateY = dbg.candidateById("build:bioLabY", "balanced");
+const bioScoreY = dbg.candidateScore(bioCandidateY, "balanced");
+gamePage.resPool.energyProd = 25;
+gamePage.resPool.energyCons = 5;
+gamePage.resPool.energyWinterProd = 25;
+const bioScoreSafeY = dbg.candidateScore(bioCandidateY, "balanced");
+check("Test Y: negative Wt heavily penalizes energy-consuming Bio Lab", bioScoreY + 100 < bioScoreSafeY);
+gamePage.resPool.energyProd = 10;
+gamePage.resPool.energyCons = 15.5;
+gamePage.resPool.energyWinterProd = 8;
+const magnetoStateY = dbg.desiredProcessorState(magnetoY);
+const factoryStateY = dbg.desiredProcessorState(factoryY);
+check("Test Y: negative Wt runs power-positive Magneto and pauses power-negative consumers", magnetoStateY.on === magnetoY.val && factoryStateY.on === 0);
+const processingTextY = dbg.optimizeProcessing("balanced");
+check("Test Y: processing log names power protection", /power deficit|protecting Wt/i.test(processingTextY));
+buildings.splice(buildings.indexOf(magnetoY), 1);
+buildings.splice(buildings.indexOf(bioLabY), 1);
+buildings.splice(buildings.indexOf(factoryY), 1);
+resources.splice(resources.findIndex((r) => r.name === "oil"), 1);
+gamePage.resPool.energyProd = savedPowerY.energyProd;
+gamePage.resPool.energyCons = savedPowerY.energyCons;
+gamePage.resPool.energyWinterProd = savedPowerY.energyWinterProd;
+res("science").value = savedScienceY.value;
+res("science").maxValue = savedScienceY.maxValue;
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

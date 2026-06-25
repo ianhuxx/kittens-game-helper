@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.5.5
+// @version      2.5.6
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.5.5";
+  const HELPER_VERSION = "2.5.6";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1771,6 +1771,10 @@
     pressureGatewayScale: 8,
     pressureGatewayCap: 26,
     pressureClosureBoost: 20,
+    powerHeadroom: 1,
+    powerEmergencyBoost: 180,
+    powerDeficitPenalty: 160,
+    powerWinterPenalty: 45,
   };
 
   // Instead of keyword tables, read the game's own metadata: every building,
@@ -1801,7 +1805,7 @@
     return best;
   };
 
-  const emptyEffectProfile = () => ({ perTick: {}, max: {}, ratio: {}, demand: {}, housing: 0, happiness: 0, craft: 0 });
+  const emptyEffectProfile = () => ({ perTick: {}, max: {}, ratio: {}, demand: {}, housing: 0, happiness: 0, craft: 0, energyProduction: 0, energyConsumption: 0 });
 
   const addEffectProfile = (target, source, scale = 1) => {
     if (!source || !isFinite(scale) || scale <= 0) return target;
@@ -1814,11 +1818,21 @@
     target.housing += (source.housing || 0) * scale;
     target.happiness += (source.happiness || 0) * scale;
     target.craft += (source.craft || 0) * scale;
+    target.energyProduction += (source.energyProduction || 0) * scale;
+    target.energyConsumption += (source.energyConsumption || 0) * scale;
     return target;
   };
 
   const parseEffectEntry = (profile, key, value) => {
     if (!isFinite(value) || value === 0) return;
+    if (key === "energyProduction") {
+      profile.energyProduction += value;
+      return;
+    }
+    if (key === "energyConsumption") {
+      profile.energyConsumption += value;
+      return;
+    }
     if (key === "maxKittens") {
       profile.housing += value;
       return;
@@ -1874,6 +1888,26 @@
     } catch (error) {
       /* keep the existing effect values */
     }
+  };
+
+  const powerStatus = () => {
+    try {
+      const pool = window.gamePage && window.gamePage.resPool || {};
+      const prod = Number(pool.energyProd) || 0;
+      const cons = Number(pool.energyCons) || 0;
+      const winterProd = Number(pool.energyWinterProd);
+      const safeWinterProd = isFinite(winterProd) ? winterProd : prod;
+      return { prod, cons, delta: prod - cons, winterProd: safeWinterProd, winterDelta: safeWinterProd - cons };
+    } catch (error) {
+      return { prod: 0, cons: 0, delta: 0, winterProd: 0, winterDelta: 0 };
+    }
+  };
+
+  const profileNetEnergy = (profile) => (profile && profile.energyProduction || 0) - (profile && profile.energyConsumption || 0);
+  const candidateNetEnergy = (candidate) => candidate ? profileNetEnergy(candidateEffectProfile(candidate.kind, candidate.meta)) : 0;
+  const isPowerEmergency = () => {
+    const power = powerStatus();
+    return power.delta < 0 || power.winterDelta < 0;
   };
 
   const metaEffectProfile = (meta) => {
@@ -2609,6 +2643,18 @@
     if (profile.happiness > 0) {
       value += Math.min(TUNING.happinessScale, profile.happiness * (0.5 + Math.max(0, 1 - currentHappinessRatio()) * 4));
     }
+    const power = powerStatus();
+    const netEnergy = profileNetEnergy(profile);
+    if (netEnergy > 0 && (power.delta < TUNING.powerHeadroom || power.winterDelta < 0)) {
+      const deficit = Math.max(0, TUNING.powerHeadroom - power.delta, -power.winterDelta);
+      value += TUNING.powerEmergencyBoost * Math.min(2, netEnergy / Math.max(1, deficit));
+    }
+    if ((profile.energyConsumption || 0) > 0) {
+      const projected = power.delta - profile.energyConsumption;
+      const projectedWinter = power.winterDelta - profile.energyConsumption;
+      if (projected < TUNING.powerHeadroom) value -= TUNING.powerDeficitPenalty * (TUNING.powerHeadroom - projected);
+      if (projectedWinter < 0) value -= TUNING.powerWinterPenalty * -projectedWinter;
+    }
     return value;
   };
 
@@ -2640,14 +2686,18 @@
     const effects = ((liveMetaView(meta) || meta) && (liveMetaView(meta) || meta).effects) || {};
     const inputs = [];
     const outputs = [];
+    let energyProduction = 0;
+    let energyConsumption = 0;
     for (const [key, value] of Object.entries(effects)) {
+      if (key === "energyProduction") energyProduction += Number(value) || 0;
+      if (key === "energyConsumption") energyConsumption += Number(value) || 0;
       if (!isFinite(value) || value === 0) continue;
       const name = effectResourceName(key);
       if (!name) continue;
       if (value < 0) inputs.push(name);
       if (value > 0) outputs.push(name);
     }
-    return { inputs: [...new Set(inputs)], outputs: [...new Set(outputs)] };
+    return { inputs: [...new Set(inputs)], outputs: [...new Set(outputs)], energyProduction, energyConsumption, netEnergy: energyProduction - energyConsumption };
   };
 
   // Converters are DISCOVERED, not listed: any owned building whose live
@@ -2681,8 +2731,9 @@
       if (!meta || !meta.name || meta.unlocked === false || !(meta.val > 0) || seen.has(meta.name)) continue;
       const profile = processingProfileFor(meta);
       const isConverter = profile.inputs.length && profile.outputs.length;
+      const isPowerToggle = hasOnToggle(meta) && (profile.energyProduction || profile.energyConsumption);
       const managedToggle = hasOnToggle(meta) && (KNOWN_CONVERTERS.includes(meta.name) || ALWAYS_ON_TOGGLES.includes(meta.name));
-      if (isConverter || managedToggle) {
+      if (isConverter || managedToggle || isPowerToggle) {
         seen.add(meta.name);
         out.push(meta);
       }
@@ -2804,6 +2855,16 @@
     const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
     const usefulOutputs = outputs.filter((output) => needed.has(output));
     const healthyInputs = inputs.length && inputs.every((input) => resRatio(resources, input, 1) >= 0.85 || productionFor(input) > 0);
+    const power = powerStatus();
+    const netEnergy = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+    const powerEmergency = power.delta < 0 || power.winterDelta < 0;
+    const hardStarvedInputs = inputs.filter((input) => resRatio(resources, input, 1) < lowRatio && productionFor(input) <= 0);
+    if (full > 0 && netEnergy > 0 && powerEmergency && hardStarvedInputs.length === 0) {
+      return { on: full, reason: "power", detail: `power deficit ${fmt(power.delta)} Wt` };
+    }
+    if (full > 0 && netEnergy < 0 && (power.delta + netEnergy < TUNING.powerHeadroom || power.winterDelta + netEnergy < 0)) {
+      return { on: 0, reason: "power", detail: "protecting Wt" };
+    }
     const wantedOutputs = outputs.some((output) => !resCapped(resources, output) || needed.has(output));
     if (full > 0 && (meta.on || 0) <= 0 && healthyInputs && wantedOutputs) {
       return { on: full, reason: "run", detail: "healthy inputs" };
@@ -2909,6 +2970,10 @@
       }
 
       if (changed.length) {
+        const power = powerStatus();
+        for (let i = 0; i < changed.length; i += 1) {
+          if (/started|resumed/.test(changed[i]) && power.delta < 0) changed[i] += ` (power deficit ${fmt(power.delta)} Wt)`;
+        }
         const forText = target && changed.some((item) => /started|resumed/.test(item)) ? ` for ${labelOf(target.meta)}` : "";
         processingPlanText = `Processing: ${changed.join("; ")}${forText}`;
         if (Date.now() - lastProcessingLog > 20000) {
@@ -3144,6 +3209,7 @@
     hardUnlock: "Hard unlock / milestone",
     scienceStorageUnlock: "Science storage unlock",
     storage: "Storage blocker",
+    power: "Power recovery",
     production: "Production bottleneck",
     housing: "Housing / population",
     economy: "Economy / normal growth",
@@ -3151,6 +3217,23 @@
   };
 
   let lastStrategicDecision = null;
+
+  const bestPowerRecoveryTarget = (candidates, resources) => {
+    const power = powerStatus();
+    if (power.delta >= TUNING.powerHeadroom && power.winterDelta >= 0) return null;
+    const options = (candidates || [])
+      .filter((candidate) => candidate && candidateNetEnergy(candidate) > 0)
+      .filter((candidate) => directStorageBlockers(candidate.kind, candidate.meta, resources).length === 0)
+      .map((candidate) => {
+        const net = candidateNetEnergy(candidate);
+        const eta = waitSecondsForCandidate(candidate, resources);
+        const etaFactor = isFinite(eta) ? Math.max(1, eta) : Number.POSITIVE_INFINITY;
+        return { candidate, net, eta, value: net / etaFactor };
+      })
+      .filter((option) => isFinite(option.value) && option.value > 0)
+      .sort((a, b) => b.value - a.value || b.net - a.net || a.eta - b.eta);
+    return options.length ? options[0].candidate : null;
+  };
 
   const resValueOf = (resources, name) => ((getRes(resources, name) || {}).value) || 0;
   const resMaxOf = (resources, name) => ((getRes(resources, name) || {}).maxValue) || 0;
@@ -4110,6 +4193,20 @@
 
     // Keep an existing research contract stable, but let a newly exposed craft
     // bootstrap downstream content before starting yet another sprint.
+    const powerTarget = bestPowerRecoveryTarget(candidates, resources);
+    if (powerTarget) {
+      const net = candidateNetEnergy(powerTarget);
+      const power = powerStatus();
+      return {
+        candidates: [powerTarget, ...candidates.filter((candidate) => targetId(candidate) !== targetId(powerTarget))],
+        target: powerTarget,
+        layer: STRATEGIC_LAYERS.power,
+        reason: `power deficit ${fmt(power.delta)} Wt; adding +${fmt(net)} Wt from ${labelOf(powerTarget.meta)}`,
+        protectedChain: candidateCraftChainResources(powerTarget),
+        rejectedTopCandidates: candidates.slice(0, 3).map((target) => ({ target, reason: "deferred until power has safe headroom" })),
+      };
+    }
+
     if (!activeSprint) {
       const expansion = bestExpansionCheckpoint(candidates, resources);
       if (expansion) {
@@ -4416,7 +4513,7 @@
       }
       const noProgress = now - (activeTarget.lastProgressAt || activeTarget.startedAt) > TARGET_LOCK_MAX_MS;
       const manualQueueChanged = activeTarget.queueSignature !== JSON.stringify(readQueue());
-      const emergency = resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0;
+      const emergency = (resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0) || isPowerEmergency();
       const feasibility = locked ? classifyTargetFeasibility(locked, resources) : { status: FEASIBILITY.IMPOSSIBLE };
       const impossible = locked && feasibility.status === FEASIBILITY.IMPOSSIBLE;
       const completed = locked && targetComplete(locked);
@@ -5116,6 +5213,8 @@
   const RAW = ["wood", "minerals", "iron", "coal"];
 
   const getBottleneck = (resources) => {
+    const power = powerStatus();
+    if (power.delta < 0) return `power deficit (${fmt(power.delta)} Wt) — build/enable positive-Wt generators before more powered buildings`;
     for (const name of SPENDABLE) {
       const r = resources.get(name);
       const cap = liveCapFor(resources, name);
@@ -5343,7 +5442,9 @@
       const topCandidates = topSource.slice(0, 3)
         .map((candidate) => `${labelOf(candidate.meta)} score ${fmt(candidate.score || 0)} ETA ${formatEta(waitSecondsForCandidate(candidate, resources))}`)
         .join("; ");
-      const baseDebug = `${lockText} · Target score ${fmt(target.score || 0)} ETA ${formatEta(waitSecondsForCandidate(target, resources))} · Top candidates: ${topCandidates || "none"} · Reservations: ${reserveBySource || "none"} · Next: ${getNowAction(resources, goalKey)}`;
+      const power = powerStatus();
+      const powerDebug = `Power: prod ${fmt(power.prod)} Wt, cons ${fmt(power.cons)} Wt, delta ${fmt(power.delta)} Wt, winter ${fmt(power.winterDelta)} Wt`;
+      const baseDebug = `${powerDebug} · ${lockText} · Target score ${fmt(target.score || 0)} ETA ${formatEta(waitSecondsForCandidate(target, resources))} · Top candidates: ${topCandidates || "none"} · Reservations: ${reserveBySource || "none"} · Next: ${getNowAction(resources, goalKey)}`;
       const phase = target.kind === "research" ? researchTargetPhase(target, resources) : null;
       const phaseDebug = phase && phase.phase !== "purchase" ? `${baseDebug} · Research phase ${phase.phase}: ${phase.explanation}` : baseDebug;
       // Research-sprint details: protected chain + deferrals + job drivers.
@@ -7718,6 +7819,24 @@
     liveMetaView,
     labelOf,
     metaEffectProfile,
+    candidateEffectProfile,
+    powerStatus,
+    profileNetEnergy,
+    candidateNetEnergy,
+    isPowerEmergency,
+    candidateScore(candidate, goalKey = getGoal()) {
+      resetTickCache();
+      return candidateScore(candidate, resourceMap(), GOALS[goalKey], goalKey);
+    },
+    desiredProcessorState(meta) {
+      resetTickCache();
+      return desiredProcessorState(meta, resourceMap(), new Set(), new Set(), {});
+    },
+    optimizeProcessing(goalKey = getGoal()) {
+      resetTickCache();
+      optimizeProcessing(resourceMap(), goalKey);
+      return processingPlanText;
+    },
     sampleResourceTelemetry,
     clearResourceTelemetry(name) {
       if (name) delete resourceTelemetry[name === "catpower" ? "manpower" : name];
