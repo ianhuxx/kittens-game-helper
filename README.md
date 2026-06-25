@@ -258,6 +258,12 @@ needs **gear**, and you have enough ingredients to make **steel**, it will craft
 from iron + coal, then craft the higher-level item when possible. The same recipe-chain
 logic feeds job balancing, so missing steel pushes work toward the raw inputs behind it
 (coal/geologists and minerals/iron support) instead of treating steel as impossible.
+If a resource is both craftable and directly job-produced, the job path stays primary:
+for example a Hut's missing **wood** is displayed and scored as Wood work, while
+Refine Catnip remains an optional surplus shortcut rather than turning the whole plan
+into a giant catnip target. Even when that wood price is above the current storage cap,
+the active plan still reserves the wood bank from side buys because crafting/refining can
+finish the purchase.
 
 It also watches resource storage pressure. If there is **no active reserve**, hot inputs
 can be converted into useful workshop goods such as beams, slabs, plates, steel, gears,
@@ -321,7 +327,9 @@ buildings.
   for the next tech while wood gathers for the current build.
 - **Pathway math:** when wood is short it compares *woodcutter* (direct wood) vs *farmer*
   (catnip, which it refines into wood) using live production rates, and picks whichever
-  gives more wood per kitten.
+  gives more wood per kitten. The dependency planner feeds this comparison a real Wood
+  need, not the Refine Catnip recipe, so large Hut/Log House deficits don't accidentally
+  rebalance the village into all-farmer refine mode.
 - **Starvation guard:** the helper watches the *net* catnip rate (the game's own number,
   which includes kitten demand, seasons and weather). The moment catnip goes net-negative
   with the pantry draining — hello, winter — farmers are reinforced before anyone starves.

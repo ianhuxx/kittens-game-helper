@@ -2133,6 +2133,74 @@ village.maxKittens = savedMaxKittensW;
 village.happiness = savedHappinessW;
 if (savedResetCountW === undefined) delete gamePage.totalResets; else gamePage.totalResets = savedResetCountW;
 
+/* ---------------------------------------------------------------------
+ * Test W2 — directly producible craft outputs stay direct work targets.
+ *
+ * Live-save regression: Hut needed a huge amount of wood, but because Wood also
+ * has the "Refine Catnip" craft, the planner displayed "Need: Refine Catnip"
+ * and rebalanced to 0 Woodcutters / many Farmers.  For a large wood deficit,
+ * the plan should be "get Wood"; the Woodcutter-vs-Farmer comparator can then
+ * decide the fastest source without the dependency graph pre-biasing everything
+ * into catnip.
+ * ------------------------------------------------------------------- */
+const hutW2 = buildings.find((b) => b.name === "hut");
+const savedHutPricesW2 = hutW2.prices;
+const savedHutUnlockedW2 = hutW2.unlocked;
+const savedGetKittensW2 = village.getKittens;
+const savedGetFreeKittensW2 = village.getFreeKittens;
+const savedGetResProductionW2 = village.getResProduction;
+const savedHappinessW2 = village.happiness;
+const savedWeatherW2 = calendar.getWeatherMod;
+const savedJobValuesW2 = jobs.map((j) => [j, j.value]);
+const savedResValuesW2 = new Map(resources.map((r) => [r.name, { value: r.value, maxValue: r.maxValue, unlocked: r.unlocked }]));
+const savedPerTickW2 = { ...perTick };
+const savedWoodCraftRatioW2 = craftRatios.wood;
+hutW2.unlocked = true;
+hutW2.prices = [{ name: "wood", val: 5000 }]; // larger than current wood cap; still craft/production reachable
+res("wood").value = 1500; res("wood").maxValue = 3000;
+res("catnip").value = 2500; res("catnip").maxValue = 5000;
+res("science").value = res("science").maxValue;
+res("faith").value = res("faith").maxValue;
+res("manpower").value = res("manpower").maxValue;
+res("furs").value = 100000;
+res("ivory").value = 100000;
+village.happiness = 1.5;
+village.getKittens = () => 30;
+village.getFreeKittens = () => 0;
+village.getResProduction = () => ({ wood: 0, catnip: 150, minerals: 0, science: 0, manpower: 0, faith: 0, coal: 0 });
+calendar.getWeatherMod = () => 0;
+perTick.catnip = 30;
+perTick.wood = 0;
+craftRatios.wood = 0;
+for (const j of jobs) j.value = 0;
+job("farmer").value = 30;
+dbg.forceActiveTarget({ kind: "build", meta: hutW2, affordable: false });
+const hutPlanW2 = dbg.planText("balanced");
+check("Test W2: huge Hut wood deficit is displayed as Wood, not Refine Catnip", /Need: .*Wood/i.test(hutPlanW2) && !/Need: .*Refine Catnip/i.test(hutPlanW2));
+const hutReserveW2 = dbg.reservedNeedsFor({ kind: "build", meta: hutW2, affordable: false });
+check("Test W2: cap-over but craft-reachable Hut wood is still reserved from side buys", hutReserveW2.wood >= 5000 && (!hutReserveW2.catnip || hutReserveW2.catnip < 100000));
+fakeNow += 60000;
+tickFn();
+check(`Test W2: Hut wood bottleneck keeps direct Woodcutters staffed above refine Farmers (woodcutters ${job("woodcutter").value}, farmers ${job("farmer").value})`, job("woodcutter").value > job("farmer").value && job("woodcutter").value >= 5);
+dbg.forceActiveTarget(null);
+hutW2.prices = savedHutPricesW2;
+hutW2.unlocked = savedHutUnlockedW2;
+village.getKittens = savedGetKittensW2;
+village.getFreeKittens = savedGetFreeKittensW2;
+village.getResProduction = savedGetResProductionW2;
+village.happiness = savedHappinessW2;
+calendar.getWeatherMod = savedWeatherW2;
+for (const [j, value] of savedJobValuesW2) j.value = value;
+for (const [name, saved] of savedResValuesW2) {
+  const r = res(name);
+  if (!r) continue;
+  r.value = saved.value;
+  r.maxValue = saved.maxValue;
+  r.unlocked = saved.unlocked;
+}
+Object.assign(perTick, savedPerTickW2);
+if (savedWoodCraftRatioW2 === undefined) delete craftRatios.wood; else craftRatios.wood = savedWoodCraftRatioW2;
+
 /* =====================================================================
  * REGRESSION — opportunity-costed, controller-owned stage transitions
  * =================================================================== */

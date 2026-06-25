@@ -57,6 +57,12 @@ state, not a baked-in base modifier:
 - `bestWoodJob` is the canonical example: it weighs a live woodcutter's wood/s
   (incl. Lumber-Mill woodRatio) against refining a farmer's in-season catnip,
   bonus-adjusted. Test D5 pins this; if you touch it, keep the comparison live.
+- Directly job-produced resources that also have craft buttons remain direct work
+  targets. Wood is the canonical case: a Hut/Log House deficit should be displayed and
+  scored as Wood, then `bestWoodJob` chooses Woodcutters vs Farmers; the dependency graph
+  must not pre-collapse the whole target into Refine Catnip. If that direct resource is
+  craft-reachable above its storage cap, it is still reserved from side buys; only true
+  non-craft storage blockers are skipped from the active ledger.
 
 ## Strategic planner — selection invariants
 
