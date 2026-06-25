@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.5.3
+// @version      2.5.4
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.5.3";
+  const HELPER_VERSION = "2.5.4";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4613,13 +4613,27 @@
       }
     }
 
-    const religionTarget = nextFaithReligionUpgrade(resources);
+    // Discretionary faith banking (priests filling faith toward a future religion
+    // upgrade) must YIELD when the colony is food-stressed.  nextFaithReligionUpgrade
+    // injects a fat faith need (weight 10) the moment ANY religion upgrade is
+    // pending — regardless of the active plan — which is how ~16 Priests kept
+    // banking faith while catnip drained to 0 and kittens starved.  A religion
+    // upgrade nothing is waiting on does not outrank feeding the colony or the
+    // active plan's own chain: allow it only when catnip is not net-negative (or is
+    // net-negative but still well-stocked), or when the active TARGET spends faith.
+    const targetNeedsFaith = target && !target.affordable &&
+      pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === "faith" && cost.val > 0);
+    const foodStressed = productionFor("catnip") < 0 && resRatio(resources, "catnip") < 0.5;
+    const allowFaithBanking = !foodStressed || targetNeedsFaith;
+    const religionTarget = allowFaithBanking ? nextFaithReligionUpgrade(resources) : null;
     if (religionTarget && !religionTarget.affordable) {
       for (const cost of pricesFor("religion", religionTarget.meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         const have = ((getRes(resources, cost.name) || {}).value) || 0;
         if (have < cost.val) scoreNeed(needs, cost.name, cost.name === "faith" ? 10 : 4);
       }
+    } else if (!allowFaithBanking && jobByName("priest")) {
+      jobSuppressText = "Suppressed: faith banking while catnip is net-negative (food first)";
     }
 
     for (const [name, amount] of Object.entries(getStoragePressureCached(resources, GOALS[goalKey], goalKey))) {
@@ -4637,7 +4651,7 @@
     // bank with compounding religion value.  Keep a small live-data baseline
     // when priests exist and faith has storage headroom; the cap check below
     // still removes the need the moment the actual bar is full.
-    if (jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
+    if (allowFaithBanking && jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
 
     // Include the same immediate diplomacy work the executor will try later in
     // the tick.  Trade routes and explorers are resource sinks just like a
@@ -7615,6 +7629,10 @@
     },
     activeSprint() {
       return activeSprint;
+    },
+    resourceNeeds(goalKey = getGoal()) {
+      resetTickCache();
+      return resourceNeeds(goalKey, resourceMap());
     },
     solveChain(candidate) {
       return solveCraftChain(resourceMap(), candidate);

@@ -1549,6 +1549,50 @@ check("Test E: details name hunters/furs for the Acoustics chain", /Hunters for 
 check("Test E: faith baseline is flagged suppressed during the sprint", /Suppressed: faith baseline during Research sprint/i.test(panelText(".kgh-note")));
 
 /* ---------------------------------------------------------------------
+ * Test E2 — discretionary faith banking yields to a food crisis.  A pending
+ * religion upgrade injects a fat faith need (weight 10) even when the active
+ * plan needs no faith; live, that kept ~16 Priests banking faith while catnip
+ * drained to 0 and kittens starved.  Faith must be a job need while food is
+ * healthy, and suppressed the moment catnip is net-negative and low.
+ * ------------------------------------------------------------------- */
+const e2Saved = {
+  techFlags: techs.map((t) => [t, t.researched]),
+  rel: [religionUpgrades[0].researched, religionUpgrades[0].on, religionUpgrades[0].val],
+  catnip: [res("catnip").value, res("catnip").maxValue],
+  perTickCatnip: perTick.catnip,
+  faith: [res("faith").value, res("faith").maxValue],
+  getKittens: village.getKittens,
+  maxKittens: village.maxKittens,
+  priest: job("priest").value,
+};
+for (const t of techs) t.researched = true;            // no research sprint can own the plan
+religionUpgrades[0].researched = false;                // a faith upgrade is pending (weight 10)
+religionUpgrades[0].on = 0; religionUpgrades[0].val = 0;
+res("faith").value = 50; res("faith").maxValue = 5500; // faith has headroom, below cap
+village.getKittens = () => 60; village.maxKittens = 91;
+job("priest").value = 8;                               // priests exist to bank faith
+// Food healthy → discretionary faith banking is a real job need.
+res("catnip").value = 3500; res("catnip").maxValue = 5000; perTick.catnip = 8;
+dbg.forceActiveTarget(null);
+dbg.selectStrategicTarget("balanced");
+const e2Healthy = dbg.resourceNeeds("balanced");
+check("Test E2: faith is a job need while food is healthy and a religion upgrade is pending", (e2Healthy.needs.faith || 0) > 0);
+// Food crisis (catnip net-negative and low) → faith banking stands down.
+res("catnip").value = 1500; res("catnip").maxValue = 5000; perTick.catnip = -8;
+dbg.forceActiveTarget(null);
+dbg.selectStrategicTarget("balanced");
+const e2Stressed = dbg.resourceNeeds("balanced");
+check("Test E2: faith job need is suppressed while catnip is net-negative (food first)", (e2Stressed.needs.faith || 0) === 0);
+// Restore.
+for (const [t, r] of e2Saved.techFlags) t.researched = r;
+[religionUpgrades[0].researched, religionUpgrades[0].on, religionUpgrades[0].val] = e2Saved.rel;
+res("catnip").value = e2Saved.catnip[0]; res("catnip").maxValue = e2Saved.catnip[1];
+perTick.catnip = e2Saved.perTickCatnip;
+res("faith").value = e2Saved.faith[0]; res("faith").maxValue = e2Saved.faith[1];
+village.getKittens = e2Saved.getKittens; village.maxKittens = e2Saved.maxKittens;
+job("priest").value = e2Saved.priest;
+
+/* ---------------------------------------------------------------------
  * Test F — Auto-hunt fires at the chain threshold for the sprint
  * ------------------------------------------------------------------- */
 setupAcoustics();
