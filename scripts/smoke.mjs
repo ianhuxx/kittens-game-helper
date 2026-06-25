@@ -975,6 +975,39 @@ for (const [j, v] of starveSaved.jobs) j.value = v;
 perTick.catnip = starveSaved.perTickCatnip;
 for (const [n, v, m] of starveSaved.res) { res(n).value = v; res(n).maxValue = m; }
 
+/* Stage 13a2 — the food emergency BYPASSES the 45s rebalance throttle.  With no
+   free kittens the executor normally rebalances at most once every 45s and skips
+   an unchanged plan; a starving colony cannot wait that long (that window is long
+   enough for catnip to crash to 0).  This was the live "farmers not increasing"
+   bug: the failsafe sized the flood correctly but the executor refused to apply
+   it.  Here a normal tick settles farmers low, then catnip crashes and only 10s
+   pass — far under the throttle — yet farmers must still jump on the next tick. */
+const bypassSaved = {
+  getKittens: village.getKittens, getFreeKittens: village.getFreeKittens,
+  jobs: jobs.map((j) => [j, j.value]), perTickCatnip: perTick.catnip,
+  catnip: [res("catnip").value, res("catnip").maxValue],
+  coal: [res("coal").value, res("coal").maxValue],
+};
+for (const j of jobs) j.value = 0;
+job("farmer").value = 10; job("geologist").value = 30; job("miner").value = 6;
+village.getKittens = () => 46; village.getFreeKittens = () => 0;
+// A normal, NON-emergency rebalance first (catnip safe) → stamps lastJobRun.
+res("catnip").value = 4000; res("catnip").maxValue = 5000; perTick.catnip = 6;
+res("coal").value = 60; res("coal").maxValue = 14750;
+fakeNow += 60000; tickFn();
+const farmersBeforeEmergency = job("farmer").value;
+// Now the pantry crashes; advance only 10s (< the 45s throttle) with no free kittens.
+res("catnip").value = 0; perTick.catnip = -24;
+fakeNow += 10000; tickFn();
+check("jobs: food emergency bypasses the 45s rebalance throttle (farmers ramp immediately)",
+  job("farmer").value > farmersBeforeEmergency && job("farmer").value >= Math.ceil(46 * 0.5));
+// Restore.
+village.getKittens = bypassSaved.getKittens; village.getFreeKittens = bypassSaved.getFreeKittens;
+for (const [j, v] of bypassSaved.jobs) j.value = v;
+perTick.catnip = bypassSaved.perTickCatnip;
+res("catnip").value = bypassSaved.catnip[0]; res("catnip").maxValue = bypassSaved.catnip[1];
+res("coal").value = bypassSaved.coal[0]; res("coal").maxValue = bypassSaved.coal[1];
+
 /* Stage 13b — diplomacy pressure feeds job balancing: if a queued Zebra trade
    is blocked by catpower, hunters must be staffed even when the visible build
    target is asking for another resource. */
