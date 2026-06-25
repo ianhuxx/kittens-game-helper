@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.5.1
+// @version      2.5.2
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.5.1";
+  const HELPER_VERSION = "2.5.2";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1909,6 +1909,16 @@
   const bestExpansionCheckpoint = (candidates, resources) => {
     const pressure = expansionPressure();
     if (pressure.score < 0.8) return null;
+    // Food gate: expansion buys population CAPACITY, but every new kitten eats
+    // catnip.  When catnip is already NET-NEGATIVE the colony cannot feed the
+    // kittens it has — growing the cap (and the housing grind that funds it:
+    // diverting farmers→woodcutters and refining catnip→wood) only deepens the
+    // starvation, exactly the death spiral a full-but-starving village showed
+    // (catnip draining at -112/s while a 500K-wood Hut stayed locked in).  Stand
+    // down until food is positive again; the starvation guard re-staffs farmers
+    // and the economy layers can fix catnip storage/production first.  Once
+    // catnip is net-positive (a real surplus to grow into) expansion re-qualifies.
+    if (productionFor("catnip") < 0) return null;
     const options = candidates
       .filter((candidate) => candidate && candidate.kind === "build")
       .map((candidate) => {
