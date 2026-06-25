@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.5.4
+// @version      2.5.5
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.5.4";
+  const HELPER_VERSION = "2.5.5";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1620,6 +1620,7 @@
   let smoothedJobWeights = {};
   let lastJobRun = 0;
   let lastJobLog = 0;
+  let lastStarvationLog = 0;
   let lastJobSignature = "";
   let jobPlanText = "Jobs: waiting…";
   let jobSuppressText = "";
@@ -2080,6 +2081,14 @@
     tickCache.production[resourceName] = result;
     return result;
   };
+
+  // A genuine FOOD EMERGENCY: the pantry is nearly empty AND catnip is still
+  // net-negative, so kittens are dying right now.  Every survival override keys
+  // off this one predicate — the farmer failsafe in desiredJobCounts AND the
+  // job-rebalance throttle bypass in balanceJobs — so the executor can re-staff
+  // farmers on the SAME tick instead of waiting out the 45s anti-churn timer.
+  const isFoodEmergency = (resources) =>
+    !!resources && resRatio(resources, "catnip") < 0.05 && productionFor("catnip") < 0;
 
   const rawPathRequirements = (name, amount, out = {}, depth = 0) => {
     if (depth > 5 || !isFinite(amount) || amount <= 0) return out;
@@ -4944,16 +4953,21 @@
     // runs LAST — after smoothing, deadband and every other adjustment — where
     // nothing downstream can undo it.
     const farmerJob = jobByName("farmer");
-    if (farmerJob && resRatio(resources, "catnip") < 0.05 && productionFor("catnip") < 0) {
+    if (farmerJob && isFoodEmergency(resources)) {
       const liveFarmers = Math.max(0, Math.floor(farmerJob.value || 0));
       const perFarmer = (jobMarginalProductionPerSecond(farmerJob, "catnip") || 0) * catnipWeatherMultiplier();
       const deficit = Math.max(0, -productionFor("catnip"));
       // Farmers needed to cover the live shortfall plus a small buffer to rebuild
-      // the pantry.  Without a live per-farmer signal, fall back to "most of the
-      // village farms" so the deaths still stop.
+      // the pantry.  Then take the MAX with "half the village farms": a single
+      // per-farmer marginal sample can read far too high (one tick of leader/
+      // happiness bonus), which would otherwise size the flood at a couple of
+      // kittens and let the colony keep starving.  Half the village guarantees a
+      // decisive response; it self-corrects up to `total` if still net-negative
+      // next tick, and disengages the moment catnip climbs back above 5%.
       let targetFarmers = perFarmer > 0
         ? liveFarmers + Math.ceil(deficit / perFarmer) + 2
         : Math.ceil(total * 0.7);
+      targetFarmers = Math.max(targetFarmers, Math.ceil(total * 0.5));
       const farmerLimit = village.getJobLimit ? village.getJobLimit("farmer") : Number.POSITIVE_INFINITY;
       targetFarmers = Math.min(targetFarmers, total, isFinite(farmerLimit) ? farmerLimit : total);
       let shortfall = targetFarmers - (desired.farmer || 0);
@@ -4969,6 +4983,10 @@
           shortfall -= take;
         }
         jobPlanText = "Jobs: ⚠ EMERGENCY farming — pantry empty, feeding kittens first";
+        if (Date.now() - lastStarvationLog > 10000) {
+          pushLog(`🚑 Starvation failsafe: farming ${desired.farmer}/${total} kittens (catnip ${fmt(productionFor("catnip"))}/s)`);
+          lastStarvationLog = Date.now();
+        }
       }
     }
     return desired;
@@ -5007,8 +5025,17 @@
       for (const job of jobs) current[job.name] = Math.max(0, Math.floor(job.value || 0));
       const now = Date.now();
       const signature = jobs.map((j) => `${j.name}:${desired[j.name] || 0}`).join("|");
-      if (now - lastJobRun < JOB_REBALANCE_MIN_MS && Math.floor(village.getFreeKittens()) <= 0) return;
-      if (signature === lastJobSignature && Math.floor(village.getFreeKittens()) <= 0) return;
+      // Anti-churn throttle: with no free kittens, normally rebalance at most once
+      // per JOB_REBALANCE_MIN_MS and skip an unchanged plan.  But a FOOD EMERGENCY
+      // cannot wait 45s — that window is exactly long enough for catnip to crash
+      // to 0 and kittens to starve before the executor is allowed to re-staff
+      // farmers.  So the emergency bypasses BOTH guards and re-applies the farmer
+      // failsafe every tick until the pantry climbs back out of the red.
+      const emergency = isFoodEmergency(resources);
+      if (!emergency) {
+        if (now - lastJobRun < JOB_REBALANCE_MIN_MS && Math.floor(village.getFreeKittens()) <= 0) return;
+        if (signature === lastJobSignature && Math.floor(village.getFreeKittens()) <= 0) return;
+      }
       lastJobRun = now;
 
       for (const job of jobs) {
