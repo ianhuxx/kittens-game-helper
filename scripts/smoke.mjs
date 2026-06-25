@@ -935,6 +935,46 @@ const woodcuttersBefore = job("woodcutter").value;
 for (let i = 0; i < 3; i += 1) { fakeNow += 25000; tickFn(); }
 check("jobs: wood starvation guard staffs woodcutters when wood drains (catnip fine)", job("woodcutter").value > woodcuttersBefore);
 
+/* Stage 13a — catnip starvation FAILSAFE: when the pantry is empty AND catnip is
+   net-negative, kittens are dying NOW, so farmers must DOMINATE regardless of
+   competing coal/mineral/faith demand.  Live, a full colony starved 19 kittens to
+   death while 24 Geologists + 16 Priests kept working and a maxed catnip GUARD
+   WEIGHT still only bought a fraction of the village (counts are proportional to
+   the weight sum).  The failsafe is a hard COUNT, not a weight, so it must win.
+   Hermetic: every global it pokes is saved and restored so nothing leaks. */
+const starveSaved = {
+  getKittens: village.getKittens,
+  getFreeKittens: village.getFreeKittens,
+  jobs: jobs.map((j) => [j, j.value]),
+  perTickCatnip: perTick.catnip,
+  res: ["catnip", "coal", "minerals", "faith"].map((n) => [n, res(n).value, res(n).maxValue]),
+};
+for (const j of jobs) j.value = 0;
+job("farmer").value = 22;
+job("geologist").value = 24; // the over-staffed rival from the live death spiral
+job("priest").value = 16;
+job("miner").value = 8;
+job("hunter").value = 2;
+village.getKittens = () => 72;
+village.getFreeKittens = () => 0;
+res("catnip").value = 0;           // pantry empty — kittens starving
+res("catnip").maxValue = 513350;
+perTick.catnip = -28;              // ~ -140/s net, still draining
+res("coal").value = 60; res("coal").maxValue = 14750;          // rival banks NOT full →
+res("minerals").value = 16000; res("minerals").maxValue = 564430; // coal/mineral jobs keep weight
+res("faith").value = 587; res("faith").maxValue = 5500;
+const farmersBeforeStarve = job("farmer").value;
+for (let i = 0; i < 4; i += 1) { fakeNow += 25000; tickFn(); }
+check("jobs: catnip failsafe floods farmers when the pantry is empty and draining",
+  job("farmer").value > farmersBeforeStarve &&
+  job("farmer").value > job("geologist").value + job("priest").value + job("miner").value);
+// Restore everything so later stages see a clean tree.
+village.getKittens = starveSaved.getKittens;
+village.getFreeKittens = starveSaved.getFreeKittens;
+for (const [j, v] of starveSaved.jobs) j.value = v;
+perTick.catnip = starveSaved.perTickCatnip;
+for (const [n, v, m] of starveSaved.res) { res(n).value = v; res(n).maxValue = m; }
+
 /* Stage 13b — diplomacy pressure feeds job balancing: if a queued Zebra trade
    is blocked by catpower, hunters must be staffed even when the visible build
    target is asking for another resource. */

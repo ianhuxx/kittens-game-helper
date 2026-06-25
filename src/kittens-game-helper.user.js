@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.5.2
+// @version      2.5.3
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.5.2";
+  const HELPER_VERSION = "2.5.3";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4914,6 +4914,48 @@
         .map(([name]) => resTitle(resources, name))
         .join(" + ");
       jobPlanText = `Jobs: ${needLine || "balanced"}${target ? ` for ${labelOf(target.meta)}` : ""}`;
+    }
+
+    // ── Starvation FAILSAFE (absolute, plan-independent survival override) ───
+    // Job COUNTS are handed out in proportion to the weight SUM (see the
+    // proportional split above), so even a maxed catnip "guard" weight only buys
+    // a FRACTION of the village once coal/mineral/faith demands pile weight on
+    // too.  That is exactly how a full colony let 19 kittens STARVE TO DEATH
+    // while 24 Geologists and 16 Priests kept working and catnip sat pinned at
+    // 0.  A weight nudge cannot guarantee survival — a hard count must.  When the
+    // pantry is nearly empty AND catnip is still net-negative, kittens are dying
+    // NOW: force enough farmers to flip catnip non-negative (plus a tiny refill
+    // buffer), pulling them from the most-staffed non-farmer jobs.  No building
+    // plan, leader bottleneck or research sprint outranks not starving, so this
+    // runs LAST — after smoothing, deadband and every other adjustment — where
+    // nothing downstream can undo it.
+    const farmerJob = jobByName("farmer");
+    if (farmerJob && resRatio(resources, "catnip") < 0.05 && productionFor("catnip") < 0) {
+      const liveFarmers = Math.max(0, Math.floor(farmerJob.value || 0));
+      const perFarmer = (jobMarginalProductionPerSecond(farmerJob, "catnip") || 0) * catnipWeatherMultiplier();
+      const deficit = Math.max(0, -productionFor("catnip"));
+      // Farmers needed to cover the live shortfall plus a small buffer to rebuild
+      // the pantry.  Without a live per-farmer signal, fall back to "most of the
+      // village farms" so the deaths still stop.
+      let targetFarmers = perFarmer > 0
+        ? liveFarmers + Math.ceil(deficit / perFarmer) + 2
+        : Math.ceil(total * 0.7);
+      const farmerLimit = village.getJobLimit ? village.getJobLimit("farmer") : Number.POSITIVE_INFINITY;
+      targetFarmers = Math.min(targetFarmers, total, isFinite(farmerLimit) ? farmerLimit : total);
+      let shortfall = targetFarmers - (desired.farmer || 0);
+      if (shortfall > 0) {
+        const donors = jobs
+          .filter((job) => job.name !== "farmer")
+          .sort((a, b) => (desired[b.name] || 0) - (desired[a.name] || 0));
+        for (const job of donors) {
+          if (shortfall <= 0) break;
+          const take = Math.min(shortfall, desired[job.name] || 0);
+          desired[job.name] = (desired[job.name] || 0) - take;
+          desired.farmer = (desired.farmer || 0) + take;
+          shortfall -= take;
+        }
+        jobPlanText = "Jobs: ⚠ EMERGENCY farming — pantry empty, feeding kittens first";
+      }
     }
     return desired;
   };
