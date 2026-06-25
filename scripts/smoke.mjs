@@ -2201,6 +2201,89 @@ res("science").value = savedScienceV.value;
 res("science").maxValue = savedScienceV.maxValue;
 
 /* =====================================================================
+ * REGRESSION — power-aware science storage + sticky power recovery (Test Z)
+ * Reproduces the live oscillation the player reported: science is capped
+ * (Biochemistry blocked) AND there is a Wt deficit, while the biggest cap
+ * building (Data Center) is itself a power consumer.  The bot used to keep
+ * targeting that Data Center for science storage; processing then paused it
+ * "protecting Wt" every tick — the Data-Center on/off flicker.  The fix: a
+ * power-negative building is not "actionable" cap-growth while Wt is short,
+ * so the layer grows the cap with a power-neutral building and recovers power
+ * with a committed generator instead of flapping between generators.
+ * =================================================================== */
+const savedPowerZ = { energyProd: gamePage.resPool.energyProd, energyCons: gamePage.resPool.energyCons, energyWinterProd: gamePage.resPool.energyWinterProd };
+const savedScienceZ = { value: res("science").value, maxValue: res("science").maxValue };
+const savedMineralsZ = res("minerals").value;
+res("minerals").value = 1e6;
+const capBlockTechZ = { name: "capBlockTechZ", label: "Biochemistry Z", unlocked: true, researched: false, prices: [{ name: "science", val: 145000 }], unlocks: { tech: ["futureCapTechZ"] } };
+const dataCenterZ = { name: "dataCenterZ", label: "Data Center Z", unlocked: true, val: 4, on: 4, prices: [{ name: "wood", val: 1000 }], priceRatio: 1, effects: { scienceMax: 10000, energyConsumption: 5 } };
+const academyZ = { name: "academyZ", label: "Academy Z", unlocked: true, val: 0, on: 0, prices: [{ name: "minerals", val: 100 }], priceRatio: 1, effects: { scienceMax: 10000 } };
+const magnetoZ = { name: "magnetoZ", label: "Magneto Z", unlocked: true, val: 1, on: 0, prices: [{ name: "minerals", val: 10 }], priceRatio: 1, effects: { energyProduction: 5 } };
+buildings.push(dataCenterZ, academyZ, magnetoZ);
+res("science").value = 105000;
+res("science").maxValue = 105000;
+gamePage.resPool.energyProd = 10;
+gamePage.resPool.energyCons = 12;
+gamePage.resPool.energyWinterProd = 10;
+dbg.forceActiveTarget?.(null); // clear any sticky power-recovery pick
+
+const dcCandZ = { kind: "build", meta: dataCenterZ, affordable: true, progress: 1, score: 10 };
+const acCandZ = { kind: "build", meta: academyZ, affordable: true, progress: 1, score: 10 };
+check("Test Z: power-negative Data Center is unsafe to build during a Wt deficit", dbg.powerSafeToBuild?.(dcCandZ) === false);
+check("Test Z: power-neutral Academy is always safe to build", dbg.powerSafeToBuild?.(acCandZ) === true);
+
+const capCandidatesZ = [
+  { kind: "research", meta: capBlockTechZ, affordable: false, progress: 0.72, score: 50 },
+  dcCandZ,
+  acCandZ,
+];
+const capDecisionZ = dbg.bestScienceStorageUnlock?.(capCandidatesZ);
+check("Test Z: cap-blocked science skips the power-hungry Data Center and grows the cap power-neutrally", capDecisionZ?.target?.meta?.name === "academyZ");
+
+// Once power has real headroom the Data Center is build-safe again.
+gamePage.resPool.energyProd = 100;
+gamePage.resPool.energyCons = 10;
+gamePage.resPool.energyWinterProd = 100;
+check("Test Z: Data Center becomes build-safe again once Wt has headroom", dbg.powerSafeToBuild?.(dcCandZ) === true);
+
+// Latent demand: a Data Center paused only to protect Wt still counts as real
+// power demand, so effective power stays below the raw pool reading and power
+// recovery keeps building generators instead of seeing a false surplus.
+gamePage.resPool.energyProd = 10;
+gamePage.resPool.energyCons = 12;
+gamePage.resPool.energyWinterProd = 10;
+dbg.optimizeProcessing?.("balanced");
+const latentZ = dbg.latentPowerDemand?.();
+const rawZ = dbg.powerStatus?.();
+const effZ = dbg.effectivePowerStatus?.();
+check("Test Z: a paused-for-power Data Center registers latent power demand", latentZ > 0 && (dataCenterZ.on || 0) === 0);
+check("Test Z: effective power subtracts latent demand from the raw pool reading", effZ.delta < rawZ.delta && Math.abs(effZ.delta - (rawZ.delta - latentZ)) < 1e-6);
+
+// Sticky power recovery: the chosen generator must not flap when a rival's live
+// value wobbles inside the hysteresis band, but must switch on a decisive gain.
+const genZ = (name, prod) => ({ kind: "build", meta: { name, label: name, unlocked: true, val: 1, on: 0, prices: [{ name: "minerals", val: 10 }], priceRatio: 1, effects: { energyProduction: prod } }, affordable: true, progress: 1, score: 10 });
+dbg.forceActiveTarget?.(null);
+const powerPick1Z = dbg.bestPowerRecoveryTarget?.([genZ("genAZ", 6), genZ("genBZ", 5)]);
+const powerPick2Z = dbg.bestPowerRecoveryTarget?.([genZ("genAZ", 6), genZ("genBZ", 7)]);
+const powerPick3Z = dbg.bestPowerRecoveryTarget?.([genZ("genAZ", 6), genZ("genBZ", 20)]);
+check("Test Z: power recovery commits within the hysteresis band, switches on a decisive gain", powerPick1Z?.meta?.name === "genAZ" && powerPick2Z?.meta?.name === "genAZ" && powerPick3Z?.meta?.name === "genBZ");
+
+// Diagnostics report is a single comprehensive, copyable block.
+const reportZ = dbg.report?.();
+check("Test Z: diagnostics report bundles plan, power, processing and resources", typeof reportZ === "string" && /— PLAN —/.test(reportZ) && /— POWER —/.test(reportZ) && /— PROCESSING —/.test(reportZ) && /— RESOURCES —/.test(reportZ) && /effective delta/.test(reportZ));
+
+buildings.splice(buildings.indexOf(dataCenterZ), 1);
+buildings.splice(buildings.indexOf(academyZ), 1);
+buildings.splice(buildings.indexOf(magnetoZ), 1);
+res("science").value = savedScienceZ.value;
+res("science").maxValue = savedScienceZ.maxValue;
+res("minerals").value = savedMineralsZ;
+gamePage.resPool.energyProd = savedPowerZ.energyProd;
+gamePage.resPool.energyCons = savedPowerZ.energyCons;
+gamePage.resPool.energyWinterProd = savedPowerZ.energyWinterProd;
+dbg.forceActiveTarget?.(null);
+
+/* =====================================================================
  * REGRESSION — reset-aware expansion checkpoints + visible festivals
  * =================================================================== */
 const savedGetKittensW = village.getKittens;

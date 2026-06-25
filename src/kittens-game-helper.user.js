@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.5.6
+// @version      2.6.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.5.6";
+  const HELPER_VERSION = "2.6.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2746,6 +2746,54 @@
     return !!(r && r.maxValue > 0 && r.value >= r.maxValue * 0.985);
   };
   const pausedProcessors = {};
+
+  // Latent power demand: consumption that is currently OFF *only* because the
+  // processing controller paused it to protect Wt.  The game's energyCons drops
+  // the instant a Data Center / Calciner is idled, so powerStatus() then reports
+  // a FALSE surplus.  Acting on that surplus — building or targeting yet another
+  // power consumer — forces processing to pause it again next tick, which is the
+  // Data-Center on/off oscillation the player sees.  Counting the paused-for-power
+  // consumers gives the planner the TRUE power picture so it keeps recovering
+  // power until everything can actually run, instead of flip-flopping.  Only
+  // reason==="power" pauses count: a converter idled for a starved input or a
+  // capped output is not blocked on Wt, so resuming it is not a power decision.
+  const latentPowerDemand = () => {
+    let demand = 0;
+    try {
+      for (const meta of converterBuildings()) {
+        const memo = pausedProcessors[meta.name];
+        if (!memo || memo.reason !== "power") continue;
+        const profile = processingProfileFor(meta);
+        const perUnitNet = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+        if (perUnitNet < 0) demand += -perUnitNet * Math.max(0, memo.on || meta.val || 0);
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return demand;
+  };
+
+  // powerStatus() minus the latent demand above: the headroom that is REALLY free
+  // once every consumer we paused for power is allowed to run again.  Planning
+  // gates read this so an idled Data Center can't masquerade as spare power.
+  const effectivePowerStatus = () => {
+    const power = powerStatus();
+    const latent = latentPowerDemand();
+    return { ...power, latent, delta: power.delta - latent, winterDelta: power.winterDelta - latent };
+  };
+
+  // A net-power-negative building is only safe to build/target when the truly
+  // free headroom (effective power) still clears the deficit after one more copy
+  // runs.  Positive / neutral-energy buildings are always safe.  Used to keep the
+  // science-storage layer from picking a power-hungry Data Center / Bio Lab while
+  // Wt is short — it would just get paused, stalling both science and power.
+  const powerSafeToBuild = (candidate) => {
+    const net = candidateNetEnergy(candidate);
+    if (net >= 0) return true;
+    const power = effectivePowerStatus();
+    return power.delta + net >= TUNING.powerHeadroom && power.winterDelta + net >= 0;
+  };
+
   let processingPlanText = "Processing: watching converters";
   let lastProcessingLog = 0;
   // Two thresholds give the on/off controller hysteresis so it cannot flap a
@@ -2839,7 +2887,7 @@
   const reservedHoldFor = (reserved, input) =>
     (reserved[input] || 0) || (input === "manpower" ? reserved.catpower || 0 : input === "catpower" ? reserved.manpower || 0 : 0);
 
-  const desiredProcessorState = (meta, resources, missing, needed, reserved) => {
+  const desiredProcessorState = (meta, resources, missing, needed, reserved, powerOverride) => {
     const name = meta.name;
     const profile = processingProfileFor(meta);
     // Keep only real resources: a live effect can list a pseudo-output such as
@@ -2855,7 +2903,10 @@
     const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
     const usefulOutputs = outputs.filter((output) => needed.has(output));
     const healthyInputs = inputs.length && inputs.every((input) => resRatio(resources, input, 1) >= 0.85 || productionFor(input) > 0);
-    const power = powerStatus();
+    // powerOverride lets optimizeProcessing thread a running projection through the
+    // pass: the game's energyCons can lag a tick, so without it several consumers
+    // would all resume off the same stale "safe" reading and oversubscribe Wt.
+    const power = powerOverride || powerStatus();
     const netEnergy = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
     const powerEmergency = power.delta < 0 || power.winterDelta < 0;
     const hardStarvedInputs = inputs.filter((input) => resRatio(resources, input, 1) < lowRatio && productionFor(input) <= 0);
@@ -2931,11 +2982,23 @@
       const needed = target ? resourcesNeededForTarget(target, resources) : new Set();
       const reserved = target ? reservedNeedsFor(target, resources) : {};
       const changed = [];
+      // Running power projection for THIS pass.  Each toggle advances it by the
+      // marginal Wt it changes, so a later converter sees power as it will be
+      // after the earlier toggles in the same pass — not the stale start-of-pass
+      // reading the game's pool may still report.  This stops several consumers
+      // all resuming off one "safe" snapshot and oversubscribing Wt.
+      let projected = powerStatus();
+      const advanceProjection = (meta, fromOn, toOn) => {
+        const profile = processingProfileFor(meta);
+        const perUnitNet = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+        const deltaWt = (toOn - fromOn) * perUnitNet;
+        projected = { ...projected, delta: projected.delta + deltaWt, winterDelta: projected.winterDelta + deltaWt };
+      };
 
       for (const meta of converters) {
         const name = meta.name;
         const currentOn = Math.max(0, meta.on || 0);
-        const state = desiredProcessorState(meta, resources, missing, needed, reserved);
+        const state = desiredProcessorState(meta, resources, missing, needed, reserved, projected);
         const transition = processorTransitions[name] || { state: currentOn > 0 ? "run" : "pause", at: 0 };
         const desiredMode = state.on > 0 ? "run" : "pause";
         if (transition.at > 0 && transition.state !== desiredMode) {
@@ -2952,6 +3015,7 @@
             if (setProcessorOn(meta, 0)) {
               processorTransitions[name] = { state: "pause", at: Date.now() };
               changed.push(`paused ${labelOf(meta)}${state.detail ? ` (${state.detail})` : ""}`);
+              advanceProjection(meta, currentOn, 0);
             }
           } else if (pausedProcessors[name]) {
             // Keep remembering why it is off so hysteresis/reporting hold.
@@ -2961,6 +3025,7 @@
           if (setProcessorOn(meta, state.on)) {
             processorTransitions[name] = { state: "run", at: Date.now() };
             changed.push(pausedProcessors[name] ? `resumed ${labelOf(meta)}` : `started ${labelOf(meta)}`);
+            advanceProjection(meta, currentOn, state.on);
           }
           delete pausedProcessors[name];
         } else if (pausedProcessors[name]) {
@@ -3218,9 +3283,22 @@
 
   let lastStrategicDecision = null;
 
+  // Sticky power-recovery choice.  net÷ETA is the right ranking (fastest Wt per
+  // second of wait), but ETA rides live trade luck and craft progress, so the raw
+  // winner wobbles between e.g. Solar Farm and Magneto every tick — the plan then
+  // flaps and finishes neither.  We commit to the prior generator while it stays
+  // a valid option and only switch when a rival is materially better, mirroring
+  // the science-storage commit.
+  let activePowerRecoveryId = null;
   const bestPowerRecoveryTarget = (candidates, resources) => {
-    const power = powerStatus();
-    if (power.delta >= TUNING.powerHeadroom && power.winterDelta >= 0) return null;
+    // Gate on EFFECTIVE power (raw minus the demand of consumers we paused only to
+    // protect Wt).  Without this, the instant processing idles a Data Center the
+    // raw delta turns positive, this layer yields, the science-storage layer picks
+    // that very Data Center, processing pauses it again → oscillation.  Effective
+    // power stays in deficit until enough generation exists to run everything, so
+    // we keep recovering power continuously instead of bouncing.
+    const power = effectivePowerStatus();
+    if (power.delta >= TUNING.powerHeadroom && power.winterDelta >= 0) { activePowerRecoveryId = null; return null; }
     const options = (candidates || [])
       .filter((candidate) => candidate && candidateNetEnergy(candidate) > 0)
       .filter((candidate) => directStorageBlockers(candidate.kind, candidate.meta, resources).length === 0)
@@ -3232,7 +3310,12 @@
       })
       .filter((option) => isFinite(option.value) && option.value > 0)
       .sort((a, b) => b.value - a.value || b.net - a.net || a.eta - b.eta);
-    return options.length ? options[0].candidate : null;
+    if (!options.length) { activePowerRecoveryId = null; return null; }
+    const best = options[0];
+    const prior = activePowerRecoveryId && options.find((option) => targetId(option.candidate) === activePowerRecoveryId);
+    const chosen = prior && best.value <= prior.value * 1.25 ? prior : best;
+    activePowerRecoveryId = targetId(chosen.candidate);
+    return chosen.candidate;
   };
 
   const resValueOf = (resources, name) => ((getRes(resources, name) || {}).value) || 0;
@@ -3714,6 +3797,12 @@
       .filter((candidate) => targetId(candidate) !== targetId(blocked))
       .filter((candidate) => scienceStorageUnlockCandidate(candidate, resources))
       .filter((candidate) => !directStorageBlockers(candidate.kind, candidate.meta, resources).length)
+      // A power-hungry cap building (Data Center, Bio Lab) is no use while Wt is
+      // short: the processing controller pauses it on sight, so it grows neither
+      // science nor anything else.  Prefer a power-neutral Library/Academy/
+      // Observatory; if none is actionable the layer yields and power recovery
+      // (which already outranks this layer) keeps building generators first.
+      .filter((candidate) => powerSafeToBuild(candidate))
       .map((candidate) => ({ candidate, ...projectScienceClosure(candidate, need, resources), wait: waitSecondsForCandidate(candidate, resources) }))
       .filter((item) => item.reachable && isFinite(item.eta));
     if (!options.length) { activeScienceUnlockId = null; activeScienceUnlockContext = null; return null; }
@@ -6884,6 +6973,91 @@
     renderLog();
   };
 
+  // One-shot diagnostics dump for debugging "why did the bot just do X?".  The
+  // panel shows only a few live lines and the game page itself can't be fully
+  // copied, so this assembles the WHOLE decision picture — plan, power (including
+  // the latent demand of consumers paused to protect Wt), per-converter
+  // processing state, every subsystem line, a full resource snapshot, the ranked
+  // candidate list and the recent action log — into one clipboard-friendly block.
+  // Exposed on the panel Copy button and as window.__kghDebug.report().
+  const buildDiagnosticsReport = () => {
+    const lines = [];
+    const push = (text) => lines.push(text);
+    try {
+      const goal = getGoal();
+      resetTickCache();
+      const resources = resourceMap();
+      getTargetCached(resources, goal);
+      const cal = (window.gamePage && window.gamePage.calendar) || {};
+      const seasonTitle = (cal.seasons && cal.seasons[cal.season] && cal.seasons[cal.season].title) || cal.season;
+      const kittens = getRes(resources, "kittens");
+      push(`🐱 Kittens Helper v${HELPER_VERSION} — diagnostics @ ${new Date().toLocaleString()}`);
+      if (isFinite(cal.year)) push(`Game: Year ${cal.year} — ${seasonTitle}, day ${Math.floor(cal.day || 0)} · ${kittens ? fmt(kittens.value) : "?"} kittens`);
+      push("");
+      push("— PLAN —");
+      push(`Bottleneck: ${getBottleneck(resources)}`);
+      push(`Next science: ${getNextScience(resources, goal)}`);
+      push(getPlanLine(resources, goal).replace(/\n/g, " · "));
+      push(`Now: ${getNowAction(resources, goal)}`);
+      const details = getAutomationDetailsLine(resources, goal);
+      if (details) push(details);
+      push("");
+      const power = powerStatus();
+      const eff = effectivePowerStatus();
+      push("— POWER —");
+      push(`prod ${fmt(power.prod)} · cons ${fmt(power.cons)} · delta ${fmt(power.delta)} Wt · winter ${fmt(power.winterDelta)} Wt`);
+      push(`latent paused-for-power demand ${fmt(eff.latent)} Wt → effective delta ${fmt(eff.delta)} Wt (winter ${fmt(eff.winterDelta)} Wt)`);
+      push("");
+      push("— PROCESSING —");
+      push(processingPlanText);
+      for (const meta of converterBuildings()) {
+        const profile = processingProfileFor(meta);
+        const net = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+        const memo = pausedProcessors[meta.name];
+        push(`  ${labelOf(meta)}: on ${meta.on || 0}/${meta.val || 0} · net ${fmt(net)} Wt/ea${memo ? ` · paused (${memo.reason})` : ""}`);
+      }
+      push("");
+      push("— SUBSYSTEMS —");
+      push(`Jobs: ${jobPlanText}${jobSuppressText ? ` · ${jobSuppressText}` : ""}`);
+      push(`Craft: ${craftPlanText} · ${overflowPlanText}`);
+      push(`Buy: ${buyPlanText}`);
+      push(`Leader: ${leaderPlanText}`);
+      push(`Reserve: ${reservePlanText}`);
+      push(`Religion: ${religionPlanText}`);
+      push(`Festival: ${festivalPlanText}`);
+      push(`Diplomacy: ${diplomacyPlanText}`);
+      push("");
+      push("— RESOURCES —");
+      try {
+        for (const r of ((window.gamePage && window.gamePage.resPool && window.gamePage.resPool.resources) || [])) {
+          if (!r || r.unlocked === false || (!(r.value > 0) && !(r.maxValue > 0))) continue;
+          const rate = productionFor(r.name);
+          const cap = r.maxValue > 0 ? `/${fmt(r.maxValue)}` : "";
+          const rateText = isFinite(rate) && rate !== 0 ? ` ${rate > 0 ? "+" : ""}${fmt(rate)}/s` : "";
+          push(`  ${r.title || r.name}: ${fmt(r.value)}${cap}${rateText}`);
+        }
+      } catch (error) {
+        push("  (resource snapshot unavailable)");
+      }
+      push("");
+      push("— TOP CANDIDATES —");
+      try {
+        const candidates = getCandidatesCached(resources, goal) || [];
+        for (const candidate of candidates.slice(0, 8)) {
+          push(`  ${labelOf(candidate.meta)} [${candidate.kind}] score ${fmt(candidate.score || 0)} ETA ${formatEta(waitSecondsForCandidate(candidate, resources))}${candidate.affordable ? " · ready" : ""}`);
+        }
+      } catch (error) {
+        push("  (candidate list unavailable)");
+      }
+      push("");
+      push(`— RECENT ACTIONS (${Math.min(actionLog.length, LOG_DISPLAY_LIMIT)}) —`);
+      push(actionLog.slice(0, LOG_DISPLAY_LIMIT).join("\n") || "(none yet)");
+    } catch (error) {
+      push(`(diagnostics error: ${error && error.message})`);
+    }
+    return lines.join("\n");
+  };
+
   // Recent-action logging is action-scoped, not tick-scoped: every automation
   // click/craft/trade/hunt takes a resource snapshot immediately before and
   // after that exact operation.  This prevents same-tick side effects (hunters,
@@ -7615,7 +7789,7 @@
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
       '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
       '</div></details>',
-      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px;display:flex;justify-content:space-between;align-items:center"><span>Recent actions:</span><button type="button" class="kgh-hbtn kgh-log-copy" title="Copy the recent action log for debugging">Copy</button></div>',
+      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px;display:flex;justify-content:space-between;align-items:center"><span>Recent actions:</span><button type="button" class="kgh-hbtn kgh-log-copy" title="Copy a full diagnostics report (plan, power, processing, resources, candidates, log) for debugging">Copy</button></div>',
       '<pre class="kgh-log" style="margin:0;max-height:260px;white-space:pre-wrap;' +
         'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
       "</div>",
@@ -7665,10 +7839,13 @@
     if (logCopyBtn) {
       logCopyBtn.addEventListener("click", () => {
         try {
-          const text = actionLog.slice(0, LOG_DISPLAY_LIMIT).join("\n");
+          // Copy the FULL diagnostics report (plan + power + processing + resources
+          // + candidates + log), not just the visible log, so a single click hands
+          // over everything needed to debug a run.
+          const text = buildDiagnosticsReport();
           if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(text);
-            logCopyBtn.textContent = "Copied";
+            logCopyBtn.textContent = "Copied report";
             setTimeout(() => { logCopyBtn.textContent = "Copy"; }, 1500);
           }
         } catch (error) {
@@ -7796,6 +7973,7 @@
       activeSprint = null;
       activeScienceUnlockId = null;
       activeScienceUnlockContext = null;
+      activePowerRecoveryId = null;
       activeTarget = candidate ? {
         id: targetId(candidate),
         startedAt: Date.now(),
@@ -7821,9 +7999,13 @@
     metaEffectProfile,
     candidateEffectProfile,
     powerStatus,
+    effectivePowerStatus,
+    latentPowerDemand,
+    powerSafeToBuild,
     profileNetEnergy,
     candidateNetEnergy,
     isPowerEmergency,
+    report: () => buildDiagnosticsReport(),
     candidateScore(candidate, goalKey = getGoal()) {
       resetTickCache();
       return candidateScore(candidate, resourceMap(), GOALS[goalKey], goalKey);
@@ -7869,6 +8051,10 @@
     bestScienceStorageUnlock(candidates) {
       resetTickCache();
       return bestScienceStorageUnlock(candidates, resourceMap());
+    },
+    bestPowerRecoveryTarget(candidates) {
+      resetTickCache();
+      return bestPowerRecoveryTarget(candidates, resourceMap());
     },
     expansionPressure,
     bestExpansionCheckpoint(goalKey = getGoal()) {
