@@ -1626,6 +1626,62 @@ village.getKittens = e2Saved.getKittens; village.maxKittens = e2Saved.maxKittens
 job("priest").value = e2Saved.priest;
 
 /* ---------------------------------------------------------------------
+ * Test E3 — faith banking stands down when a far-off NON-faith cost is the
+ * real gate.  Live (v2.6.0), Apocrypha needed ~5K faith AND ~5K gold while
+ * gold trickled in at +0.3/s; faith was already ~79% there, so ~11 Priests
+ * filled the faith bank to its cap with nothing to spend it on (praise is held
+ * for a pending upgrade).  Faith must be a job need ONLY when faith is the
+ * binding constraint; the moment the non-faith gate clears, priests resume.
+ * ------------------------------------------------------------------- */
+const e3Saved = {
+  techFlags: techs.map((t) => [t, t.researched]),
+  rel0: [religionUpgrades[0].researched, religionUpgrades[0].on, religionUpgrades[0].val],
+  rel1: { researched: religionUpgrades[1].researched, on: religionUpgrades[1].on, val: religionUpgrades[1].val, prices: religionUpgrades[1].prices, faith: religionUpgrades[1].faith },
+  worship: gamePage.religion.faith,
+  faith: [res("faith").value, res("faith").maxValue],
+  gold: [res("gold").value, res("gold").maxValue],
+  wood: [res("wood").value, res("wood").maxValue],
+  catnip: [res("catnip").value, res("catnip").maxValue],
+  perTickCatnip: perTick.catnip,
+  priest: job("priest").value,
+};
+for (const t of techs) t.researched = true;                  // no research sprint owns the plan
+religionUpgrades[0].researched = true; religionUpgrades[0].on = 1; // Solar Chant done → not pending
+gamePage.religion.faith = 5000;                              // worship high → Solar Revolution visible
+religionUpgrades[1].researched = false; religionUpgrades[1].on = 0; religionUpgrades[1].val = 0;
+religionUpgrades[1].faith = 1000;                            // visibility threshold (worship 5000 >= 1000)
+religionUpgrades[1].prices = [{ name: "gold", val: 5000 }, { name: "faith", val: 5000 }]; // Apocrypha-shaped
+res("faith").value = 3900; res("faith").maxValue = 5500;     // 78% of the faith cost
+res("catnip").value = 3500; res("catnip").maxValue = 5000; perTick.catnip = 8; // food healthy
+res("wood").value = 50; res("wood").maxValue = 200000;       // a plain non-faith build target exists
+// Pin the active plan to a wood building so the religion upgrade itself is not the
+// target (isolating the faith-banking layer under test from generic target costs).
+const e3Target = dbg.candidateById("build:hut") || dbg.candidateById("build:library");
+res("gold").value = 5; res("gold").maxValue = 6880;          // gold ~0.1% of cost → far-off gate
+dbg.forceActiveTarget(e3Target);
+const e3GoldGated = dbg.resourceNeeds("balanced");
+check("Test E3: faith is NOT a job need while the upgrade is gated on a far-off gold cost", (e3GoldGated.needs.faith || 0) === 0);
+check("Test E3: the real bottleneck (gold) is still surfaced as a need", (e3GoldGated.needs.gold || 0) > 0);
+// Clear the gold gate → faith becomes the binding constraint → priests resume.
+res("gold").value = 5000;
+dbg.forceActiveTarget(e3Target);
+const e3FaithBinding = dbg.resourceNeeds("balanced");
+check("Test E3: faith resumes as a job need once it is the binding constraint", (e3FaithBinding.needs.faith || 0) > 0);
+// Restore.
+for (const [t, r] of e3Saved.techFlags) t.researched = r;
+[religionUpgrades[0].researched, religionUpgrades[0].on, religionUpgrades[0].val] = e3Saved.rel0;
+religionUpgrades[1].researched = e3Saved.rel1.researched; religionUpgrades[1].on = e3Saved.rel1.on; religionUpgrades[1].val = e3Saved.rel1.val;
+religionUpgrades[1].prices = e3Saved.rel1.prices; religionUpgrades[1].faith = e3Saved.rel1.faith;
+gamePage.religion.faith = e3Saved.worship;
+res("faith").value = e3Saved.faith[0]; res("faith").maxValue = e3Saved.faith[1];
+res("gold").value = e3Saved.gold[0]; res("gold").maxValue = e3Saved.gold[1];
+res("wood").value = e3Saved.wood[0]; res("wood").maxValue = e3Saved.wood[1];
+res("catnip").value = e3Saved.catnip[0]; res("catnip").maxValue = e3Saved.catnip[1];
+perTick.catnip = e3Saved.perTickCatnip;
+job("priest").value = e3Saved.priest;
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
  * Test F — Auto-hunt fires at the chain threshold for the sprint
  * ------------------------------------------------------------------- */
 setupAcoustics();
@@ -2269,8 +2325,25 @@ const powerPick3Z = dbg.bestPowerRecoveryTarget?.([genZ("genAZ", 6), genZ("genBZ
 check("Test Z: power recovery commits within the hysteresis band, switches on a decisive gain", powerPick1Z?.meta?.name === "genAZ" && powerPick2Z?.meta?.name === "genAZ" && powerPick3Z?.meta?.name === "genBZ");
 
 // Diagnostics report is a single comprehensive, copyable block.
+// New census sections (v2.7.0): per-building count + next incremental cost, the
+// pending-workshop list with its lock/requirement, and a job census so "why are
+// N kittens on Priest?" is answerable straight from the dump.  Force a known
+// locked workshop upgrade with an un-researched gate so the assertions are stable
+// regardless of which upgrades earlier scenarios flipped to researched.
+const printingPressZ = gamePage.workshop.get("printingPress");
+const machineryZ = techs.find((t) => t.name === "machinery");
+const savedWorkshopZ = { researched: printingPressZ.researched, unlocked: printingPressZ.unlocked, machinery: machineryZ.researched };
+printingPressZ.researched = false; printingPressZ.unlocked = false; machineryZ.researched = false;
+const libraryZ = buildings.find((b) => b.name === "library");
+const savedLibraryZ = libraryZ.val;
+libraryZ.val = 3;
 const reportZ = dbg.report?.();
 check("Test Z: diagnostics report bundles plan, power, processing and resources", typeof reportZ === "string" && /— PLAN —/.test(reportZ) && /— POWER —/.test(reportZ) && /— PROCESSING —/.test(reportZ) && /— RESOURCES —/.test(reportZ) && /effective delta/.test(reportZ));
+check("Test Z: report adds a BUILDINGS census with counts and next cost", /— BUILDINGS .*—/.test(reportZ) && /Library ×3.*· next .*Wood/.test(reportZ));
+check("Test Z: report adds a WORKSHOP section listing the locked upgrade and its gate", /— WORKSHOP .*—/.test(reportZ) && /Printing Press · LOCKED — needs Machinery/.test(reportZ));
+check("Test Z: report adds a job census line", /census: /.test(reportZ));
+printingPressZ.researched = savedWorkshopZ.researched; printingPressZ.unlocked = savedWorkshopZ.unlocked;
+machineryZ.researched = savedWorkshopZ.machinery; libraryZ.val = savedLibraryZ;
 
 buildings.splice(buildings.indexOf(dataCenterZ), 1);
 buildings.splice(buildings.indexOf(academyZ), 1);

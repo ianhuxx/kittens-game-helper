@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.6.0
+// @version      2.7.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.6.0";
+  const HELPER_VERSION = "2.7.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4602,11 +4602,19 @@
       }
       const noProgress = now - (activeTarget.lastProgressAt || activeTarget.startedAt) > TARGET_LOCK_MAX_MS;
       const manualQueueChanged = activeTarget.queueSignature !== JSON.stringify(readQueue());
-      const emergency = (resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0) || isPowerEmergency();
       const feasibility = locked ? classifyTargetFeasibility(locked, resources) : { status: FEASIBILITY.IMPOSSIBLE };
       const impossible = locked && feasibility.status === FEASIBILITY.IMPOSSIBLE;
       const completed = locked && targetComplete(locked);
       const same = locked && preferred && targetId(locked) === targetId(preferred);
+      // An emergency only matters if it would actually CHANGE the target.  A
+      // chronic small power deficit (or a same-target catnip dip) used to break
+      // the lock every tick when the planner just re-locked the SAME target — e.g.
+      // a manual-queue pick the emergency can never switch away from — spamming
+      // "Plan switch accepted: emergency" and resetting the no-progress timer each
+      // tick.  Gate it on `!same` so a genuine emergency that surfaces a different
+      // target (a generator taking over) still breaks the lock as before.
+      const emergency = !same &&
+        ((resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0) || isPowerEmergency());
       const structuralLayerTakeover = preferred && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock &&
         activeTarget.layer !== STRATEGIC_LAYERS.scienceStorageUnlock;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
@@ -4821,11 +4829,36 @@
     const foodStressed = productionFor("catnip") < 0 && resRatio(resources, "catnip") < 0.5;
     const allowFaithBanking = !foodStressed || targetNeedsFaith;
     const religionTarget = allowFaithBanking ? nextFaithReligionUpgrade(resources) : null;
+    // Faith is only worth banking while it is the LIMITING cost of the pending
+    // upgrade.  Live, Apocrypha needs ~5K faith AND ~5K gold while gold trickles
+    // in at +0.3/s; faith was already 79% there, so filling it first just pinned
+    // the bank at the cap with nothing to spend it on (praise is held for a
+    // pending upgrade) while ~11 Priests ran for nothing.  When a far-off
+    // non-faith cost is the real gate, priests stand down and let it resolve;
+    // faith banking resumes the moment faith becomes the binding constraint.
+    let faithIsBinding = true;
     if (religionTarget && !religionTarget.affordable) {
-      for (const cost of pricesFor("religion", religionTarget.meta)) {
-        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-        const have = ((getRes(resources, cost.name) || {}).value) || 0;
-        if (have < cost.val) scoreNeed(needs, cost.name, cost.name === "faith" ? 10 : 4);
+      const upgradeCosts = pricesFor("religion", religionTarget.meta)
+        .filter((cost) => cost && cost.name && isFinite(cost.val) && cost.val > 0);
+      const ratioOf = (cost) => resValueOf(resources, cost.name) / cost.val;
+      const faithCost = upgradeCosts.find((cost) => cost.name === "faith");
+      const nonFaithMinRatio = upgradeCosts
+        .filter((cost) => cost.name !== "faith")
+        .reduce((min, cost) => Math.min(min, ratioOf(cost)), 1);
+      faithIsBinding = !faithCost || ratioOf(faithCost) <= nonFaithMinRatio + 0.15;
+      for (const cost of upgradeCosts) {
+        if (resValueOf(resources, cost.name) >= cost.val) continue;
+        if (cost.name === "faith") {
+          if (faithIsBinding) scoreNeed(needs, "faith", 10);
+        } else {
+          scoreNeed(needs, cost.name, 4);
+        }
+      }
+      if (!faithIsBinding && jobByName("priest")) {
+        const gate = upgradeCosts
+          .filter((cost) => cost.name !== "faith" && resValueOf(resources, cost.name) < cost.val)
+          .map((cost) => resTitle(resources, cost.name)).join("/") || "another cost";
+        jobSuppressText = `Suppressed: faith banked enough — ${labelOf(religionTarget.meta)} is gated on ${gate}, not faith`;
       }
     } else if (!allowFaithBanking && jobByName("priest")) {
       jobSuppressText = "Suppressed: faith banking while catnip is net-negative (food first)";
@@ -4846,7 +4879,7 @@
     // bank with compounding religion value.  Keep a small live-data baseline
     // when priests exist and faith has storage headroom; the cap check below
     // still removes the need the moment the actual bar is full.
-    if (allowFaithBanking && jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
+    if (allowFaithBanking && faithIsBinding && jobByName("priest") && resRatio(resources, "faith", 1) < 0.9) scoreNeed(needs, "faith", 2);
 
     // Include the same immediate diplomacy work the executor will try later in
     // the tick.  Trade routes and explorers are resource sinks just like a
@@ -6973,6 +7006,87 @@
     renderLog();
   };
 
+  // --- diagnostics census helpers --------------------------------------------
+  // The player asked the diagnostics dump to also show, per building, how many
+  // are built and what the NEXT one costs, plus which workshop upgrades are still
+  // locked and what gates them.  Everything reads LIVE (active-stage prices via
+  // pricesFor / evaluate), so the numbers match exactly what the game shows.
+  const formatPriceList = (resources, kind, meta) => {
+    const prices = pricesFor(kind, meta).filter((p) => p && p.name && isFinite(p.val) && p.val > 0);
+    if (!prices.length) return "free";
+    return prices.map((p) => `${fmt(p.val)} ${resTitle(resources, p.name)}`).join(", ");
+  };
+
+  const buildingsReportLines = (resources) => {
+    const lines = [];
+    for (const meta of buildingMetas()) {
+      if (!meta || !meta.name || isDeniedKey(meta.name)) continue; // never advertise resets etc.
+      const live = liveMetaView(meta) || meta;
+      if (live.unlocked === false) continue; // unlocked (visible) buildings only
+      const val = live.val || 0;
+      const on = live.on;
+      const onText = on != null && on !== val ? ` (${fmt(on)} on)` : "";
+      const ev = evaluate("build", meta, resources);
+      const status = ev.affordable ? "buildable now" : (ev.missing ? `need ${ev.missing}` : "—");
+      lines.push(`  ${labelOf(meta)} ×${fmt(val)}${onText} · next ${formatPriceList(resources, "build", meta)} · ${status}`);
+    }
+    return lines;
+  };
+
+  // Which still-unsatisfied tech / upgrade / building grants a locked workshop
+  // upgrade (walks every unlocks.upgrades list and prefers an un-done gate so the
+  // report names the actual blocker, not an already-finished one).
+  const upgradeUnlockGate = (upgradeName) => {
+    try {
+      const game = window.gamePage;
+      const sources = [];
+      const collect = (list, doneOf, kind) => {
+        for (const item of list || []) {
+          const ups = (item && item.unlocks && item.unlocks.upgrades) || [];
+          if (ups.includes(upgradeName)) sources.push({ label: labelOf(item), done: doneOf(item), kind });
+        }
+      };
+      collect((game.science && game.science.techs) || [], (t) => !!t.researched, "tech");
+      collect((game.workshop && game.workshop.upgrades) || [], (u) => !!u.researched, "upgrade");
+      collect(buildingMetas(), (b) => (b.val || 0) > 0, "building");
+      return sources.find((s) => !s.done) || sources[0] || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const workshopReportLines = (resources) => {
+    const lines = [];
+    const upgrades = (window.gamePage && window.gamePage.workshop && window.gamePage.workshop.upgrades) || [];
+    for (const u of upgrades) {
+      if (!u || !u.name || u.researched) continue; // pending (unresearched) upgrades only
+      if (u.unlocked === false) {
+        const gate = upgradeUnlockGate(u.name);
+        lines.push(`  ${labelOf(u)} · LOCKED${gate ? ` — needs ${gate.label}` : ""} · costs ${formatPriceList(resources, "upgrade", u)}`);
+      } else {
+        const ev = evaluate("upgrade", u, resources);
+        lines.push(`  ${labelOf(u)} · ${ev.affordable ? "READY now" : `need ${ev.missing || "—"}`} · costs ${formatPriceList(resources, "upgrade", u)}`);
+      }
+    }
+    return lines;
+  };
+
+  // Live job census so the report explains "why are N kittens on Priest?" — the
+  // counts plus the Jobs need line (and any jobSuppressText) tell the whole story.
+  const jobsReportLine = () => {
+    try {
+      const village = window.gamePage.village;
+      const parts = (village.jobs || [])
+        .filter((j) => j && j.unlocked !== false && (j.value || 0) > 0)
+        .map((j) => `${j.title || j.name} ${fmt(j.value || 0)}`);
+      const free = village.getFreeKittens ? Math.max(0, Math.floor(village.getFreeKittens())) : 0;
+      const leader = village.leader ? ` · leader ${village.leader.name || "?"}` : "";
+      return `${parts.join(" · ") || "(none assigned)"}${free > 0 ? ` · free ${free}` : ""}${leader}`;
+    } catch (error) {
+      return "(job census unavailable)";
+    }
+  };
+
   // One-shot diagnostics dump for debugging "why did the bot just do X?".  The
   // panel shows only a few live lines and the game page itself can't be fully
   // copied, so this assembles the WHOLE decision picture — plan, power (including
@@ -7019,6 +7133,7 @@
       push("");
       push("— SUBSYSTEMS —");
       push(`Jobs: ${jobPlanText}${jobSuppressText ? ` · ${jobSuppressText}` : ""}`);
+      push(`  census: ${jobsReportLine()}`);
       push(`Craft: ${craftPlanText} · ${overflowPlanText}`);
       push(`Buy: ${buyPlanText}`);
       push(`Leader: ${leaderPlanText}`);
@@ -7038,6 +7153,24 @@
         }
       } catch (error) {
         push("  (resource snapshot unavailable)");
+      }
+      push("");
+      push("— BUILDINGS (count · next incremental cost) —");
+      try {
+        const lines2 = buildingsReportLines(resources);
+        if (lines2.length) for (const line of lines2) push(line);
+        else push("  (no buildings unlocked)");
+      } catch (error) {
+        push("  (building census unavailable)");
+      }
+      push("");
+      push("— WORKSHOP (pending upgrades · lock/requirement) —");
+      try {
+        const lines3 = workshopReportLines(resources);
+        if (lines3.length) for (const line of lines3) push(line);
+        else push("  (all unlocked upgrades researched)");
+      } catch (error) {
+        push("  (workshop census unavailable)");
       }
       push("");
       push("— TOP CANDIDATES —");
