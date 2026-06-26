@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.7.0
+// @version      2.8.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.7.0";
+  const HELPER_VERSION = "2.8.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1908,6 +1908,20 @@
   const isPowerEmergency = () => {
     const power = powerStatus();
     return power.delta < 0 || power.winterDelta < 0;
+  };
+
+  // Does building this candidate actually relieve a FOOD crisis?  True when it
+  // adds catnip production, catnip storage, a catnip production multiplier, or
+  // cuts catnip demand.  Used so a transient winter catnip dip (already handled
+  // by the farmer failsafe) can only break the plan lock to switch toward a
+  // catnip building — never to ping-pong between unrelated targets.
+  const foodHelpingCandidate = (candidate) => {
+    if (!candidate || !candidate.meta) return false;
+    const profile = metaEffectProfile(candidate.meta);
+    return (profile.perTick.catnip || 0) > 0 ||
+      (profile.max.catnip || 0) > 0 ||
+      (profile.ratio.catnip || 0) > 0 ||
+      (profile.demand.catnip || 0) < 0;
   };
 
   const metaEffectProfile = (meta) => {
@@ -4606,15 +4620,23 @@
       const impossible = locked && feasibility.status === FEASIBILITY.IMPOSSIBLE;
       const completed = locked && targetComplete(locked);
       const same = locked && preferred && targetId(locked) === targetId(preferred);
-      // An emergency only matters if it would actually CHANGE the target.  A
-      // chronic small power deficit (or a same-target catnip dip) used to break
-      // the lock every tick when the planner just re-locked the SAME target — e.g.
-      // a manual-queue pick the emergency can never switch away from — spamming
-      // "Plan switch accepted: emergency" and resetting the no-progress timer each
-      // tick.  Gate it on `!same` so a genuine emergency that surfaces a different
-      // target (a generator taking over) still breaks the lock as before.
-      const emergency = !same &&
-        ((resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0) || isPowerEmergency());
+      // An emergency may only BREAK a held plan to switch to a target that
+      // actually ADDRESSES it.  Two failure modes this guards against, both seen
+      // live as a 2-second plan ping-pong that finished nothing:
+      //   • a transient winter catnip dip (already handled by the farmer
+      //     failsafe) was unlocking the plan every tick even though the rival
+      //     target — Magneto / Hut / Bio Lab — does nothing for food;
+      //   • an EFFECTIVE-only power dip (raw Wt is fine, Data Centers are merely
+      //     paused) is NOT a real emergency — isPowerEmergency reads RAW power, so
+      //     it stays false here and the held plan no longer flaps to the power
+      //     layer and back.
+      // A genuine raw-power deficit still hands the plan to a generator, and a
+      // real food crisis still hands it to a catnip building.
+      const catnipEmergency = resRatio(resources, "catnip", 1) < 0.08 && productionFor("catnip") < 0;
+      const emergency = !same && (
+        (catnipEmergency && foodHelpingCandidate(preferred)) ||
+        (isPowerEmergency() && candidateNetEnergy(preferred) > 0)
+      );
       const structuralLayerTakeover = preferred && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock &&
         activeTarget.layer !== STRATEGIC_LAYERS.scienceStorageUnlock;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
@@ -8100,22 +8122,31 @@
     queueAdd: (id, val) => queueAdd(id, val),
     queueRemove: (id) => queueRemove(id),
     queueClear: () => writeQueue([]),
-    forceActiveTarget(candidate) {
+    forceActiveTarget(candidate, layer = null, ageMs = 0) {
       // A debug/manual target override resets ALL locks so the planner starts
-      // from a clean state (mirrors an explicit player priority change).
+      // from a clean state (mirrors an explicit player priority change).  Tests
+      // may pass a layer and a synthetic age to exercise the lock-hold paths.
       activeSprint = null;
       activeScienceUnlockId = null;
       activeScienceUnlockContext = null;
       activePowerRecoveryId = null;
+      const startedAt = Date.now() - Math.max(0, ageMs);
       activeTarget = candidate ? {
         id: targetId(candidate),
-        startedAt: Date.now(),
-        lastProgressAt: Date.now(),
+        startedAt,
+        lastProgressAt: startedAt,
         lastProgressSignature: targetProgressSignature(candidate, resourceMap()),
         initialVal: VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0,
+        layer,
         queueSignature: JSON.stringify(readQueue()),
       } : null;
     },
+    chooseWorkTarget(goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
+      return chooseWorkTarget(resourceMap(), goalKey);
+    },
+    foodHelpingCandidate,
     targetId,
     candidateScoreGain,
     candidateMeetsSwitchScoreGain,

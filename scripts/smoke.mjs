@@ -2345,6 +2345,56 @@ check("Test Z: report adds a job census line", /census: /.test(reportZ));
 printingPressZ.researched = savedWorkshopZ.researched; printingPressZ.unlocked = savedWorkshopZ.unlocked;
 machineryZ.researched = savedWorkshopZ.machinery; libraryZ.val = savedLibraryZ;
 
+/* =====================================================================
+ * Test AA (v2.8.0) — the emergency lock-break must ADDRESS the emergency.
+ * Live, a winter catnip dip (handled by the farmer failsafe) plus an
+ * effective-only Wt dip (raw power fine, Data Centers merely paused) broke
+ * the plan lock every ~2s, ping-ponging Power recovery / Expansion / Science
+ * storage and finishing nothing.  A food crisis may now only break the lock
+ * toward a catnip building; a power crisis only toward a generator; and an
+ * effective-only dip (raw Wt positive) is not an emergency at all.
+ * =================================================================== */
+const barnMetaAA = buildings.find((b) => b.name === "barn");
+const mineCandAA = dbg.candidateById("build:mine");
+const magnetoCandAA = dbg.candidateById("build:magnetoZ");
+check("Test AA: a catnip-storage building counts as food-helping", dbg.foodHelpingCandidate({ kind: "build", meta: barnMetaAA }) === true);
+check("Test AA: a non-food building is not food-helping", !!mineCandAA && dbg.foodHelpingCandidate(mineCandAA) === false);
+check("Test AA: a power generator is not food-helping", !!magnetoCandAA && dbg.foodHelpingCandidate(magnetoCandAA) === false);
+
+// Age a forced lock past the lock-min but well under the lock-max timeout (360s)
+// so only a real break condition — not a stale-lock timeout — can move the plan.
+const LOCK_AGE_AA = 150000;
+// (1) Genuine RAW power deficit still hands a held non-generator plan to the
+// generator.  Test Z left energyProd 10 / cons 12 → raw delta -2 (real deficit).
+gamePage.resPool.energyProd = 10; gamePage.resPool.energyCons = 12; gamePage.resPool.energyWinterProd = 10;
+const savedCatnipAA = { v: res("catnip").value, m: res("catnip").maxValue, p: perTick.catnip };
+res("catnip").value = 4000; res("catnip").maxValue = 5000; perTick.catnip = 5; // food safe
+dbg.queueClear?.();
+dbg.forceActiveTarget(mineCandAA, "Economy / normal growth", LOCK_AGE_AA); // held non-generator plan
+const powerBreakAA = dbg.chooseWorkTarget("balanced");
+check("Test AA: a genuine raw-Wt deficit breaks the lock toward a generator", dbg.targetId(powerBreakAA) === "build:magnetoZ");
+
+// (2) A catnip emergency is INERT for a held non-food plan when raw Wt is fine
+// (no power emergency): run the same locked state with catnip SAFE vs catnip
+// EMERGENCY and assert the decision is identical AND retains the held plan —
+// proving the food dip no longer adds a spurious lock-break.  Raw Wt is made
+// healthy and science uncapped so neither the power nor the science-storage layer
+// confounds the comparison.
+gamePage.resPool.energyProd = 200; gamePage.resPool.energyCons = 10; gamePage.resPool.energyWinterProd = 200;
+const savedSciAA = { v: res("science").value, m: res("science").maxValue };
+res("science").value = 1000; res("science").maxValue = 1e9; // research fits → no science-storage layer
+dbg.forceActiveTarget(mineCandAA, "Economy / normal growth", LOCK_AGE_AA);
+res("catnip").value = 4000; res("catnip").maxValue = 5000; perTick.catnip = 5; // safe
+const decSafeAA = dbg.chooseWorkTarget("balanced");
+dbg.forceActiveTarget(mineCandAA, "Economy / normal growth", LOCK_AGE_AA);
+res("catnip").value = 50; res("catnip").maxValue = 5000; perTick.catnip = -5; // emergency (1%, net-negative)
+const decEmergAA = dbg.chooseWorkTarget("balanced");
+check("Test AA: a catnip emergency does not change a held non-food plan (no spurious break)", dbg.targetId(decSafeAA) === dbg.targetId(decEmergAA));
+check("Test AA: the held non-food plan is actually retained through the catnip emergency", dbg.targetId(decEmergAA) === "build:mine");
+res("catnip").value = savedCatnipAA.v; res("catnip").maxValue = savedCatnipAA.m; perTick.catnip = savedCatnipAA.p;
+res("science").value = savedSciAA.v; res("science").maxValue = savedSciAA.m;
+dbg.forceActiveTarget(null);
+
 buildings.splice(buildings.indexOf(dataCenterZ), 1);
 buildings.splice(buildings.indexOf(academyZ), 1);
 buildings.splice(buildings.indexOf(magnetoZ), 1);

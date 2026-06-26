@@ -123,6 +123,16 @@ Key invariants (see comments in the source for the why):
 - **Structural layers own the plan directly.** A live research sprint and a
   science-storage unlock both bypass the economy target-lock, so a half-saved
   Temple can never hold the plan hostage.
+- **An emergency may only break the plan lock toward a target that ADDRESSES it.**
+  A food crisis (catnip <8% and net-negative — already handled by the farmer
+  failsafe) may break the lock only toward a catnip producer/store/booster
+  (`foodHelpingCandidate`); a power crisis only toward a net-positive generator.
+  Critically, the power emergency reads **raw** Wt (`isPowerEmergency`), not
+  effective Wt: an effective-only dip (raw Wt fine, Data Centers merely paused for
+  power) is NOT an emergency, so a held plan stops ping-ponging between Power
+  recovery / Expansion / Science storage every tick and finishing none of them.
+  The power-recovery LAYER still reads effective Wt to *start* recovery; only the
+  lock *break* is gated on a genuine raw shortfall.
 - **The science-storage unlock COMMITS to one building (no flicker).** The game
   often doesn't expose a building's `scienceMax`/`scienceRatio` until
   `calculateEffects` runs, so `scienceStorageGain` ties at 0 and the secondary
