@@ -1372,13 +1372,22 @@
     // crafting Plate for missing Scaffold must wait until the direct Iron bill
     // is already covered.
     const directInputCost = pricesFor(target.kind, target.meta).find((cost) => cost && cost.name === inputName && isFinite(cost.val) && cost.val > 0);
-    if (directInputCost && inputName !== outputName && !ownedIntermediateSpend) {
+    if (directInputCost && inputName !== outputName) {
       const haveDirect = ((getRes(resources, inputName) || {}).value) || 0;
-      if (haveDirect < directInputCost.val) return Number.MAX_SAFE_INTEGER;
+      if (haveDirect < directInputCost.val && !ownedIntermediateSpend) return Number.MAX_SAFE_INTEGER;
+      // Direct/final costs are hard reserves. Active-plan crafting may spend the
+      // surplus above that final bank, but it must not drain the final purchase
+      // amount just because the same raw resource also appears in a craft chain.
+      // Research is special: science/culture craft costs are rolling banks during
+      // the intermediate phase (e.g. Blueprint/Compendium chains), so the phase
+      // model explicitly marks shared inputs that may cycle before refilling.
+      const phase = target.kind === "research" ? researchTargetPhase(target, resources) : null;
+      const rollingResearchInput = phase && phase.phase === "intermediate" && phase.sharedInputs.has(inputName);
+      if (!rollingResearchInput) floor = Math.max(floor, directInputCost.val);
     }
 
     const converterInputs = converterInputsNeededForMissingCosts(target, resources);
-    if (converterInputs.has(inputName) && inputName !== outputName) return Number.MAX_SAFE_INTEGER;
+    if (!ownedIntermediateSpend && converterInputs.has(inputName) && inputName !== outputName) return Number.MAX_SAFE_INTEGER;
 
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
@@ -1422,7 +1431,7 @@
         for (const price of prices) {
           const input = getRes(resources, price.name);
           const value = (input && input.value) || 0;
-          const reserve = overflowInputFloor(target, resources, price.name, name);
+          const reserve = overflowInputFloor(target, resources, price.name, name, helpsTarget);
           maxUnits = Math.min(maxUnits, Math.floor(Math.max(0, value - reserve) / price.val));
           if (value - reserve <= 0 && (reservedNeedsFor(target, resources)[price.name] || 0) > 0 && Date.now() - lastOverflowLog > 20000) {
             const sources = buildReservationLedger(target, resources).sources[price.name] || [];
@@ -1443,9 +1452,15 @@
       const units = Math.max(1, Math.min(best.maxUnits, best.score >= 100 ? Math.ceil(best.maxUnits * 0.5) : Math.ceil(best.maxUnits * 0.2)));
       const measured = withActionResourceDeltas(() => craftUnits(best.name, units));
       if (measured.result) {
-        overflowPlanText = `Overflow: converted surplus into ${craftLabel(best.name)}`;
+        const activeCraft = target && (targetNeedsResource(target, best.name) || craftOutputHelpsTarget(target, best.name, resources));
+        overflowPlanText = activeCraft
+          ? `Craft-before-reserve: converted capped resources into ${craftLabel(best.name)}`
+          : `Overflow: converted surplus into ${craftLabel(best.name)}`;
         if (Date.now() - lastOverflowLog > 20000) {
-          pushLog(`📦 ${overflowPlanText}: ${measured.suffix}; reason overflow/capped storage`);
+          const hot = craftPricesFor(craftByName(best.name)).filter((price) => price && wouldWasteResource(resources, price.name));
+          const capped = hot.map((price) => `${resTitle(resources, price.name)} at ${fmt(resRatio(resources, price.name) * 100)}%`).join("+");
+          const advance = activeCraft ? ` for ${labelOf(target.meta)}. This is rolling craft cost, not a hard storage blocker` : "; reason overflow/capped storage";
+          pushLog(`📦 ${overflowPlanText}${capped ? ` (${capped})` : ""}: ${measured.suffix}${advance}`);
           lastOverflowLog = Date.now();
         }
       }
@@ -3593,11 +3608,42 @@
   };
 
   const targetOwnsIntermediateSpend = (target, resources, inputName, outputName, forPlanChain) => {
-    if (!forPlanChain || !target || target.kind !== "research" || !outputName) return false;
-    const phase = researchTargetPhase(target, resources);
-    return phase.phase === "intermediate" &&
-      phase.sharedInputs.has(inputName) &&
-      phase.craftCosts.some((cost) => cost.name === outputName && resValueOf(resources, outputName) < cost.val);
+    if (!target || !inputName || !outputName || inputName === outputName) return false;
+    if (!forPlanChain && !wouldWasteResource(resources, inputName)) return false;
+    if (!craftOutputHelpsTarget(target, outputName, resources) && !targetNeedsResource(target, outputName)) return false;
+    const directInputCost = pricesFor(target.kind, target.meta)
+      .find((cost) => cost && cost.name === inputName && isFinite(cost.val) && cost.val > 0);
+    if (directInputCost && resValueOf(resources, inputName) < directInputCost.val) {
+      if (forPlanChain || resRatio(resources, inputName, 0) < 0.95) return false;
+    }
+
+    // The active plan owns its craft chain.  A reserve on raw/rolling inputs
+    // (science for compendia, furs for parchment, catnip for wood, etc.) means
+    // "do not spend outside this plan", not "freeze this resource in raw
+    // form".  If the output is a still-needed active-plan intermediate, let the
+    // craft consume the input down to the ordinary survival/luxury floor.
+    const outputNeed = pricesFor(target.kind, target.meta)
+      .find((cost) => cost && cost.name === outputName && isFinite(cost.val) && cost.val > 0);
+    if (outputNeed && resValueOf(resources, outputName) < outputNeed.val) return true;
+
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0 || !craftByName(cost.name)) continue;
+      const deficit = Math.max(0, cost.val - resValueOf(resources, cost.name));
+      if (deficit <= 0) continue;
+      const raw = rawPathRequirements(cost.name, deficit);
+      if ((raw[inputName] || 0) > 0 && craftChainOutputsFor(cost.name).has(outputName)) return true;
+    }
+
+    // Research sprints have an additional final-bank/refill phase where science
+    // and crafted culture resources intentionally cycle through intermediates
+    // before the final buy.  Keep the older explicit phase test as a backstop.
+    if (target.kind === "research") {
+      const phase = researchTargetPhase(target, resources);
+      return phase.phase === "intermediate" &&
+        phase.sharedInputs.has(inputName) &&
+        phase.craftCosts.some((cost) => cost.name === outputName && resValueOf(resources, outputName) < cost.val);
+    }
+    return false;
   };
 
   // What can START a new sprint: science at/near cap, OR a clear actionable
