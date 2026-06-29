@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.8.0
+// @version      2.8.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.8.0";
+  const HELPER_VERSION = "2.8.1";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4839,13 +4839,19 @@
     }
 
     // Discretionary faith banking (priests filling faith toward a future religion
-    // upgrade) must YIELD when the colony is food-stressed.  nextFaithReligionUpgrade
-    // injects a fat faith need (weight 10) the moment ANY religion upgrade is
-    // pending — regardless of the active plan — which is how ~16 Priests kept
-    // banking faith while catnip drained to 0 and kittens starved.  A religion
-    // upgrade nothing is waiting on does not outrank feeding the colony or the
-    // active plan's own chain: allow it only when catnip is not net-negative (or is
-    // net-negative but still well-stocked), or when the active TARGET spends faith.
+    // upgrade) must YIELD in two cases.  (1) When the colony is food-stressed:
+    // nextFaithReligionUpgrade injects a fat faith need (weight 10) the moment ANY
+    // religion upgrade is pending — regardless of the active plan — which is how
+    // ~16 Priests kept banking faith while catnip drained to 0 and kittens starved.
+    // (2) When religion is NOT the active plan: the full weight-10 push is for an
+    // ACTIVE religion target (one whose price spends faith); an unrelated future
+    // upgrade is background work that must not crowd out the live build/research
+    // plan (this is what put ~30 of 120 kittens on Priest while a no-faith
+    // science-storage build starved for its own chain).  A religion upgrade
+    // nothing is waiting on does not outrank feeding the colony or the active
+    // plan's own chain: bank it at full weight only when catnip is not
+    // net-negative (or is net-negative but still well-stocked) AND the active
+    // TARGET spends faith; otherwise the small weight-2 baseline keeps a trickle.
     const targetNeedsFaith = target && !target.affordable &&
       pricesFor(target.kind, target.meta).some((cost) => cost && cost.name === "faith" && cost.val > 0);
     const foodStressed = productionFor("catnip") < 0 && resRatio(resources, "catnip") < 0.5;
@@ -4868,10 +4874,19 @@
         .filter((cost) => cost.name !== "faith")
         .reduce((min, cost) => Math.min(min, ratioOf(cost)), 1);
       faithIsBinding = !faithCost || ratioOf(faithCost) <= nonFaithMinRatio + 0.15;
+      // The fat faith need (weight 10) belongs to an ACTIVE religion push — the
+      // live plan's own target spends faith.  A future upgrade we are merely
+      // *able* to save toward is background work: banking it at full weight put
+      // ~25-30% of the colony on Priest while an unrelated active plan (e.g. a
+      // science-storage building that costs no faith) starved for its own chain.
+      // When religion is not the focus, fall through to the small weight-2
+      // baseline below so a few priests keep the bank trickling up without
+      // crowding out the plan.  The upgrade's non-faith gate (gold/spice) is
+      // still surfaced so the bot makes background progress toward it (Test E3).
       for (const cost of upgradeCosts) {
         if (resValueOf(resources, cost.name) >= cost.val) continue;
         if (cost.name === "faith") {
-          if (faithIsBinding) scoreNeed(needs, "faith", 10);
+          if (faithIsBinding && targetNeedsFaith) scoreNeed(needs, "faith", 10);
         } else {
           scoreNeed(needs, cost.name, 4);
         }
@@ -4881,6 +4896,8 @@
           .filter((cost) => cost.name !== "faith" && resValueOf(resources, cost.name) < cost.val)
           .map((cost) => resTitle(resources, cost.name)).join("/") || "another cost";
         jobSuppressText = `Suppressed: faith banked enough — ${labelOf(religionTarget.meta)} is gated on ${gate}, not faith`;
+      } else if (faithIsBinding && !targetNeedsFaith && jobByName("priest")) {
+        jobSuppressText = `Suppressed: ${labelOf(religionTarget.meta)} is not the active plan — banking faith at background level only`;
       }
     } else if (!allowFaithBanking && jobByName("priest")) {
       jobSuppressText = "Suppressed: faith banking while catnip is net-negative (food first)";

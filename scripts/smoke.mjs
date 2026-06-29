@@ -1682,6 +1682,63 @@ job("priest").value = e3Saved.priest;
 dbg.forceActiveTarget(null);
 
 /* ---------------------------------------------------------------------
+ * Test E4 — discretionary faith banking YIELDS to an unrelated active plan.
+ * Live (v2.8.0) a pending religion upgrade (Frescoes) whose faith read as
+ * "binding" injected a fat weight-10 faith need REGARDLESS of the active plan,
+ * putting ~30 of 120 kittens on Priest while a no-faith science-storage build
+ * (Bio Lab) starved for its own alloy chain.  The full push is now reserved
+ * for an ACTIVE religion target; an unrelated pending upgrade banks faith at
+ * the small weight-2 background level only.  (Distinct from E3: here faith IS
+ * binding — the upgrade's gold cost is well-funded, not a far-off gate.)
+ * ------------------------------------------------------------------- */
+const e4Saved = {
+  techFlags: techs.map((t) => [t, t.researched]),
+  rel1: { researched: religionUpgrades[1].researched, on: religionUpgrades[1].on, val: religionUpgrades[1].val, prices: religionUpgrades[1].prices, faith: religionUpgrades[1].faith },
+  worship: gamePage.religion.faith,
+  faith: [res("faith").value, res("faith").maxValue],
+  gold: [res("gold").value, res("gold").maxValue],
+  catnip: [res("catnip").value, res("catnip").maxValue],
+  perTickCatnip: perTick.catnip,
+  perTickFaith: perTick.faith,
+  priest: job("priest").value,
+};
+for (const t of techs) t.researched = true;                  // no research sprint owns the plan
+gamePage.religion.faith = 5000;                              // worship high → Solar Revolution visible
+religionUpgrades[1].researched = false; religionUpgrades[1].on = 0; religionUpgrades[1].val = 0;
+religionUpgrades[1].faith = 1000;                            // visibility threshold (worship 5000 >= 1000)
+religionUpgrades[1].prices = [{ name: "gold", val: 500 }, { name: "faith", val: 750 }];
+// Faith binding: faith ratio (0.4) within 0.15 of the gold ratio (0.5), and
+// gold is well-funded so it is NOT a far-off gate (that is the E3 case).
+res("faith").value = 300; res("faith").maxValue = 5500;
+res("gold").value = 250; res("gold").maxValue = 6880;
+res("catnip").value = 3500; res("catnip").maxValue = 5000; perTick.catnip = 8; // food healthy
+perTick.faith = 1;                                            // faith refill exists → upgrade is feasible/lockable
+job("priest").value = 8;
+// Case A: a NON-faith build is the active plan → faith banked at background only.
+const e4Build = dbg.candidateById("build:hut") || dbg.candidateById("build:library");
+dbg.forceActiveTarget(e4Build);
+const e4Unrelated = dbg.resourceNeeds("balanced");
+check("Test E4: faith banked at background level (no fat push) when religion is NOT the active plan", (e4Unrelated.needs.faith || 0) > 0 && (e4Unrelated.needs.faith || 0) <= 5);
+// Case B: the religion upgrade itself is the active plan → full faith push.
+const e4Religion = dbg.candidateById("religion:solarRevolution");
+dbg.forceActiveTarget(e4Religion);
+const e4Focused = dbg.resourceNeeds("balanced");
+check("Test E4: faith gets the full push (>= 10) when the religion upgrade IS the active plan", (e4Focused.needs.faith || 0) >= 10);
+check("Test E4: focusing religion materially outweighs background banking", (e4Focused.needs.faith || 0) >= (e4Unrelated.needs.faith || 0) + 6);
+// Restore.
+for (const [t, r] of e4Saved.techFlags) t.researched = r;
+religionUpgrades[1].researched = e4Saved.rel1.researched; religionUpgrades[1].on = e4Saved.rel1.on; religionUpgrades[1].val = e4Saved.rel1.val;
+religionUpgrades[1].prices = e4Saved.rel1.prices; religionUpgrades[1].faith = e4Saved.rel1.faith;
+gamePage.religion.faith = e4Saved.worship;
+res("faith").value = e4Saved.faith[0]; res("faith").maxValue = e4Saved.faith[1];
+res("gold").value = e4Saved.gold[0]; res("gold").maxValue = e4Saved.gold[1];
+res("catnip").value = e4Saved.catnip[0]; res("catnip").maxValue = e4Saved.catnip[1];
+perTick.catnip = e4Saved.perTickCatnip;
+perTick.faith = e4Saved.perTickFaith;
+job("priest").value = e4Saved.priest;
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
  * Test F — Auto-hunt fires at the chain threshold for the sprint
  * ------------------------------------------------------------------- */
 setupAcoustics();
