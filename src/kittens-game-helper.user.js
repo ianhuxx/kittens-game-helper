@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.8.1
+// @version      2.9.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.8.1";
+  const HELPER_VERSION = "2.9.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3389,6 +3389,66 @@
     return chosen.candidate;
   };
 
+  /* ------------------------ converter-fuel starvation -----------------------
+   * A converter (Magneto, Calciner, …) burns a NON-craftable fuel (oil) made by a
+   * producer building (Oil Well).  When that fuel is pinned at/near zero with
+   * non-positive net production, desiredProcessorState starve-pauses the converter
+   * every tick — the Magneto/Calciner on/off churn the player sees, plus the lost
+   * power and iron.  The economy scorer already ranks the producer #1 (the
+   * producerPrereq boost), but a structural hold (research sprint / science
+   * storage) outranks economy, so the fuel never recovers on its own.  This makes
+   * the long-defined STRATEGIC_LAYERS.production a real layer: a starved converter
+   * fleet is treated like a power deficit and its producer is built first.
+   */
+  const converterFuelStarvation = (resources) => {
+    const fuels = new Set();
+    for (const meta of converterBuildings()) {
+      const profile = processingProfileFor(meta);
+      const inputs = profile.inputs.length ? profile.inputs : (PROCESSOR_INPUTS[meta.name] || []);
+      for (const input of inputs) {
+        if (fuels.has(input) || !getRes(resources, input)) continue;
+        // Food has its own farmer failsafe; a craftable input is assembled on
+        // demand, not pumped by a producer building, so it is not a "fuel".
+        if (input === "catnip" || craftByName(input)) continue;
+        if (resRatio(resources, input, 1) >= PROCESSOR_STARVE_RATIO) continue; // not pinned low
+        if (productionFor(input) > 0) continue;                                // already climbing
+        if (!producerBuildingsFor(input).length) continue;                     // nothing can build it
+        fuels.add(input);
+      }
+    }
+    return fuels;
+  };
+
+  // Sticky producer choice, mirroring the power-recovery commit so the pick cannot
+  // wobble tick-to-tick.  Building producers permanently raises fuel production, so
+  // the layer converges (it yields the moment net fuel production turns positive).
+  let activeConverterFuelId = null;
+  let lastConverterFuelDiagnostic = { fuel: "", action: "not evaluated" };
+  const bestConverterFuelTarget = (candidates, resources) => {
+    const fuels = converterFuelStarvation(resources);
+    if (!fuels.size) { activeConverterFuelId = null; lastConverterFuelDiagnostic = { fuel: "", action: "no starved converter fuel" }; return null; }
+    const fuelText = [...fuels].join("+");
+    const options = (candidates || [])
+      .filter((c) => c && c.kind === "build" && c.meta)
+      .filter((c) => {
+        const profile = candidateEffectProfile(c.kind, c.meta);
+        return Object.keys(profile.perTick || {}).some((n) => fuels.has(n) && (profile.perTick[n] || 0) > 0);
+      })
+      .filter((c) => directStorageBlockers(c.kind, c.meta, resources).length === 0)
+      .filter((c) => powerSafeToBuild(c))
+      .filter((c) => solveCraftChain(resources, c).reachable)
+      .map((c) => ({ candidate: c, eta: waitSecondsForCandidate(c, resources), score: c.score || 0 }))
+      .filter((o) => isFinite(o.eta))
+      .sort((a, b) => (b.score - a.score) || (a.eta - b.eta));
+    if (!options.length) { activeConverterFuelId = null; lastConverterFuelDiagnostic = { fuel: fuelText, action: `${fuelText} starved but no buildable producer is reachable` }; return null; }
+    const best = options[0];
+    const prior = activeConverterFuelId && options.find((o) => targetId(o.candidate) === activeConverterFuelId);
+    const chosen = prior && best.score <= prior.score * 1.25 ? prior : best;
+    activeConverterFuelId = targetId(chosen.candidate);
+    lastConverterFuelDiagnostic = { fuel: fuelText, action: `building ${labelOf(chosen.candidate.meta)} to relieve starved ${fuelText}` };
+    return chosen.candidate;
+  };
+
   const resValueOf = (resources, name) => ((getRes(resources, name) || {}).value) || 0;
   const resMaxOf = (resources, name) => ((getRes(resources, name) || {}).maxValue) || 0;
   const isNearResourceCap = (resources, name, ratio = CAP_RELIEF_RATIO) => {
@@ -3503,8 +3563,6 @@
     }
     return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no path for ${resTitle(resources, name)}`, chain };
   };
-
-  const hasObtainablePathFor = (resources, name, amount) => capDrainReachabilityFor(resources, name, amount).reachable;
 
   const researchScienceCost = (tech) => {
     const price = pricesFor("research", tech).find((cost) => cost && cost.name === "science" && isFinite(cost.val) && cost.val > 0);
@@ -4399,6 +4457,23 @@
       };
     }
 
+    // Converter-fuel starvation ranks with power recovery (above the research
+    // sprint / science-storage holds): a chronically empty fuel like oil keeps
+    // starve-pausing the Magneto/Calciner fleet, so its producer is built first.
+    const fuelTarget = bestConverterFuelTarget(candidates, resources);
+    if (fuelTarget) {
+      return {
+        candidates: [fuelTarget, ...candidates.filter((candidate) => targetId(candidate) !== targetId(fuelTarget))],
+        target: fuelTarget,
+        layer: STRATEGIC_LAYERS.production,
+        reason: lastConverterFuelDiagnostic.action,
+        protectedChain: candidateCraftChainResources(fuelTarget),
+        rejectedTopCandidates: candidates.slice(0, 3)
+          .filter((target) => targetId(target) !== targetId(fuelTarget))
+          .map((target) => ({ target, reason: `deferred until ${lastConverterFuelDiagnostic.fuel} stops starving the converters` })),
+      };
+    }
+
     if (!activeSprint) {
       const expansion = bestExpansionCheckpoint(candidates, resources);
       if (expansion) {
@@ -4568,8 +4643,6 @@
     return { status: missing ? FEASIBILITY.BLOCKED_PRODUCIBLE : FEASIBILITY.READY, reason: missing ? "waiting on producible resources" : "ready", solver };
   };
 
-  const targetImpossible = (candidate, resources) => classifyTargetFeasibility(candidate, resources).status === FEASIBILITY.IMPOSSIBLE;
-
   const targetProgressSignature = (candidate, resources) => {
     if (!candidate) return "";
     return pricesFor(candidate.kind, candidate.meta)
@@ -4734,6 +4807,12 @@
       );
       const structuralLayerTakeover = preferred && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock &&
         activeTarget.layer !== STRATEGIC_LAYERS.scienceStorageUnlock;
+      // A newly detected converter-fuel starvation (oil pinned at zero, the
+      // Magneto/Calciner fleet starve-pausing) breaks a held plan toward its
+      // producer immediately — the same prompt takeover power recovery gets,
+      // since the loss compounds every tick the fuel stays empty.
+      const productionTakeover = preferred && decision.layer === STRATEGIC_LAYERS.production &&
+        activeTarget.layer !== STRATEGIC_LAYERS.production;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
@@ -4742,11 +4821,11 @@
       const etaBetter = preferredWait < lockedWait * 0.75;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
-      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || age > TARGET_LOCK_MAX_MS ||
+      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || productionTakeover || age > TARGET_LOCK_MAX_MS ||
           lockedIsStaleStorage || lockedIsStorageBlocked || nearTechBreak) {
         const reason = !locked ? "target unavailable" : completed ? "target completed" : impossible ? "target impossible" :
           noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
-          structuralLayerTakeover ? "science storage emergency" :
+          structuralLayerTakeover ? "science storage emergency" : productionTakeover ? "converter-fuel starvation" :
           emergency ? "emergency" : "lock timeout";
         pushPlanLog(`🔓 Plan switch accepted: ${reason}`, 20000);
         if (impossible && locked) rejectedTargets.set(targetId(locked), { reason: feasibility.reason || reason, at: now });
@@ -5596,18 +5675,6 @@
     return exploreMissing ? `save ${exploreMissing} for explorers, then trade Zebras` : "send explorers to meet Zebras, then trade titanium";
   };
 
-  const formatRequirements = (kind, meta, resources) => {
-    const parts = [];
-    for (const cost of pricesFor(kind, meta)) {
-      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-      const res = getRes(resources, cost.name);
-      const have = (res && res.value) || 0;
-      const title = resTitle(resources, cost.name);
-      parts.push(`${title} ${fmt(Math.min(have, cost.val))}/${fmt(cost.val)}`);
-    }
-    return parts.slice(0, 4).join(" · ");
-  };
-
   const formatEta = (seconds) => {
     if (!isFinite(seconds)) return "unknown";
     if (seconds <= 0) return "now";
@@ -6119,6 +6186,16 @@
       const [kind] = String(item.id).split(":");
       if (!meta) continue;
       const candidate = { kind, meta, affordable: false };
+      // Reserve ONLY for queue items the bot can actually work toward right now —
+      // the same reachability gate pickQueuedTarget uses to choose one.  A
+      // storage-blocked queued tech (e.g. Biochemistry, whose final pure-science
+      // cost is several times the science cap) is NOT yet actionable: its craft
+      // intermediates cycle science incrementally, so reserving the whole chain
+      // (an unsatisfiable, >cap science hold) only locked every other spender and
+      // stalled the plan.  Once science storage grows enough that the final cost
+      // fits the cap, the item becomes reachable and is both selected AND reserved
+      // together — keeping the "craft first, spend pure science last" ordering.
+      if (!solveCraftChain(resources, candidate).reachable) continue;
       mergeLedger(out, buildTargetLedger(candidate, resources), `manual queue ${labelOf(meta)}`);
     }
     return out;
@@ -7264,6 +7341,7 @@
       push(`prod ${fmt(power.prod)} · cons ${fmt(power.cons)} · delta ${fmt(power.delta)} Wt · winter ${fmt(power.winterDelta)} Wt`);
       push(`latent paused-for-power demand ${fmt(eff.latent)} Wt → effective delta ${fmt(eff.delta)} Wt (winter ${fmt(eff.winterDelta)} Wt)`);
       push(`computed deficit ${fmt(Math.max(0, -eff.delta, -eff.winterDelta))} Wt · selected/skipped: ${(lastPowerRecoveryDiagnostic && lastPowerRecoveryDiagnostic.action) || "not evaluated"}`);
+      push(`converter fuel: ${(lastConverterFuelDiagnostic && lastConverterFuelDiagnostic.action) || "not evaluated"}`);
       push("");
       push("— PROCESSING —");
       push(processingPlanText);
@@ -8342,6 +8420,14 @@
     bestPowerRecoveryTarget(candidates) {
       resetTickCache();
       return bestPowerRecoveryTarget(candidates, resourceMap());
+    },
+    converterFuelStarvation() {
+      resetTickCache();
+      return [...converterFuelStarvation(resourceMap())];
+    },
+    bestConverterFuelTarget(candidates) {
+      resetTickCache();
+      return bestConverterFuelTarget(candidates || gatherCandidates(resourceMap(), getGoal()), resourceMap());
     },
     expansionPressure,
     bestExpansionCheckpoint(goalKey = getGoal()) {

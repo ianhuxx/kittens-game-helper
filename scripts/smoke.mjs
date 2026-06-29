@@ -1539,6 +1539,18 @@ dbg.queueAdd("build:mine", queueMine.val);
 const qBlocked = dbg.selectStrategicTarget("balanced");
 check("Test Q: a cap-blocked queued tech is skipped, next actionable item wins", qBlocked.layer === "Manual queue" && qBlocked.target?.meta?.name === "mine");
 
+// Regression (v2.9.0): a cap-blocked queued tech must NOT lock the science bank.
+// Electricity's Compendium chain expands to a science reservation (its own ledger
+// proves the chain exists), but the tech is not actionable — its final pure-science
+// cost is above the cap, and crafting Compendia only cycles science incrementally.
+// So pickQueuedTarget skips it AND the manual-queue reservation ledger must skip it
+// too; otherwise the whole (unsatisfiable, would-be >cap) science hold froze every
+// other science spender and stalled the plan on the queued tech.
+const elecChainScience = dbg.buildTargetLedger({ kind: "research", meta: electricity, affordable: false }).reserved.science || 0;
+const queueLockedScience = dbg.reservedNeedsFor(qBlocked.target).science || 0;
+check("Test Q: a cap-blocked queued tech does NOT lock the science bank (craft science cycles, not reserved)",
+  elecChainScience > 0 && queueLockedScience === 0);
+
 // Completed items auto-remove from the stored queue.
 dbg.queueClear();
 electricity.researched = true;
@@ -2717,6 +2729,37 @@ const factoryStateY = dbg.desiredProcessorState(factoryY);
 check("Test Y: negative Wt runs power-positive Magneto and pauses power-negative consumers", magnetoStateY.on === magnetoY.val && factoryStateY.on === 0);
 const processingTextY = dbg.optimizeProcessing("balanced");
 check("Test Y: processing log names power protection", /power deficit|protecting Wt/i.test(processingTextY));
+
+/* ---------------------------------------------------------------------
+ * Test AB — converter-fuel starvation (v2.9.0).  Reproduces the live state
+ * where oil sat pinned at 0 and the Magneto/Calciner fleet kept
+ * starve-pausing while the plan was stuck on a science-cap grind.  A
+ * chronically empty, net-draining fuel with a buildable producer must build
+ * that producer FIRST (Production bottleneck layer, above science storage),
+ * and must yield the moment production turns net-positive so it can't
+ * oscillate.  magnetoY (oilPerTickCon) is the live oil consumer here.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+gamePage.resPool.energyProd = 60;   // power healthy → power-recovery layer yields
+gamePage.resPool.energyCons = 5;
+gamePage.resPool.energyWinterProd = 60;
+const oilWellZ = { name: "oilWellZ", label: "Oil Well", unlocked: true, val: 5, on: 5, prices: [{ name: "minerals", val: 10 }], priceRatio: 1, effects: { oilPerTickProd: 0.5 } };
+buildings.push(oilWellZ);
+res("oil").value = 0;            // pinned empty
+res("oil").maxValue = 1000;
+perTick.oil = -0.5;             // net draining → genuinely starved
+dbg.clearResourceTelemetry?.("oil");
+check("Test AB: oil is detected as a starved converter fuel", dbg.converterFuelStarvation().includes("oil"));
+const fuelDecisionZ = dbg.selectStrategicTarget("balanced");
+check("Test AB: starved oil builds its producer first at the Production bottleneck layer", fuelDecisionZ.layer === "Production bottleneck" && fuelDecisionZ.target?.meta?.name === "oilWellZ");
+perTick.oil = 0.5;             // production now net-positive
+dbg.clearResourceTelemetry?.("oil");
+const recoveredZ = dbg.selectStrategicTarget("balanced");
+check("Test AB: a recovering fuel yields the layer (no oscillation)", dbg.converterFuelStarvation().length === 0 && recoveredZ.layer !== "Production bottleneck");
+buildings.splice(buildings.indexOf(oilWellZ), 1);
+dbg.forceActiveTarget(null);
+
 buildings.splice(buildings.indexOf(magnetoY), 1);
 buildings.splice(buildings.indexOf(bioLabY), 1);
 buildings.splice(buildings.indexOf(factoryY), 1);
