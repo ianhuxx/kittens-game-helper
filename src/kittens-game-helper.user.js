@@ -593,7 +593,11 @@
     for (const cost of pricesFor(target.kind, target.meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       const have = ((getRes(resources || resourceMap(), cost.name) || {}).value) || 0;
-      if (have >= cost.val && !craftByName(cost.name)) continue;
+      // Only expand the craft chain for components that are still genuinely
+      // missing after netting current inventory.  An oversupplied craftable
+      // direct cost (Magneto gear/blueprint, for example) must not make its
+      // whole upstream chain look like active-plan work.
+      if (have >= cost.val) continue;
       craftChainOutputsFor(cost.name, allowed);
     }
     return allowed;
@@ -602,6 +606,20 @@
   const craftOutputHelpsTarget = (target, outputName, resources) => {
     if (!target || !outputName) return false;
     return targetCraftOutputsFor(target, resources).has(outputName);
+  };
+
+  const directTargetCostFor = (target, name) => pricesFor(target.kind, target.meta)
+    .find((cost) => cost && cost.name === name && isFinite(cost.val) && cost.val > 0);
+
+  const oversuppliedForTarget = (target, resources, name) => {
+    const cost = target && directTargetCostFor(target, name);
+    return !!(cost && resValueOf(resources || resourceMap(), name) >= cost.val * 1.05);
+  };
+
+  const doesCraftAdvanceActivePlan = (target, resources, outputName) => {
+    if (!target || !outputName) return false;
+    if (oversuppliedForTarget(target, resources, outputName)) return false;
+    return targetNeedsResource(target, outputName) || craftOutputHelpsTarget(target, outputName, resources);
   };
 
 
@@ -1420,7 +1438,7 @@
         if (output && output.maxValue && output.value / output.maxValue > 0.92 && !targetNeedsResource(target, name)) continue;
         const hotInputs = prices.filter((price) => wouldWasteResource(resources, price.name));
         const activeReserve = target && !target.affordable;
-        const helpsTarget = targetNeedsResource(target, name) || craftOutputHelpsTarget(target, name, resources);
+        const helpsTarget = doesCraftAdvanceActivePlan(target, resources, name);
         const safeWoodOverflow = name === "wood" && !targetNeedsResource(target, "catnip") && wouldWasteResource(resources, "catnip");
         const safeCultureOverflow = ["parchment", "manuscript", "compedium", "blueprint"].includes(name) &&
           wouldWasteResource(resources, "culture") &&
@@ -1440,7 +1458,7 @@
           }
         }
         if (!isFinite(maxUnits) || maxUnits < 1) continue;
-        const targetBoost = targetNeedsResource(target, name) || craftOutputHelpsTarget(target, name, resources) ? 100 : 0;
+        const targetBoost = doesCraftAdvanceActivePlan(target, resources, name) ? 100 : 0;
         const heat = hotInputs.reduce((sum, price) => sum + Math.max(0, resRatio(resources, price.name, 0) - 0.86), 0);
         scored.push({ name, maxUnits, score: targetBoost + heat });
       }
@@ -1452,7 +1470,7 @@
       const units = Math.max(1, Math.min(best.maxUnits, best.score >= 100 ? Math.ceil(best.maxUnits * 0.5) : Math.ceil(best.maxUnits * 0.2)));
       const measured = withActionResourceDeltas(() => craftUnits(best.name, units));
       if (measured.result) {
-        const activeCraft = target && (targetNeedsResource(target, best.name) || craftOutputHelpsTarget(target, best.name, resources));
+        const activeCraft = doesCraftAdvanceActivePlan(target, resources, best.name);
         overflowPlanText = activeCraft
           ? `Craft-before-reserve: converted capped resources into ${craftLabel(best.name)}`
           : `Overflow: converted surplus into ${craftLabel(best.name)}`;
@@ -3319,6 +3337,10 @@
   // a valid option and only switch when a rival is materially better, mirroring
   // the science-storage commit.
   let activePowerRecoveryId = null;
+  let lastPowerRecoveryDiagnostic = {
+    rawDelta: 0, winterDelta: 0, latent: 0, pausedDemand: 0, deficit: 0,
+    action: "not evaluated",
+  };
   const bestPowerRecoveryTarget = (candidates, resources) => {
     // Gate on EFFECTIVE power (raw minus the demand of consumers we paused only to
     // protect Wt).  Without this, the instant processing idles a Data Center the
@@ -3326,8 +3348,23 @@
     // that very Data Center, processing pauses it again → oscillation.  Effective
     // power stays in deficit until enough generation exists to run everything, so
     // we keep recovering power continuously instead of bouncing.
+    const raw = powerStatus();
     const power = effectivePowerStatus();
-    if (power.delta >= TUNING.powerHeadroom && power.winterDelta >= 0) { activePowerRecoveryId = null; return null; }
+    const deficit = Math.max(0, -power.delta, -power.winterDelta);
+    lastPowerRecoveryDiagnostic = {
+      rawDelta: raw.delta,
+      winterDelta: power.winterDelta,
+      rawWinterDelta: raw.winterDelta,
+      latent: power.latent || 0,
+      pausedDemand: power.latent || 0,
+      deficit,
+      action: "",
+    };
+    if (power.delta >= 0 && power.winterDelta >= 0) {
+      activePowerRecoveryId = null;
+      lastPowerRecoveryDiagnostic.action = `Power recovery skipped: effective delta +${fmt(power.delta)} Wt, winter delta +${fmt(power.winterDelta)} Wt, latent demand ${fmt(power.latent || 0)} Wt.`;
+      return null;
+    }
     const options = (candidates || [])
       .filter((candidate) => candidate && candidateNetEnergy(candidate) > 0)
       .filter((candidate) => directStorageBlockers(candidate.kind, candidate.meta, resources).length === 0)
@@ -3339,11 +3376,16 @@
       })
       .filter((option) => isFinite(option.value) && option.value > 0)
       .sort((a, b) => b.value - a.value || b.net - a.net || a.eta - b.eta);
-    if (!options.length) { activePowerRecoveryId = null; return null; }
+    if (!options.length) {
+      activePowerRecoveryId = null;
+      lastPowerRecoveryDiagnostic.action = `Power recovery needed (${fmt(deficit)} Wt deficit) but no valid generator target is available.`;
+      return null;
+    }
     const best = options[0];
     const prior = activePowerRecoveryId && options.find((option) => targetId(option.candidate) === activePowerRecoveryId);
     const chosen = prior && best.value <= prior.value * 1.25 ? prior : best;
     activePowerRecoveryId = targetId(chosen.candidate);
+    lastPowerRecoveryDiagnostic.action = `selected ${labelOf(chosen.candidate.meta)} for computed deficit ${fmt(deficit)} Wt`;
     return chosen.candidate;
   };
 
@@ -4345,12 +4387,13 @@
     const powerTarget = bestPowerRecoveryTarget(candidates, resources);
     if (powerTarget) {
       const net = candidateNetEnergy(powerTarget);
-      const power = powerStatus();
+      const power = effectivePowerStatus();
+      const deficit = Math.max(0, -power.delta, -power.winterDelta);
       return {
         candidates: [powerTarget, ...candidates.filter((candidate) => targetId(candidate) !== targetId(powerTarget))],
         target: powerTarget,
         layer: STRATEGIC_LAYERS.power,
-        reason: `power deficit ${fmt(power.delta)} Wt; adding +${fmt(net)} Wt from ${labelOf(powerTarget.meta)}`,
+        reason: `power deficit ${fmt(deficit)} Wt; adding +${fmt(net)} Wt from ${labelOf(powerTarget.meta)}`,
         protectedChain: candidateCraftChainResources(powerTarget),
         rejectedTopCandidates: candidates.slice(0, 3).map((target) => ({ target, reason: "deferred until power has safe headroom" })),
       };
@@ -4549,7 +4592,13 @@
         blockers.push(`ETA ${formatEta(details.preferredWait)} is not 25% faster than ${formatEta(details.lockedWait)}`);
       }
       const whyText = blockers.length ? blockers.join("; ") : why;
-      pushLog(`🔒 Plan switch rejected: ${to ? labelOf(to.meta) : "none"} score better by ${Math.max(0, pct)}% but switch requirements were not met (${whyText})`);
+      const fromScore = from ? (from.score || 0) : 0;
+      const toScore = to ? (to.score || 0) : 0;
+      const absDelta = toScore - fromScore;
+      const scoreText = absDelta > 0
+        ? `improvement ${fmt(absDelta)} (${Math.max(0, pct)}%)`
+        : `no score improvement (${fmt(absDelta)}, ${pct}%)`;
+      pushLog(`🔒 Plan switch rejected: ${to ? labelOf(to.meta) : "none"} score ${fmt(toScore)} vs current ${from ? labelOf(from.meta) : "none"} ${fmt(fromScore)}; ${scoreText}; ETA candidate ${formatEta(details.preferredWait)} vs current ${formatEta(details.lockedWait)}; ${whyText}`);
       activePlanDebug.lastRejectLog = Date.now();
     }
   };
@@ -5650,7 +5699,9 @@
         .map((candidate) => `${labelOf(candidate.meta)} score ${fmt(candidate.score || 0)} ETA ${formatEta(waitSecondsForCandidate(candidate, resources))}`)
         .join("; ");
       const power = powerStatus();
-      const powerDebug = `Power: prod ${fmt(power.prod)} Wt, cons ${fmt(power.cons)} Wt, delta ${fmt(power.delta)} Wt, winter ${fmt(power.winterDelta)} Wt`;
+      const effPower = effectivePowerStatus();
+      const pd = lastPowerRecoveryDiagnostic || {};
+      const powerDebug = `Power: prod ${fmt(power.prod)} Wt, cons ${fmt(power.cons)} Wt, delta ${fmt(power.delta)} Wt, winter ${fmt(power.winterDelta)} Wt, latent ${fmt(effPower.latent || 0)} Wt, computed deficit ${fmt(Math.max(0, -effPower.delta, -effPower.winterDelta))} Wt, ${pd.action || "Power recovery not evaluated"}`;
       const baseDebug = `${powerDebug} · ${lockText} · Target score ${fmt(target.score || 0)} ETA ${formatEta(waitSecondsForCandidate(target, resources))} · Top candidates: ${topCandidates || "none"} · Reservations: ${reserveBySource || "none"} · Next: ${getNowAction(resources, goalKey)}`;
       const phase = target.kind === "research" ? researchTargetPhase(target, resources) : null;
       const phaseDebug = phase && phase.phase !== "purchase" ? `${baseDebug} · Research phase ${phase.phase}: ${phase.explanation}` : baseDebug;
@@ -6034,11 +6085,17 @@
       const missing = Math.max(0, reservable - have);
       ledger.direct[cost.name] = Math.max(ledger.direct[cost.name] || 0, reservable);
       ledger.missing[cost.name] = Math.max(ledger.missing[cost.name] || 0, missing);
+      ledger.critical.add(cost.name);
+      // Reserve only components that remain unsatisfied after inventory netting.
+      // If the player already holds enough Gear/Blueprint for a Magneto, those
+      // components (and their upstream Science/Compendium/Manuscript chains) are
+      // deliberately left out of the active reserve.
+      if (missing <= 0 && target.kind !== "stage" && !target._stageRebuild) continue;
       addLedgerNeed(ledger, cost.name, reservable);
       if (craftByName(cost.name) && rawWorkNeedName(cost.name) !== cost.name) {
         ledger.crafted.add(cost.name);
-        addCraftClosureToLedger(ledger, cost.name, Math.max(1, missing || reservable), resources);
-        const raw = rawPathRequirements(cost.name, Math.max(1, missing || reservable));
+        addCraftClosureToLedger(ledger, cost.name, Math.max(1, missing), resources);
+        const raw = rawPathRequirements(cost.name, Math.max(1, missing));
         for (const [name, amount] of Object.entries(raw)) addLedgerNeed(ledger, name, amount);
       }
     }
@@ -7206,6 +7263,7 @@
       push("— POWER —");
       push(`prod ${fmt(power.prod)} · cons ${fmt(power.cons)} · delta ${fmt(power.delta)} Wt · winter ${fmt(power.winterDelta)} Wt`);
       push(`latent paused-for-power demand ${fmt(eff.latent)} Wt → effective delta ${fmt(eff.delta)} Wt (winter ${fmt(eff.winterDelta)} Wt)`);
+      push(`computed deficit ${fmt(Math.max(0, -eff.delta, -eff.winterDelta))} Wt · selected/skipped: ${(lastPowerRecoveryDiagnostic && lastPowerRecoveryDiagnostic.action) || "not evaluated"}`);
       push("");
       push("— PROCESSING —");
       push(processingPlanText);
@@ -8228,6 +8286,8 @@
     powerStatus,
     effectivePowerStatus,
     latentPowerDemand,
+    powerRecoveryDiagnostic: () => lastPowerRecoveryDiagnostic,
+    doesCraftAdvanceActivePlan(candidate, outputName) { return doesCraftAdvanceActivePlan(candidate, resourceMap(), outputName); },
     powerSafeToBuild,
     profileNetEnergy,
     candidateNetEnergy,
