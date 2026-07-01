@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.9.0
+// @version      2.10.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -31,7 +31,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.9.0";
+  const HELPER_VERSION = "2.10.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -406,12 +406,23 @@
     return { ...raw, ...(raw.stages[stage] || {}), stage };
   };
 
-  // Space programs and Chronoforge/Void structures are stackable buildings of
-  // the SAME controller family as bonfire buildings, so the planner treats them
-  // as extra "build"-style candidates (kinds "space"/"time"). This is what lets
-  // the reservation-backed planner finally cover the late game. Enumerated
+  // Space programs (one-time planet-unlock missions, e.g. orbitalLaunch) and
+  // Chronoforge/Void structures are stackable buildings of the SAME controller
+  // family as bonfire buildings, so the planner treats them as extra
+  // "build"-style candidates (kinds "space"/"time"). This is what lets the
+  // reservation-backed planner finally cover the late game. Enumerated
   // defensively — these managers are empty until the relevant tech unlocks them.
-  const spaceMetas = () => {
+  //
+  // Space ALSO has a second, separate structure: each reached planet
+  // (`space.planets[]`) carries its own `buildings[]` array — the actual Cath
+  // "Satellite" (internal name `sattelite`), Space Elevator, Space Station,
+  // etc. These are stackable buildings too (val/on/priceRatio), but they are
+  // NOT in `space.programs` — a candidate scanner that only reads `programs`
+  // silently never sees them. Both lists feed the same "space" candidate kind;
+  // `isSpacePlanetBuilding` tells purchase/pricing which controller family a
+  // given meta belongs to (missions vs planet buildings use different game
+  // controllers — see `controllerSpecFor` / `spacePricesFor`).
+  const spaceProgramMetas = () => {
     try {
       const space = window.gamePage && window.gamePage.space;
       return Array.isArray(space && space.programs) ? space.programs : [];
@@ -419,6 +430,24 @@
       return [];
     }
   };
+
+  const spacePlanetBuildingMetas = () => {
+    const out = [];
+    try {
+      const space = window.gamePage && window.gamePage.space;
+      const planets = Array.isArray(space && space.planets) ? space.planets : [];
+      for (const planet of planets) {
+        if (Array.isArray(planet && planet.buildings)) out.push(...planet.buildings);
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    return out;
+  };
+
+  const spaceMetas = () => [...spaceProgramMetas(), ...spacePlanetBuildingMetas()];
+
+  const isSpacePlanetBuilding = (meta) => spacePlanetBuildingMetas().includes(meta);
 
   const timeMetas = () => {
     const out = [];
@@ -452,6 +481,35 @@
   const spaceTimeOpen = (meta) =>
     meta && meta.unlocked !== false && meta.researched !== true && !(meta.noStackable && (meta.on || meta.val || 0) >= 1);
 
+  // Space missions and planet buildings scale price differently in the live
+  // game (missions: flat priceRatio^val; planet buildings: priceRatio^val with
+  // a special 1.05 oil ratio, PLUS live *CostReduction effects), so read the
+  // real controller's getPrices when available instead of re-deriving the
+  // formula — same reasoning as `religionUpgradePrices`. Falls back to the
+  // naive scaled formula (also what the test harness, which has no dojo
+  // controllers, exercises).
+  const spacePricesFor = (meta) => {
+    try {
+      const game = window.gamePage;
+      const Controller = getGlobalPath(
+        isSpacePlanetBuilding(meta)
+          ? ["classes", "ui", "space", "PlanetBuildingBtnController"]
+          : ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"],
+      );
+      if (typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ id: meta.name, controller });
+        if (model && typeof controller.getPrices === "function") {
+          const live = controller.getPrices(model);
+          if (Array.isArray(live) && live.length) return live;
+        }
+      }
+    } catch (error) {
+      /* fall through to the scaled fallback */
+    }
+    return scaledStackablePrices(meta);
+  };
+
   const pricesFor = (kind, meta) => {
     try {
       if (kind === "bootstrap" || kind === "festival" || kind === "stage") return meta.prices || [];
@@ -459,7 +517,8 @@
         const livePrices = window.gamePage.bld.getPrices(meta.name);
         return Array.isArray(livePrices) && livePrices.length ? livePrices : meta.prices || [];
       }
-      if (kind === "space" || kind === "time") return scaledStackablePrices(meta);
+      if (kind === "space") return spacePricesFor(meta);
+      if (kind === "time") return scaledStackablePrices(meta);
       if ((kind === "research" || kind === "policy") && window.gamePage.science.getPrices) {
         return window.gamePage.science.getPrices(meta) || meta.prices || [];
       }
@@ -5695,7 +5754,6 @@
     upgrade: "WORKSHOP UPGRADE",
     religion: "RELIGION UPGRADE",
     policy: "POLICY",
-    space: "SPACE PROGRAM",
     time: "TIME STRUCTURE",
     festival: "FESTIVAL",
     stage: "BUILDING STAGE",
@@ -5703,7 +5761,15 @@
 
   const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳", festival: "🎉", stage: "⇄" };
 
-  const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase()}`;
+  // Space missions (orbitalLaunch, moonMission, ...) and planet buildings
+  // (Cath's Satellite, Space Elevator, ...) share the "space" candidate kind
+  // but are different game concepts — label them distinctly for diagnostics.
+  const kindLabelFor = (candidate) => {
+    if (candidate.kind === "space") return isSpacePlanetBuilding(candidate.meta) ? "SPACE BUILDING" : "SPACE PROGRAM";
+    return KIND_LABELS[candidate.kind] || candidate.kind.toUpperCase();
+  };
+
+  const focusLabel = (candidate) => `${KIND_ICONS[candidate.kind] || "🎯"} ${kindLabelFor(candidate)}`;
 
   // Compact "Need:" summary — the still-missing direct costs (cap-drain banks
   // and craft intermediates), e.g. "12.29K Science, 27.2 Compendium".
@@ -5903,7 +5969,7 @@
     }
   };
 
-  const controllerSpecFor = (kind) => {
+  const controllerSpecFor = (kind, meta) => {
     if (kind === "research") {
       return {
         path: ["com", "nuclearunicorn", "game", "ui", "TechButtonController"],
@@ -5935,10 +6001,12 @@
       };
     }
     if (kind === "space") {
-      return {
-        path: ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"],
-        opts: (name) => ({ id: name }),
-      };
+      // Missions (space.programs, e.g. orbitalLaunch) and planet buildings
+      // (space.planets[].buildings, e.g. Cath's Satellite) share the "space"
+      // candidate kind but are bought through different game controllers.
+      return isSpacePlanetBuilding(meta)
+        ? { path: ["classes", "ui", "space", "PlanetBuildingBtnController"], opts: (name) => ({ id: name }) }
+        : { path: ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"], opts: (name) => ({ id: name }) };
     }
     if (kind === "time") {
       // Chronoforge controller for CFU; Void-space metas fall through to the
@@ -5955,7 +6023,7 @@
     const game = window.gamePage;
     const meta = candidate && candidate.meta;
     const name = meta && meta.name;
-    const spec = controllerSpecFor(candidate && candidate.kind);
+    const spec = controllerSpecFor(candidate && candidate.kind, meta);
     const Controller = spec && getGlobalPath(spec.path);
     if (!game || !name || typeof Controller !== "function") return false;
     const controller = new Controller(game);
@@ -7290,6 +7358,41 @@
     return lines;
   };
 
+  // Planet buildings gate on `requiredTech` (tech names) directly, unlike
+  // workshop upgrades which are gated indirectly via `unlocks.upgrades` lists.
+  const spaceUnlockGate = (meta) => {
+    if (!meta || !Array.isArray(meta.requiredTech) || !meta.requiredTech.length) return null;
+    const names = meta.requiredTech
+      .map((techName) => {
+        const tech = techByName(techName);
+        return tech && !tech.researched ? labelOf(tech) : null;
+      })
+      .filter(Boolean);
+    return names.length ? names.join(", ") : null;
+  };
+
+  // Space missions (space.programs) AND planet buildings (space.planets[].buildings,
+  // e.g. Cath's Satellite) — separate from the WORKSHOP section above, which only
+  // covers workshop upgrades like Solar Satellites / Satellite Navigation / Satellite
+  // Radio and must never be confused with an actual buildable space structure.
+  const spaceReportLines = (resources) => {
+    const lines = [];
+    for (const meta of spaceMetas()) {
+      if (!meta || !meta.name || isDeniedKey(meta.name)) continue;
+      if (meta.noStackable && (meta.on || meta.val || 0) >= 1) continue; // one-time mission already complete
+      if (meta.unlocked === false) {
+        const gate = spaceUnlockGate(meta);
+        lines.push(`  ${labelOf(meta)} · LOCKED${gate ? ` — needs ${gate}` : ""} · costs ${formatPriceList(resources, "space", meta)}`);
+        continue;
+      }
+      const val = meta.val || 0;
+      const ev = evaluate("space", meta, resources);
+      const status = ev.affordable ? "buildable now" : (ev.missing ? `need ${ev.missing}` : "—");
+      lines.push(`  ${labelOf(meta)} ×${fmt(val)} · next ${formatPriceList(resources, "space", meta)} · ${status}`);
+    }
+    return lines;
+  };
+
   // Live job census so the report explains "why are N kittens on Priest?" — the
   // counts plus the Jobs need line (and any jobSuppressText) tell the whole story.
   const jobsReportLine = () => {
@@ -7392,6 +7495,15 @@
         else push("  (all unlocked upgrades researched)");
       } catch (error) {
         push("  (workshop census unavailable)");
+      }
+      push("");
+      push("— SPACE (missions · planet buildings · lock/requirement) —");
+      try {
+        const lines4 = spaceReportLines(resources);
+        if (lines4.length) for (const line of lines4) push(line);
+        else push("  (no space content reached yet)");
+      } catch (error) {
+        push("  (space census unavailable)");
       }
       push("");
       push("— TOP CANDIDATES —");

@@ -2760,6 +2760,87 @@ check("Test AB: a recovering fuel yields the layer (no oscillation)", dbg.conver
 buildings.splice(buildings.indexOf(oilWellZ), 1);
 dbg.forceActiveTarget(null);
 
+/* ---------------------------------------------------------------------
+ * Test AC — Space tab candidate scanning (v2.10.0). The scanner used to
+ * only read `space.programs` (one-time planet-unlock missions like
+ * orbitalLaunch), so an actual buildable Cath structure — e.g. `sattelite`
+ * (Satellite) living under `space.planets[].buildings` — was invisible to
+ * planning even though workshop upgrades that merely SOUND similar (Solar
+ * Satellites / Satellite Navigation / Satellite Radio) were already scanned
+ * as locked upgrades. Planet buildings must be enumerated, scored,
+ * reported, and bought through their own game controller — distinct from
+ * both workshop upgrades and space missions.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+const orbitalEngineeringAC = { name: "orbitalEngineeringAC", label: "Orbital Engineering", unlocked: true, researched: false, prices: [{ name: "science", val: 1000 }], unlocks: {} };
+techs.push(orbitalEngineeringAC);
+const satelliteAC = { name: "satelliteAC", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, requiredTech: [], prices: [{ name: "titanium", val: 50 }, { name: "science", val: 500 }], effects: { observatoryRatio: 0.05 } };
+const spaceElevatorAC = { name: "spaceElevatorAC", label: "Space Elevator", unlocked: false, val: 0, on: 0, priceRatio: 1.15, requiredTech: ["orbitalEngineeringAC"], prices: [{ name: "titanium", val: 6000 }, { name: "science", val: 75000 }], effects: {} };
+const cathAC = { name: "cathAC", label: "Cath", buildings: [satelliteAC, spaceElevatorAC] };
+const orbitalLaunchAC = { name: "orbitalLaunchAC", label: "Orbital Launch", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 400 }], effects: {} };
+gamePage.space = {
+  programs: [orbitalLaunchAC],
+  planets: [cathAC],
+  getProgram: (id) => [orbitalLaunchAC].find((p) => p.name === id),
+  getBuilding: (id) => [satelliteAC, spaceElevatorAC].find((b) => b.name === id),
+  build(item) {
+    const name = typeof item === "string" ? item : item && item.name;
+    const meta = [orbitalLaunchAC, satelliteAC, spaceElevatorAC].find((m) => m.name === name);
+    if (!meta || !pay(meta.prices || [])) return false;
+    meta.val = (meta.val || 0) + 1;
+    meta.on = (meta.on || 0) + 1;
+    return true;
+  },
+};
+
+check("Test AC: an unlocked Cath planet building (Satellite) is scanned as a candidate", dbg.candidateById("space:satelliteAC")?.kind === "space");
+check("Test AC: the space mission (Orbital Launch) is ALSO still scanned", !!dbg.candidateById("space:orbitalLaunchAC"));
+check("Test AC: a locked planet building (needs Orbital Engineering) is NOT yet a candidate", !dbg.candidateById("space:spaceElevatorAC"));
+
+const solarSatellitesAC = { name: "solarSatellitesAC", label: "Solar Satellites", unlocked: false, researched: false, prices: [{ name: "science", val: 225000 }, { name: "alloy", val: 750 }], effects: {} };
+workshopUpgrades.push(solarSatellitesAC);
+
+const reportAC = dbg.report();
+check(
+  "Test AC: report SPACE section lists the buildable Satellite distinctly from the LOCKED workshop 'Solar Satellites' upgrade",
+  /— SPACE /.test(reportAC) && /\n {2}Satellite ×0 · next .*(buildable now|need )/.test(reportAC) && /Solar Satellites · LOCKED/.test(reportAC),
+);
+check("Test AC: report SPACE section shows the locked Space Elevator gated on Orbital Engineering", /Space Elevator · LOCKED — needs Orbital Engineering/.test(reportAC));
+
+// Fund and buy the Satellite through the native planner path (kind "space",
+// planet-building sub-type) — proves purchase EXECUTION, not just scanning,
+// works for planet buildings distinctly from missions (different controller).
+// Neutralize every competing candidate first (same isolation technique as
+// simulate.mjs's "space" phase) so Satellite is the clear pick.
+const savedBuildingUnlockedAC = buildings.map((b) => b.unlocked);
+const savedTechUnlockedAC = techs.map((t) => t.unlocked);
+const savedTechResearchedAC = techs.map((t) => t.researched);
+const savedUpgradeResearchedAC = workshopUpgrades.map((u) => u.researched);
+const savedReligionUnlockedAC = religionUpgrades.map((u) => u.unlocked);
+const savedFestivalDaysAC = calendar.festivalDays;
+for (const b of buildings) b.unlocked = false;
+for (const t of techs) t.researched = true;
+for (const u of workshopUpgrades) u.researched = true;
+for (const u of religionUpgrades) u.unlocked = false;
+calendar.festivalDays = calendar.daysPerSeason + 1; // festival "active" → not a competing candidate
+orbitalLaunchAC.unlocked = false; // isolate the PLANET BUILDING purchase path from the space MISSION
+res("titanium").value = 100; res("titanium").maxValue = 200;
+res("science").value = 2000; res("science").maxValue = 5000;
+dbg.forceActiveTarget(null);
+tickFn();
+check("Test AC: the Satellite planet building is actually bought by the native planner", satelliteAC.val > 0);
+buildings.forEach((b, i) => { b.unlocked = savedBuildingUnlockedAC[i]; });
+techs.forEach((t, i) => { t.unlocked = savedTechUnlockedAC[i]; t.researched = savedTechResearchedAC[i]; });
+workshopUpgrades.forEach((u, i) => { u.researched = savedUpgradeResearchedAC[i]; });
+religionUpgrades.forEach((u, i) => { u.unlocked = savedReligionUnlockedAC[i]; });
+calendar.festivalDays = savedFestivalDaysAC;
+orbitalLaunchAC.unlocked = true;
+
+dbg.forceActiveTarget(null);
+techs.splice(techs.indexOf(orbitalEngineeringAC), 1);
+delete gamePage.space;
+
 buildings.splice(buildings.indexOf(magnetoY), 1);
 buildings.splice(buildings.indexOf(bioLabY), 1);
 buildings.splice(buildings.indexOf(factoryY), 1);
