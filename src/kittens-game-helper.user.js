@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.11.3
+// @version      2.11.4
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.11.3";
+  const HELPER_VERSION = "2.11.4";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4275,10 +4275,58 @@
   // Some buildings stay hidden until the player owns a fraction of a newly
   // craftable price resource.  Discover that requirement from live metadata
   // instead of keeping a list of Concrete/Tanker/etc. special cases.
+  const metaGrantsBuilding = (meta, buildingName) => {
+    if (!meta || !buildingName) return false;
+    for (const node of [meta.unlocks, meta.upgrades]) {
+      if (!node || typeof node !== "object") continue;
+      for (const list of [node.buildings, node.building]) {
+        if (Array.isArray(list) && list.includes(buildingName)) return true;
+      }
+    }
+    return false;
+  };
+
+  const hiddenBuildingBootstrapAllowed = (raw) => {
+    const live = liveMetaView(raw) || raw;
+    if (raw.defaultUnlockable || (live && live.defaultUnlockable)) return true;
+    const name = raw && raw.name;
+    if (!name) return false;
+    try {
+      for (const source of buildingMetas()) {
+        if (source && source.name !== name && metaGrantsBuilding(source, name) && (source.val || source.on || 0) > 0) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    try {
+      for (const source of techList()) {
+        if (source && metaGrantsBuilding(source, name) && source.researched) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    try {
+      for (const source of (window.gamePage.workshop && window.gamePage.workshop.upgrades) || []) {
+        if (source && metaGrantsBuilding(source, name) && (source.researched || source.on || source.val)) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    try {
+      for (const source of religionUpgrades()) {
+        if (source && metaGrantsBuilding(source, name) && religionUpgradePurchased(source)) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    return false;
+  };
+
   const bootstrapResourceCandidate = (resources = resourceMap()) => {
     const options = [];
     for (const raw of buildingMetas()) {
       if (!raw || raw.unlocked !== false || !(raw.unlockable || raw.defaultUnlockable)) continue;
+      if (!hiddenBuildingBootstrapAllowed(raw)) continue;
       const live = liveMetaView(raw) || raw;
       const ratio = isFinite(live.unlockRatio) ? Math.max(0, live.unlockRatio) : null;
       if (ratio == null || ratio <= 0) continue;

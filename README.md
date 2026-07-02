@@ -23,10 +23,11 @@ stay off so your progress is never wiped.
    somewhere safe. (Automation changes your real save; this is your undo.)
 2. Install a userscript manager: **[Tampermonkey](https://www.tampermonkey.net/)**
    (Chrome/Edge/Firefox/Safari).
-3. Install this script: open
-   [`src/kittens-game-helper.user.js`](src/kittens-game-helper.user.js) → click **Raw**
-   → Tampermonkey offers to install it → **Install**.
-   (Or open Tampermonkey → *Create a new script*, paste the file contents, save.)
+3. Install this script: open the
+   [direct raw userscript](https://raw.githubusercontent.com/ianhuxx/kittens-game-helper/main/src/kittens-game-helper.user.js)
+   → Tampermonkey offers to install/update it → **Install** or **Update**.
+   If an older pasted copy is still installed, replace it once with the raw link above
+   so Tampermonkey can track future updates.
    There is **nothing else to install** — the helper has no external dependency.
 4. Open / refresh **<https://kittensgame.com/web/>**.
 5. A 🐱 **Kittens Helper** box appears bottom-right. It already started on **Autopilot**.
