@@ -36,7 +36,11 @@ so a scenario can be asserted from the real decision path, not a reimplementatio
 
 No external libraries, no Kitten Scientists bridge. Irreversible actions
 (reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate
-list and must stay that way.
+list and must stay that way. One deliberate carve-out (v2.11.0): the repeatable
+unicorn→tears sacrifice is performed by the `manageUnicornReligion` subsystem —
+never as a candidate — bounded to the measured tears deficit of the ziggurat
+upgrade the unicorn planner picked, at the live exchange rate. Alicorn sacrifice
+(time crystals → prestige territory) remains fully denied.
 
 ### 4. Read every rate LIVE — never bake in base numbers
 
@@ -87,6 +91,7 @@ Building stage transition  reversible change with opportunity-costed rebuild par
 Storage blocker            a resource cap is actively wasting income
 Production bottleneck       a needed resource has no production/craft path
 Housing / population
+Ziggurat / unicorn path    a funded unicorn-economy step reserves its shared costs
 Economy / normal growth     the general ROI scorer
 Long project               Temple, Ziggurat, religion/space/time structures
 ```
@@ -165,6 +170,24 @@ Key invariants (see comments in the source for the why):
 - **Storage-blocked banks never become craft targets.** A tech whose final
   science price can't fit storage is deferred, not crafted toward (no compendiums
   for Electricity until the final cost fits).
+- **The unicorn economy is ranked in ONE currency and its sacrifice is bounded.**
+  Ziggurat upgrades are first-class candidates (kind `ziggurat`, val-based,
+  bought via `ZigguratBtnController` / the religion tab's own buttons).
+  `unicornEconomyPlan` prices every open step — Unicorn Pasture, each ziggurat
+  upgrade, building another Ziggurat first — in unicorn-equivalents (a tear
+  costs `batch ÷ ziggurats` unicorns, both read live) and ranks by payback
+  against LIVE unicorn income; an upgrade whose first copy unlocks alicorns is
+  exempt from the payback horizon but never from reachability. When one more
+  Ziggurat saves ≥`UNICORN_ZIG_FIRST_SAVINGS` of the pick's unicorn bill and is
+  itself reachable, the Ziggurat is built BEFORE sacrificing. The sacrifice
+  (`manageUnicornReligion`) serves the ACTIVE target when it is tear-priced
+  (manual queue wins), otherwise the ranked pick; it converts exactly the tears
+  deficit in whole batches, spends no externally-reserved unicorns, and the
+  reservation ledger holds the unicorns a pending tears bill needs
+  (`unicornPathReservationLedger` + the tears branch in `buildTargetLedger`) so
+  surplus pasture buys can't eat the bank. Tears reachability/ETA flows through
+  `sacrificeConversionFor` in `capDrainReachabilityFor` / `waitSecondsForSacrifice`
+  — never treat tears as a dead-end resource. Test AD pins all of this.
 - **No-op policies are excluded from planning** (`isNoopPolicyCandidate`, e.g.
   Socialism) — they are never gathered as candidates, auto-bought, or advised.
 - **Any non-target spender must evaluate expanded spend impact against the active target ledger.** Direct price checks are insufficient: surplus buys, cap relief, policies, diplomacy, trade, overflow crafting and other spenders must compare their direct costs plus crafted/raw chain impact against `buildTargetLedger()`/`violatesTargetLock()` so a ship/scaffold/plate/slab-style buy cannot consume the material chain being saved for the active focus.

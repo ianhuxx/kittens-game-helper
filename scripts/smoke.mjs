@@ -79,6 +79,9 @@ const resources = [
   R("titanium", 0, 100, "Titanium"),
   R("furs", 600, 0),
   R("ivory", 100, 0),
+  R("unicorns", 0, 0, "Unicorns"),
+  R("tears", 0, 0, "Tears"),
+  R("alicorn", 0, 0, "Alicorns", { unlocked: false }),
   R("spice", 0, 0, "Spice", { unlocked: false }),
   R("parchment", 100, 0),
   R("manuscript", 5, 0),
@@ -134,6 +137,12 @@ const buildings = [
     prices: [{ name: "beam", val: 200 }, { name: "slab", val: 350 }],
     effects: { manpowerMax: 500, woodMax: 1000, mineralsMax: 1000, ironMax: 250, coalMax: 250 },
   },
+  // Unicorn economy (Test AD): both stay locked/absent until that stage flips
+  // them on, so earlier stages see no new candidates. The Ziggurat's slab bill
+  // is deliberately huge — reachable (slab is a rolling craft) but never an
+  // impulse buy that would change the ziggurat count mid-test.
+  { name: "unicornPasture", label: "Unic. Pasture", unlocked: false, val: 0, on: 0, priceRatio: 1.75, prices: [{ name: "unicorns", val: 2 }], effects: { unicornsPerTickBase: 0.001 } },
+  { name: "ziggurat", label: "Ziggurat", unlocked: false, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "slab", val: 5000 }], effects: {} },
   // Safety bait: a denied ("reset") action that is the CHEAPEST unlocked item.
   // If isDeniedKey() were not filtering candidates, the planner would grab it
   // immediately — so its val staying 0 proves irreversible actions are excluded.
@@ -193,6 +202,14 @@ const workshopUpgrades = [
   },
 ];
 
+// Ziggurat branch of the Religion tab (Test AD): tear-priced, stackable,
+// 1.15 price ratio — the game's real shapes for Unicorn Tomb / Ivory Tower.
+const zigguratUpgradesMock = [
+  { name: "unicornTomb", label: "Unicorn Tomb", unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "ivory", val: 500 }, { name: "tears", val: 5 }], effects: { unicornsRatioReligion: 0.05 } },
+  { name: "ivoryTower", label: "Ivory Tower", unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "ivory", val: 25000 }, { name: "tears", val: 25 }], effects: { unicornsRatioReligion: 0.1, alicornChance: 5 } },
+];
+const scaledZigPrices = (u) => (u.prices || []).map((p) => ({ name: p.name, val: p.val * Math.pow(u.priceRatio || 1, u.val || 0) }));
+
 const religionUpgrades = [
   {
     name: "solarchant",
@@ -241,6 +258,7 @@ let observeCalls = 0;
 let praiseCalls = 0;
 let festivalCalls = 0;
 let tradeCalls = 0;
+let sacrificeChunks = 0; // 2500-unicorn batches converted to tears
 
 const calendar = {
   festivalDays: 0,
@@ -295,7 +313,7 @@ const village = {
   },
 };
 
-const perTick = { catnip: -0.4, wood: 0.4, minerals: 0.3, science: 0.2, culture: 0.2, manpower: 0.2, iron: 0.05, coal: 0.01, gold: 0.01 };
+const perTick = { catnip: -0.4, wood: 0.4, minerals: 0.3, science: 0.2, culture: 0.2, manpower: 0.2, iron: 0.05, coal: 0.01, gold: 0.01, unicorns: 0 };
 const craftRatios = { plate: 0.16 };
 const resourcePerTickCalls = [];
 
@@ -344,10 +362,16 @@ const gamePage = {
   },
   bld: {
     buildingsData: buildings,
-    getPrices: (name) => (buildings.find((b) => b.name === name) || {}).prices || [],
+    // Real buildings scale price by priceRatio^val; mocks without a priceRatio
+    // keep ratio 1, so every pre-existing test sees identical numbers.
+    getPrices: (name) => {
+      const meta = buildings.find((b) => b.name === name) || {};
+      const mult = Math.pow(meta.priceRatio || 1, meta.val || 0);
+      return (meta.prices || []).map((p) => ({ name: p.name, val: p.val * mult }));
+    },
     build(name) {
       const meta = buildings.find((b) => b.name === name);
-      if (!meta || !pay(meta.prices || [])) return false;
+      if (!meta || !pay(gamePage.bld.getPrices(name))) return false;
       meta.val = (meta.val || 0) + 1;
       meta.on = (meta.on || 0) + 1;
       return true;
@@ -374,6 +398,7 @@ const gamePage = {
   religion: {
     faith: 200,
     religionUpgrades,
+    zigguratUpgrades: zigguratUpgradesMock,
     build(item) {
       const meta = typeof item === "string" ? religionUpgrades.find((u) => u.name === item) : item;
       if (!meta || !pay(meta.prices || [])) return false;
@@ -403,6 +428,36 @@ const gamePage = {
   village,
   calendar,
   diplomacy,
+  // Religion tab with the game's real button shapes: the sacrifice button's
+  // controller._transform (unicorns→tears at one tear per ziggurat per 2500)
+  // and the zgUpgradeButtons the helper falls back to for purchases.
+  religionTab: {
+    sacrificeBtn: {
+      model: { prices: [{ name: "unicorns", val: 2500 }] },
+      controller: {
+        _transform(model, amount) {
+          const zigs = (buildings.find((b) => b.name === "ziggurat") || {}).val || 0;
+          const cost = 2500 * amount;
+          if (!zigs || amount <= 0 || res("unicorns").value < cost) return false;
+          res("unicorns").value -= cost;
+          res("tears").value += zigs * amount;
+          sacrificeChunks += amount;
+          return true;
+        },
+      },
+    },
+    zgUpgradeButtons: zigguratUpgradesMock.map((u) => ({
+      model: { options: { id: u.name } },
+      controller: {
+        buyItem() {
+          if (!pay(scaledZigPrices(u))) return { itemBought: false };
+          u.val = (u.val || 0) + 1;
+          u.on = (u.on || 0) + 1;
+          return { itemBought: true };
+        },
+      },
+    })),
+  },
   villageTab: { updateTab() {} },
   updateResources() {},
   unlock() {},
@@ -2850,6 +2905,117 @@ gamePage.resPool.energyCons = savedPowerY.energyCons;
 gamePage.resPool.energyWinterProd = savedPowerY.energyWinterProd;
 res("science").value = savedScienceY.value;
 res("science").maxValue = savedScienceY.maxValue;
+
+/* ---------------------------------------------------------------------
+ * Test AD — ziggurat / unicorn path (v2.11.0).  The player used to run the
+ * unicorn loop by hand: sacrifice unicorns for tears, buy the ziggurat
+ * upgrades, decide when a pasture or another Ziggurat is the better spend.
+ * The planner must rank all three in unicorn-equivalents (LIVE rates), fund
+ * a chosen tear-priced upgrade with a BOUNDED sacrifice (exactly the tears
+ * deficit, whole 2500-unicorn batches), buy it through the game's own
+ * button, hold sacrifices while a pasture is the better payback, and rush
+ * one more Ziggurat first when it cuts ≥25% of the pick's tear bill.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+dbg.clearUnicornPathState();
+const pastureAD = buildings.find((b) => b.name === "unicornPasture");
+const zigguratAD = buildings.find((b) => b.name === "ziggurat");
+const tombAD = zigguratUpgradesMock[0];
+const towerAD = zigguratUpgradesMock[1];
+pastureAD.unlocked = true; pastureAD.val = 25; pastureAD.on = 25; // next pasture ≈2.4M unicorns → terrible payback
+zigguratAD.unlocked = false; zigguratAD.val = 4;                  // 4 zigs → 1 tear costs 625 unicorns; count read from val
+res("unicorns").value = 20000;
+res("tears").value = 0;
+res("ivory").value = 600;
+res("manpower").value = 500; // a previous stage's hunt zeroed catpower; ivory reachability hunts with it
+perTick.unicorns = 4; // ×5 ticks/s → 20 unicorns/s live production
+dbg.clearResourceTelemetry?.("unicorns");
+dbg.clearResourceTelemetry?.("manpower");
+
+const uPlanAD = dbg.unicornEconomyPlan();
+check("Test AD: ranked in unicorn-equivalents — Unicorn Tomb (5 tears ≈ 3.1K unicorns) beats a 2.4M-unicorn pasture", uPlanAD.best?.meta?.name === "unicornTomb" && uPlanAD.best.kind === "ziggurat");
+check("Test AD: tear cost uses the LIVE ziggurat count (5 tears × 2500/4 zigs + no direct unicorns = 3125)", Math.abs(uPlanAD.best.cost.total - 3125) < 1e-6);
+check("Test AD: at 4 ziggurats the marginal-ziggurat saving (20%) stays below the 25% rush threshold", !uPlanAD.zigguratFirst);
+const tombCandidateAD = dbg.candidateById("ziggurat:unicornTomb");
+check("Test AD: a ziggurat upgrade is a first-class candidate whose missing tears point at the sacrifice", !!tombCandidateAD && /sacrifice unicorns/.test(tombCandidateAD.missing || ""));
+check("Test AD: the target ledger reserves the unicorns the sacrifice will consume (2 batches = 5000)", (dbg.buildTargetLedger(tombCandidateAD).reserved.unicorns || 0) === 5000);
+const uDecisionAD = dbg.selectStrategicTarget("balanced");
+check("Test AD: funded unicorn side claims the plan at the Ziggurat / unicorn path layer", uDecisionAD.layer === "Ziggurat / unicorn path" && uDecisionAD.target?.meta?.name === "unicornTomb");
+
+// Full-tick integration: sacrifice EXACTLY the deficit, then buy the upgrade
+// through the religion-tab button — isolated like Test AC so nothing competes.
+const savedBuildingUnlockedAD = buildings.map((b) => b.unlocked);
+const savedTechResearchedAD = techs.map((t) => t.researched);
+const savedUpgradeResearchedAD = workshopUpgrades.map((u) => u.researched);
+const savedReligionUnlockedAD = religionUpgrades.map((u) => u.unlocked);
+const savedFestivalDaysAD = calendar.festivalDays;
+for (const b of buildings) b.unlocked = false;
+pastureAD.unlocked = true;
+for (const t of techs) t.researched = true;
+for (const u of workshopUpgrades) u.researched = true;
+for (const u of religionUpgrades) u.unlocked = false;
+calendar.festivalDays = calendar.daysPerSeason + 1;
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+tickFn();
+check("Test AD: sacrifice is BOUNDED to the measured deficit — exactly 2 batches (5000 unicorns) for 5 tears", sacrificeChunks === 2 && res("unicorns").value === 15000);
+check("Test AD: the Unicorn Tomb is actually bought through the game's ziggurat button", tombAD.val === 1 && res("tears").value === 3 && res("ivory").value === 100);
+check("Test AD: the sacrifice and the unicorn-path plan are logged", logText().includes("🦄") && /Ziggurat \/ unicorn path/.test(logText()));
+check("Test AD: the panel shows the unicorn subsystem line", /Unicorns:/.test(panelText(".kgh-unicorn")));
+const reportAD = dbg.report();
+check("Test AD: diagnostics report ranks the unicorn options with payback", /Unicorns: /.test(reportAD) && /unicorn-eq/.test(reportAD));
+buildings.forEach((b, i) => { b.unlocked = savedBuildingUnlockedAD[i]; });
+techs.forEach((t, i) => { t.researched = savedTechResearchedAD[i]; });
+workshopUpgrades.forEach((u, i) => { u.researched = savedUpgradeResearchedAD[i]; });
+religionUpgrades.forEach((u, i) => { u.unlocked = savedReligionUnlockedAD[i]; });
+calendar.festivalDays = savedFestivalDaysAD;
+pastureAD.unlocked = true;
+
+// Balance flip: a CHEAP pasture (val 2 → ≈6 unicorns, payback ≈0.6s) must
+// out-rank the next Tomb and SUPPRESS sacrificing — unicorns are banked for
+// the pasture instead of melted into tears.
+fakeNow += 30000;
+dbg.forceActiveTarget(null);
+dbg.clearUnicornPathState();
+dbg.clearResourceTelemetry?.("unicorns");
+pastureAD.val = 2; pastureAD.on = 2;
+res("unicorns").value = 30000;
+const uPlanFlipAD = dbg.unicornEconomyPlan();
+check("Test AD: a cheap pasture out-ranks the next tear upgrade (payback balance)", uPlanFlipAD.best?.meta?.name === "unicornPasture");
+const sacrificesBeforeFlipAD = sacrificeChunks;
+dbg.forceActiveTarget(dbg.candidateById("build:unicornPasture"), "Economy / normal growth", 0);
+dbg.manageUnicornReligion();
+check("Test AD: no sacrifice fires while the pasture is the better unicorn spend", sacrificeChunks === sacrificesBeforeFlipAD && /saving unicorns/i.test(dbg.unicornPlanText()));
+dbg.forceActiveTarget(null);
+
+// Rush-ziggurats rule: at ONE ziggurat a tear costs 2500 unicorns and the
+// next Ziggurat halves that (50% ≥ 25% threshold) — so the layer targets the
+// reachable Ziggurat build itself and holds the sacrifice for the discount.
+fakeNow += 30000;
+dbg.clearUnicornPathState();
+dbg.clearResourceTelemetry?.("unicorns");
+pastureAD.val = 25; pastureAD.on = 25;
+zigguratAD.unlocked = true; zigguratAD.val = 1;
+const uPlanRushAD = dbg.unicornEconomyPlan();
+check("Test AD: one more Ziggurat halving the tear bill trips the ≥25% rush rule", !!uPlanRushAD.zigguratFirst && uPlanRushAD.zigguratFirst.share >= 0.25);
+const uRushDecisionAD = dbg.selectStrategicTarget("balanced");
+check("Test AD: the unicorn-path layer rushes the Ziggurat build before sacrificing", uRushDecisionAD.layer === "Ziggurat / unicorn path" && uRushDecisionAD.target?.meta?.name === "ziggurat" && /tear bill/.test(uRushDecisionAD.reason || ""));
+const sacrificesBeforeRushAD = sacrificeChunks;
+dbg.manageUnicornReligion();
+check("Test AD: the sacrifice is HELD while the Ziggurat discount is worth building first", sacrificeChunks === sacrificesBeforeRushAD && /holding sacrifice/i.test(dbg.unicornPlanText()));
+
+// Restore the unicorn economy to inert so nothing later is perturbed.
+pastureAD.unlocked = false; pastureAD.val = 0; pastureAD.on = 0;
+zigguratAD.unlocked = false; zigguratAD.val = 0; zigguratAD.on = 0;
+tombAD.val = 0; tombAD.on = 0;
+res("unicorns").value = 0;
+res("tears").value = 0;
+res("ivory").value = 100;
+perTick.unicorns = 0;
+dbg.clearUnicornPathState();
+dbg.clearResourceTelemetry?.("unicorns");
+dbg.forceActiveTarget(null);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
