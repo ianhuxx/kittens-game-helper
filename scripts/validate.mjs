@@ -12,6 +12,9 @@ import vm from "node:vm";
 
 const scriptPath = fileURLToPath(new URL("../src/kittens-game-helper.user.js", import.meta.url));
 const source = await readFile(scriptPath, "utf8");
+const readmePath = fileURLToPath(new URL("../README.md", import.meta.url));
+const readme = await readFile(readmePath, "utf8");
+const rawScriptUrl = "https://raw.githubusercontent.com/ianhuxx/kittens-game-helper/main/src/kittens-game-helper.user.js";
 
 // The helper now drives the game's own API directly. None of these may appear:
 // any reintroduction of Kitten Scientists or a settings-tree bridge is a
@@ -224,6 +227,18 @@ const constVersion = (source.match(/HELPER_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]
 const pkg = JSON.parse(await readFile(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
 if (!metaVersion || !constVersion || metaVersion !== constVersion || metaVersion !== pkg.version) {
   console.error(`✗ Version mismatch — @version=${metaVersion}, HELPER_VERSION=${constVersion}, package.json=${pkg.version} (all three must match; bump every update).`);
+  process.exit(1);
+}
+
+const updateUrl = (source.match(/@updateURL\s+(\S+)/) || [])[1];
+const downloadUrl = (source.match(/@downloadURL\s+(\S+)/) || [])[1];
+if (updateUrl !== rawScriptUrl || downloadUrl !== rawScriptUrl) {
+  console.error(`✗ Userscript update metadata must point to ${rawScriptUrl}.`);
+  process.exit(1);
+}
+
+if (!readme.includes(rawScriptUrl)) {
+  console.error(`✗ README install/update steps must include the direct raw userscript URL: ${rawScriptUrl}`);
   process.exit(1);
 }
 

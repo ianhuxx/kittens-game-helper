@@ -2335,6 +2335,7 @@ const hiddenSmartBuilding = {
   label: "Smart Archive",
   unlocked: false,
   unlockable: true,
+  defaultUnlockable: true,
   unlockRatio: 0.1,
   val: 0,
   on: 0,
@@ -2353,6 +2354,71 @@ check("Test U: Resource bootstrap structurally outranks ordinary economy work", 
 buildings.splice(buildings.indexOf(hiddenSmartBuilding), 1);
 crafts.splice(crafts.indexOf(smartcreteCraft), 1);
 resources.splice(resources.indexOf(smartcrete), 1);
+
+const hiddenLogHouseU = {
+  name: "hiddenLogHouseU",
+  label: "Log House",
+  unlocked: false,
+  unlockable: true,
+  defaultUnlockable: false,
+  unlockRatio: 1,
+  val: 0,
+  on: 0,
+  prices: [{ name: "wood", val: 1 }],
+  effects: { maxKittens: 1 },
+};
+const savedWoodU = res("wood").value;
+const savedCatnipU = res("catnip").value;
+res("wood").value = 0;
+res("catnip").value = 1000;
+buildings.push(hiddenLogHouseU);
+dbg.forceActiveTarget(null);
+const hiddenLogHouseBootstrap = dbg.bootstrapResourceCandidate?.();
+check("Test U: source-less hidden buildings such as Log House are not focused as Resource bootstrap targets", hiddenLogHouseBootstrap?.meta?.downstreamName !== "hiddenLogHouseU");
+buildings.splice(buildings.indexOf(hiddenLogHouseU), 1);
+res("wood").value = savedWoodU;
+res("catnip").value = savedCatnipU;
+
+const lockedZigguratU = buildings.find((b) => b.name === "ziggurat");
+const savedLockedZigguratU = {
+  unlocked: lockedZigguratU.unlocked,
+  unlockable: lockedZigguratU.unlockable,
+  defaultUnlockable: lockedZigguratU.defaultUnlockable,
+  unlockRatio: lockedZigguratU.unlockRatio,
+  prices: lockedZigguratU.prices,
+  upgrades: lockedZigguratU.upgrades,
+};
+const savedZigguratResourcesU = {
+  scaffold: res("scaffold").value,
+  plate: res("plate").value,
+  iron: res("iron").value,
+};
+Object.assign(lockedZigguratU, {
+  unlocked: false,
+  unlockable: true,
+  defaultUnlockable: false,
+  unlockRatio: 1,
+  prices: [{ name: "scaffold", val: 1 }],
+  upgrades: { buildings: ["temple"] },
+});
+res("scaffold").value = 0;
+res("plate").value = 0;
+res("iron").value = 25;
+dbg.forceActiveTarget(null);
+const lockedZigguratBootstrap = dbg.bootstrapResourceCandidate?.();
+check("Test U: source-gated locked Ziggurat does not create a Scaffold bootstrap before its unlock source is owned", lockedZigguratBootstrap?.meta?.downstreamName !== "ziggurat");
+const lockedZigguratDecision = dbg.selectStrategicTarget("balanced");
+check("Test U: strategic planning does not focus Scaffold for locked Ziggurat", lockedZigguratDecision.target?.meta?.downstreamName !== "ziggurat");
+lockedZigguratU.unlocked = savedLockedZigguratU.unlocked;
+lockedZigguratU.unlockable = savedLockedZigguratU.unlockable;
+lockedZigguratU.defaultUnlockable = savedLockedZigguratU.defaultUnlockable;
+lockedZigguratU.unlockRatio = savedLockedZigguratU.unlockRatio;
+lockedZigguratU.prices = savedLockedZigguratU.prices;
+lockedZigguratU.upgrades = savedLockedZigguratU.upgrades;
+res("scaffold").value = savedZigguratResourcesU.scaffold;
+res("plate").value = savedZigguratResourcesU.plate;
+res("iron").value = savedZigguratResourcesU.iron;
+dbg.forceActiveTarget(null);
 
 /* =====================================================================
  * REGRESSION — direct science-cap evidence and full-deficit projection
