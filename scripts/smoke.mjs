@@ -2911,6 +2911,60 @@ buildings.splice(buildings.indexOf(oilWellZ), 1);
 dbg.forceActiveTarget(null);
 
 /* ---------------------------------------------------------------------
+ * Test AE — first-uranium bootstrap is not a fake minerals wait.  In the
+ * live v2.11.1 diagnostic, Uranium was 0, Reactors were owned but never ON,
+ * and Accelerator / uranium upgrades appeared in the ranked candidates with
+ * finite ETAs.  The first uranium-producing building itself costs uranium, so
+ * without an existing uranium income/trade path it is hard-blocked and must
+ * not head the planner's consideration list.
+ * ------------------------------------------------------------------- */
+const uraniumAE = R("uranium", 0, 2250, "Uranium");
+const acceleratorAE = {
+  name: "acceleratorAE",
+  label: "Accelerator AE",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "minerals", val: 10 }, { name: "uranium", val: 25 }],
+  effects: { uraniumPerTickAutoprod: 0.05 },
+};
+const reactorAE = {
+  name: "reactorAE",
+  label: "Reactor AE",
+  unlocked: true,
+  val: 8,
+  on: 0,
+  prices: [{ name: "minerals", val: 10 }],
+  effects: { uraniumPerTickCon: -0.02, energyProduction: 10 },
+};
+const nuclearSmeltersAE = {
+  name: "nuclearSmeltersAE",
+  label: "Nuclear Smelters AE",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 100 }, { name: "uranium", val: 250 }],
+  effects: {},
+};
+resources.push(uraniumAE);
+buildings.push(acceleratorAE, reactorAE);
+workshopUpgrades.push(nuclearSmeltersAE);
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+dbg.forceActiveTarget(null);
+const acceleratorCandidateAE = dbg.candidateById("build:acceleratorAE", "balanced");
+const acceleratorChainAE = dbg.solveChain(acceleratorCandidateAE);
+const uraniumDecisionAE = dbg.selectStrategicTarget("balanced");
+check("Test AE: first uranium producer is hard-blocked when it also costs uranium", acceleratorChainAE.hardBlocked && /no path for Uranium/i.test((acceleratorChainAE.blockers || []).map((b) => b.text).join(" ")));
+check("Test AE: hard-blocked first-uranium producer is scored below viable work", acceleratorCandidateAE.score < 0);
+check("Test AE: hard-blocked uranium bootstrap does not head the ranked candidates", uraniumDecisionAE.candidates?.[0]?.meta?.name !== "acceleratorAE");
+workshopUpgrades.splice(workshopUpgrades.indexOf(nuclearSmeltersAE), 1);
+buildings.splice(buildings.indexOf(acceleratorAE), 1);
+buildings.splice(buildings.indexOf(reactorAE), 1);
+resources.splice(resources.indexOf(uraniumAE), 1);
+delete perTick.uranium;
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
  * Test AC — Space tab candidate scanning (v2.10.0). The scanner used to
  * only read `space.programs` (one-time planet-unlock missions like
  * orbitalLaunch), so an actual buildable Cath structure — e.g. `sattelite`
