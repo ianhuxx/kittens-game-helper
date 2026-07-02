@@ -100,8 +100,15 @@ Long project               Temple, Ziggurat, religion/space/time structures
   returns the front-most queued item that resolves to a reachable candidate
   (`solveCraftChain().reachable`); blocked/locked items are skipped so a bad pick
   can never stall the bot, and completed items (`queueItemDone`) auto-remove. It
-  bypasses the economy target-lock like the other structural layers. The queue is
-  persisted under `kgh.queue` as `[{ id: "kind:name", val }]`.
+  bypasses the economy target-lock like the other structural layers — and that
+  bypass is enforced in `chooseWorkTarget` as a lock TAKEOVER
+  (`manualQueueTakeover`, v2.12.0): an actionable queue pick is never
+  score/ETA/age-gated behind whatever the autopilot locked earlier. Why the
+  queue is or is not driving the plan (front item + the exact blocker text) is
+  kept in `queuePlanText` and shown as the `Queue:` subsystem line in the
+  diagnostics report. The queue is persisted under `kgh.queue` as
+  `[{ id: "kind:name", val }]`. Test AE pins the takeover and the blocked-item
+  diagnostics.
 
 Key invariants (see comments in the source for the why):
 
@@ -155,9 +162,41 @@ Key invariants (see comments in the source for the why):
   refill science to make Blueprints, then enter a final-bank phase. Only the
   active target may cycle its own cap-drain bank; every external spender still
   sees the complete target ledger.
-- **Unlock discovery includes resources and crafts.** Generic bootstrap planning
-  reads live hidden-building prices/thresholds and makes the first required craft
-  unit without adding a resource-name rule.
+- **A sprint paced by a no-job cap-drain trickle GROWS that resource instead of
+  freezing the village** (v2.12.0). Culture is the only cap-drain bank no job can
+  work (science has scholars, faith has priests), so 35 Manuscripts against
+  +0.04 culture/s is a multi-day passive wait that hunting cannot shorten.
+  `sprintCapDrainPacing` computes the CUMULATIVE trickle bill through
+  `rawPathRequirements` (35×400 culture, never one craft-step), and when the
+  wait exceeds `SPRINT_PACING_REDIRECT_S` the sprint keeps its contract but
+  redirects the plan target to the best live per-tick producer of that resource
+  (Amphitheatre) via the sticky `bestSprintPacingBooster` — storage-only growers
+  (cultureMax) never qualify, because bigger batches don't shorten a
+  production-bound wait. While redirected: the tech's chain stays reserved
+  (`sprintRedirectChainLedger` merges into both the reservation ledger and
+  `executePlan`'s surplus gate), jobs revert to normal target-driven needs
+  (miners return; the hunter flood only runs when hunting actually paces the
+  chain), and the lock follows the contract (`sprintRedirectTakeover`). The
+  redirect releases on its own once production catches up. Test AE pins all of
+  this against the live save that motivated it.
+- **A staffable resource is never "unreachable".** `capDrainReachabilityFor`
+  treats a resource with a direct job path (minerals with every miner
+  temporarily pulled elsewhere) as reachable, with one marginal worker's live
+  output (`directJobRatePerSecondFor`) as the conservative rate floor —
+  otherwise a job override that empties the mines makes every minerals-priced
+  candidate read "impossible", which is exactly the deadlock that keeps the
+  override alive.
+- **Unlock discovery includes resources and crafts — but only for craft-ONLY
+  resources.** Generic bootstrap planning reads live hidden-building
+  prices/thresholds and makes the first required craft unit (first Manuscript /
+  Concrete / Tanker) without adding a resource-name rule. Three gates keep it
+  from re-creating the v2.11.5 "revealing Log House instead of buying ready
+  work" stall that briefly disabled the whole layer: the price resource must
+  have NO direct job path and NO live production (wood accrues through normal
+  work — the game reveals wood-priced buildings on its own), the hidden
+  building's unlock source must be owned (`hiddenBuildingBootstrapAllowed`),
+  and the reveal craft must be quick (`BOOTSTRAP_MAX_ETA_S`). Test U pins both
+  directions.
 - **Stage changes are full transactions.** Evaluate adjacent unlocked stages using
   the 50% refund, bank-limited usable refund, price-scaled parity rebuild,
   downtime utility, energy/consumption penalties, cap safety and payback. Execute

@@ -2346,10 +2346,11 @@ resources.push(smartcrete);
 crafts.push(smartcreteCraft);
 buildings.push(hiddenSmartBuilding);
 const bootstrapProbe = dbg.bootstrapResourceCandidate?.();
-check("Test U: hidden live building thresholds do not create focus targets before the game unlocks them", bootstrapProbe?.meta?.downstreamName !== "smartArchive");
+check("Test U: hidden live building threshold creates a generic Resource bootstrap", bootstrapProbe?.kind === "bootstrap" && bootstrapProbe.meta.outputName === "smartcrete" && bootstrapProbe.meta.targetAmount === 1);
+check("Test U: bootstrap uses the live craft/resource label", /Smart Concrete/.test(bootstrapProbe?.meta?.label || ""));
 dbg.forceActiveTarget(null);
 const bootstrapDecision = dbg.selectStrategicTarget("balanced");
-check("Test U: strategic planning does not focus a hidden Resource bootstrap target", bootstrapDecision.target?.meta?.downstreamName !== "smartArchive");
+check("Test U: Resource bootstrap structurally outranks ordinary economy work", bootstrapDecision.layer === "Resource bootstrap" && bootstrapDecision.target?.meta?.outputName === "smartcrete");
 buildings.splice(buildings.indexOf(hiddenSmartBuilding), 1);
 crafts.splice(crafts.indexOf(smartcreteCraft), 1);
 resources.splice(resources.indexOf(smartcrete), 1);
@@ -2373,7 +2374,7 @@ res("catnip").value = 1000;
 buildings.push(hiddenLogHouseU);
 dbg.forceActiveTarget(null);
 const hiddenLogHouseBootstrap = dbg.bootstrapResourceCandidate?.();
-check("Test U: source-less hidden buildings such as Log House are not focused as Resource bootstrap targets", hiddenLogHouseBootstrap?.meta?.downstreamName !== "hiddenLogHouseU");
+check("Test U: a job-workable price resource (wood) never becomes a reveal focus — Log House accrues through normal work", hiddenLogHouseBootstrap?.meta?.downstreamName !== "hiddenLogHouseU");
 buildings.splice(buildings.indexOf(hiddenLogHouseU), 1);
 res("wood").value = savedWoodU;
 res("catnip").value = savedCatnipU;
@@ -3263,6 +3264,128 @@ res("ivory").value = 100;
 perTick.unicorns = 0;
 dbg.clearUnicornPathState();
 dbg.clearResourceTelemetry?.("unicorns");
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
+ * Test AE — culture-bound sprint pacing redirect + manual-queue takeover
+ * (v2.12.0).  Live save regression: Theology (20K science + 35 Manuscript)
+ * owned the plan while manuscripts were paced by +0.04/s culture — a
+ * multi-day passive wait.  The sprint flooded 39/41 kittens into Hunter,
+ * zero Miners meant minerals stayed 0, every minerals-priced candidate
+ * (including the Amphitheatre that would GROW culture) read "unreachable",
+ * and the player's queued Steel Armour was score-gated behind the lock.
+ * The fix: the sprint stays alive but redirects its plan target to the
+ * best live producer of the trickling resource; a staffable resource is
+ * reachable even at 0 live production; the manual queue takes the lock
+ * over whenever its front item is actionable; the queue's blocker is
+ * spelled out in diagnostics.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+
+const theologyAE = techs.find((t) => t.name === "theology");
+const savedTechStateAE = techs.map((t) => ({ unlocked: t.unlocked, researched: t.researched }));
+for (const tech of techs) tech.researched = true;
+theologyAE.unlocked = true;
+theologyAE.researched = false;
+
+const amphitheatreAE = {
+  name: "amphitheatreAE",
+  label: "Amphitheatre",
+  unlocked: true,
+  val: 1,
+  on: 1,
+  prices: [{ name: "wood", val: 230 }, { name: "minerals", val: 1380 }, { name: "parchment", val: 3.45 }],
+  effects: { culturePerTickBase: 0.005, cultureMax: 50 },
+};
+buildings.push(amphitheatreAE);
+
+const savedResAE = ["science", "culture", "minerals", "wood", "catnip", "parchment", "manuscript", "furs", "manpower"].map((name) => ({
+  name, value: res(name).value, maxValue: res(name).maxValue,
+}));
+const savedPerTickAE = { culture: perTick.culture, minerals: perTick.minerals, science: perTick.science, catnip: perTick.catnip };
+res("science").value = 24800; res("science").maxValue = 25000;   // near cap → sprint trigger
+res("culture").value = 33; res("culture").maxValue = 1150;       // the trickling bank
+res("minerals").value = 0; res("minerals").maxValue = 8000;      // zero MINERS pulled by the old job flood
+res("wood").value = 450;
+res("catnip").value = 3000;
+res("parchment").value = 686;
+res("manuscript").value = 0;
+res("furs").value = 400;
+res("manpower").value = 800;
+perTick.culture = 0.008;   // ×5 ticks/s → +0.04/s, the live save's rate
+perTick.minerals = 0;      // no miners staffed — job path must still count as reachable
+perTick.science = 0.2;
+perTick.catnip = 1;
+dbg.clearResourceTelemetry?.();
+
+const aeDecision = dbg.selectStrategicTarget("balanced");
+check("Test AE: culture-bound Theology sprint stays alive as the contract", dbg.activeSprint()?.techName === "theology");
+check("Test AE: sprint redirects the plan to the culture producer, not the tech", aeDecision.layer === "Research sprint" && aeDecision.target?.meta?.name === "amphitheatreAE" && !!aeDecision.sprintRedirect);
+check("Test AE: redirect names the trickle leg in its reason", /culture-bound/i.test(aeDecision.reason || "") && /Amphitheatre/.test(aeDecision.reason || ""));
+check("Test AE: cultureMax-only Temple is never the redirect pick", aeDecision.target?.meta?.name !== "temple");
+const aePacing = dbg.sprintCapDrainPacing?.(dbg.candidateById("research:theology"));
+check("Test AE: pacing math counts the CUMULATIVE culture bill (35×400), not one craft", aePacing?.name === "culture" && aePacing.missing > 13000 && aePacing.wait > 100000);
+const aeReserved = dbg.reservedNeedsFor(aeDecision.target);
+check("Test AE: the sprint chain (35 Manuscript) stays reserved while the plan builds the producer", (aeReserved.manuscript || 0) >= 35);
+const aeNeeds = dbg.resourceNeeds("balanced");
+check("Test AE: jobs serve the redirect target (miners return) instead of flooding hunters", (aeNeeds.needs?.minerals ?? aeNeeds.minerals ?? 0) > 0);
+const aeNow = dbg.nowText("balanced");
+const aeDetails = dbg.detailsText("balanced");
+check("Test AE: Now action explains the redirect", /grow Culture/i.test(aeNow) && /Theology/i.test(aeNow));
+check("Test AE: details spell out the trickle leg with rate and ETA", /Trickle leg:/.test(aeDetails) && /Culture/i.test(aeDetails));
+
+// Manual-queue takeover: a 5-second-old sprint lock must yield to the
+// player's actionable queued pick immediately — no score/ETA gate.
+const queueMineAE = buildings.find((b) => b.name === "mine");
+dbg.queueAdd("build:mine", queueMineAE.val);
+dbg.forceActiveTarget(dbg.candidateById("research:theology"), "Research sprint", 5000);
+const aeQueueTarget = dbg.chooseWorkTarget("balanced");
+check("Test AE: actionable manual-queue item takes the plan lock over from a young sprint lock", aeQueueTarget?.meta?.name === "mine");
+check("Test AE: the takeover is logged as a manual-queue takeover", /manual queue takeover/i.test(logText()));
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+
+// Queue diagnostics: a blocked front item must say WHY it is skipped.
+const obsidianAE = R("obsidianAE", 0, 0, "Obsidian");
+const obsidianShrineAE = {
+  name: "obsidianShrineAE",
+  label: "Obsidian Shrine",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "obsidianAE", val: 10 }],
+  effects: {},
+};
+resources.push(obsidianAE);
+buildings.push(obsidianShrineAE);
+dbg.queueAdd("build:obsidianShrineAE", 0);
+dbg.selectStrategicTarget("balanced");
+const aeQueueStatus = dbg.queueStatus?.() || "";
+check("Test AE: blocked queue item reports its exact blocker in the queue status", /blocked/i.test(aeQueueStatus) && /Obsidian/i.test(aeQueueStatus));
+check("Test AE: the diagnostics report carries the queue line", /Queue: .*Obsidian/i.test(dbg.report()));
+dbg.queueClear();
+buildings.splice(buildings.indexOf(obsidianShrineAE), 1);
+resources.splice(resources.indexOf(obsidianAE), 1);
+
+// Redirect releases once culture production catches up (wait < 30 min):
+// the sprint's own tech becomes the plan target again.
+perTick.culture = 2; // +10/s → 35 manuscripts of culture ≈ 23 minutes
+dbg.clearResourceTelemetry?.("culture");
+dbg.forceActiveTarget(null);
+const aeFastDecision = dbg.selectStrategicTarget("balanced");
+check("Test AE: a fast culture rate ends the redirect — the sprint tech owns the plan again", aeFastDecision.layer === "Research sprint" && aeFastDecision.target?.meta?.name === "theology" && !aeFastDecision.sprintRedirect);
+
+// Restore the board.
+buildings.splice(buildings.indexOf(amphitheatreAE), 1);
+for (const saved of savedResAE) { res(saved.name).value = saved.value; res(saved.name).maxValue = saved.maxValue; }
+perTick.culture = savedPerTickAE.culture;
+perTick.minerals = savedPerTickAE.minerals;
+perTick.science = savedPerTickAE.science;
+perTick.catnip = savedPerTickAE.catnip;
+techs.forEach((t, i) => { t.unlocked = savedTechStateAE[i].unlocked; t.researched = savedTechStateAE[i].researched; });
+dbg.clearResourceTelemetry?.();
 dbg.forceActiveTarget(null);
 
 if (failures.length) {
