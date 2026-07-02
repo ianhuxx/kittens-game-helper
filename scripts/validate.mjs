@@ -192,6 +192,22 @@ const required = [
   // Purchase safety: the raw-metadata buy fallback stays OFF by default; official
   // controller/API purchase only. If it fails, the item is benched, never poked.
   "ALLOW_RAW_METADATA_BUY_FALLBACK = false",
+  // Ziggurat / unicorn path (v2.11.0): ziggurat upgrades are first-class
+  // candidates, ranked against Unicorn Pastures in unicorn-equivalents, funded
+  // by the bounded unicorn→tears sacrifice (the only sacrifice ever performed;
+  // alicorn sacrifice stays denied), with the "rush ziggurats" tear-discount rule.
+  "zigguratUpgrades",
+  "ZigguratBtnController",
+  'candidate.kind === "ziggurat"',
+  "sacrificeConversionFor",
+  "sacrificePotentialFor",
+  "unicornEconomyPlan",
+  "bestUnicornPathTarget",
+  "manageUnicornReligion",
+  "unicornPathReservationLedger",
+  "UNICORN_ZIG_FIRST_SAVINGS",
+  "Ziggurat / unicorn path",
+  "kgh-unicorn",
 ];
 
 const missing = required.filter((token) => !source.includes(token));

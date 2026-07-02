@@ -46,9 +46,12 @@ wood/mineral starvation. You never touch a number.
 
 The first thing it does on load is set the game's **no-confirm** option, so automation is
 never blocked by a pop-up dialog. It keeps prestige **resets OFF**, plus every other
-irreversible / resource-burning action (transcend, sacrifice unicorns/alicorns, time-skip,
-shatter time crystals): those are filtered out of every candidate and trade list, so the
-helper *continues* your game and can never reset it behind your back.
+irreversible action (transcend, sacrifice alicorns, time-skip, shatter time crystals):
+those are filtered out of every candidate and trade list, so the helper *continues* your
+game and can never reset it behind your back. The one deliberate exception is the
+repeatable **unicorn→tears sacrifice**, which the unicorn planner performs in bounded
+batches to fund the ziggurat upgrade it has chosen (see below) — it can never fire as a
+generic candidate and never touches alicorns.
 
 ## What the panel shows
 
@@ -69,6 +72,8 @@ The bottom-right box is a live dashboard:
 - **👑 Leader:** the currently selected leader trait/kitten chosen for the active bottleneck.
 - **🧰 Craft:** prerequisite crafting plus overflow conversions that prevent near-capped inputs from being wasted.
 - **☀ Religion / 🤝 Diplomacy:** what praise/upgrades and trade/explorers/embassies are doing.
+- **🦄 Unicorns:** what the ziggurat/unicorn planner is doing — banking unicorns, holding
+  the sacrifice for a cheaper tear rate, or which upgrade it just funded.
 - **🎉 Festival:** whether the happiness/birth-rate layer is active, saving, deferred by
   the active reservation, or waiting for Drama & Poetry.
 - **🎯 Now:** what it can build/buy right this second.
@@ -96,6 +101,29 @@ tech — add it to the **manual build queue** in the panel:
 - A queued item that can't be acted on yet (still locked, or its science price can't fit
   your cap) is **skipped**, not stalled — the next workable item, or the autopilot, takes
   over. Finished items drop off automatically.
+
+## Ziggurat / unicorn economy (v2.11.0)
+
+The unicorn loop — Unicorn Pastures make unicorns, sacrificing 2 500 unicorns at a
+Ziggurat yields one tear **per ziggurat built**, and tears (+ivory/gold/megaliths) buy the
+ziggurat upgrades (Unicorn Tomb → Ivory Tower → …) that multiply unicorn production and
+eventually unlock alicorns — is fully automated:
+
+- Every open step (**buy a pasture**, **each ziggurat upgrade**, **build another
+  Ziggurat first**) is ranked in one currency, **unicorn-equivalents**, using live rates:
+  a tear costs `2 500 ÷ ziggurats` unicorns, an upgrade's gain is measured against your
+  live unicorn income, and the fastest payback wins.
+- The **sacrifice is bounded**: it converts exactly the tears deficit of the chosen
+  upgrade (whole batches only), never a speculative dump, and it respects every active
+  reservation. Nothing else may spend the unicorns being saved for it.
+- **When to rush ziggurats:** if one more Ziggurat would cut ≥25 % off the chosen
+  upgrade's unicorn bill (tears get cheaper with every ziggurat), the planner builds the
+  Ziggurat *before* sacrificing and says so in the 🦄 panel line.
+- An upgrade whose first copy **unlocks alicorns** (Ivory Tower) may claim the plan even
+  when its payback is slow — it's new content, not just production.
+- Queue a specific ziggurat upgrade in the manual build queue and the sacrifice will fund
+  *that* item instead of the planner's pick. **Alicorn sacrifice stays off** (it feeds
+  time crystals, prestige territory).
 
 So the autopilot handles the steady grind, and the queue is your steering wheel for
 anything you want prioritised.
@@ -350,10 +378,11 @@ buildings.
 ## Turning on resets later (advanced, optional)
 
 Resets trade your current run for permanent bonuses (Paragon/Karma). This **wipes the
-current game**, so it is intentionally never automated here — reset/transcend/sacrifice/
-time-skip actions are filtered out of every decision the helper makes. If you want a
-reset after you've **exported a backup**, do it yourself in the game's **Time Control**
-tab.
+current game**, so it is intentionally never automated here — reset/transcend/
+alicorn-sacrifice/time-skip actions are filtered out of every decision the helper makes
+(the bounded unicorn→tears sacrifice above is the only exception, and it can't touch your
+prestige state). If you want a reset after you've **exported a backup**, do it yourself
+in the game's **Time Control** tab.
 
 ## Files
 

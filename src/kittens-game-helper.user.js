@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.10.1
-// @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible actions (prestige reset/transcend/sacrifice/shatter/time-skip) are filtered out of every candidate and trade list, so they can never fire.
+// @version      2.11.0
+// @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.10.1";
+  const HELPER_VERSION = "2.11.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -64,6 +64,12 @@
   // kept OUT of every candidate and trade list, so the helper can never reset,
   // transcend, sacrifice, shatter time crystals or time-skip. This is the single
   // native safety guard now that there is no external engine to disable.
+  // NOTE: "sacrifice" staying on this list means a sacrifice BUTTON can never
+  // become a plan/candidate target. The unicorn planner's bounded unicorn→tears
+  // conversion (manageUnicornReligion) is a separate subsystem, like hunting or
+  // praise: it only converts the measured tears deficit of the ziggurat upgrade
+  // it has chosen, at the game's live exchange rate, and never touches alicorns
+  // (alicorn sacrifice feeds time crystals / shatter and stays fully denied).
   const DENY_SUBSTRINGS = ["reset", "transcend", "sacrifice", "shatter", "timeskip"];
   const DENY_EXACT = new Set([
     "adore",
@@ -477,7 +483,7 @@
   };
 
   // Kinds whose "owned" count is a numeric val (vs a researched flag).
-  const VAL_BASED_KINDS = new Set(["build", "space", "time"]);
+  const VAL_BASED_KINDS = new Set(["build", "space", "time", "ziggurat"]);
 
   // Space/time candidate is open while unlocked and (for one-time missions) not
   // already built; stackable structures stay open.
@@ -531,6 +537,7 @@
         if (typeof workshop.getPrice === "function") return workshop.getPrice(meta) || meta.prices || [];
       }
       if (kind === "religion") return religionUpgradePrices(meta);
+      if (kind === "ziggurat") return zigguratUpgradePrices(meta);
     } catch (error) {
       /* ignore */
     }
@@ -554,7 +561,7 @@
     for (const cost of costs) {
       const res = getRes(resources, cost.name);
       const have = (res && res.value) || 0;
-      const possible = have + craftablePotential(cost.name);
+      const possible = have + craftablePotential(cost.name) + sacrificePotentialFor(resources, cost.name);
       progress = Math.min(progress, possible / cost.val);
       if (have < cost.val) {
         affordable = false;
@@ -563,7 +570,8 @@
           ? ` (storage cap ${fmt(cap)})`
           : "";
         const craftHint = !storageHint && craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
-        missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${storageHint || craftHint}`);
+        const sacrificeHint = !storageHint && !craftHint && sacrificeConversionFor(cost.name) ? " (sacrifice unicorns)" : "";
+        missing.push(`${fmt(cost.val - have)} ${(res && res.title) || cost.name}${storageHint || craftHint || sacrificeHint}`);
       }
     }
     return { affordable, progress, missing: missing.slice(0, 3).join(", ") };
@@ -628,6 +636,92 @@
         if (b.progress !== a.progress) return b.progress - a.progress;
         return a.faithPrice - b.faithPrice;
       })[0] || null;
+  };
+
+  /* --------------------- ziggurat upgrades / unicorn tears --------------------
+   * The Ziggurat branch of the Religion tab (Unicorn Tomb, Ivory Tower, …) is a
+   * separate candidate kind ("ziggurat"): stackable, val-based, priced in tears/
+   * ivory/gold/megaliths and bought through the game's ZigguratBtnController.
+   * Tears have NO production or craft path — they only come from the bounded
+   * unicorn→tears sacrifice — so everything that reasons about reachability,
+   * ETA or reservations for a tears cost goes through sacrificeConversionFor,
+   * which reads the live exchange rate (batch size from the game's own button
+   * model when available, one tear per ziggurat per batch from the live count).
+   */
+  const zigguratUpgrades = () => {
+    try {
+      const religion = window.gamePage && window.gamePage.religion;
+      return Array.isArray(religion && religion.zigguratUpgrades) ? religion.zigguratUpgrades : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const zigguratCount = () => {
+    const meta = buildingByName("ziggurat");
+    return (meta && meta.val) || 0;
+  };
+
+  // A ziggurat upgrade is workable once its metadata is unlocked AND at least
+  // one Ziggurat stands (no ziggurat → no tears → nothing to plan with).
+  const zigguratUpgradeVisible = (meta) => !!meta && meta.unlocked !== false && zigguratCount() >= 1;
+
+  const zigguratUpgradePrices = (meta) => {
+    try {
+      const game = window.gamePage;
+      const Controller = getGlobalPath(["com", "nuclearunicorn", "game", "ui", "ZigguratBtnController"]);
+      if (game && typeof Controller === "function") {
+        const controller = new Controller(game);
+        const model = controller.fetchModel({ id: meta.name, controller });
+        if (model && typeof controller.getPrices === "function") {
+          const live = controller.getPrices(model);
+          if (Array.isArray(live) && live.length) return live;
+        }
+      }
+    } catch (error) {
+      /* fall through to the scaled fallback */
+    }
+    return scaledStackablePrices(meta);
+  };
+
+  // Base batch size of the game's "Sacrifice Unicorns" ritual; the live button
+  // model's price overrides this whenever the Religion tab has been rendered.
+  const UNICORNS_PER_SACRIFICE = 2500;
+
+  const sacrificeUnicornsButton = () => {
+    try {
+      const tab = window.gamePage && window.gamePage.religionTab;
+      return (tab && tab.sacrificeBtn) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  // The live unicorn→tears exchange: `inputPerChunk` unicorns buy `gainPerChunk`
+  // tears per batch (the game grants one tear per ziggurat per batch). Returns
+  // null for every resource except tears, and while no ziggurat stands.
+  const sacrificeConversionFor = (name) => {
+    if (name !== "tears") return null;
+    const gainPerChunk = zigguratCount();
+    if (!(gainPerChunk >= 1)) return null;
+    let inputPerChunk = UNICORNS_PER_SACRIFICE;
+    try {
+      const btn = sacrificeUnicornsButton();
+      const prices = btn && btn.model && btn.model.prices;
+      const unicornPrice = Array.isArray(prices) && prices.find((price) => price && price.name === "unicorns" && price.val > 0);
+      if (unicornPrice) inputPerChunk = unicornPrice.val;
+    } catch (error) {
+      /* keep the base batch size */
+    }
+    return { inputName: "unicorns", inputPerChunk, gainPerChunk };
+  };
+
+  // Tears obtainable RIGHT NOW from the banked unicorns (whole batches only).
+  const sacrificePotentialFor = (resources, name) => {
+    const conversion = sacrificeConversionFor(name);
+    if (!conversion) return 0;
+    const bank = ((getRes(resources, conversion.inputName) || {}).value) || 0;
+    return Math.floor(Math.max(0, bank) / conversion.inputPerChunk) * conversion.gainPerChunk;
   };
 
   let diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
@@ -1836,7 +1930,7 @@
   // minus its COST (time to afford, storage blocks). Tune weights here instead
   // of hunting per-item special cases through the code.
   const TUNING = {
-    kindPrior: { research: 12, upgrade: 12, religion: 11, build: 4, policy: 6 },
+    kindPrior: { research: 12, upgrade: 12, religion: 11, ziggurat: 9, build: 4, policy: 6 },
     affordBonus: 6, // fully affordable right now
     progressScale: 5, // partial affordability, 0..1
     gatewayScale: 3, // per item a tech unlocks (recursively dampened)
@@ -3197,6 +3291,14 @@
           continue;
         }
       }
+      const sacrifice = sacrificeConversionFor(cost.name);
+      if (sacrifice) {
+        const sacrificeWait = waitSecondsForSacrifice(deficit, resources, sacrifice);
+        if (isFinite(sacrificeWait)) {
+          worst = Math.max(worst, sacrificeWait);
+          continue;
+        }
+      }
       // Resources with their own positive net production (wood, minerals…)
       // arrive directly — don't expand them into a craft chain, or a negative
       // catnip rate would mark a 25-second wood wait as "never".
@@ -3221,6 +3323,23 @@
       }
     }
     return worst;
+  };
+
+  // Tears mirror titanium: no per-tick production, but a live conversion route
+  // (the bounded unicorn sacrifice) supplies them.  Batches still needed ×
+  // live unicorns-per-batch, paid by live unicorn income, minus whatever the
+  // current unicorn bank already covers.
+  const waitSecondsForSacrifice = (tearsDeficit, resources, conversion) => {
+    if (!isFinite(tearsDeficit) || tearsDeficit <= 0) return 0;
+    const bank = resValueOf(resources, conversion.inputName);
+    const banked = Math.floor(bank / conversion.inputPerChunk) * conversion.gainPerChunk;
+    const still = tearsDeficit - banked;
+    if (still <= 0) return 0;
+    const chunks = Math.ceil(still / conversion.gainPerChunk);
+    const prod = rawProductionForNeed(conversion.inputName);
+    if (prod <= 0) return Number.POSITIVE_INFINITY;
+    const leftover = bank % conversion.inputPerChunk;
+    return Math.max(0, chunks * conversion.inputPerChunk - leftover) / prod;
   };
 
   // Titanium usually has no ordinary positive production when Mansions and
@@ -3332,6 +3451,13 @@
       /* ignore */
     }
     try {
+      for (const u of zigguratUpgrades()) {
+        if (zigguratUpgradeVisible(u)) candidates.push({ kind: "ziggurat", weight: 3, meta: u });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    try {
       for (const b of buildingMetas()) {
         if (b && b.unlocked !== false) candidates.push({ kind: "build", weight: 2, meta: b });
       }
@@ -3386,6 +3512,7 @@
     power: "Power recovery",
     production: "Production bottleneck",
     housing: "Housing / population",
+    unicornPath: "Ziggurat / unicorn path",
     economy: "Economy / normal growth",
     longProject: "Long project",
   };
@@ -3622,6 +3749,21 @@
     if (CAPPED_REFILL_RESOURCES.has(name)) {
       if (max > 0 && amount > max) return { reachable: true, eta: prod > 0 ? deficit / prod : 0, chain };
       return { reachable: prod > 0, eta: prod > 0 ? deficit / prod : Number.POSITIVE_INFINITY, reason: `no ${resTitle(resources, name)} refill`, chain };
+    }
+    // Tears have no production/craft path: they arrive through the bounded
+    // unicorn→tears sacrifice, batch by batch, so a tears deficit is reachable
+    // whenever the banked unicorns already cover it or unicorn income exists.
+    const sacrifice = sacrificeConversionFor(name);
+    if (sacrifice) {
+      chain.add(sacrifice.inputName);
+      const banked = sacrificePotentialFor(resources, name);
+      if (deficit <= banked) return { reachable: true, eta: 0, chain };
+      const inputProd = rawProductionForNeed(sacrifice.inputName);
+      if (inputProd > 0) {
+        const chunks = Math.ceil((deficit - banked) / sacrifice.gainPerChunk);
+        return { reachable: true, eta: (chunks * sacrifice.inputPerChunk) / inputProd, chain };
+      }
+      return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no ${resTitle(resources, sacrifice.inputName)} income to sacrifice for ${resTitle(resources, name)}`, chain };
     }
     return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no path for ${resTitle(resources, name)}`, chain };
   };
@@ -4383,6 +4525,7 @@
       if (kind === "build") return buildingByName(name);
       if (kind === "upgrade") return (window.gamePage.workshop.upgrades || []).find((u) => u.name === name) || null;
       if (kind === "religion") return religionUpgrades().find((u) => u.name === name) || null;
+      if (kind === "ziggurat") return zigguratUpgrades().find((u) => u.name === name) || null;
       if (kind === "space") return spaceMetas().find((m) => m.name === name) || null;
       if (kind === "time") return timeMetas().find((m) => m.name === name) || null;
     } catch (error) {
@@ -4431,7 +4574,7 @@
     }
     if (directStorageBlockers(candidate.kind, candidate.meta, resources).length > 0 || isStorageMeta(candidate.meta)) return STRATEGIC_LAYERS.storage;
     if (candidate.kind === "build" && ["hut", "logHouse", "mansion"].includes(candidate.meta && candidate.meta.name)) return STRATEGIC_LAYERS.housing;
-    if (candidate.kind === "religion" || candidate.kind === "space" || candidate.kind === "time" ||
+    if (candidate.kind === "religion" || candidate.kind === "ziggurat" || candidate.kind === "space" || candidate.kind === "time" ||
         (candidate.kind === "build" && ["temple", "ziggurat"].includes(candidate.meta && candidate.meta.name))) return STRATEGIC_LAYERS.longProject;
     return STRATEGIC_LAYERS.economy;
   };
@@ -4457,6 +4600,350 @@
       }));
     for (const item of chainUsers) out.push(item);
     return out.slice(0, 6);
+  };
+
+  /* ------------------------- ziggurat / unicorn path -------------------------
+   * The unicorn economy is a parallel currency loop the player used to run by
+   * hand: Unicorn Pastures make unicorns; sacrificing unicorns at a Ziggurat
+   * yields tears; tears + ivory/gold/megaliths buy the ziggurat upgrades that
+   * multiply unicorn production and eventually unlock alicorns.  The planner
+   * ranks every open step of that loop in ONE currency — unicorn-equivalents —
+   * so "buy a pasture", "sacrifice for the Tomb" and "build another Ziggurat
+   * first" are directly comparable (all rates read LIVE, per rule 4):
+   *   - a pasture's marginal gain is live unicorn production ÷ owned pastures
+   *     (base production is linear in count); its cost is its live price;
+   *   - a ratio upgrade's gain is P × Δr ÷ (1 + r), with P (live unicorns/s)
+   *     and r (live unicornsRatioReligion) both read from the game; its
+   *     unicorn cost is tears × (batch ÷ ziggurats) + any direct unicorns;
+   *   - one more Ziggurat cuts every future tear to batch ÷ (z+1) unicorns, so
+   *     when that saving covers ≥25% of the chosen upgrade's unicorn bill AND
+   *     the Ziggurat itself is reachable, the planner builds the Ziggurat
+   *     BEFORE sacrificing (the "rush ziggurats" rule).
+   * The layer claims the plan only when the pick's unicorn side is already
+   * funded (bank + sacrificable tears) and the SHARED currencies (ivory, gold,
+   * megaliths) are what's missing — exactly when a reservation finishes the
+   * purchase instead of surplus buys eating it.  An upgrade whose first copy
+   * unlocks alicorns is a content unlock and may claim regardless of payback.
+   * Everything else (the actual sacrifice, pasture-vs-upgrade balance, status)
+   * runs in the manageUnicornReligion subsystem every tick.
+   */
+  const UNICORN_PAYBACK_HORIZON_S = 6 * 3600; // rush only reasonably-paced upgrades
+  const UNICORN_ZIG_FIRST_SAVINGS = 0.25;     // build a Ziggurat first when it saves ≥25% of the pick's unicorn bill
+  const UNICORN_SACRIFICE_MIN_MS = 15000;     // batch sacrifices; keeps the action log readable
+
+  let unicornPlanText = "Unicorns: watching the unicorn economy";
+  let unicornPlanCache = { key: null, plan: null };
+  let activeUnicornPathId = null; // sticky pick (mirrors the power/science commits)
+  let lastUnicornSacrificeAt = 0;
+
+  const unicornItemId = (item) => `${item.kind}:${item.meta.name}`;
+
+  // Live religion multiplier on unicorn production: prefer the game's own
+  // getEffect; fall back to summing owned upgrades' live metadata.
+  const liveUnicornReligionRatio = () => {
+    try {
+      const viaEffect = window.gamePage.getEffect && window.gamePage.getEffect("unicornsRatioReligion");
+      if (isFinite(viaEffect) && viaEffect > 0) return viaEffect;
+    } catch (error) {
+      /* fall through to metadata */
+    }
+    let total = 0;
+    for (const meta of zigguratUpgrades()) {
+      const each = meta && meta.effects && meta.effects.unicornsRatioReligion;
+      if (isFinite(each) && each > 0) total += each * (meta.val || 0);
+    }
+    return total;
+  };
+
+  // Unicorn-denominated share of a price list: direct unicorns plus tears at
+  // the live sacrifice exchange rate.  Shared currencies (ivory, gold,
+  // megaliths…) are gated by ordinary affordability/reservations instead of
+  // being folded into this ranking.
+  const unicornEquivalentCost = (prices) => {
+    let unicorns = 0;
+    let tears = 0;
+    for (const price of prices || []) {
+      if (!price || !isFinite(price.val) || price.val <= 0) continue;
+      if (price.name === "unicorns") unicorns += price.val;
+      if (price.name === "tears") tears += price.val;
+    }
+    const conversion = sacrificeConversionFor("tears");
+    const tearCost = tears > 0
+      ? (conversion ? tears * (conversion.inputPerChunk / conversion.gainPerChunk) : Number.POSITIVE_INFINITY)
+      : 0;
+    return { unicorns, tears, total: unicorns + tearCost };
+  };
+
+  const unicornEconomyPlan = (resources) => {
+    const plan = { open: false, items: [], best: null, zigguratFirst: null, summary: [], action: "" };
+    const pasture = buildingByName("unicornPasture");
+    const pastureOpen = !!pasture && pasture.unlocked !== false;
+    const zigs = zigguratCount();
+    const upgradesOpen = zigs >= 1 && zigguratUpgrades().some((u) => zigguratUpgradeVisible(u));
+    if (!pastureOpen && !upgradesOpen) {
+      plan.action = "unicorn economy not open yet";
+      return plan;
+    }
+    plan.open = true;
+    const production = Math.max(0, productionFor("unicorns"));
+    const religionRatio = liveUnicornReligionRatio();
+    const items = [];
+    if (pastureOpen) {
+      const prices = pricesFor("build", pasture);
+      const owned = pasture.val || 0;
+      const perTickBase = (pasture.effects && pasture.effects.unicornsPerTickBase) || 0;
+      // Marginal pasture output: live production ÷ owned count; the metadata
+      // base × live multiplier is the fallback only while none are built yet.
+      const gain = owned > 0 && production > 0
+        ? production / owned
+        : perTickBase * ticksPerSecond() * (1 + religionRatio);
+      items.push({ kind: "build", meta: pasture, prices, cost: unicornEquivalentCost(prices), gain, unlocksAlicorns: false, label: labelOf(pasture) });
+    }
+    if (zigs >= 1) {
+      const alicornRes = getRes(resources, "alicorn");
+      const alicornsKnown = !!alicornRes && (alicornRes.unlocked === true || (alicornRes.value || 0) > 0);
+      for (const meta of zigguratUpgrades()) {
+        if (!zigguratUpgradeVisible(meta)) continue;
+        const prices = pricesFor("ziggurat", meta);
+        const deltaRatio = (meta.effects && meta.effects.unicornsRatioReligion) || 0;
+        const gain = production > 0 && deltaRatio > 0 ? production * (deltaRatio / (1 + religionRatio)) : 0;
+        const unlocksAlicorns = ((meta.effects && meta.effects.alicornChance) || 0) > 0 && (meta.val || 0) === 0 && !alicornsKnown;
+        items.push({ kind: "ziggurat", meta, prices, cost: unicornEquivalentCost(prices), gain, unlocksAlicorns, label: labelOf(meta) });
+      }
+    }
+    for (const item of items) {
+      item.payback = item.gain > 0 && isFinite(item.cost.total) && item.cost.total > 0
+        ? item.cost.total / item.gain
+        : Number.POSITIVE_INFINITY;
+    }
+    // Rank by fastest unicorn payback: cheap upgrades compound unicorn income,
+    // which then funds the expensive ones (and the alicorn unlock) sooner.
+    // `unlocksAlicorns` stays a claim-horizon exemption, not a rank override.
+    items.sort((a, b) => a.payback - b.payback || a.cost.total - b.cost.total);
+    plan.items = items;
+    let best = items.find((item) => isFinite(item.payback)) || items.find((item) => item.unlocksAlicorns) || null;
+    // Commit to the prior pick while it stays within 25% of the new winner, so
+    // slow-moving payback ties can't flip the sacrifice target every tick.
+    if (best && activeUnicornPathId && unicornItemId(best) !== activeUnicornPathId) {
+      const prior = items.find((item) => unicornItemId(item) === activeUnicornPathId);
+      if (prior && (prior.unlocksAlicorns || !best.unlocksAlicorns) &&
+          isFinite(prior.payback) && prior.payback <= best.payback * 1.25) {
+        best = prior;
+      }
+    }
+    activeUnicornPathId = best ? unicornItemId(best) : null;
+    plan.best = best;
+    // "Rush ziggurats" rule: when one more Ziggurat saves a big slice of the
+    // pick's tear bill and is itself reachable, hold the sacrifice for it.
+    if (best && best.cost.tears > 0) {
+      const zigMeta = buildingByName("ziggurat");
+      const conversion = sacrificeConversionFor("tears");
+      if (zigMeta && zigMeta.unlocked !== false && conversion && isFinite(best.cost.total) && best.cost.total > 0) {
+        const savings = best.cost.tears * conversion.inputPerChunk * (1 / zigs - 1 / (zigs + 1));
+        if (savings >= best.cost.total * UNICORN_ZIG_FIRST_SAVINGS &&
+            solveCraftChain(resources, { kind: "build", meta: zigMeta, affordable: false }).reachable) {
+          plan.zigguratFirst = { savings, share: savings / best.cost.total };
+        }
+      }
+    }
+    plan.summary = items.slice(0, 5).map((item) => {
+      const tearsPart = item.cost.tears > 0 ? ` (${fmt(item.cost.tears)} tears)` : "";
+      const paybackPart = isFinite(item.payback) ? ` · payback ${formatEta(item.payback)}` : " · no unicorn gain";
+      const alicornPart = item.unlocksAlicorns ? " · unlocks alicorns" : "";
+      return `${item.label}: +${fmt(item.gain)}/s for ${fmt(item.cost.total)} unicorn-eq${tearsPart}${paybackPart}${alicornPart}`;
+    });
+    return plan;
+  };
+
+  // Keyed on the tickCache object: resetTickCache() makes a fresh one, so both
+  // the tick loop and the debug/test paths invalidate this plan together.
+  const getUnicornPlanCached = (resources) => {
+    if (unicornPlanCache.key === tickCache && unicornPlanCache.plan) return unicornPlanCache.plan;
+    const plan = unicornEconomyPlan(resources);
+    unicornPlanCache = { key: tickCache, plan };
+    return plan;
+  };
+
+  // Unicorn side of an item = its direct unicorn price plus the unicorns its
+  // remaining tears deficit will consume through whole sacrifice batches.
+  const unicornSideFunded = (resources, item) => {
+    const prices = item.prices || [];
+    const unicornPrice = prices.find((price) => price && price.name === "unicorns" && price.val > 0);
+    const tearsPrice = prices.find((price) => price && price.name === "tears" && price.val > 0);
+    const missingTears = Math.max(0, (tearsPrice ? tearsPrice.val : 0) - resValueOf(resources, "tears"));
+    const conversion = sacrificeConversionFor("tears");
+    if (missingTears > 0 && !conversion) return false;
+    const unicornsForTears = missingTears > 0 ? Math.ceil(missingTears / conversion.gainPerChunk) * conversion.inputPerChunk : 0;
+    return resValueOf(resources, "unicorns") >= (unicornPrice ? unicornPrice.val : 0) + unicornsForTears;
+  };
+
+  const bestUnicornPathTarget = (candidates, resources) => {
+    const plan = getUnicornPlanCached(resources);
+    const best = plan.open ? plan.best : null;
+    if (!best) return null;
+    // Rushes are gated on the pick being genuinely worth focus: a fast unicorn
+    // payback, or the alicorn content unlock.
+    if (!(best.unlocksAlicorns || best.payback <= UNICORN_PAYBACK_HORIZON_S)) return null;
+    if (plan.zigguratFirst) {
+      const zigCandidate = candidates.find((candidate) => candidate.kind === "build" && candidate.meta && candidate.meta.name === "ziggurat");
+      if (zigCandidate && !zigCandidate.affordable) {
+        return {
+          candidate: zigCandidate,
+          plan,
+          reason: `next Ziggurat cuts ${labelOf(best.meta)}'s tear bill ${Math.round(plan.zigguratFirst.share * 100)}% (≈${fmt(plan.zigguratFirst.savings)} unicorns saved)`,
+        };
+      }
+      return null; // an affordable Ziggurat is grabbed by the ordinary executor
+    }
+    const candidate = findCandidateById(candidates, unicornItemId(best));
+    if (!candidate || candidate.affordable) return null; // affordable picks need no plan slot
+    if (!unicornSideFunded(resources, best)) return null; // still banking unicorns — nothing to reserve
+    if (!solveCraftChain(resources, candidate).reachable) return null;
+    return {
+      candidate,
+      plan,
+      reason: `${labelOf(best.meta)}'s unicorn bill is funded (${fmt(best.cost.total)} unicorn-eq); reserving the remaining costs`,
+    };
+  };
+
+  // While the unicorn planner saves toward a tear-priced upgrade, hold the
+  // unicorns its sacrifice will consume — otherwise a surplus Unicorn Pasture
+  // buy eats the bank between sacrifices.  Merged into the shared reservation
+  // ledger under the "unicorn path" source.
+  const unicornPathReservationLedger = (resources) => {
+    const out = { reserved: {}, critical: new Set(), sources: {} };
+    try {
+      const plan = getUnicornPlanCached(resources);
+      const best = plan.open ? plan.best : null;
+      const conversion = sacrificeConversionFor("tears");
+      if (!best || !conversion || !(best.cost.tears > 0)) return out;
+      const missingTears = Math.max(0, best.cost.tears - resValueOf(resources, "tears"));
+      if (missingTears <= 0) return out;
+      out.reserved.unicorns = Math.ceil(missingTears / conversion.gainPerChunk) * conversion.inputPerChunk;
+      out.critical.add("unicorns");
+      out.sources.unicorns = ["unicorn path"];
+    } catch (error) {
+      /* advisory reserve only */
+    }
+    return out;
+  };
+
+  // Unicorns some OTHER focus has dibs on: the active plan (when it is not the
+  // item this sacrifice serves) and any manual-queue item other than it.  The
+  // "unicorn path" background reserve and the served item's own ledger are the
+  // sacrifice's OWN budget and must not deadlock it.
+  const externalUnicornReserveFor = (resources, servedId, target) => {
+    let hold = 0;
+    try {
+      if (target && targetId(target) !== servedId) {
+        hold = Math.max(hold, (buildTargetLedger(target, resources).reserved || {}).unicorns || 0);
+      }
+      for (const item of readQueue()) {
+        if (String(item.id) === servedId || queueItemDone(item)) continue;
+        const meta = lookupMetaById(item.id);
+        if (!meta) continue;
+        const [kind] = String(item.id).split(":");
+        const candidate = { kind, meta, affordable: false };
+        if (!solveCraftChain(resources, candidate).reachable) continue;
+        hold = Math.max(hold, (buildTargetLedger(candidate, resources).reserved || {}).unicorns || 0);
+      }
+    } catch (error) {
+      /* treat unreadable reserves as zero */
+    }
+    return hold;
+  };
+
+  const executeUnicornSacrifice = (chunks) => {
+    const btn = sacrificeUnicornsButton();
+    if (!btn || !btn.controller || !btn.model) return { gained: 0, reason: "sacrifice button unavailable (open the Religion tab once)" };
+    const before = resValueOf(resourceMap(), "tears");
+    const attempts = [
+      () => typeof btn.controller._transform === "function" && btn.controller._transform(btn.model, chunks),
+      () => typeof btn.controller.transform === "function" && btn.controller.transform(btn.model, chunks),
+      () => typeof btn.controller.sacrifice === "function" && btn.controller.sacrifice(btn.model, chunks),
+    ];
+    for (const attempt of attempts) {
+      try {
+        attempt();
+      } catch (error) {
+        /* try the next API shape */
+      }
+      const gained = resValueOf(resourceMap(), "tears") - before;
+      if (gained > 0) return { gained, reason: "" };
+    }
+    return { gained: 0, reason: "sacrifice call had no effect" };
+  };
+
+  // Tick subsystem: balance the unicorn loop and perform the bounded sacrifice.
+  //  - the ACTIVE PLAN wins: if the current target itself is tear-priced (a
+  //    manual-queue ziggurat upgrade, or this layer's own claim), the sacrifice
+  //    serves it; otherwise it serves the planner's ranked best pick;
+  //  - the "rush ziggurats" hold defers sacrificing while one more Ziggurat
+  //    would cut the bill (never when it would override an explicit target);
+  //  - only the measured tears deficit is converted, in whole batches, from
+  //    unicorns no other focus has reserved.
+  const manageUnicornReligion = (resources, goalKey) => {
+    try {
+      const plan = getUnicornPlanCached(resources);
+      if (!plan.open) {
+        unicornPlanText = `Unicorns: ${plan.action || "unicorn economy not open yet"}`;
+        return;
+      }
+      const target = getTargetCached(resources, goalKey);
+      const targetTears = target && pricesFor(target.kind, target.meta)
+        .find((price) => price && price.name === "tears" && isFinite(price.val) && price.val > 0);
+      const served = targetTears
+        ? { id: targetId(target), label: labelOf(target.meta), tearsCost: targetTears.val, explicit: true }
+        : plan.best && plan.best.cost.tears > 0
+          ? { id: unicornItemId(plan.best), label: labelOf(plan.best.meta), tearsCost: plan.best.cost.tears, explicit: false }
+          : null;
+      if (!served) {
+        unicornPlanText = plan.best
+          ? `Unicorns: saving unicorns for ${labelOf(plan.best.meta)} (best payback ${isFinite(plan.best.payback) ? formatEta(plan.best.payback) : "n/a"}); no sacrifice needed`
+          : "Unicorns: no unicorn upgrade worth ranking yet";
+        return;
+      }
+      if (!served.explicit && plan.zigguratFirst) {
+        unicornPlanText = `Unicorns: holding sacrifice — next Ziggurat cuts ${served.label}'s tear bill ${Math.round(plan.zigguratFirst.share * 100)}%`;
+        return;
+      }
+      const conversion = sacrificeConversionFor("tears");
+      if (!conversion) {
+        unicornPlanText = "Unicorns: build a Ziggurat to enable tear sacrifices";
+        return;
+      }
+      const missingTears = Math.max(0, served.tearsCost - resValueOf(resources, "tears"));
+      if (missingTears <= 0) {
+        unicornPlanText = `Unicorns: tears ready for ${served.label}; waiting on the other costs`;
+        return;
+      }
+      const chunksNeeded = Math.ceil(missingTears / conversion.gainPerChunk);
+      const externalReserve = externalUnicornReserveFor(resources, served.id, target);
+      const spendable = Math.max(0, resValueOf(resources, "unicorns") - externalReserve);
+      const chunks = Math.min(chunksNeeded, Math.floor(spendable / conversion.inputPerChunk));
+      if (chunks <= 0) {
+        unicornPlanText = `Unicorns: banking unicorns to sacrifice for ${served.label} (${fmt(missingTears)} tears short)`;
+        return;
+      }
+      if (Date.now() - lastUnicornSacrificeAt < UNICORN_SACRIFICE_MIN_MS) {
+        unicornPlanText = `Unicorns: sacrifice for ${served.label} queued (batching)`;
+        return;
+      }
+      const result = executeUnicornSacrifice(chunks);
+      if (result.gained > 0) {
+        lastUnicornSacrificeAt = Date.now();
+        // The sacrifice may have just completed the served target's tears bill:
+        // drop the per-tick plan snapshot so the executor's re-read sees the
+        // fresh affordability and buys THIS tick (same latency contract crafts get).
+        activePlanSnapshot = { cycleId: -1, target: undefined };
+        unicornPlanText = `Unicorns: sacrificed ${fmt(chunks * conversion.inputPerChunk)} unicorns → +${fmt(result.gained)} tears for ${served.label}`;
+        pushLog(`🦄 sacrificed ${fmt(chunks * conversion.inputPerChunk)} unicorns → +${fmt(result.gained)} tears for ${served.label}`);
+      } else {
+        unicornPlanText = `Unicorns: ${result.reason || "sacrifice unavailable"}`;
+      }
+    } catch (error) {
+      /* ignore unicorn-subsystem failures */
+    }
   };
 
   /* ------------------------------ layer selector ----------------------------
@@ -4625,6 +5112,24 @@
       };
     }
 
+    // Ziggurat / unicorn path: claim the plan when the chosen unicorn-economy
+    // step is funded on the unicorn side (or a Ziggurat should be rushed first)
+    // so its shared-currency costs get reserved instead of eaten by surplus buys.
+    const unicornPath = bestUnicornPathTarget(candidates, resources);
+    if (unicornPath && unicornPath.candidate) {
+      return {
+        candidates,
+        target: unicornPath.candidate,
+        layer: STRATEGIC_LAYERS.unicornPath,
+        reason: unicornPath.reason,
+        protectedChain: candidateCraftChainResources(unicornPath.candidate),
+        unicornPath: unicornPath.plan,
+        rejectedTopCandidates: candidates.slice(0, 2)
+          .filter((candidate) => targetId(candidate) !== targetId(unicornPath.candidate))
+          .map((candidate) => ({ target: candidate, reason: "deferred while the funded unicorn-path step completes" })),
+      };
+    }
+
     // No sprint/storage-unlock: fall back to the mature ROI scorer (storage / production /
     // housing / economy / long project), which already raises storage blockers
     // and producer prerequisites by pressure.
@@ -4773,6 +5278,7 @@
         /* ignore */
       }
       for (const u of religionUpgrades()) note("religion", u, religionUpgradeVisible(u));
+      for (const u of zigguratUpgrades()) note("ziggurat", u, zigguratUpgradeVisible(u));
       for (const b of buildingMetas()) note("build", b, !!b && b.unlocked !== false);
       try {
         for (const res of window.gamePage.resPool.resources || []) note("resource", { ...res, label: res.title || res.name }, !!res && res.unlocked !== false);
@@ -5997,6 +6503,12 @@
         opts: (name) => ({ id: name }),
       };
     }
+    if (kind === "ziggurat") {
+      return {
+        path: ["com", "nuclearunicorn", "game", "ui", "ZigguratBtnController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
     if (kind === "build") {
       return {
         path: ["classes", "ui", "btn", "BuildingBtnModernController"],
@@ -6020,6 +6532,26 @@
       };
     }
     return null;
+  };
+
+  // Ziggurat upgrades buy through the game's own ZigguratBtnController
+  // (primary path in buyViaGameController).  When that class is unavailable,
+  // the rendered Religion-tab buttons are the fallback — the same controller
+  // instances the player clicks, so discounts stay exact.
+  const buyViaZigguratTabButton = (name) => {
+    try {
+      const tab = window.gamePage && window.gamePage.religionTab;
+      const buttons = (tab && (tab.zgUpgradeButtons || tab.zgUpgradeBtns)) || [];
+      for (const button of buttons) {
+        const id = button && ((button.opts && button.opts.id) || (button.model && button.model.options && button.model.options.id) || button.id);
+        if (id !== name || !button.controller || typeof button.controller.buyItem !== "function") continue;
+        const result = button.controller.buyItem(button.model, { boughtByQueue: true });
+        return !!(result && result.itemBought);
+      }
+    } catch (error) {
+      /* fall through to the next purchase attempt */
+    }
+    return false;
   };
 
   const buyViaGameController = (candidate) => {
@@ -6118,6 +6650,9 @@
         () => game.religion && typeof game.religion.build === "function" && game.religion.build(name),
         () => game.religion && typeof game.religion.build === "function" && game.religion.build(candidate.meta),
       );
+    }
+    if (candidate.kind === "ziggurat") {
+      attempts.push(() => buyViaZigguratTabButton(name));
     }
     if (candidate.kind === "build") {
       attempts.push(
@@ -6236,6 +6771,13 @@
         const raw = rawPathRequirements(cost.name, Math.max(1, missing));
         for (const [name, amount] of Object.entries(raw)) addLedgerNeed(ledger, name, amount);
       }
+      // A tears deficit is funded by the bounded unicorn→tears sacrifice, so
+      // reserve the unicorns that conversion will consume — otherwise a surplus
+      // Unicorn Pasture buy could eat the bank mid-save.
+      const sacrifice = sacrificeConversionFor(cost.name);
+      if (sacrifice && missing > 0) {
+        addLedgerNeed(ledger, sacrifice.inputName, Math.ceil(missing / sacrifice.gainPerChunk) * sacrifice.inputPerChunk);
+      }
     }
     return ledger;
   };
@@ -6295,6 +6837,7 @@
     const out = { target, reserved: {}, critical: new Set(), sources: {} };
     mergeLedger(out, buildTargetLedger(target, resources), target ? `active plan ${labelOf(target.meta)}` : "active plan");
     mergeLedger(out, manualQueueReservationLedger(resources), "manual queue");
+    mergeLedger(out, unicornPathReservationLedger(resources), "unicorn path");
     mergeLedger(out, survivalReservationLedger(resources), "survival");
     return out;
   };
@@ -7466,6 +8009,12 @@
       push(`Leader: ${leaderPlanText}`);
       push(`Reserve: ${reservePlanText}`);
       push(`Religion: ${religionPlanText}`);
+      push(`Unicorns: ${unicornPlanText}`);
+      try {
+        for (const line of (getUnicornPlanCached(resources).summary || []).slice(0, 4)) push(`  ${line}`);
+      } catch (error) {
+        /* unicorn summary is optional */
+      }
       push(`Festival: ${festivalPlanText}`);
       push(`Diplomacy: ${diplomacyPlanText}`);
       push("");
@@ -7968,6 +8517,7 @@
   let processingEl;
   let reserveStatusEl;
   let religionEl;
+  let unicornEl;
   let festivalEl;
   let diplomacyEl;
   let policyEl;
@@ -8115,6 +8665,10 @@
       keepHealthyConvertersStable(resources);
       craftTowardTarget(resources, goal);
       craftDiplomacyPrerequisites(resources, goal);
+      // The unicorn subsystem runs BEFORE the plan executor for the same reason
+      // crafting does: a sacrifice can complete a ziggurat upgrade's tears bill
+      // this very tick, and the buy should follow immediately.
+      manageUnicornReligion(resources, goal);
       // Crafting or trade can turn a plan affordable immediately. Re-read and
       // try the locked plan BEFORE any surplus/overflow conversion, otherwise a
       // generic craft can spend the exact raw resource window the plan needed.
@@ -8168,6 +8722,7 @@
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (reserveStatusEl) reserveStatusEl.textContent = `🛡 ${reservePlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
+      if (unicornEl) unicornEl.textContent = `🦄 ${unicornPlanText}`;
       if (festivalEl) festivalEl.textContent = `🎉 ${festivalPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
@@ -8251,6 +8806,7 @@
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
       '<small class="kgh-reserve" style="color:#9fd0ff">…</small>',
       '<small class="kgh-religion" style="color:#ffe3a3">…</small>',
+      '<small class="kgh-unicorn" style="color:#e8c7ff">…</small>',
       '<small class="kgh-festival" style="color:#ffd18f">…</small>',
       '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
@@ -8284,6 +8840,7 @@
     processingEl = box.querySelector(".kgh-processing");
     reserveStatusEl = box.querySelector(".kgh-reserve");
     religionEl = box.querySelector(".kgh-religion");
+    unicornEl = box.querySelector(".kgh-unicorn");
     festivalEl = box.querySelector(".kgh-festival");
     diplomacyEl = box.querySelector(".kgh-diplomacy");
     policyEl = box.querySelector(".kgh-policy");
@@ -8550,6 +9107,28 @@
       const resources = resourceMap();
       return bestExpansionCheckpoint(gatherCandidates(resources, goalKey), resources);
     },
+    unicornEconomyPlan() {
+      resetTickCache();
+      return unicornEconomyPlan(resourceMap());
+    },
+    bestUnicornPathTarget(candidates, goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return bestUnicornPathTarget(candidates || gatherCandidates(resources, goalKey), resources);
+    },
+    manageUnicornReligion(goalKey = getGoal()) {
+      resetTickCache();
+      manageUnicornReligion(resourceMap(), goalKey);
+      return unicornPlanText;
+    },
+    clearUnicornPathState() {
+      activeUnicornPathId = null;
+      lastUnicornSacrificeAt = 0;
+      unicornPlanCache = { key: null, plan: null };
+    },
+    sacrificeConversionFor,
+    sacrificePotentialFor(name) { return sacrificePotentialFor(resourceMap(), name); },
+    unicornPlanText: () => unicornPlanText,
     festivalOpportunity() {
       resetTickCache();
       return festivalOpportunity(resourceMap());
