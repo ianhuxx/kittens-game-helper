@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.11.0
+// @version      2.11.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.11.0";
+  const HELPER_VERSION = "2.11.1";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4051,8 +4051,27 @@
 
 
 
-  const scienceStorageGain = (candidate) => {
+  const usableScienceStorageFromEffects = (effects, scale = 1, resources = resourceMap()) => {
+    const profile = profileFromEffects(effects || {});
+    const direct = Math.max(0, (profile.max && profile.max.science) || 0) * Math.max(0, scale);
+    const compendiumCeiling = Math.max(0, (((effects || {}).scienceMaxCompendia) || 0)) * Math.max(0, scale);
+    const usableCompendiumHeadroom = Math.max(0, resValueOf(resources, "compedium") * 10 - resMaxOf(resources, "science"));
+    return direct + Math.min(compendiumCeiling, usableCompendiumHeadroom);
+  };
+
+  const stagedScienceStorageGain = (candidate, resources = resourceMap()) => {
+    const analysis = candidate && candidate.meta && candidate.meta.analysis;
+    if (!analysis) return 0;
+    const currentCount = Math.max(0, analysis.active || analysis.owned || 0);
+    const targetCount = Math.max(0, analysis.parityCount || 0);
+    const current = usableScienceStorageFromEffects(analysis.currentEffects, currentCount, resources);
+    const target = usableScienceStorageFromEffects(analysis.targetEffects, targetCount, resources);
+    return Math.max(0, target - current);
+  };
+
+  const scienceStorageGain = (candidate, resources = resourceMap()) => {
     if (!candidate) return 0;
+    if (candidate.kind === "stage") return stagedScienceStorageGain(candidate, resources);
     const profile = candidateEffectProfile(candidate.kind, candidate.meta);
     const direct = Math.max(0, (profile.max && profile.max.science) || 0);
     // Data Centers also lift the Compendium-derived ceiling.  Only its usable
@@ -4060,19 +4079,38 @@
     // and deliberately contributes nothing here.
     const live = liveMetaView(candidate.meta) || candidate.meta || {};
     const compendiumCeiling = Math.max(0, (((live.effects || {}).scienceMaxCompendia) || 0));
-    const usableCompendiumHeadroom = Math.max(0, resValueOf(resourceMap(), "compedium") * 10 - resMaxOf(resourceMap(), "science"));
+    const usableCompendiumHeadroom = Math.max(0, resValueOf(resources, "compedium") * 10 - resMaxOf(resources, "science"));
     return direct + Math.min(compendiumCeiling, usableCompendiumHeadroom);
   };
 
   const scienceStorageUnlockCandidate = (candidate, resources) => {
     if (!candidate || candidate.kind === "policy") return false;
     if (candidate.kind === "research" && candidate.meta && !finalScienceFitsCap(candidate.meta, resources)) return false;
-    return scienceStorageGain(candidate) > 0;
+    return scienceStorageGain(candidate, resources) > 0;
   };
 
   const projectScienceClosure = (candidate, need, resources) => {
-    const gain = scienceStorageGain(candidate);
+    const gain = scienceStorageGain(candidate, resources);
     if (!(gain > 0) || !(need > 0)) return { reachable: false, gain, copies: 0, projectedGain: 0, closure: 0, eta: Number.POSITIVE_INFINITY, prices: [] };
+    if (candidate && candidate.kind === "stage") {
+      const prices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && price.val > 0);
+      let eta = 0;
+      let reachable = true;
+      for (const price of prices) {
+        const reach = capDrainReachabilityFor(resources, price.name, price.val);
+        if (!reach.reachable) reachable = false;
+        eta = Math.max(eta, reach.eta || 0);
+      }
+      return {
+        reachable,
+        gain,
+        copies: 1,
+        projectedGain: gain,
+        closure: Math.min(1, gain / need),
+        eta: reachable ? eta : Number.POSITIVE_INFINITY,
+        prices,
+      };
+    }
     const copies = Math.min(100, Math.max(1, Math.ceil(need / gain)));
     const ratio = Math.max(1, Number((liveMetaView(candidate.meta) || candidate.meta || {}).priceRatio) || 1);
     const firstPrices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && price.val > 0);
@@ -4268,6 +4306,13 @@
   const stageUnitUtility = (view, resources) => {
     const profile = profileFromEffects((view && view.effects) || {});
     let utility = 0;
+    const catnipRatio = resRatio(resources, "catnip", 1);
+    const catnipRate = productionFor("catnip");
+    const catnipPressure = Math.max(
+      0,
+      catnipRatio < 0.5 ? (0.5 - catnipRatio) * 2 : 0,
+      catnipRate < 0 ? Math.min(2, -catnipRate / Math.max(1, Math.abs(catnipRate))) : 0,
+    );
     for (const [name, amount] of Object.entries(profile.max || {})) {
       const cap = Math.max(1, resMaxOf(resources, name));
       const pressure = resRatio(resources, name, 0);
@@ -4280,6 +4325,18 @@
     }
     for (const [name, amount] of Object.entries(profile.ratio || {})) {
       if (amount > 0 && productionFor(name) > 0) utility += Math.min(2, amount) * 8;
+      if (name === "catnip" && amount > 0 && catnipPressure > 0) {
+        // Food-pressure stage checks must value live catnip relief even when
+        // net catnip is currently negative; the ordinary positive-production
+        // ratio branch above deliberately skips that emergency case.
+        utility += Math.min(3, amount) * (18 + catnipPressure * 34);
+        if (rawProductionForNeed("wood") <= 0 || resRatio(resources, "wood", 1) < 0.35) {
+          utility += Math.min(2, amount) * catnipPressure * (1 + craftRatioFor("wood")) * 8;
+        }
+      }
+    }
+    for (const [name, amount] of Object.entries(profile.demand || {})) {
+      if (amount < 0) utility += Math.min(8, -amount * 80 * (name === "catnip" ? 1 + catnipPressure : 1));
     }
     utility += Math.max(0, profile.housing || 0) * 8;
     utility += Math.max(0, profile.happiness || 0) * 5;
@@ -4413,6 +4470,15 @@
       const postCap = Math.max(0, resMaxOf(resources, name) - lostCapacity);
       if (lostCapacity > 0 && resValueOf(resources, name) > postCap * 0.98) safetyVetoes.push(`${resTitle(resources, name)} would exceed post-transition cap`);
     }
+    const currentNetEnergy = profileNetEnergy(currentProfile) * active;
+    const targetNetEnergy = profileNetEnergy(targetProfile) * parityCount;
+    const netEnergyDelta = targetNetEnergy - currentNetEnergy;
+    if (netEnergyDelta < 0) {
+      const power = powerStatus();
+      if (power.delta + netEnergyDelta < TUNING.powerHeadroom || power.winterDelta + netEnergyDelta < 0) {
+        safetyVetoes.push("target stage would break power safety");
+      }
+    }
     const incrementalUtility = targetUtility - currentUtility;
     const lostUtility = currentUtility * Math.max(0, eta);
     const payback = incrementalUtility > 0 ? eta + lostUtility / incrementalUtility : Number.POSITIVE_INFINITY;
@@ -4425,7 +4491,9 @@
       actionable, reason, raw, fromStage, toStage: targetStage, fromLabel: currentView.label || raw.name,
       toLabel: targetView.label || raw.name, owned, active, currentUnitUtility, targetUnitUtility,
       currentUtility, targetUtility, parityCount, refund, usableRefund, refundLoss, rebuild, net, eta, lostUtility,
-      incrementalUtility, payback, safetyVetoes, targetEffects: { ...((targetView && targetView.effects) || {}) },
+      incrementalUtility, payback, safetyVetoes,
+      currentEffects: { ...((currentView && currentView.effects) || {}) },
+      targetEffects: { ...((targetView && targetView.effects) || {}) },
     };
   };
 
@@ -4447,7 +4515,7 @@
     return { kind: "stage", weight: 5, meta, ...evaluate("stage", meta, resources), score: 60 + Math.min(40, analysis.incrementalUtility) };
   };
 
-  const bestStageTransition = (resources = resourceMap()) => {
+  const stageTransitionCandidates = (resources = resourceMap()) => {
     const options = [];
     for (const raw of buildingMetas()) {
       if (!raw || !Array.isArray(raw.stages) || !(raw.val > 0) || (stageCooldownUntil[raw.name] || 0) > Date.now()) continue;
@@ -4458,6 +4526,11 @@
         if (candidate) options.push(candidate);
       }
     }
+    return options;
+  };
+
+  const bestStageTransition = (resources = resourceMap(), candidates = null) => {
+    const options = candidates ? [...candidates] : stageTransitionCandidates(resources);
     options.sort((a, b) => (b.meta.analysis.incrementalUtility / Math.max(1, b.meta.analysis.payback + 1)) -
       (a.meta.analysis.incrementalUtility / Math.max(1, a.meta.analysis.payback + 1)));
     return options[0] || null;
@@ -4952,7 +5025,13 @@
    * owns the plan.
    */
   const selectStrategicTarget = (resources, goalKey) => {
-    const candidates = gatherCandidates(resources, goalKey);
+    const baseCandidates = gatherCandidates(resources, goalKey);
+    // Stage transitions are structural candidates, not economy afterthoughts:
+    // if a staged rebuild solves the active bottleneck (science cap, power, or
+    // food pressure), it must compete inside that layer before a normal building
+    // claims the plan.
+    const stageCandidates = stageTransitionCandidates(resources);
+    const candidates = [...stageCandidates, ...baseCandidates];
 
     // A stage switch sells the old stack before the replacement stack can be
     // rebuilt. Treat that rebuild as one atomic planning contract: it outranks
@@ -5098,7 +5177,7 @@
       };
     }
 
-    const stageTarget = bestStageTransition(resources);
+    const stageTarget = bestStageTransition(resources, stageCandidates);
     if (stageTarget) {
       const analysis = stageTarget.meta.analysis;
       return {
@@ -6457,6 +6536,7 @@
     if (!capped.length) return null;
     return getCandidatesCached(resources, goalKey).find((candidate) =>
       candidate.affordable &&
+      candidate.kind !== "stage" &&
       (!target || targetId(candidate) !== targetId(target)) &&
       !buyBenched(targetId(candidate)) &&
       candidateSpendsAny(candidate, capped) &&
@@ -6993,6 +7073,7 @@
       const ready = candidates.find((candidate) =>
         !sprint &&
         candidate.affordable &&
+        candidate.kind !== "stage" &&
         (!target || targetId(candidate) !== targetId(target)) &&
         !buyBenched(targetId(candidate)) &&
         respectsReservations(candidate, reserved, resources, ledger));
