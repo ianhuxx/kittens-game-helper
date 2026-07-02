@@ -2243,6 +2243,17 @@ check("Test S: post-first-reset advisor drops the first-run milestone", !/130\+ 
 setKittens(40);
 const adv40 = dbg.resetAdvisor();
 check("Test S: sub-70 advisor still shows karma, not a negative efficiency", /karma if reset now/.test(adv40) && !/paragon-eff/.test(adv40));
+storage.set("kgh.speedrun.lastRestartLog", JSON.stringify(0));
+const resetLogsBeforeS = (logText().match(/new run detected/g) || []).length;
+storage.set("kgh.speedrun.lastResetCount", JSON.stringify(0));
+storage.set("kgh.speedrun.runStart", JSON.stringify(fakeNow - 3600000));
+for (let i = 0; i < 3; i += 1) {
+  storage.set("kgh.speedrun.peakKittens", JSON.stringify(130));
+  setKittens(10);
+  dbg.resetAdvisor();
+}
+const resetLogsAfterS = (logText().match(/new run detected/g) || []).length;
+check("Test S: reset advisor logs one restart for a stale low-kitten run, not every tick", resetLogsAfterS - resetLogsBeforeS === 1);
 kittensArr.length = 0; for (const k of savedKittens) kittensArr.push(k);
 delete gamePage.totalResets;
 
@@ -2550,6 +2561,29 @@ res("science").value = Math.min(res("science").maxValue, res("science").maxValue
 dbg.forceActiveTarget(null);
 let expansionDecisionW = dbg.selectStrategicTarget("balanced");
 check("Test W: full pre-reset village chooses an Expansion checkpoint before another sprint", expansionDecisionW.layer === "Expansion checkpoint" && expansionDecisionW.target?.meta?.name === "housingW");
+const savedWoodCapW = { value: res("wood").value, maxValue: res("wood").maxValue };
+const savedHousingPricesW = housingW.prices;
+housingW.prices = [{ name: "wood", val: 500 }];
+res("wood").value = 200;
+res("wood").maxValue = 200;
+dbg.clearResourceTelemetry?.("wood");
+dbg.forceActiveTarget(null);
+const cappedExpansionW = dbg.selectStrategicTarget("balanced");
+check("Test W: expansion stands down when housing final wood cost is above storage cap", cappedExpansionW.layer !== "Expansion checkpoint");
+dbg.forceActiveTarget({ kind: "build", meta: housingW, affordable: false }, "Expansion checkpoint", 60000);
+const cappedExpansionPlanW = dbg.planText("balanced");
+check("Test W: locked expansion target releases when final storage cap blocks it", !/Focus: Efficient Housing/i.test(cappedExpansionPlanW));
+res("science").value = 100;
+res("science").maxValue = 1000;
+expansionTechW.prices = [{ name: "science", val: 500 }];
+dbg.forceActiveTarget(null);
+const earlyScienceNeedsW = dbg.resourceNeeds("balanced");
+check("Test W: early balanced planning keeps science as a meaningful worker need", (earlyScienceNeedsW.needs.science || 0) >= 6);
+housingW.prices = savedHousingPricesW;
+res("wood").value = savedWoodCapW.value;
+res("wood").maxValue = savedWoodCapW.maxValue;
+dbg.clearResourceTelemetry?.("wood");
+res("science").value = Math.min(res("science").maxValue, res("science").maxValue);
 // Food gate: the SAME full village, but catnip is net-negative (food already
 // out, like the live -112/s starvation).  Expansion must stand down — buying
 // housing capacity it cannot feed (and the farmer→woodcutter / catnip→wood
