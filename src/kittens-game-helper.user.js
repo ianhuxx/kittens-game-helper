@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.11.2
+// @version      2.11.3
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.11.2";
+  const HELPER_VERSION = "2.11.3";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -43,6 +43,7 @@
   const SPEEDRUN_PEAK_KITTENS_KEY = SPEEDRUN_STATE_PREFIX + "peakKittens";
   const SPEEDRUN_LAST_RESET_COUNT_KEY = SPEEDRUN_STATE_PREFIX + "lastResetCount";
   const SPEEDRUN_PARAGON_HISTORY_KEY = SPEEDRUN_STATE_PREFIX + "paragonHistory";
+  const SPEEDRUN_LAST_RESTART_LOG_KEY = SPEEDRUN_STATE_PREFIX + "lastRestartLog";
   const TARGET_LOCK_MIN_EARLY_MS = 30000;
   const TARGET_LOCK_MIN_MID_MS = 60000;
   const TARGET_LOCK_MIN_LATE_MS = 120000;
@@ -320,7 +321,11 @@
         lastResetCount = resetCount;
         writeJson(SPEEDRUN_PARAGON_HISTORY_KEY, history.slice(-10));
         writeJson(SPEEDRUN_LAST_RESET_COUNT_KEY, lastResetCount);
-        pushLog("🔄 new run detected — reset advisor restarted tracking");
+        const lastRestartLog = readJson(SPEEDRUN_LAST_RESTART_LOG_KEY, 0);
+        if (now - lastRestartLog > 60000) {
+          writeJson(SPEEDRUN_LAST_RESTART_LOG_KEY, now);
+          pushLog("🔄 new run detected — reset advisor restarted tracking");
+        }
       }
 
       peakKittens = Math.max(peakKittens, kittens);
@@ -2165,7 +2170,10 @@
         const value = slots > 0 && isFinite(eta) ? pressure.score * slots * 20 / (1 + Math.log10(eta + 1)) : 0;
         return { candidate, slots, eta, value };
       })
-      .filter((option) => option.value > 0 && !directStorageBlockers(option.candidate.kind, option.candidate.meta, resources).length)
+      .filter((option) =>
+        option.value > 0 &&
+        !directStorageBlockers(option.candidate.kind, option.candidate.meta, resources).length &&
+        !finalPurchaseCapBlockers(option.candidate.kind, option.candidate.meta, resources).length)
       .sort((a, b) => b.value - a.value || a.eta - b.eta);
     return options.length ? { ...options[0], pressure, options: options.slice(0, 3) } : null;
   };
@@ -2399,6 +2407,18 @@
     for (const cost of pricesFor(kind, meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       if (craftByName(cost.name)) continue;
+      const res = getRes(resources, cost.name);
+      const cap = liveCapFor(resources, cost.name);
+      if (!res || cap <= 0 || cost.val <= cap) continue;
+      blockers.push({ name: cost.name, need: cost.val, max: cap });
+    }
+    return blockers;
+  };
+
+  const finalPurchaseCapBlockers = (kind, meta, resources) => {
+    const blockers = [];
+    for (const cost of pricesFor(kind, meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       const res = getRes(resources, cost.name);
       const cap = liveCapFor(resources, cost.name);
       if (!res || cap <= 0 || cost.val <= cap) continue;
@@ -5480,15 +5500,18 @@
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
+      const lockedExpansionFinalCapBlocked = locked && activeTarget.layer === STRATEGIC_LAYERS.expansion &&
+        finalPurchaseCapBlockers(locked.kind, locked.meta, resources).length > 0;
       const scoreGain = preferred && locked ? candidateScoreGain(locked, preferred) : 0;
       const scoreBetter = preferred && locked && candidateMeetsSwitchScoreGain(locked, preferred);
       const etaBetter = preferredWait < lockedWait * 0.75;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
       if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || productionTakeover || age > TARGET_LOCK_MAX_MS ||
-          lockedIsStaleStorage || lockedIsStorageBlocked || nearTechBreak) {
+          lockedIsStaleStorage || lockedIsStorageBlocked || lockedExpansionFinalCapBlocked || nearTechBreak) {
         const reason = !locked ? "target unavailable" : completed ? "target completed" : impossible ? "target impossible" :
           noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
+          lockedExpansionFinalCapBlocked ? "storage cap blocks expansion" :
           structuralLayerTakeover ? "science storage emergency" : productionTakeover ? "converter-fuel starvation" :
           emergency ? "emergency" : "lock timeout";
         pushPlanLog(`🔓 Plan switch accepted: ${reason}`, 20000);
@@ -5651,6 +5674,17 @@
     if (lastStrategicDecision && lastStrategicDecision.scienceStorageBlocker &&
         jobByName("scholar") && !isNearResourceCap(resources, "science")) {
       scoreNeed(needs, "science", 8);
+    }
+
+    const openResearchNeedingScience = getCandidatesCached(resources, goalKey).find((candidate) => {
+      if (!candidate || candidate.kind !== "research" || !candidate.meta || !isOpen(candidate.meta)) return false;
+      const scienceCost = researchScienceCost(candidate.meta);
+      return scienceCost > resValueOf(resources, "science") &&
+        finalScienceFitsCap(candidate.meta, resources) &&
+        (gatewayValue(candidate.meta) > 0 || (candidate.score || 0) > 0);
+    });
+    if (openResearchNeedingScience && jobByName("scholar") && resRatio(resources, "science") < 0.92) {
+      scoreNeed(needs, "science", totalKittenCount() < EARLY_GAME_KITTENS ? 6 : 3);
     }
 
     // Lookahead: the next few runner-up candidates also pull a little weight,
