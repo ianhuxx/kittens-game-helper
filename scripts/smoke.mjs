@@ -2346,11 +2346,10 @@ resources.push(smartcrete);
 crafts.push(smartcreteCraft);
 buildings.push(hiddenSmartBuilding);
 const bootstrapProbe = dbg.bootstrapResourceCandidate?.();
-check("Test U: hidden live building threshold creates a generic Resource bootstrap", bootstrapProbe?.kind === "bootstrap" && bootstrapProbe.meta.outputName === "smartcrete" && bootstrapProbe.meta.targetAmount === 1);
-check("Test U: bootstrap uses the live craft/resource label", /Smart Concrete/.test(bootstrapProbe?.meta?.label || ""));
+check("Test U: hidden live building thresholds do not create focus targets before the game unlocks them", bootstrapProbe?.meta?.downstreamName !== "smartArchive");
 dbg.forceActiveTarget(null);
 const bootstrapDecision = dbg.selectStrategicTarget("balanced");
-check("Test U: Resource bootstrap structurally outranks ordinary economy work", bootstrapDecision.layer === "Resource bootstrap" && bootstrapDecision.target?.meta?.outputName === "smartcrete");
+check("Test U: strategic planning does not focus a hidden Resource bootstrap target", bootstrapDecision.target?.meta?.downstreamName !== "smartArchive");
 buildings.splice(buildings.indexOf(hiddenSmartBuilding), 1);
 crafts.splice(crafts.indexOf(smartcreteCraft), 1);
 resources.splice(resources.indexOf(smartcrete), 1);
@@ -2360,7 +2359,7 @@ const hiddenLogHouseU = {
   label: "Log House",
   unlocked: false,
   unlockable: true,
-  defaultUnlockable: false,
+  defaultUnlockable: true,
   unlockRatio: 1,
   val: 0,
   on: 0,
