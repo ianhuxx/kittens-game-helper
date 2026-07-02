@@ -2724,8 +2724,103 @@ check("Test X: rebuild continuation reserves every remaining parity copy, not on
 buildings.splice(buildings.indexOf(stageEconomyX), 1);
 buildings.splice(buildings.indexOf(stageBadX), 1);
 
+/* ---------------------------------------------------------------------
+ * Test X2 - staged science storage is first-class inside the cap layer.
+ * A Library-like stage upgrade that closes the next tech's science deficit must
+ * compete in Science storage unlock, not wait for the generic stage layer.
+ * ------------------------------------------------------------------- */
+const savedX2 = {
+  science: [res("science").value, res("science").maxValue],
+  wood: [res("wood").value, res("wood").maxValue],
+  perTickScience: perTick.science,
+  perTickWood: perTick.wood,
+  buildingFlags: buildings.map((b) => [b, b.unlocked]),
+};
+for (const b of buildings) {
+  const effects = (b && b.effects) || {};
+  if (effects.scienceMax || effects.scienceRatio || Array.isArray(b.stages)) b.unlocked = false;
+}
+const stageScienceX2 = {
+  name: "stageScienceX2",
+  unlocked: true,
+  stage: 0,
+  val: 10,
+  on: 10,
+  priceRatio: 1,
+  stages: [
+    { label: "Small Archive X2", prices: [{ name: "wood", val: 10 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "Data Center X2", prices: [{ name: "wood", val: 100 }], effects: { scienceMax: 3000 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+const stageBlockTechX2 = {
+  name: "stageBlockTechX2",
+  label: "Stage Block Tech X2",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 12000 }],
+  unlocks: { tech: ["stageBlockFutureX2"] },
+};
+buildings.push(stageScienceX2);
+techs.push(stageBlockTechX2);
+res("science").value = 10000; res("science").maxValue = 10000;
+res("wood").value = 1000; res("wood").maxValue = 5000;
+perTick.science = 10; perTick.wood = 10;
+dbg.forceActiveTarget(null);
+const stageScienceCandidateX2 = dbg.stageTransitionCandidate?.(stageScienceX2, 1);
+const stageScienceDecisionX2 = dbg.selectStrategicTarget("balanced");
+check("Test X2: stage science storage gain is the net target-stage cap increase", dbg.scienceStorageGain?.(stageScienceCandidateX2) === 2000);
+check("Test X2: staged cap growth wins inside Science storage unlock", stageScienceDecisionX2.layer === "Science storage unlock" && stageScienceDecisionX2.target?.kind === "stage" && stageScienceDecisionX2.target?.meta?.buildingName === "stageScienceX2");
+buildings.splice(buildings.indexOf(stageScienceX2), 1);
+techs.splice(techs.indexOf(stageBlockTechX2), 1);
+for (const [b, unlocked] of savedX2.buildingFlags) b.unlocked = unlocked;
+res("science").value = savedX2.science[0]; res("science").maxValue = savedX2.science[1];
+res("wood").value = savedX2.wood[0]; res("wood").maxValue = savedX2.wood[1];
+perTick.science = savedX2.perTickScience;
+perTick.wood = savedX2.perTickWood;
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
+ * Test X3 - staged food relief responds to live catnip pressure.  Hydro-style
+ * energy stages do not help food; switching back to a catnip-ratio stage does.
+ * ------------------------------------------------------------------- */
+const savedX3 = {
+  catnip: [res("catnip").value, res("catnip").maxValue],
+  perTickCatnip: perTick.catnip,
+  energyProd: gamePage.resPool.energyProd,
+  energyCons: gamePage.resPool.energyCons,
+  energyWinterProd: gamePage.resPool.energyWinterProd,
+};
+const stageFoodX3 = {
+  name: "stageFoodX3",
+  unlocked: true,
+  stage: 1,
+  val: 4,
+  on: 4,
+  priceRatio: 1,
+  stages: [
+    { label: "Aqueduct X3", prices: [{ name: "minerals", val: 10 }], effects: { catnipRatio: 0.4 }, stageUnlocked: true },
+    { label: "Hydro Plant X3", prices: [{ name: "minerals", val: 10 }], effects: { energyProduction: 5 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageFoodX3);
+res("catnip").value = 120; res("catnip").maxValue = 5000;
+perTick.catnip = -12;
+gamePage.resPool.energyProd = 100;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 100;
+const stageFoodDecisionX3 = dbg.bestStageTransition?.();
+check("Test X3: catnip pressure values a food-positive stage transition", stageFoodDecisionX3?.meta?.buildingName === "stageFoodX3" && stageFoodDecisionX3.meta.analysis.toStage === 0);
+buildings.splice(buildings.indexOf(stageFoodX3), 1);
+res("catnip").value = savedX3.catnip[0]; res("catnip").maxValue = savedX3.catnip[1];
+perTick.catnip = savedX3.perTickCatnip;
+gamePage.resPool.energyProd = savedX3.energyProd;
+gamePage.resPool.energyCons = savedX3.energyCons;
+gamePage.resPool.energyWinterProd = savedX3.energyWinterProd;
+
 /* =====================================================================
- * REGRESSION — power/Wt is a first-class planner and toggle constraint
+ * REGRESSION - power/Wt is a first-class planner and toggle constraint
  * =================================================================== */
 const savedPowerY = {
   energyProd: gamePage.resPool.energyProd,
