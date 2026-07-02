@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.11.5
+// @version      2.12.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.11.5";
+  const HELPER_VERSION = "2.12.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1369,6 +1369,25 @@
       /* managed jobs are advisory; fall back to craft-chain handling */
     }
     return false;
+  };
+
+  // One marginal worker's live output for a staffable resource.  Used as the
+  // conservative rate floor when the resource currently reads 0/s only because
+  // its job is unstaffed (all miners pulled to hunt): the job balancer WILL
+  // staff it the moment a plan needs it, so it is a wait, not a dead end.
+  const directJobRatePerSecondFor = (name) => {
+    const key = name === "catpower" ? "manpower" : name;
+    try {
+      for (const job of managedJobs()) {
+        const produced = jobResourceFor(job);
+        if ((produced === "catpower" ? "manpower" : produced) !== key) continue;
+        const rate = jobMarginalProductionPerSecond(job, key);
+        if (isFinite(rate) && rate > 0) return rate;
+      }
+    } catch (error) {
+      /* no live job signal */
+    }
+    return 0;
   };
 
 
@@ -3787,6 +3806,17 @@
       if (max > 0 && amount > max) return { reachable: true, eta: prod > 0 ? deficit / prod : 0, chain };
       return { reachable: prod > 0, eta: prod > 0 ? deficit / prod : Number.POSITIVE_INFINITY, reason: `no ${resTitle(resources, name)} refill`, chain };
     }
+    // A staffable resource (minerals with every miner temporarily pulled to
+    // another job, catnip with no farmers in autumn, …) is never a dead end:
+    // the job balancer assigns workers the moment a plan needs it.  Reading
+    // "production 0 → unreachable" here made every minerals-priced candidate
+    // look impossible exactly when a sprint's job override had emptied the
+    // mines, which then kept the deadlock alive.  Model one marginal worker
+    // as the conservative rate floor instead.
+    if (resourceHasDirectJobPath(name)) {
+      const jobRate = directJobRatePerSecondFor(name);
+      return { reachable: true, eta: jobRate > 0 ? deficit / jobRate : deficit, chain };
+    }
     // Tears have no production/craft path: they arrive through the bounded
     // unicorn→tears sacrifice, batch by batch, so a tears deficit is reachable
     // whenever the banked unicorns already cover it or unicorn income exists.
@@ -4086,7 +4116,79 @@
     return { sprint: null, deferred, actionable };
   };
 
+  /* --------------------- sprint cap-drain pacing redirect -------------------
+   * A sprint's craft chain can be paced by a cap-drain bank NO job can work
+   * (culture is the only one in practice: science has scholars, faith has
+   * priests).  35 Manuscripts at 400 culture each against +0.04 culture/s is a
+   * multi-DAY passive wait — hunting more furs does not shorten it by one
+   * second.  When that trickle leg dominates, the sprint contract stays alive
+   * (chain still protected, manuscripts still crafted every time the bank
+   * fills), but the PLAN target redirects to the best live producer of the
+   * trickling resource (Amphitheatre for culture) so the wait is spent
+   * shortening itself instead of freezing the village.  Without an actionable
+   * producer the sprint behaves exactly as before.
+   */
+  const SPRINT_PACING_REDIRECT_S = 1800; // redirect when the passive wait exceeds 30 minutes
 
+  const sprintCapDrainPacing = (candidate, resources) => {
+    if (!candidate || !candidate.meta) return null;
+    let worst = null;
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0 || !craftByName(cost.name)) continue;
+      const deficit = cost.val - resValueOf(resources, cost.name);
+      if (deficit <= 0) continue;
+      const raw = rawPathRequirements(cost.name, deficit);
+      for (const [name, amount] of Object.entries(raw)) {
+        if (!CAP_DRAIN_RESOURCES.has(name) || resourceHasDirectJobPath(name)) continue;
+        const missing = Math.max(0, amount - resValueOf(resources, name));
+        if (missing <= 0) continue;
+        const prod = productionFor(name);
+        const wait = prod > 0 ? missing / prod : Number.POSITIVE_INFINITY;
+        if (wait > SPRINT_PACING_REDIRECT_S && (!worst || wait > worst.wait)) {
+          worst = { name, missing, prod, wait };
+        }
+      }
+    }
+    return worst;
+  };
+
+  // Sticky booster pick (mirrors the power/science-unlock commits): rank live
+  // per-tick producers of the trickling resource by gain per second of wait and
+  // keep the incumbent while it remains an option, so the redirect cannot
+  // oscillate between two near-equal producers tick to tick.  Storage-only
+  // growers (cultureMax) are deliberately excluded — bigger batches do not
+  // shorten a production-bound wait.
+  let activeSprintPacingBoostId = null;
+
+  const bestSprintPacingBooster = (candidates, resources, pacing) => {
+    if (!pacing) {
+      activeSprintPacingBoostId = null;
+      return null;
+    }
+    const options = [];
+    for (const candidate of candidates) {
+      if (!candidate || !candidate.meta || candidate.kind === "policy" || candidate.kind === "stage") continue;
+      const profile = candidateEffectProfile(candidate.kind, candidate.meta);
+      const gain = (profile.perTick && profile.perTick[pacing.name]) || 0;
+      if (!(gain > 0)) continue;
+      const solver = solveCraftChain(resources, candidate);
+      if (!solver.reachable) continue;
+      const eta = waitSecondsForCandidate(candidate, resources);
+      if (!isFinite(eta) || eta >= pacing.wait) continue; // slower than just waiting → useless
+      options.push({ candidate, gain, eta });
+    }
+    if (!options.length) {
+      activeSprintPacingBoostId = null;
+      return null;
+    }
+    options.sort((a, b) => (b.gain / Math.max(60, b.eta)) - (a.gain / Math.max(60, a.eta)));
+    const sticky = activeSprintPacingBoostId
+      ? options.find((option) => targetId(option.candidate) === activeSprintPacingBoostId)
+      : null;
+    const chosen = sticky || options[0];
+    activeSprintPacingBoostId = targetId(chosen.candidate);
+    return chosen;
+  };
 
   const usableScienceStorageFromEffects = (effects, scale = 1, resources = resourceMap()) => {
     const profile = profileFromEffects(effects || {});
@@ -4272,12 +4374,97 @@
     return { target: chosen.candidate, blocked, need, options: options.slice(0, 3) };
   };
 
-  // Hidden building metadata is predictive, not player-visible. The helper may
-  // craft resources opportunistically, but the strategic focus must only name
-  // buildings the game has actually unlocked, otherwise early saves get stuck
-  // "revealing" Log House/Lumber Mill/Academy/Ziggurat instead of buying ready work.
+  // Some buildings stay hidden until the player owns a fraction of a newly
+  // craftable price resource.  Discover that requirement from live metadata
+  // instead of keeping a list of Concrete/Tanker/etc. special cases.
+  const metaGrantsBuilding = (meta, buildingName) => {
+    if (!meta || !buildingName) return false;
+    for (const node of [meta.unlocks, meta.upgrades]) {
+      if (!node || typeof node !== "object") continue;
+      for (const list of [node.buildings, node.building]) {
+        if (Array.isArray(list) && list.includes(buildingName)) return true;
+      }
+    }
+    return false;
+  };
+
+  const hiddenBuildingBootstrapAllowed = (raw) => {
+    const live = liveMetaView(raw) || raw;
+    if (raw.defaultUnlockable || (live && live.defaultUnlockable)) return true;
+    const name = raw && raw.name;
+    if (!name) return false;
+    try {
+      for (const source of buildingMetas()) {
+        if (source && source.name !== name && metaGrantsBuilding(source, name) && (source.val || source.on || 0) > 0) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    try {
+      for (const source of techList()) {
+        if (source && metaGrantsBuilding(source, name) && source.researched) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    try {
+      for (const source of (window.gamePage.workshop && window.gamePage.workshop.upgrades) || []) {
+        if (source && metaGrantsBuilding(source, name) && (source.researched || source.on || source.val)) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    try {
+      for (const source of religionUpgrades()) {
+        if (source && metaGrantsBuilding(source, name) && religionUpgradePurchased(source)) return true;
+      }
+    } catch (error) {
+      /* ignore source scan failures */
+    }
+    return false;
+  };
+
+  // Reveal-crafting is only a FOCUS when nothing else would ever make the
+  // resource: a craft-only price resource with no job path and no live
+  // production (the first Manuscript, Concrete, Tanker).  A price resource
+  // with an ordinary work path (wood for Log House / Lumber Mill / Academy)
+  // accrues through normal play and the game reveals the building on its own —
+  // focusing those stalled early saves on "revealing" instead of buying ready
+  // work (the v2.11.5 regression that disabled this layer entirely).  The
+  // reveal craft must also be quick (reach ETA-bounded) so a weak economy is
+  // never parked on a long reveal grind.
+  const BOOTSTRAP_MAX_ETA_S = 3600;
+
   const bootstrapResourceCandidate = (resources = resourceMap()) => {
-    return null;
+    const options = [];
+    for (const raw of buildingMetas()) {
+      if (!raw || raw.unlocked !== false || !(raw.unlockable || raw.defaultUnlockable)) continue;
+      if (!hiddenBuildingBootstrapAllowed(raw)) continue;
+      const live = liveMetaView(raw) || raw;
+      const ratio = isFinite(live.unlockRatio) ? Math.max(0, live.unlockRatio) : null;
+      if (ratio == null || ratio <= 0) continue;
+      for (const price of live.prices || raw.prices || []) {
+        if (!price || !price.name || !(price.val > 0) || !craftByName(price.name)) continue;
+        if (resourceHasDirectJobPath(price.name) || rawProductionForNeed(price.name) > 0) continue;
+        const targetAmount = Math.max(1, price.val * ratio);
+        const have = resValueOf(resources, price.name);
+        if (have >= targetAmount) continue;
+        const meta = {
+          name: `bootstrap-${price.name}-for-${raw.name}`,
+          label: `${craftLabel(price.name)} for ${labelOf(raw)}`,
+          prices: [{ name: price.name, val: targetAmount }],
+          outputName: price.name,
+          targetAmount,
+          downstreamName: raw.name,
+          downstreamLabel: labelOf(raw),
+        };
+        const candidate = { kind: "bootstrap", weight: 5, meta, ...evaluate("bootstrap", meta, resources), score: 100 };
+        const reach = capDrainReachabilityFor(resources, price.name, targetAmount);
+        if (reach.reachable && (reach.eta || 0) <= BOOTSTRAP_MAX_ETA_S) options.push({ candidate, eta: reach.eta || 0 });
+      }
+    }
+    options.sort((a, b) => a.eta - b.eta || a.candidate.meta.targetAmount - b.candidate.meta.targetAmount);
+    return options.length ? options[0].candidate : null;
   };
 
   /* ---------------- opportunity-costed staged-building transitions --------- */
@@ -4628,23 +4815,44 @@
     return (Number(meta.val) || 0) > (Number(item.val) || 0); // one more built
   };
 
+  // Why the manual queue is / is not driving the plan, for the panel and the
+  // diagnostics report — "my queue is not pushing through" must be answerable
+  // from the report alone (front item + the exact blocker).
+  let queuePlanText = "Queue: empty";
+
   const pickQueuedTarget = (candidates, resources) => {
     const queue = readQueue();
-    if (!queue.length) return null;
+    if (!queue.length) {
+      queuePlanText = "Queue: empty";
+      return null;
+    }
     let chosen = null;
     let changed = false;
+    let frontStatus = "";
     const remaining = [];
     for (const item of queue) {
       if (queueItemDone(item)) { changed = true; continue; } // drop finished item, advance
       remaining.push(item);
       if (chosen) continue;
       const candidate = findCandidateById(candidates, item.id);
-      if (candidate) {
-        const solver = solveCraftChain(resources, candidate);
-        if (solver.reachable) chosen = { candidate, solver }; // first actionable item wins
+      if (!candidate) {
+        const meta = lookupMetaById(item.id);
+        if (!frontStatus) frontStatus = `${meta ? labelOf(meta) : item.id} waiting to unlock — skipped`;
+        continue;
+      }
+      const solver = solveCraftChain(resources, candidate);
+      if (solver.reachable) {
+        chosen = { candidate, solver }; // first actionable item wins
+      } else if (!frontStatus) {
+        const blocker = (solver.blockers && solver.blockers[0] && solver.blockers[0].text) || "chain unreachable";
+        frontStatus = `${labelOf(candidate.meta)} blocked — ${blocker}; skipped`;
       }
     }
     if (changed) writeQueue(remaining);
+    const extra = remaining.length > 1 ? ` (+${remaining.length - 1} more queued)` : "";
+    queuePlanText = !remaining.length ? "Queue: empty"
+      : chosen ? `Queue: driving the plan — ${labelOf(chosen.candidate.meta)}${frontStatus ? ` (ahead of it: ${frontStatus})` : ""}${extra}`
+      : `Queue: ${frontStatus || "nothing actionable"}${extra}`;
     return chosen;
   };
 
@@ -5147,6 +5355,29 @@
       const target = sprint.candidate;
       const protectedChain = sprint.protectedChain && sprint.protectedChain.size ? sprint.protectedChain : candidateCraftChainResources(target);
       const chainText = [...protectedChain].filter((n) => craftByName(n)).slice(0, 3).map((n) => resTitle(resources, n)).join("→") || "science";
+      // Trickle-leg redirect: when the chain is paced by a no-job cap-drain
+      // bank (culture), point the plan at the best live producer of that bank
+      // while the sprint contract keeps protecting the chain.
+      const pacing = sprintCapDrainPacing(target, resources);
+      const booster = pacing ? bestSprintPacingBooster(candidates, resources, pacing) : (activeSprintPacingBoostId = null, null);
+      if (booster) {
+        const boosted = booster.candidate;
+        const mergedChain = new Set([...protectedChain, ...candidateCraftChainResources(boosted)]);
+        return {
+          candidates,
+          target: boosted,
+          layer: STRATEGIC_LAYERS.researchSprint,
+          reason: `${labelOf(target.meta)} chain is ${resTitle(resources, pacing.name)}-bound (+${fmt(pacing.prod)}/s, ${formatEta(pacing.wait)}); growing ${resTitle(resources, pacing.name)} via ${labelOf(boosted.meta)}`,
+          protectedChain: mergedChain,
+          sprint,
+          sprintRedirect: { candidate: boosted, ...pacing },
+          rejectedTopCandidates: [
+            { target, reason: `${resTitle(resources, pacing.name)} refill ${formatEta(pacing.wait)} at +${fmt(pacing.prod)}/s paces the chain` },
+            ...buildSprintDeferrals(candidates, resources, goalKey, target, protectedChain, deferred)
+              .filter((item) => item && item.target && targetId(item.target) !== targetId(boosted)),
+          ].slice(0, 6),
+        };
+      }
       return {
         candidates,
         target,
@@ -5466,6 +5697,18 @@
       );
       const structuralLayerTakeover = preferred && decision.layer === STRATEGIC_LAYERS.scienceStorageUnlock &&
         activeTarget.layer !== STRATEGIC_LAYERS.scienceStorageUnlock;
+      // The manual queue overrides everything when actionable (documented layer
+      // invariant): the player's explicit pick must not be score-gated behind
+      // whatever the autopilot locked before the queue item became reachable.
+      const manualQueueTakeover = preferred && !same && decision.layer === STRATEGIC_LAYERS.manualQueue &&
+        activeTarget.layer !== STRATEGIC_LAYERS.manualQueue;
+      // A sprint trickle-leg redirect engaging or releasing swaps the sprint's
+      // plan target (tech ↔ producer building) inside the same live contract;
+      // the lock must follow the contract, not pin the stale step.
+      const sprintRedirectTakeover = preferred && !same &&
+        decision.layer === STRATEGIC_LAYERS.researchSprint &&
+        activeTarget.layer === STRATEGIC_LAYERS.researchSprint &&
+        !!decision.sprintRedirect !== !!activeTarget.sprintRedirect;
       // A newly detected converter-fuel starvation (oil pinned at zero, the
       // Magneto/Calciner fleet starve-pausing) breaks a held plan toward its
       // producer immediately — the same prompt takeover power recovery gets,
@@ -5482,10 +5725,12 @@
       const etaBetter = preferredWait < lockedWait * 0.75;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
-      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || productionTakeover || age > TARGET_LOCK_MAX_MS ||
+      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || manualQueueTakeover || sprintRedirectTakeover || productionTakeover || age > TARGET_LOCK_MAX_MS ||
           lockedIsStaleStorage || lockedIsStorageBlocked || lockedExpansionFinalCapBlocked || nearTechBreak) {
         const reason = !locked ? "target unavailable" : completed ? "target completed" : impossible ? "target impossible" :
           noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
+          manualQueueTakeover ? "manual queue takeover" :
+          sprintRedirectTakeover ? "sprint pacing redirect" :
           lockedExpansionFinalCapBlocked ? "storage cap blocks expansion" :
           structuralLayerTakeover ? "science storage emergency" : productionTakeover ? "converter-fuel starvation" :
           emergency ? "emergency" : "lock timeout";
@@ -5534,6 +5779,7 @@
         initialVal: VAL_BASED_KINDS.has(preferred.kind) ? preferred.meta.val || 0 : 0,
         layer: decision.layer,
         reason: decision.reason,
+        sprintRedirect: !!decision.sprintRedirect,
         queueSignature: JSON.stringify(readQueue()),
       };
       const reserved = buildTargetLedger(preferred, resources).reserved;
@@ -5617,7 +5863,12 @@
     const target = getTargetCached(resources, goalKey);
     const sprint = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint
       ? lastStrategicDecision.sprint : null;
-    if (sprint && sprint.candidate && !target?.affordable) {
+    // While a trickle-leg redirect is live (Theology paced by +0.04/s culture,
+    // plan pointed at an Amphitheatre), jobs must serve the redirect target's
+    // economy (miners for its minerals) — flooding hunters for furs cannot
+    // shorten a culture wait by a single second.
+    const sprintRedirected = lastStrategicDecision && lastStrategicDecision.sprintRedirect;
+    if (sprint && sprint.candidate && !sprintRedirected && !target?.affordable) {
       return researchSprintJobNeeds(sprint, resources);
     }
     jobSuppressText = "";
@@ -6415,7 +6666,11 @@
         : target.affordable ? "ready now" : needs.join(", ") || target.missing || "prerequisites";
       const phase = target.kind === "research" ? researchTargetPhase(target, resources) : null;
       const phaseLine = phase && phase.phase !== "purchase" ? `\nPhase: ${phase.explanation}` : "";
-      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}${phaseLine}\nNeed: ${needLine}`;
+      const redirect = lastStrategicDecision && lastStrategicDecision.sprintRedirect;
+      const redirectLine = redirect && lastStrategicDecision.sprint && lastStrategicDecision.sprint.candidate
+        ? `\nSprint: ${labelOf(lastStrategicDecision.sprint.candidate.meta)} is ${resTitle(resources, redirect.name)}-bound (${formatEta(redirect.wait)} at +${fmt(redirect.prod)}/s) — growing ${resTitle(resources, redirect.name)} first`
+        : "";
+      return `🎯 Focus: ${labelOf(target.meta)}\nLayer: ${layer}${phaseLine}${redirectLine}\nNeed: ${needLine}`;
     } catch (error) {
       return "🎯 Focus: —";
     }
@@ -6456,6 +6711,9 @@
       if (decision && decision.layer === STRATEGIC_LAYERS.researchSprint && decision.sprint) {
         const parts = [];
         parts.push(phaseDebug);
+        if (decision.sprintRedirect && decision.sprint.candidate) {
+          parts.push(`Trickle leg: ${labelOf(decision.sprint.candidate.meta)} needs ${fmt(decision.sprintRedirect.missing)} ${resTitle(resources, decision.sprintRedirect.name)} at +${fmt(decision.sprintRedirect.prod)}/s (${formatEta(decision.sprintRedirect.wait)}) — growing it via ${labelOf(target.meta)}`);
+        }
         const chain = protectedChainLabels(resources, decision.protectedChain);
         if (chain.length) parts.push(`Protected chain: ${chain.join(" → ")}`);
         for (const item of (decision.rejectedTopCandidates || []).filter((i) => i && i.target).slice(0, 4)) {
@@ -6523,6 +6781,9 @@
     // Research-sprint action: surface the immediate chain step (craft / hunt /
     // refill), e.g. "craft Compendium for Acoustics chain".
     if (decision && decision.layer === STRATEGIC_LAYERS.researchSprint && decision.sprint) {
+      if (decision.sprintRedirect && decision.sprint.candidate) {
+        return `build ${labelOf(target.meta)} to grow ${resTitle(resources, decision.sprintRedirect.name)} for ${labelOf(decision.sprint.candidate.meta)} chain`;
+      }
       const label = labelOf(target.meta);
       const step = decision.sprint.currentStep;
       if (step && HUNTABLE_RESOURCES.has(step)) return `hunt for ${resTitle(resources, step)} for ${label} chain`;
@@ -6920,6 +7181,17 @@
     return out;
   };
 
+  // While a sprint trickle-leg redirect points the plan at a producer building,
+  // the sprint tech's own chain (manuscripts, their parchment/furs legs) must
+  // stay reserved — otherwise a surplus Temple buy could eat the manuscripts
+  // the moment the plan target stops being the tech itself.
+  const sprintRedirectChainLedger = (resources, target) => {
+    if (!activeSprint || !activeSprint.candidate) return null;
+    if (!lastStrategicDecision || !lastStrategicDecision.sprintRedirect) return null;
+    if (target && targetId(target) === activeSprint.id) return null;
+    return buildTargetLedger(activeSprint.candidate, resources);
+  };
+
   const survivalReservationLedger = (resources) => {
     const out = { reserved: {}, critical: new Set(), sources: {} };
     const catnip = getRes(resources, "catnip");
@@ -6942,6 +7214,8 @@
   const buildReservationLedger = (target, resources) => {
     const out = { target, reserved: {}, critical: new Set(), sources: {} };
     mergeLedger(out, buildTargetLedger(target, resources), target ? `active plan ${labelOf(target.meta)}` : "active plan");
+    const sprintChain = sprintRedirectChainLedger(resources, target);
+    if (sprintChain) mergeLedger(out, sprintChain, `research sprint ${labelOf(activeSprint.candidate.meta)}`);
     mergeLedger(out, manualQueueReservationLedger(resources), "manual queue");
     mergeLedger(out, unicornPathReservationLedger(resources), "unicorn path");
     mergeLedger(out, survivalReservationLedger(resources), "survival");
@@ -7067,6 +7341,15 @@
       }
 
       const ledger = buildTargetLedger(target, resources);
+      // A redirected sprint's chain stays reserved against surplus/cap-relief
+      // buys even though the plan target is the producer building.
+      const sprintChain = sprintRedirectChainLedger(resources, target);
+      if (sprintChain) {
+        for (const [name, amount] of Object.entries(sprintChain.reserved)) {
+          ledger.reserved[name] = Math.max(ledger.reserved[name] || 0, amount);
+        }
+        for (const name of sprintChain.critical) ledger.critical.add(name);
+      }
       const reserved = ledger.reserved;
       const capRelief = findCapReliefPurchase(resources, goalKey, target, reserved);
       if (capRelief && !sprint) {
@@ -8113,6 +8396,7 @@
       push(`  census: ${jobsReportLine()}`);
       push(`Craft: ${craftPlanText} · ${overflowPlanText}`);
       push(`Buy: ${buyPlanText}`);
+      push(`Queue: ${queuePlanText}`);
       push(`Leader: ${leaderPlanText}`);
       push(`Reserve: ${reservePlanText}`);
       push(`Religion: ${religionPlanText}`);
@@ -9100,6 +9384,11 @@
     queueAdd: (id, val) => queueAdd(id, val),
     queueRemove: (id) => queueRemove(id),
     queueClear: () => writeQueue([]),
+    queueStatus: () => queuePlanText,
+    sprintCapDrainPacing(candidate) {
+      resetTickCache();
+      return sprintCapDrainPacing(candidate, resourceMap());
+    },
     forceActiveTarget(candidate, layer = null, ageMs = 0) {
       // A debug/manual target override resets ALL locks so the planner starts
       // from a clean state (mirrors an explicit player priority change).  Tests
