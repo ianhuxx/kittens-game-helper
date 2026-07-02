@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.11.1
+// @version      2.11.2
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.11.1";
+  const HELPER_VERSION = "2.11.2";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3307,6 +3307,12 @@
         worst = Math.max(worst, deficit / directProd);
         continue;
       }
+      const reach = capDrainReachabilityFor(resources, cost.name, cost.val);
+      if (!reach.reachable) return Number.POSITIVE_INFINITY;
+      if (isFinite(reach.eta)) {
+        worst = Math.max(worst, reach.eta);
+        continue;
+      }
       const raw = {};
       rawPathRequirements(cost.name, deficit, raw);
       const rawEntries = Object.entries(raw);
@@ -3378,13 +3384,24 @@
   // reservation system makes saving for it actually work. One framework for
   // every kind: score = value (parsed economic effects + unlocks + goal
   // alignment + spend-before-store) − cost (time to afford, storage blocks).
+  const hasUnreachableDirectInput = (candidate, resources) =>
+    pricesFor(candidate.kind, candidate.meta).some((cost) => {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) return false;
+      if (craftByName(cost.name) || sacrificeConversionFor(cost.name)) return false;
+      if (resValueOf(resources, cost.name) >= cost.val) return false;
+      const reach = capDrainReachabilityFor(resources, cost.name, cost.val);
+      return !reach.reachable;
+    });
+
   const candidateScore = (candidate, resources, goal, goalKey) => {
     const { kind, meta } = candidate;
     const wait = waitSecondsForCandidate(candidate, resources);
+    const unreachableHardBlocked = hasUnreachableDirectInput(candidate, resources);
     const waitPenalty = isFinite(wait)
       ? Math.min(TUNING.waitPenaltyCap, Math.log10(wait + 1) * 4)
       : TUNING.unreachablePenalty;
     const storageBlockPenalty = directStorageBlockers(kind, meta, resources).length > 0 ? TUNING.storageBlockPenalty : 0;
+    const unreachableBlockPenalty = unreachableHardBlocked ? TUNING.storageBlockPenalty + TUNING.unreachablePenalty : 0;
     const pressure = getStoragePressureCached(resources, goal, goalKey);
     const idleStoragePenalty = isStorageMeta(meta) && !candidate.affordable && !storageStillWanted(meta, resources, pressure)
       ? TUNING.idleStoragePenalty
@@ -3411,7 +3428,7 @@
     // Producer prerequisite: if this building makes a resource a focused target
     // needs but can't produce or craft (oil for a Calciner), lift it so it is
     // built first — the generic version of the titanium ship/trade path.
-    if (kind === "build") {
+    if (kind === "build" && !unreachableHardBlocked) {
       const prodDemand = getProductionDemandCached(resources, goalKey);
       if (Object.keys(prodDemand).length) {
         const buildProfile = candidateEffectProfile(kind, meta);
@@ -3423,7 +3440,7 @@
         }
       }
     }
-    return score - waitPenalty - idleStoragePenalty - storageBlockPenalty;
+    return score - waitPenalty - idleStoragePenalty - storageBlockPenalty - unreachableBlockPenalty;
   };
 
   const gatherCandidates = (resources, goalKey) => {
