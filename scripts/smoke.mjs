@@ -552,14 +552,20 @@ check(
   praiseCalls === 0 && /Solar Chant/.test(panelText(".kgh-religion")),
 );
 
+// One more tick so the policy auto-buys settle (one purchase per pass: the
+// bootstrap tick bought Open Fairs, the stage tick adopted the exclusive pick)
+// and the pass falls through to the reservation report.
+fakeNow += 5000;
+tickFn();
 check("plan: Library chosen over storage-blocked Theology and cheap Mine", /Library/.test(panelText(".kgh-plan")));
 check("ETA shown in automation details", /ETA/.test(panelText(".kgh-note")));
 check("plan: reservation visible in the panel", /reserving/i.test(panelText(".kgh-plan")) || /saving for/i.test(panelText(".kgh-buy")));
 check("reservation: reserve status reports holding the plan's inputs (nothing external left to pause)", /holding/i.test(panelText(".kgh-reserve")));
 check("reservation: affordable Mine NOT bought while Library saves up", buildings[1].val === 2);
 check("policy: non-exclusive auto-bought", policies[2].researched === true);
-check("policy: exclusive choices left for the player", policies[0].researched === false && policies[1].researched === false);
-check("policy: panel flags the exclusive decision", /exclusive/i.test(panelText(".kgh-policy")));
+check("policy: best exclusive side auto-adopted, rival left unbought (mutual exclusion respected)", policies[0].researched === true && policies[1].researched === false);
+check("policy: adoption logged with the side it was chosen over", /chosen over tradition/i.test(logText()));
+check("policy: panel reports the auto-adopt state instead of waiting for a manual click", /auto-adopt/i.test(panelText(".kgh-policy")));
 check("production reads: helper requests conversion-aware net per tick", resourcePerTickCalls.some((call) => call.includeConversion === true));
 
 /* Stage 1b — during an active reserve the native crafter leaves reserved inputs alone */
@@ -1088,16 +1094,17 @@ fakeNow += 25000;
 tickFn();
 check("jobs: Zebra trade catpower deficit staffs hunters generically", job("hunter").value > huntersBeforeTradePressure);
 
-/* Stage 14 — Zebra Relations: Appeasement is adopted to improve titanium trades.
-   The generic automation leaves exclusive policies to the player, but this one
-   is the titanium bottleneck lever, so the diplomacy manager adopts it. */
+/* Stage 14 — Zebra Relations: exclusive policies are auto-adopted (v2.13.0),
+   and policyScore prefers the trade-friendly Appeasement side so the generic
+   pick and the diplomacy titanium lever can never settle on opposite sides.
+   Adoption must still not wake the titanium/Zebra PATH for a non-titanium plan. */
 policies.push({
   name: "zebraRelationsAppeasement",
   label: "Zebra Relations: Appeasement",
   unlocked: true,
   researched: false,
   blocked: false,
-  blocks: ["zebraRelationsBellicosity"], // exclusive — normally left to the player
+  blocks: ["zebraRelationsBellicosity"], // exclusive — auto-adopted by ranked pick
   prices: [{ name: "culture", val: 1000 }],
   effects: {},
 });
@@ -1105,23 +1112,27 @@ res("culture").value = 3000;
 res("culture").maxValue = 3000; // capped → free to spend
 res("titanium").value = 0;
 
-// (a) COHERENCE: the locked plan here is Mint (needs minerals, not titanium), so
-// the bot must NOT force-adopt the Zebra policy or run the titanium/Zebra path —
-// global titanium scarcity alone is not a reason to act. (This is the regression
-// guard for "saving for X but doing Zebra trading underneath".)
+// (a) COHERENCE: the locked plan here is Mint (needs minerals, not titanium).
+// The exclusive policy is adopted on its own merits — no more manual holdback —
+// but the titanium/Zebra PATH must stay asleep: global titanium scarcity alone
+// is not a reason to act. (This remains the regression guard for "saving for X
+// but doing Zebra trading underneath".)
 fakeNow += 25000;
 tickFn();
-check("coherence: a non-titanium plan does NOT trigger Zebra policy adoption or the titanium path", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === false && !/titanium path|Zebra/i.test(panelText(".kgh-now")));
+fakeNow += 25000;
+tickFn();
+check("policy: exclusive Zebra choice auto-adopted without a titanium need", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true);
+check("coherence: a non-titanium plan does NOT trigger the titanium path", !/titanium path|Zebra/i.test(panelText(".kgh-now")));
 
 // (b) Now make the titanium-blocked Titanium Saw the locked plan (retire the
 // rival buildings so the only open candidate is the Saw, which needs titanium):
-// the policy IS the titanium bottleneck lever, so it gets adopted.
+// the titanium path wakes for a plan that genuinely needs it.
 buildings.forEach((b) => { b.unlocked = false; });
 fakeNow += 25000;
 tickFn();
 fakeNow += 25000;
 tickFn();
-check("diplomacy: Zebra Relations Appeasement adopted once the plan genuinely needs titanium", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true && /titanium/i.test(panelText(".kgh-plan")));
+check("diplomacy: the titanium path serves a titanium-blocked plan (policy already adopted)", policies.find((p) => p.name === "zebraRelationsAppeasement").researched === true && /titanium/i.test(panelText(".kgh-plan")));
 
 /* Stage N — native subsystems that replaced Kitten Scientists fire directly ---- */
 
@@ -3387,6 +3398,67 @@ perTick.catnip = savedPerTickAE.catnip;
 techs.forEach((t, i) => { t.unlocked = savedTechStateAE[i].unlocked; t.researched = savedTechStateAE[i].researched; });
 dbg.clearResourceTelemetry?.();
 dbg.forceActiveTarget(null);
+
+/* ---------- Test AF (v2.13.0): exclusive policies auto-adopt; the pending
+   pick is culture-chain state ----------
+   A fresh exclusive pair opens late-game. While the ranked pick cannot be paid
+   for, its bill must be HELD in the shared reservation ledger — side festival
+   refreshes, embassies and surplus buys leave the bank alone — and adoption
+   must respect mutual exclusion, manual-queue intent and storage caps. */
+const republicAF = { name: "republicAF", label: "Republic", unlocked: true, researched: false, blocked: false, blocks: ["monarchyAF"], prices: [{ name: "culture", val: 7000 }], effects: { scienceRatio: 0.05 } };
+const monarchyAF = { name: "monarchyAF", label: "Monarchy", unlocked: true, researched: false, blocked: false, blocks: ["republicAF"], prices: [{ name: "culture", val: 7000 }], effects: {} };
+policies.push(republicAF, monarchyAF);
+const grandBureauAF = { name: "grandBureauAF", label: "Grand Bureau", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 1000000 }], effects: {} };
+const operaHouseAF = { name: "operaHouseAF", label: "Opera House", unlocked: true, val: 0, on: 0, prices: [{ name: "culture", val: 800 }], effects: {} };
+buildings.push(grandBureauAF, operaHouseAF);
+res("culture").value = 6000;
+res("culture").maxValue = 9000;
+res("manpower").value = 2000;
+res("parchment").value = 3000;
+
+check("Test AF: pending exclusive pick is not adoptable while unaffordable", dbg.autoPolicyChoice("balanced") === null);
+check("Test AF: the pending pick's bill is held in the shared reservation ledger", (dbg.reservedNeedsFor(null).culture || 0) >= 7000);
+const afAdvice = dbg.policyAdvice("balanced");
+check("Test AF: panel line names the auto-pick and the held bank", /auto-pick Republic/i.test(afAdvice) && /bank reserved/i.test(afAdvice));
+
+// A side festival refresh (raw prices affordable: 6000 culture ≥ 5000) must
+// not eat the bank the policy pick is saving toward.
+const afLedgerTarget = dbg.candidateById("build:grandBureauAF");
+check("Test AF: side festival refresh deferred while the policy bank accrues", dbg.festivalCanPay(afLedgerTarget) === false);
+
+// The purchase loop's surplus scan sees the same hold: an affordable
+// culture-priced building is deferred while the pick saves.
+fakeNow += 5000;
+dbg.forceActiveTarget(afLedgerTarget, "Economy / normal growth", 5000);
+dbg.executePlan("balanced");
+check("Test AF: surplus buy deferred while the policy bank accrues", operaHouseAF.val === 0);
+
+// A price above the live storage cap is storage-blocked, not reservable —
+// nothing may be held for it.
+res("culture").maxValue = 5000;
+check("Test AF: a storage-blocked policy price reserves nothing", Object.keys(dbg.pendingPolicyReserve("balanced")).length === 0);
+res("culture").maxValue = 9000;
+
+// The manual queue is explicit player intent: with the RIVAL side queued, the
+// auto-pick must not foreclose it — the queued side itself is what adopts.
+res("culture").value = 8000;
+dbg.queueAdd("policy:monarchyAF", 0);
+check("Test AF: a queued rival side wins the auto-pick", dbg.autoPolicyChoice("balanced")?.meta?.name === "monarchyAF");
+dbg.queueClear();
+
+// Once the group settles (Republic adopted), the rival is de-facto blocked,
+// the reserve releases, and the deferred spenders may pay again.
+res("culture").value = 6000;
+republicAF.researched = true;
+check("Test AF: a researched side de-facto blocks its rival even if the game's blocked flag lags", dbg.autoPolicyChoice("balanced") === null && /nothing pending/i.test(dbg.policyAdvice("balanced")));
+check("Test AF: the reserve releases once the group settles", Object.keys(dbg.pendingPolicyReserve("balanced")).length === 0);
+check("Test AF: festival refresh allowed again after the release", dbg.festivalCanPay(afLedgerTarget) === true);
+fakeNow += 5000;
+dbg.executePlan("balanced");
+check("Test AF: surplus buy proceeds after the release", operaHouseAF.val === 1);
+dbg.forceActiveTarget(null);
+buildings.splice(buildings.indexOf(grandBureauAF), 1);
+buildings.splice(buildings.indexOf(operaHouseAF), 1);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

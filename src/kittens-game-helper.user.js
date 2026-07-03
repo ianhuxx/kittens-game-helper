@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.12.0
+// @version      2.13.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.12.0";
+  const HELPER_VERSION = "2.13.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -74,7 +74,10 @@
   const DENY_SUBSTRINGS = ["reset", "transcend", "sacrifice", "shatter", "timeskip"];
   const DENY_EXACT = new Set([
     "adore",
-    "policies", // permanent, often exclusive choices — left to the player
+    // Policy purchases flow ONLY through autoPolicyChoice (non-exclusive on
+    // sight, exclusive groups by ranked best side) — never through generic
+    // candidate lists, so any raw button/key named "policies" stays denied.
+    "policies",
   ]);
 
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -925,9 +928,16 @@
   const festivalCanPay = (target = null, resources = resourceMap()) => {
     const prices = festivalPrices();
     if (!prices.every((cost) => resValueOf(resources, cost.name) >= cost.val)) return false;
+    // A festival the PLANNER picked owns its bill; a side refresh must respect
+    // both the active plan's ledger and the culture the pending exclusive
+    // policy pick is saving toward (pendingPolicyReservationLedger).
     if (!target || target.kind === "festival") return true;
     const ledger = buildTargetLedger(target, resources);
-    return !targetLockViolationForPrices(prices, ledger, resources) && pricesRespectReservations(prices, ledger.reserved, resources);
+    const reserved = { ...ledger.reserved };
+    for (const [name, amount] of Object.entries(pendingPolicyReservationLedger(resources).reserved)) {
+      reserved[name] = Math.max(reserved[name] || 0, amount);
+    }
+    return !targetLockViolationForPrices(prices, ledger, resources) && pricesRespectReservations(prices, reserved, resources);
   };
 
   const festivalOpportunity = (resources = resourceMap()) => {
@@ -1123,6 +1133,7 @@
     production: Object.create(null),
     candidates: null,
     target: undefined,
+    pendingPolicy: undefined,
     pressure: null,
     goalFrontier: null,
     goalClosure: null,
@@ -1212,6 +1223,7 @@
       production: Object.create(null),
       candidates: null,
       target: undefined,
+      pendingPolicy: undefined,
       pressure: null,
       producerDemand: null,
       goalFrontier: null,
@@ -7218,6 +7230,7 @@
     if (sprintChain) mergeLedger(out, sprintChain, `research sprint ${labelOf(activeSprint.candidate.meta)}`);
     mergeLedger(out, manualQueueReservationLedger(resources), "manual queue");
     mergeLedger(out, unicornPathReservationLedger(resources), "unicorn path");
+    mergeLedger(out, pendingPolicyReservationLedger(resources), "policy choice");
     mergeLedger(out, survivalReservationLedger(resources), "survival");
     return out;
   };
@@ -7307,7 +7320,8 @@
 
   // The purchase loop, replacing KS's bonfire/science/workshop-upgrade buyers:
   //  1. buy the PLAN the moment it is affordable;
-  //  2. auto-buy policies that block no alternatives (exclusive ones stay manual);
+  //  2. auto-buy policies — non-exclusive on sight, exclusive groups by ranked
+  //     best side; a pending pick's bill is reserved as culture-chain state;
   //  3. spend only unreserved surplus on everything else, best-scored first.
   // Assist mode stays advisory-only.
   const isSprintCandidate = (target, resources) => {
@@ -7350,6 +7364,14 @@
         }
         for (const name of sprintChain.critical) ledger.critical.add(name);
       }
+      // The pending exclusive policy's bill is culture-chain state: cap relief
+      // and surplus buys below must leave that bank alone while it accrues.
+      // Amounts only — the policy save is a bank hold like the unicorn path,
+      // not a hard chain lock, so ledger.critical stays the target's own chain.
+      const policyHold = pendingPolicyReservationLedger(resources, goalKey);
+      for (const [name, amount] of Object.entries(policyHold.reserved)) {
+        ledger.reserved[name] = Math.max(ledger.reserved[name] || 0, amount);
+      }
       const reserved = ledger.reserved;
       const capRelief = findCapReliefPurchase(resources, goalKey, target, reserved);
       if (capRelief && !sprint) {
@@ -7366,11 +7388,17 @@
       if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
 
       if (!sprint) {
+        // Exclusive picks also clear the FULL reservation ledger (manual queue,
+        // unicorn path, a higher-ranked pending pick from another group) — a
+        // policy buy must not eat culture some other focus is saving. The
+        // pending pick itself never appears in that ledger while affordable.
         const policy = autoPolicyChoice(resources, goalKey);
-        if (policy && !buyBenched(targetId(policy)) && !violatesTargetLock(policy, ledger, resources)) {
+        if (policy && !buyBenched(targetId(policy)) && !violatesTargetLock(policy, ledger, resources) &&
+            pricesRespectReservations(pricesFor("policy", policy.meta), reservedNeedsFor(target, resources), resources)) {
           lastAutoBuy = now;
           if (buyCandidate(policy)) {
-            pushLog(`📜 policy ${labelOf(policy.meta)} (blocks nothing)`);
+            const blocks = (policy.meta.blocks || []).filter(Boolean);
+            pushLog(`📜 policy ${labelOf(policy.meta)}${blocks.length ? ` — chosen over ${blocks.join(", ")}` : " (blocks nothing)"}`);
           } else {
             noteBuyFailure(targetId(policy));
           }
@@ -8142,10 +8170,11 @@
 
   // The Zebra Relations policies (culture-cost, mutually exclusive) change how
   // the Zebras deal with us; Appeasement is the trade-friendly side — better
-  // relations and trade outcomes.  The generic policy automation leaves
-  // exclusive choices to the player, but when titanium is gated behind Zebra
-  // trades this policy IS the bottleneck lever, so adopt the trade side as a
-  // one-time pick instead of leaving it unbought while titanium stalls.
+  // relations and trade outcomes.  The generic automation now adopts exclusive
+  // policies on its own (and policyScore prefers this side, so the two paths
+  // can never adopt opposite sides), but when titanium is gated behind Zebra
+  // trades this policy IS the bottleneck lever — keep the direct fast path so
+  // it is adopted even while the generic step is throttled or lock-gated.
   const zebraTradePolicyMeta = () => {
     for (const meta of policyMetas()) {
       if (!policyOpen(meta)) continue;
@@ -8677,7 +8706,14 @@
     return [];
   };
 
-  const policyOpen = (meta) => isOpen(meta) && meta.blocked !== true && meta.disabled !== true;
+  // researchPolicy marks rivals `blocked` when a side is adopted, but the flag
+  // can lag (save-load order, mid-tick state). A policy whose rival is already
+  // researched is closed regardless, so the helper can never try to adopt both
+  // sides of an exclusive pair.
+  const policyBlockedByRival = (meta) => policyMetas().some((other) =>
+    other && other !== meta && other.researched === true && Array.isArray(other.blocks) && other.blocks.includes(meta && meta.name));
+
+  const policyOpen = (meta) => isOpen(meta) && meta.blocked !== true && meta.disabled !== true && !policyBlockedByRival(meta);
 
   const isSocialismPolicy = (meta) => {
     const id = `${(meta && meta.name) || ""} ${labelOf(meta)}`.toLowerCase();
@@ -8687,9 +8723,49 @@
   const isNoopPolicyCandidate = (candidate) => candidate && candidate.kind === "policy" && isSocialismPolicy(candidate.meta);
 
   // A policy with an empty `blocks` list forecloses nothing — buying it can
-  // never lock you out of another choice, so it's safe to automate. Exclusive
-  // policies (liberty vs tradition, monarchy vs republic …) stay manual.
+  // never lock you out of another choice, so it's bought on sight. Exclusive
+  // policies (liberty vs tradition, monarchy vs republic …) are auto-adopted
+  // too (v2.13.0): the helper picks the ranked best side of each group itself
+  // instead of holding the choice for a manual click.
   const policyIsExclusive = (meta) => Array.isArray(meta && meta.blocks) && meta.blocks.length > 0;
+
+  // The manual queue is explicit player intent: an exclusive side the player
+  // queued must never be forced or foreclosed by the auto-pick, so any choice
+  // that blocks a pending queued policy is ineligible for auto-adoption (the
+  // queued side itself remains eligible — buying it just completes the queue).
+  const queuedPolicyNames = () => {
+    const names = new Set();
+    try {
+      for (const item of readQueue()) {
+        const [kind, name] = String(item.id).split(":");
+        if (kind === "policy" && name && !queueItemDone(item)) names.add(name);
+      }
+    } catch (error) {
+      /* unreadable queue — nothing excluded */
+    }
+    return names;
+  };
+
+  const autoEligiblePolicyChoices = (resources, goalKey) => {
+    const queued = queuedPolicyNames();
+    return availablePolicyChoices(resources, goalKey).filter((choice) =>
+      queued.has(choice.meta.name) || !(choice.meta.blocks || []).some((name) => queued.has(name)));
+  };
+
+  // The best affordable exclusive side that no OPEN rival strictly outranks.
+  // A rival with a higher score is worth saving for instead of settling, but a
+  // tied rival must not deadlock the group (empty-effect pairs tie at 0), so
+  // the comparison is strict.
+  const bestAdoptableExclusivePolicy = (resources, goalKey) => {
+    const choices = autoEligiblePolicyChoices(resources, goalKey);
+    for (const choice of choices) {
+      if (!choice.affordable) continue;
+      const rivalOutranks = choices.some((other) => other !== choice && other.score > choice.score &&
+        ((other.meta.blocks || []).includes(choice.meta.name) || (choice.meta.blocks || []).includes(other.meta.name)));
+      if (!rivalOutranks) return choice;
+    }
+    return null;
+  };
 
   const autoPolicyChoice = (resources, goalKey) => {
     for (const meta of policyMetas()) {
@@ -8697,7 +8773,44 @@
       const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resources) };
       if (candidate.affordable) return candidate;
     }
-    return null;
+    return bestAdoptableExclusivePolicy(resources, goalKey);
+  };
+
+  // The ranked exclusive pick while it is still UNAFFORDABLE — the policy the
+  // helper is saving toward. Cached per tick: it anchors reservation ledgers,
+  // which are rebuilt many times per pass.
+  const getPendingPolicyCached = (resources, goalKey = getGoal()) => {
+    if (tickCache.pendingPolicy === undefined) {
+      const best = autoEligiblePolicyChoices(resources, goalKey)[0] || null;
+      tickCache.pendingPolicy = best && !best.affordable ? best : null;
+    }
+    return tickCache.pendingPolicy;
+  };
+
+  // The chosen exclusive policy is culture-chain state while it saves: hold its
+  // still-unaffordable price so festivals, embassies, cap relief and surplus
+  // buys can't eat the bank the policy is accruing. A price above the live
+  // storage cap is a storage problem, not a savings problem — nothing is
+  // reserved for it (cap growth is owned by the normal scorer/storage layers).
+  // The pick's own purchase never self-blocks: a pending (unaffordable) pick
+  // holds the reserve, an affordable pick clears it and buys.
+  const pendingPolicyReservationLedger = (resources, goalKey = getGoal()) => {
+    const out = { reserved: {}, critical: new Set(), sources: {} };
+    try {
+      const best = getPendingPolicyCached(resources, goalKey);
+      if (!best) return out;
+      for (const cost of pricesFor("policy", best.meta)) {
+        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+        const cap = liveCapFor(resources, cost.name);
+        if (cap > 0 && cost.val > cap) continue;
+        out.reserved[cost.name] = Math.max(out.reserved[cost.name] || 0, cost.val);
+        out.critical.add(cost.name);
+        out.sources[cost.name] = [`policy ${labelOf(best.meta)}`];
+      }
+    } catch (error) {
+      /* advisory reserve only */
+    }
+    return out;
   };
 
   const summarizeEffects = (meta) => {
@@ -8733,10 +8846,17 @@
     const { cons } = summarizeEffects(meta);
     let score = economicValue("policy", meta, resources, goal, goalKey) + goalAlignmentBoost("policy", meta, goalKey);
     score -= cons.length * 4;
+    // The Zebra Relations pair parses to no economic effects, but Appeasement
+    // is the trade-friendly side (better relations → titanium trades) and the
+    // diplomacy layer's titanium lever (maybeAdoptZebraTradePolicy) adopts
+    // exactly that side. Prefer it here so the generic auto-pick can never
+    // foreclose the titanium path by settling the group toward Bellicosity.
+    const id = `${(meta && meta.name) || ""} ${labelOf(meta)}`.toLowerCase();
+    if (/zebra/.test(id) && /appeas/.test(id)) score += 6;
     return score;
   };
 
-  // Only EXCLUSIVE policies appear here — the executor auto-buys the rest.
+  // Only EXCLUSIVE policies appear here — ranked; the executor adopts the best.
   const availablePolicyChoices = (resources, goalKey) => policyMetas()
     .filter((meta) => policyOpen(meta) && policyIsExclusive(meta) && !isSocialismPolicy(meta))
     .map((meta) => ({ kind: "policy", meta, ...evaluate("policy", meta, resources), score: policyScore(meta, resources, goalKey) }))
@@ -8744,11 +8864,12 @@
 
   const policyAdviceLine = (resources, goalKey) => {
     const choices = availablePolicyChoices(resources, goalKey);
-    if (!choices.length) return "Policies: non-exclusive auto-buy; no exclusive choice pending";
+    if (!choices.length) return "Policies: auto-adopt; nothing pending";
     const best = choices[0];
     const { pros, cons } = summarizeEffects(best.meta);
-    const state = best.affordable ? "ready" : `need ${best.missing || "resources"}`;
-    return `Policies: exclusive choice! rec ${labelOf(best.meta)} (blocks ${(best.meta.blocks || []).join(", ")}) (${state}) · pros: ${(pros.length ? pros : ["unlocks future choices"]).join("; ")} · cons: ${(cons.length ? cons : ["none obvious"]).join("; ")}`;
+    const heldNote = !best.affordable && Object.keys(pendingPolicyReservationLedger(resources, goalKey).reserved).length ? "; bank reserved" : "";
+    const state = best.affordable ? "adopting" : `saving — need ${best.missing || "resources"}${heldNote}`;
+    return `Policies: exclusive auto-pick ${labelOf(best.meta)} over ${(best.meta.blocks || []).join(", ")} (${state}) · pros: ${(pros.length ? pros : ["unlocks future choices"]).join("; ")} · cons: ${(cons.length ? cons : ["none obvious"]).join("; ")}`;
   };
 
   const buyPolicyChoice = (name) => {
@@ -8986,7 +9107,7 @@
     if (!choices.length) {
       const option = document.createElement("option");
       option.value = "";
-      option.textContent = "No exclusive policy pending (others auto-buy)";
+      option.textContent = "No exclusive policy pending (all auto-adopt)";
       policySelectEl.appendChild(option);
       policySelectEl.disabled = true;
       policyApplyEl.disabled = true;
@@ -9202,7 +9323,7 @@
       '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
       '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
-      '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Apply the selected policy only after you choose it">Policy</button></div>',
+      '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Manual override — the autopilot auto-adopts the ranked best side on its own; queue a policy to pin a different side">Policy</button></div>',
       '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
       '</div></details>',
       '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px;display:flex;justify-content:space-between;align-items:center"><span>Recent actions:</span><button type="button" class="kgh-hbtn kgh-log-copy" title="Copy a full diagnostics report (plan, power, processing, resources, candidates, log) for debugging">Copy</button></div>',
@@ -9385,6 +9506,27 @@
     queueRemove: (id) => queueRemove(id),
     queueClear: () => writeQueue([]),
     queueStatus: () => queuePlanText,
+    policyAdvice(goalKey = getGoal()) {
+      resetTickCache();
+      return policyAdviceLine(resourceMap(), goalKey);
+    },
+    autoPolicyChoice(goalKey = getGoal()) {
+      resetTickCache();
+      return autoPolicyChoice(resourceMap(), goalKey);
+    },
+    pendingPolicyReserve(goalKey = getGoal()) {
+      resetTickCache();
+      return pendingPolicyReservationLedger(resourceMap(), goalKey).reserved;
+    },
+    festivalCanPay(target = null) {
+      resetTickCache();
+      return festivalCanPay(target, resourceMap());
+    },
+    executePlan(goalKey = getGoal()) {
+      resetTickCache();
+      executePlan(resourceMap(), goalKey);
+      return buyPlanText;
+    },
     sprintCapDrainPacing(candidate) {
       resetTickCache();
       return sprintCapDrainPacing(candidate, resourceMap());

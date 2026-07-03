@@ -271,13 +271,18 @@ The late game is covered by the same engine: **space programs** and **Chronoforg
 structures** are scored, reserved for, and bought through the game's own controllers, just
 like bonfire buildings — so the planner doesn't go blank after Rocketry.
 
-## Policies: automatic where safe, yours where permanent
+## Policies: fully automatic — exclusive picks included
 
 Policies with an empty `blocks` list can never lock anything out — the helper buys those
-automatically (📜 in the log). **Mutually exclusive** policies (Liberty vs Tradition,
-Monarchy vs Republic vs Autocracy…) are permanent strategy choices, so they stay manual:
-the panel lists the pending exclusive choices with pros/cons and a **Policy** button, and
-nothing is applied until you pick.
+on sight (📜 in the log). **Mutually exclusive** policies (Liberty vs Tradition,
+Monarchy vs Republic vs Autocracy…) are auto-adopted too (v2.13.0): the helper ranks each
+group's sides with the same effect-based scorer as every other candidate and adopts the
+best one itself, logging what it was chosen over. While the pick is still unaffordable,
+its culture bill is held in the shared reservation ledger — festivals, embassies and
+surplus buys leave that bank alone until the policy lands. The panel still shows the
+pending pick with pros/cons, and the **Policy** dropdown remains as a manual override;
+queueing a policy in the manual build queue pins the choice — the autopilot will never
+adopt a rival side that would foreclose your queued pick.
 
 ## Workshop crafting prerequisites and overflow control
 
@@ -392,7 +397,8 @@ src/kittens-game-helper.user.js   The userscript (the whole thing; no dependenci
 scripts/validate.mjs              Sanity check: parses, is fully native (no KS), reset-safe
 scripts/smoke.mjs                 Behavioral test: runs the script against a mocked game and
                                   proves the plan reserves & pushes through, gateway techs win,
-                                  policies split auto/manual, leader/promotions/jobs fire, and
+                                  policies auto-adopt (exclusive picks ranked, pending bill
+                                  reserved), leader/promotions/jobs fire, and
                                   the native praise/festival/trade/observe subsystems work
 scripts/simulate.mjs              Multi-scenario harness (npm run simulate): drives the bot
                                   through early / mid / titanium-trap / titanium-needed /

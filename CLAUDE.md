@@ -227,6 +227,29 @@ Key invariants (see comments in the source for the why):
   surplus pasture buys can't eat the bank. Tears reachability/ETA flows through
   `sacrificeConversionFor` in `capDrainReachabilityFor` / `waitSecondsForSacrifice`
   — never treat tears as a dead-end resource. Test AD pins all of this.
+- **Exclusive policies auto-adopt, and the pending pick is culture-chain state**
+  (v2.13.0). `autoPolicyChoice` buys non-exclusive policies on sight and
+  otherwise adopts the ranked best side of each exclusive group
+  (`policyScore` → `availablePolicyChoices` → `bestAdoptableExclusivePolicy`) —
+  no manual holdback. Guard rails: a side is never adopted while an OPEN rival
+  ranks strictly higher (ties can't deadlock — the comparison is strict); a
+  researched side de-facto blocks its rivals even when the game's `blocked`
+  flag lags (`policyBlockedByRival`); a policy queued in the manual queue is
+  player intent — the auto-pick never adopts a side that would foreclose it
+  (`queuedPolicyNames` filter); and the trade-friendly Zebra side outranks
+  Bellicosity so the generic pick can't settle that group against the
+  diplomacy layer's titanium lever (`maybeAdoptZebraTradePolicy` stays as the
+  fast path). While the ranked pick is still UNAFFORDABLE its full price is
+  culture-chain state: `pendingPolicyReservationLedger` holds the bill in
+  `buildReservationLedger`, `executePlan`'s cap-relief/surplus gate and the
+  side-festival check (`festivalCanPay`), so festivals, embassies and surplus
+  buys can't eat the bank the policy is accruing — amounts only, never a hard
+  chain lock, and the plan target itself is never gated by it. A price above
+  the live storage cap reserves nothing (storage growth is someone else's
+  layer), and the hold releases the moment the pick is affordable or its group
+  settles. The policy buy itself must clear the FULL reservation ledger
+  (`reservedNeedsFor`), never just the target's prices. Test AF pins the whole
+  contract; Stage 1 / Stage 14 pin tick-level adoption.
 - **No-op policies are excluded from planning** (`isNoopPolicyCandidate`, e.g.
   Socialism) — they are never gathered as candidates, auto-bought, or advised.
 - **Any non-target spender must evaluate expanded spend impact against the active target ledger.** Direct price checks are insufficient: surplus buys, cap relief, policies, diplomacy, trade, overflow crafting and other spenders must compare their direct costs plus crafted/raw chain impact against `buildTargetLedger()`/`violatesTargetLock()` so a ship/scaffold/plate/slab-style buy cannot consume the material chain being saved for the active focus.
