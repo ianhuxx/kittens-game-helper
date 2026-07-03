@@ -149,9 +149,16 @@ const required = [
   "fursHealthy",
   // The autopilot toggle button must never wrap its label.
   ".kgh-panel button{white-space:nowrap;flex:0 0 auto}",
-  // Policies: non-exclusive auto-buy; exclusive (blocks-list) stays manual.
+  // Policies: non-exclusive auto-buy on sight; exclusive groups auto-adopt the
+  // ranked best side, and the pending pick's bill is culture-chain state held
+  // in every reservation ledger while it saves (v2.13.0). A researched side
+  // de-facto blocks its rivals; a queued rival is never forced or foreclosed.
   "policyIsExclusive",
   "autoPolicyChoice",
+  "bestAdoptableExclusivePolicy",
+  "pendingPolicyReservationLedger",
+  "policyBlockedByRival",
+  "queuedPolicyNames",
   // Diplomacy: explorers/embassies sent from the game's own prices.
   "manageDiplomacy",
   "maybeSendExplorers",

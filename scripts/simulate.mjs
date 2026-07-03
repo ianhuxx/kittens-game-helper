@@ -432,6 +432,11 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
 
       // Universal invariants
       check(`display/action coherence (no titanium-path shown for a non-titanium focus) — ${coherenceViolations} violations`, coherenceViolations === 0);
+      // Exclusive policies auto-adopt exactly ONE side (v2.13.0): a researched
+      // side de-facto blocks its rival, so the pair can never both be bought.
+      const libertyAdopted = st.policies.some((p) => p.name === "liberty" && p.researched);
+      const traditionAdopted = st.policies.some((p) => p.name === "tradition" && p.researched);
+      check(`exclusive policy pair never double-adopted (liberty=${libertyAdopted}, tradition=${traditionAdopted})`, !(libertyAdopted && traditionAdopted));
 
       // Phase-specific invariants
       if (phase === "early" || phase === "mid") {
@@ -442,7 +447,6 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
       if (phase === "titaniumTrap") {
         check(`NO Zebra trades for a non-titanium plan (was ${spies.zebraTrades})`, spies.zebraTrades === 0);
         check(`NO ship crafted for a non-titanium plan (was ${spies.shipBuilt})`, spies.shipBuilt === 0);
-        check(`Zebra trade policy not force-adopted`, !st.policies.some((p) => /zebra/i.test(p.name) && p.researched));
         check(`made progress despite empty titanium (gained ${gained})`, gained >= 3);
       }
       if (phase === "titaniumNeeded") {
