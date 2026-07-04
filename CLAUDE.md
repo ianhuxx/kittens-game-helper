@@ -62,11 +62,24 @@ state, not a baked-in base modifier:
   (incl. Lumber-Mill woodRatio) against refining a farmer's in-season catnip,
   bonus-adjusted. Test D5 pins this; if you touch it, keep the comparison live.
 - Directly job-produced resources that also have craft buttons remain direct work
-  targets. Wood is the canonical case: a Hut/Log House deficit should be displayed and
-  scored as Wood, then `bestWoodJob` chooses Woodcutters vs Farmers; the dependency graph
-  must not pre-collapse the whole target into Refine Catnip. If that direct resource is
-  craft-reachable above its storage cap, it is still reserved from side buys; only true
-  non-craft storage blockers are skipped from the active ledger.
+  targets. Wood is the canonical case: an IN-CAP Hut/Log House deficit should be
+  displayed and scored as Wood, then `bestWoodJob` chooses Woodcutters vs Farmers; the
+  dependency graph must not pre-collapse the whole target into Refine Catnip.
+- **A final price above a CAPPED bank is storage-blocked no matter how the
+  resource is produced** (v2.14.0, reversing the v2.11 craft carve-out). Capped
+  banks clamp AT their cap, so Refine Catnip can fill wood TO the cap but never
+  hold the 202/200 a scaled Library wants — the old "craft-reachable above cap"
+  exemption in `directStorageBlockers` / `solveCraftChain` / `buildTargetLedger`
+  left the plan locked on an unattainable target forever after a reset. Now such
+  a target reads IMPOSSIBLE, the lock breaks with a `rejectedTargets` cooldown
+  ("storage cap blocks the final price"), nothing is reserved for it, and the
+  storage layer grows the cap so the build resumes on its own. Intermediate
+  CUMULATIVE chain needs stay exempt (`capDrainReachabilityFor` models their
+  spend-and-refill cycles), as do hunt-refilled luxuries. `directStorageBlockers`
+  is the single final-cap test (the expansion layer's identical
+  `finalPurchaseCapBlockers` copy was merged into it). Test AG pins the whole
+  loop against the live post-reset stall that motivated it; Test W2 keeps the
+  in-cap direct-work half.
 
 ## Strategic planner — selection invariants
 
@@ -252,4 +265,14 @@ Key invariants (see comments in the source for the why):
   contract; Stage 1 / Stage 14 pin tick-level adoption.
 - **No-op policies are excluded from planning** (`isNoopPolicyCandidate`, e.g.
   Socialism) — they are never gathered as candidates, auto-bought, or advised.
+- **Panel data is contract-tested, not cosmetic** (v2.14.0). The queue picker
+  presents a FIXED browsable order — kind group, then name
+  (`queuePickerEntries` / `QUEUE_KIND_ORDER`), signature-gated so an open
+  dropdown never rebuilds under the cursor; the Top-targets card renders
+  `rankingRows` (live scores, per-tick trend arrows, readiness/ETA, the active
+  plan always included — even synthetic layer targets like festivals); and the
+  reset advisor exposes an explicit verdict (`resetAdvisorState`:
+  wait/target/ok/go with headline + "reset now banks +P/+karma" detail) in an
+  always-visible card instead of a stat line inside the collapsed details.
+  Test AH pins all three through `__kghDebug`.
 - **Any non-target spender must evaluate expanded spend impact against the active target ledger.** Direct price checks are insufficient: surplus buys, cap relief, policies, diplomacy, trade, overflow crafting and other spenders must compare their direct costs plus crafted/raw chain impact against `buildTargetLedger()`/`violatesTargetLock()` so a ship/scaffold/plate/slab-style buy cannot consume the material chain being saved for the active focus.

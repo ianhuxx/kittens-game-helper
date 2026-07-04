@@ -2576,6 +2576,11 @@ check("Test AA: a power generator is not food-helping", !!magnetoCandAA && dbg.f
 // Age a forced lock past the lock-min but well under the lock-max timeout (360s)
 // so only a real break condition — not a stale-lock timeout — can move the plan.
 const LOCK_AGE_AA = 150000;
+// An earlier stage retired the Mine by pricing it at 999,999 wood; raise the
+// wood cap so the held Mine is merely EXPENSIVE, not storage-blocked — this
+// test is about emergency semantics, not the v2.14.0 final-cap break.
+const savedWoodMaxAA = res("wood").maxValue;
+res("wood").maxValue = 2000000;
 // (1) Genuine RAW power deficit still hands a held non-generator plan to the
 // generator.  Test Z left energyProd 10 / cons 12 → raw delta -2 (real deficit).
 gamePage.resPool.energyProd = 10; gamePage.resPool.energyCons = 12; gamePage.resPool.energyWinterProd = 10;
@@ -2605,6 +2610,7 @@ check("Test AA: a catnip emergency does not change a held non-food plan (no spur
 check("Test AA: the held non-food plan is actually retained through the catnip emergency", dbg.targetId(decEmergAA) === "build:mine");
 res("catnip").value = savedCatnipAA.v; res("catnip").maxValue = savedCatnipAA.m; perTick.catnip = savedCatnipAA.p;
 res("science").value = savedSciAA.v; res("science").maxValue = savedSciAA.m;
+res("wood").maxValue = savedWoodMaxAA;
 dbg.forceActiveTarget(null);
 
 buildings.splice(buildings.indexOf(dataCenterZ), 1);
@@ -2729,7 +2735,7 @@ const savedResValuesW2 = new Map(resources.map((r) => [r.name, { value: r.value,
 const savedPerTickW2 = { ...perTick };
 const savedWoodCraftRatioW2 = craftRatios.wood;
 hutW2.unlocked = true;
-hutW2.prices = [{ name: "wood", val: 5000 }]; // larger than current wood cap; still craft/production reachable
+hutW2.prices = [{ name: "wood", val: 2500 }]; // fits the wood cap; the deficit is work, not storage
 res("wood").value = 1500; res("wood").maxValue = 3000;
 res("catnip").value = 2500; res("catnip").maxValue = 5000;
 res("science").value = res("science").maxValue;
@@ -2751,10 +2757,38 @@ dbg.forceActiveTarget({ kind: "build", meta: hutW2, affordable: false });
 const hutPlanW2 = dbg.planText("balanced");
 check("Test W2: huge Hut wood deficit is displayed as Wood, not Refine Catnip", /Need: .*Wood/i.test(hutPlanW2) && !/Need: .*Refine Catnip/i.test(hutPlanW2));
 const hutReserveW2 = dbg.reservedNeedsFor({ kind: "build", meta: hutW2, affordable: false });
-check("Test W2: cap-over but craft-reachable Hut wood is still reserved from side buys", hutReserveW2.wood >= 5000 && (!hutReserveW2.catnip || hutReserveW2.catnip < 100000));
+check("Test W2: in-cap Hut wood is reserved from side buys", hutReserveW2.wood >= 2500 && (!hutReserveW2.catnip || hutReserveW2.catnip < 100000));
 fakeNow += 60000;
 tickFn();
 check(`Test W2: Hut wood bottleneck keeps direct Woodcutters staffed above refine Farmers (woodcutters ${job("woodcutter").value}, farmers ${job("farmer").value})`, job("woodcutter").value > job("farmer").value && job("woodcutter").value >= 5);
+dbg.forceActiveTarget(null);
+
+/* =====================================================================
+ * Test AG (v2.14.0) — a final price above a CAPPED bank is storage-blocked
+ * even when the resource is craftable/job-produced.
+ *
+ * Live post-reset regression: the plan locked a Library whose wood price had
+ * scaled past the wood cap. Wood is craftable (Refine Catnip), so the old
+ * carve-out treated it as reachable — but a capped bank clamps AT its cap,
+ * the purchase could never complete, and the lock re-picked the Library
+ * forever. Now the target reads storage-blocked, the lock breaks with a
+ * cooldown, and the storage layer grows the wood cap instead.
+ * ------------------------------------------------------------------- */
+hutW2.prices = [{ name: "wood", val: 5000 }]; // above the 3000 wood cap → unattainable until storage grows
+const lumberYardAG = { name: "lumberYardAG", label: "Lumber Yard", unlocked: true, val: 0, on: 0, prices: [{ name: "catnip", val: 100 }], effects: { woodMax: 1500 } };
+buildings.push(lumberYardAG);
+res("catnip").value = 2500;
+const hutCandAG = { kind: "build", meta: hutW2, affordable: false };
+const feasAG = dbg.classifyTargetFeasibility(hutCandAG);
+check("Test AG: wood-capped Hut reads storage-blocked despite the Refine Catnip craft", feasAG.status === "IMPOSSIBLE" && /storage/i.test(feasAG.reason || ""));
+const hutReserveAG = dbg.reservedNeedsFor(hutCandAG);
+check("Test AG: an unattainable above-cap wood price is NOT reserved (the bank stays usable)", !(hutReserveAG.wood >= 5000));
+dbg.forceActiveTarget(hutCandAG, "Economy / normal growth", 150000);
+const afterBreakAG = dbg.chooseWorkTarget("balanced");
+check("Test AG: the held wood-capped target is released instead of re-picked", dbg.targetId(afterBreakAG) !== "build:hut");
+check("Test AG: the storage layer grows the wood cap (Lumber Yard) so the blocked build can resume", afterBreakAG?.meta?.name === "lumberYardAG");
+check("Test AG: the release is logged as a storage-cap break", /storage cap blocks the final price|target impossible/i.test(logText()));
+buildings.splice(buildings.indexOf(lumberYardAG), 1);
 dbg.forceActiveTarget(null);
 hutW2.prices = savedHutPricesW2;
 hutW2.unlocked = savedHutUnlockedW2;
@@ -3349,13 +3383,18 @@ check("Test AE: details spell out the trickle leg with rate and ETA", /Trickle l
 
 // Manual-queue takeover: a 5-second-old sprint lock must yield to the
 // player's actionable queued pick immediately — no score/ETA gate.
+// (The Mine was retired earlier at 999,999 wood; lift the wood cap so the
+// queued pick is reachable — takeover semantics, not the final-cap break.)
 const queueMineAE = buildings.find((b) => b.name === "mine");
+const savedWoodMaxAE = res("wood").maxValue;
+res("wood").maxValue = 2000000;
 dbg.queueAdd("build:mine", queueMineAE.val);
 dbg.forceActiveTarget(dbg.candidateById("research:theology"), "Research sprint", 5000);
 const aeQueueTarget = dbg.chooseWorkTarget("balanced");
 check("Test AE: actionable manual-queue item takes the plan lock over from a young sprint lock", aeQueueTarget?.meta?.name === "mine");
 check("Test AE: the takeover is logged as a manual-queue takeover", /manual queue takeover/i.test(logText()));
 dbg.queueClear();
+res("wood").maxValue = savedWoodMaxAE;
 dbg.forceActiveTarget(null);
 
 // Queue diagnostics: a blocked front item must say WHY it is skipped.
@@ -3411,6 +3450,7 @@ policies.push(republicAF, monarchyAF);
 const grandBureauAF = { name: "grandBureauAF", label: "Grand Bureau", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 1000000 }], effects: {} };
 const operaHouseAF = { name: "operaHouseAF", label: "Opera House", unlocked: true, val: 0, on: 0, prices: [{ name: "culture", val: 800 }], effects: {} };
 buildings.push(grandBureauAF, operaHouseAF);
+res("wood").maxValue = 2000000; // the Bureau must be expensive, NOT storage-blocked (v2.14.0 break)
 res("culture").value = 6000;
 res("culture").maxValue = 9000;
 res("manpower").value = 2000;
@@ -3459,6 +3499,43 @@ check("Test AF: surplus buy proceeds after the release", operaHouseAF.val === 1)
 dbg.forceActiveTarget(null);
 buildings.splice(buildings.indexOf(grandBureauAF), 1);
 buildings.splice(buildings.indexOf(operaHouseAF), 1);
+
+/* ---------- Test AH (v2.14.0): panel data — stable queue picker, live target
+   ranking, reset-advisor verdict ----------
+   The queue picker must present a FIXED browsable order (kind, then name) —
+   not the per-tick score order that reshuffled the open dropdown — and the
+   ranking rows must expose live scores with the active plan flagged. The
+   reset advisor must give an explicit verdict, not a buried stat line. */
+const atelierAH = { name: "ahAtelier", label: "Atelier", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 100 }], effects: { cultureMax: 50 } };
+const bakeryAH = { name: "ahBakery", label: "Bakery", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 120 }], effects: { catnipMax: 100 } };
+buildings.push(atelierAH, bakeryAH);
+res("wood").value = 500;
+res("wood").maxValue = 10000;
+const pickerAH = dbg.queuePickerEntries("balanced");
+const kindOrderAH = ["build", "research", "upgrade", "religion", "space", "time"];
+const pickerSortedAH = pickerAH.every((entry, i) => {
+  if (i === 0) return true;
+  const prev = pickerAH[i - 1];
+  const kd = kindOrderAH.indexOf(prev.kind) - kindOrderAH.indexOf(entry.kind);
+  return kd < 0 || (kd === 0 && prev.label.localeCompare(entry.label) <= 0);
+});
+check("Test AH: queue picker is sorted by kind then name (stable, browsable)", pickerAH.length >= 2 && pickerSortedAH);
+check("Test AH: queue picker lists the open buildings", pickerAH.some((e) => e.id === "build:ahAtelier") && pickerAH.some((e) => e.id === "build:ahBakery"));
+const rowsAH = dbg.rankingRows("balanced");
+check("Test AH: ranking rows expose label + live score + readiness", rowsAH.length >= 1 && rowsAH.every((r) => r.label && typeof r.score === "number" && typeof r.ready === "boolean"));
+check("Test AH: the active plan is flagged inside the ranking (synthetic layer targets included)", rowsAH.some((r) => r.active));
+const rowsAH2 = dbg.rankingRows("balanced");
+check("Test AH: an unchanged board reads as a flat score trend", rowsAH2.length >= 1 && rowsAH2[0].trend === "flat");
+gamePage.totalResets = 0;
+setKittens(30);
+const advWaitAH = dbg.resetAdvisorState();
+check("Test AH: sub-35 kittens gets an explicit DO-NOT-RESET verdict", advWaitAH.tone === "wait" && /Do NOT reset/i.test(advWaitAH.headline));
+setKittens(100);
+const advTargetAH = dbg.resetAdvisorState();
+check("Test AH: pre-first-reset verdict names the 130-kitten milestone with live progress", advTargetAH.tone === "target" && /130\+ kittens/.test(advTargetAH.headline) && /100\/130/.test(advTargetAH.headline));
+check("Test AH: the verdict details always state what a reset banks right now", /reset now banks \+.*paragon, \+.*karma/i.test(advTargetAH.detail));
+buildings.splice(buildings.indexOf(atelierAH), 1);
+buildings.splice(buildings.indexOf(bakeryAH), 1);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
