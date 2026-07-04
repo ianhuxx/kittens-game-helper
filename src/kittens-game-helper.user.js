@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.13.0
+// @version      2.14.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.13.0";
+  const HELPER_VERSION = "2.14.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -305,6 +305,11 @@
   };
 
   let resetAdvisorText = "♻ Reset advisor: tracking this run…";
+  // Structured advisor state for the panel card: an explicit verdict the player
+  // can read at a glance (the old single line buried WHEN a reset pays off).
+  // tone: "wait" (too early), "target" (milestone set), "ok" (keep pushing),
+  // "go" (reset is beneficial now). The reset itself stays advisory-only.
+  let resetAdvisorState = { tone: "wait", headline: "Reset advisor: tracking this run…", detail: "" };
 
   const computeResetAdvisor = () => {
     try {
@@ -354,16 +359,47 @@
       // kittens (≈60 paragon), enough to buy Diplomacy and the first price-ratio
       // metas — the foundation every later run compounds on. Only surface this
       // before the very first reset; afterward fall back to the paragon/day read.
-      const advice = kittens < 70
-        ? `push to 70+ kittens (${fmt(expectedKarma)} karma if reset now)`
-        : resetCount === 0 && kittens < 130
-          ? "first reset target: 130+ kittens with Concrete Huts (~60P → Diplomacy + price-ratio metas)"
-          : paragonPerDay < RESET_ADVISOR_MIN_PARAGON_PER_DAY
-            ? "slow paragon/day — consider a manual reset after checking your save"
-            : "healthy paragon/day — keep pushing";
-      resetAdvisorText = `♻ Reset: ${kittens} kittens · ${fmt(expectedParagon)}P now${effText} · ${fmt(paragonPerDay)}P/day · ${advice}${metaText}`;
+      // The verdict is explicit: WAIT (a reset now banks ~nothing), TARGET (a
+      // concrete milestone with a live progress count), OK (healthy pace, keep
+      // pushing) or GO (paragon/day has flattened — resetting now compounds
+      // faster than continuing this run).
+      const bank = `reset now banks +${fmt(expectedParagon)} paragon, +${fmt(expectedKarma)} karma`;
+      if (kittens < 35) {
+        resetAdvisorState = {
+          tone: "wait",
+          headline: `Do NOT reset — nothing is banked below 35 kittens (${kittens}/35)`,
+          detail: `karma starts at 35 kittens, paragon at 70 · ${bank}`,
+        };
+      } else if (kittens < 70) {
+        resetAdvisorState = {
+          tone: "wait",
+          headline: `Too early — +${fmt(expectedKarma)} karma if reset now, but paragon needs 70+ kittens (${kittens}/70)`,
+          detail: `${bank} · every kitten past 70 adds +1 paragon`,
+        };
+      } else if (resetCount === 0 && kittens < 130) {
+        resetAdvisorState = {
+          tone: "target",
+          headline: `First reset target: 130+ kittens with Concrete Huts (${kittens}/130)`,
+          detail: `${bank} · at 130+ (~60P) the next run affords Diplomacy + the first price-ratio metaphysics`,
+        };
+      } else if (paragonPerDay < RESET_ADVISOR_MIN_PARAGON_PER_DAY) {
+        resetAdvisorState = {
+          tone: "go",
+          headline: `Reset is beneficial NOW — this run has flattened (${fmt(paragonPerDay)} P/day)`,
+          detail: `${bank} · kitten arrivals no longer keep up, so banking and restarting compounds faster · reset manually via Time Control after exporting a backup`,
+        };
+      } else {
+        resetAdvisorState = {
+          tone: "ok",
+          headline: `Keep pushing — healthy pace (${fmt(paragonPerDay)} P/day)`,
+          detail: `${bank} · reset when arrivals stop keeping up (advisor flips when P/day drops below ${fmt(RESET_ADVISOR_MIN_PARAGON_PER_DAY)})`,
+        };
+      }
+      resetAdvisorState.detail += metaText;
+      resetAdvisorText = `♻ Reset: ${kittens} kittens · ${fmt(expectedParagon)}P now${effText} · ${fmt(paragonPerDay)}P/day · ${resetAdvisorState.headline}${metaText}`;
     } catch (error) {
       resetAdvisorText = "♻ Reset advisor: unavailable";
+      resetAdvisorState = { tone: "wait", headline: "Reset advisor: unavailable", detail: "" };
     }
   };
 
@@ -574,7 +610,9 @@
       if (have < cost.val) {
         affordable = false;
         const cap = liveCapFor(resources, cost.name);
-        const storageHint = res && cap > 0 && cost.val > cap && !craftByName(cost.name)
+        // A capped bank below the price is a storage problem even when the
+        // resource is craftable — crafting cannot fill past the cap.
+        const storageHint = res && cap > 0 && cost.val > cap
           ? ` (storage cap ${fmt(cap)})`
           : "";
         const craftHint = !storageHint && craftByName(cost.name) ? ` (craft ${craftLabel(cost.name)})` : "";
@@ -2203,8 +2241,7 @@
       })
       .filter((option) =>
         option.value > 0 &&
-        !directStorageBlockers(option.candidate.kind, option.candidate.meta, resources).length &&
-        !finalPurchaseCapBlockers(option.candidate.kind, option.candidate.meta, resources).length)
+        !directStorageBlockers(option.candidate.kind, option.candidate.meta, resources).length)
       .sort((a, b) => b.value - a.value || a.eta - b.eta);
     return options.length ? { ...options[0], pressure, options: options.slice(0, 3) } : null;
   };
@@ -2433,23 +2470,20 @@
       (name) => (pressure[name] || 0) > 0 || resRatio(resources, name, 0) > 0.9,
     );
 
+  // A final price in a CAPPED bank above its live cap is a storage block no
+  // matter how the resource is produced: the game clamps a capped bank AT its
+  // cap, so crafting/jobs can only fill it TO the cap, never past it (v2.14.0
+  // — the post-reset "Library wood 202/200, target never changes" stall).
+  // Craftable-but-capped raw banks (wood via Refine Catnip) are blocked exactly
+  // like science; genuinely uncapped crafted goods (beam/slab, cap 0) and
+  // hunt-refilled luxuries are exempt. This is the single final-purchase cap
+  // test — the expansion layer's old separate copy (finalPurchaseCapBlockers)
+  // was identical and merged into it.
   const directStorageBlockers = (kind, meta, resources) => {
     const blockers = [];
     for (const cost of pricesFor(kind, meta)) {
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-      if (craftByName(cost.name)) continue;
-      const res = getRes(resources, cost.name);
-      const cap = liveCapFor(resources, cost.name);
-      if (!res || cap <= 0 || cost.val <= cap) continue;
-      blockers.push({ name: cost.name, need: cost.val, max: cap });
-    }
-    return blockers;
-  };
-
-  const finalPurchaseCapBlockers = (kind, meta, resources) => {
-    const blockers = [];
-    for (const cost of pricesFor(kind, meta)) {
-      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (HUNTABLE_RESOURCES.has(cost.name)) continue;
       const res = getRes(resources, cost.name);
       const cap = liveCapFor(resources, cost.name);
       if (!res || cap <= 0 || cost.val <= cap) continue;
@@ -3914,8 +3948,12 @@
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       const cap = resMaxOf(resources, cost.name);
       const have = resValueOf(resources, cost.name);
-      // Direct final cost in a non-craftable bank above its cap = storage-blocked.
-      if (!craftByName(cost.name) && cap > 0 && cost.val > cap && !HUNTABLE_RESOURCES.has(cost.name)) {
+      // Direct final cost in a CAPPED bank above its cap = storage-blocked,
+      // craftable or not: the bank clamps at its cap, so Refine Catnip can
+      // fill wood TO the cap but never hold the 202/200 a Library wants —
+      // intermediate cumulative needs stay exempt (capDrainReachabilityFor
+      // models their spend-and-refill cycles).
+      if (cap > 0 && cost.val > cap && !HUNTABLE_RESOURCES.has(cost.name)) {
         finalPurchaseCapsOk = false;
         protectedChain.add(cost.name);
         blockers.push({ name: cost.name, kind: "finalCap", need: cost.val, cap, text: `${resTitle(resources, cost.name)} storage ${fmt(cap)}/${fmt(cost.val)}` });
@@ -5729,25 +5767,31 @@
         activeTarget.layer !== STRATEGIC_LAYERS.production;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
+      // directStorageBlockers covers every capped final price (craftable or
+      // not), so the expansion layer's old separate final-cap break is
+      // subsumed by this one condition.
       const lockedIsStorageBlocked = locked && directStorageBlockers(locked.kind, locked.meta, resources).length > 0;
-      const lockedExpansionFinalCapBlocked = locked && activeTarget.layer === STRATEGIC_LAYERS.expansion &&
-        finalPurchaseCapBlockers(locked.kind, locked.meta, resources).length > 0;
       const scoreGain = preferred && locked ? candidateScoreGain(locked, preferred) : 0;
       const scoreBetter = preferred && locked && candidateMeetsSwitchScoreGain(locked, preferred);
       const etaBetter = preferredWait < lockedWait * 0.75;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
       if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || manualQueueTakeover || sprintRedirectTakeover || productionTakeover || age > TARGET_LOCK_MAX_MS ||
-          lockedIsStaleStorage || lockedIsStorageBlocked || lockedExpansionFinalCapBlocked || nearTechBreak) {
+          lockedIsStaleStorage || lockedIsStorageBlocked || nearTechBreak) {
         const reason = !locked ? "target unavailable" : completed ? "target completed" : impossible ? "target impossible" :
           noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
           manualQueueTakeover ? "manual queue takeover" :
           sprintRedirectTakeover ? "sprint pacing redirect" :
-          lockedExpansionFinalCapBlocked ? "storage cap blocks expansion" :
+          lockedIsStorageBlocked ? "storage cap blocks the final price" :
           structuralLayerTakeover ? "science storage emergency" : productionTakeover ? "converter-fuel starvation" :
           emergency ? "emergency" : "lock timeout";
         pushPlanLog(`🔓 Plan switch accepted: ${reason}`, 20000);
-        if (impossible && locked) rejectedTargets.set(targetId(locked), { reason: feasibility.reason || reason, at: now });
+        // A storage-blocked target must not be re-picked next tick (that was
+        // the post-reset Library↔lock loop) — cool it down like an impossible
+        // one; the storage layer owns the plan until the cap grows.
+        if ((impossible || lockedIsStorageBlocked) && locked) {
+          rejectedTargets.set(targetId(locked), { reason: feasibility.reason || reason, at: now });
+        }
         activeTarget = null;
       } else if (!same && !muchBetter) {
         switchRejected(locked, preferred, `locked ${labelOf(locked.meta)} age ${formatEta(age / 1000)}`, {
@@ -7128,7 +7172,10 @@
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       if (isSprintTarget && CAP_DRAIN_RESOURCES.has(cost.name) && !isNearResourceCap(resources, cost.name)) continue;
       const res = getRes(resources, cost.name);
-      if (res && res.maxValue > 0 && cost.val > res.maxValue && !craftByName(cost.name) && !target._stageRebuild) continue;
+      // An above-cap final price is unattainable until storage grows (capped
+      // banks clamp at their cap, craftable or not) — reserving it would only
+      // freeze the bank for a purchase that cannot complete.
+      if (res && res.maxValue > 0 && cost.val > res.maxValue && !target._stageRebuild) continue;
       const have = (res && res.value) || 0;
       // A multi-copy rebuild can cost more than one bank can hold. Reserve a
       // full live bank in that case; each copy spends it down and the atomic
@@ -9040,6 +9087,9 @@
   let queueSelectEl;
   let queueAddEl;
   let queueListEl;
+  let rankingEl;
+  let resetHeadEl;
+  let resetCardEl;
 
   // Human label for a queued targetId ("build:magneto" → "🏗 Magneto"), resolved
   // against the live candidate when possible so it shows the game's own name.
@@ -9051,39 +9101,67 @@
     return `${icon} ${candidate ? labelOf(candidate.meta) : name}`;
   };
 
+  // The queue picker is sorted by KIND then NAME — a fixed, browsable order.
+  // Sorting by live score (the old behavior) reshuffled the list every tick,
+  // which made the dropdown impossible to scan while it was open (v2.14.0).
+  const QUEUE_KIND_ORDER = ["build", "research", "upgrade", "religion", "space", "time"];
+  const QUEUE_KIND_GROUP = { build: "🏗 Buildings", research: "🔬 Research", upgrade: "⚙ Workshop", religion: "☀ Religion", space: "🚀 Space", time: "⏳ Time" };
+  const queuePickerEntries = (resources, goalKey) => {
+    const candidates = getCandidatesCached(resources, goalKey);
+    const queued = new Set(readQueue().map((item) => item.id));
+    return candidates
+      .filter((c) => QUEUE_KIND_ORDER.includes(c.kind))
+      .filter((c) => !queued.has(targetId(c)) && !targetComplete(c))
+      .map((c) => ({ id: targetId(c), kind: c.kind, label: labelOf(c.meta), ready: !!c.affordable }))
+      .sort((a, b) => (QUEUE_KIND_ORDER.indexOf(a.kind) - QUEUE_KIND_ORDER.indexOf(b.kind)) || a.label.localeCompare(b.label))
+      .slice(0, 80);
+  };
+
   // Populate the "add to queue" picker with the buyable/open candidates not
   // already queued, and render the current queue with reorder/remove controls.
+  // Both halves are signature-gated: the DOM is only rebuilt when the option
+  // SET actually changes, so an open dropdown never jumps under the cursor.
   const renderQueueControl = (resources, goalKey) => {
     if (!queueSelectEl || !queueListEl) return;
     const candidates = getCandidatesCached(resources, goalKey);
-    const queued = new Set(readQueue().map((item) => item.id));
-    const current = queueSelectEl.value;
-    const pickable = candidates
-      .filter((c) => ["build", "research", "upgrade", "religion", "space", "time"].includes(c.kind))
-      .filter((c) => !queued.has(targetId(c)) && !targetComplete(c))
-      .slice(0, 60);
-    queueSelectEl.innerHTML = "";
-    const placeholder = document.createElement("option");
-    placeholder.value = "";
-    placeholder.textContent = pickable.length ? "Add to build queue…" : "Nothing new to queue";
-    queueSelectEl.appendChild(placeholder);
-    for (const c of pickable) {
-      const option = document.createElement("option");
-      option.value = targetId(c);
-      option.textContent = `${queueItemLabel(targetId(c), candidates)}${c.affordable ? " — ready" : ""}`;
-      queueSelectEl.appendChild(option);
+    const entries = queuePickerEntries(resources, goalKey);
+    const pickerSig = entries.map((entry) => `${entry.id}${entry.ready ? "!" : ""}`).join("|");
+    if (queueSelectEl._kghSig !== pickerSig) {
+      queueSelectEl._kghSig = pickerSig;
+      const current = queueSelectEl.value;
+      queueSelectEl.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = entries.length ? "Add to build queue…" : "Nothing new to queue";
+      queueSelectEl.appendChild(placeholder);
+      let group = null;
+      let groupKind = null;
+      for (const entry of entries) {
+        if (entry.kind !== groupKind) {
+          groupKind = entry.kind;
+          group = document.createElement("optgroup");
+          group.label = QUEUE_KIND_GROUP[entry.kind] || entry.kind;
+          queueSelectEl.appendChild(group);
+        }
+        const option = document.createElement("option");
+        option.value = entry.id;
+        option.textContent = `${entry.label}${entry.ready ? " ✓ ready" : ""}`;
+        (group || queueSelectEl).appendChild(option);
+      }
+      const options = queueSelectEl.options ? [...queueSelectEl.options] : [];
+      if (options.some((o) => o.value === current)) queueSelectEl.value = current;
     }
-    const options = queueSelectEl.options ? [...queueSelectEl.options] : [];
-    if (options.some((o) => o.value === current)) queueSelectEl.value = current;
 
     const queue = readQueue();
+    const listSig = queue.map((item) => item.id).join("|");
+    if (queueListEl._kghSig === listSig) return;
+    queueListEl._kghSig = listSig;
     queueListEl.innerHTML = "";
     queue.forEach((item, index) => {
       const row = document.createElement("div");
-      row.className = "kgh-row";
-      row.style.cssText = "gap:3px;align-items:center;justify-content:space-between";
+      row.className = "kgh-row kgh-queue-item";
       const label = document.createElement("span");
-      label.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      label.className = "kgh-queue-label";
       label.textContent = `${index + 1}. ${queueItemLabel(item.id, candidates)}`;
       const controls = document.createElement("span");
       controls.style.cssText = "white-space:nowrap;flex:0 0 auto";
@@ -9097,11 +9175,80 @@
     });
   };
 
+  /* ------------------------- live target ranking ---------------------------- */
+
+  // Top-of-the-board score ranking, refreshed every tick: the plan's top rivals
+  // with their CURRENT scores, an up/down trend against the previous tick, and
+  // readiness/ETA — so "why is X the plan?" is visible at a glance instead of
+  // buried in the diagnostics report.
+  const esc = (text) => String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  let lastRankingScores = Object.create(null);
+
+  const rankingRows = (resources, goalKey) => {
+    const candidates = getCandidatesCached(resources, goalKey) || [];
+    const target = getTargetCached(resources, goalKey);
+    const targetKey = target ? targetId(target) : null;
+    const top = candidates.slice(0, 5);
+    if (targetKey && !top.some((c) => targetId(c) === targetKey)) {
+      // The plan target always appears — even a synthetic layer target
+      // (festival, stage change, bootstrap) that gatherCandidates never lists.
+      top.push(findCandidateById(candidates, targetKey) || target);
+    }
+    const rows = top.map((c) => {
+      const id = targetId(c);
+      const score = c.score || 0;
+      const prev = lastRankingScores[id];
+      const delta = prev == null ? 0 : score - prev;
+      return {
+        id,
+        rank: candidates.indexOf(c) + 1,
+        label: labelOf(c.meta),
+        icon: KIND_QUEUE_ICON[c.kind] || KIND_ICONS[c.kind] || "🎯",
+        score,
+        delta,
+        trend: Math.abs(delta) < 0.05 ? "flat" : delta > 0 ? "up" : "down",
+        ready: !!c.affordable,
+        eta: waitSecondsForCandidate(c, resources),
+        active: id === targetKey,
+      };
+    });
+    const next = Object.create(null);
+    for (const c of candidates.slice(0, 12)) next[targetId(c)] = c.score || 0;
+    lastRankingScores = next;
+    return rows;
+  };
+
+  const renderRankingControl = (resources, goalKey) => {
+    if (!rankingEl) return;
+    const rows = rankingRows(resources, goalKey);
+    if (!rows.length) {
+      rankingEl.innerHTML = '<div class="kgh-rk-empty">No open candidates yet</div>';
+      return;
+    }
+    rankingEl.innerHTML = rows.map((row) => {
+      const arrow = row.trend === "up" ? "▲" : row.trend === "down" ? "▼" : "·";
+      const deltaTitle = row.trend === "flat" ? "score steady" : `score ${row.delta > 0 ? "+" : ""}${fmt(row.delta)} vs last tick`;
+      const state = row.ready ? '<span class="kgh-rk-ready">ready</span>' : `<span class="kgh-rk-eta">${esc(formatEta(row.eta))}</span>`;
+      return `<div class="kgh-rk${row.active ? " kgh-rk-on" : ""}" title="${esc(deltaTitle)}">` +
+        `<span class="kgh-rk-n">${row.rank > 0 ? row.rank : "•"}</span>` +
+        `<span class="kgh-rk-name">${esc(`${row.icon} ${row.label}`)}${row.active ? ' <span class="kgh-rk-plan">plan</span>' : ""}</span>` +
+        `<span class="kgh-rk-tr kgh-rk-${row.trend}">${arrow}</span>` +
+        `<span class="kgh-rk-score">${esc(fmt(row.score))}</span>` +
+        state +
+        "</div>";
+    }).join("");
+  };
+
   const renderPolicyControl = (resources, goalKey) => {
     if (!policyEl) return;
     const choices = availablePolicyChoices(resources, goalKey);
     policyEl.textContent = `📜 ${policyAdviceLine(resources, goalKey)}`;
     if (!policySelectEl || !policyApplyEl) return;
+    // Same anti-flicker contract as the queue picker: only rebuild the options
+    // when the choice SET changes, so an open dropdown never jumps.
+    const policySig = choices.slice(0, 6).map((choice) => `${choice.meta.name}${choice.affordable ? "!" : ""}`).join("|");
+    if (policySelectEl._kghSig === policySig) return;
+    policySelectEl._kghSig = policySig;
     const current = policySelectEl.value;
     policySelectEl.innerHTML = "";
     if (!choices.length) {
@@ -9149,6 +9296,8 @@
     if (festivalEl) festivalEl.textContent = "";
     if (diplomacyEl) diplomacyEl.textContent = "";
     if (policyEl) policyEl.textContent = "";
+    if (rankingEl) rankingEl.innerHTML = '<div class="kgh-rk-empty">Paused (autopilot off)</div>';
+    if (resetHeadEl) resetHeadEl.textContent = "Paused (autopilot off)";
     if (goalEl) { goalEl.textContent = ""; goalEl.style.display = "none"; }
   };
 
@@ -9228,7 +9377,9 @@
       if (noteEl) noteEl.textContent = getAutomationDetailsLine(resources, goal);
       if (jobsEl) jobsEl.textContent = `👷 ${jobPlanText}`;
       if (buyEl) buyEl.textContent = `🛒 ${buyPlanText}`;
-      if (resetEl) resetEl.textContent = resetAdvisorText;
+      if (resetHeadEl) resetHeadEl.textContent = resetAdvisorState.headline;
+      if (resetCardEl && resetCardEl.setAttribute) resetCardEl.setAttribute("data-tone", resetAdvisorState.tone);
+      if (resetEl) resetEl.textContent = resetAdvisorState.detail || resetAdvisorText;
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
       if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
@@ -9239,6 +9390,7 @@
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
       renderPolicyControl(resources, goal);
       renderQueueControl(resources, goal);
+      renderRankingControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
       lastTickAt = Date.now();
     } catch (error) {
@@ -9263,56 +9415,101 @@
     style.id = "kgh-style";
     style.textContent =
       "body.kgh-helper-ready{overflow-x:hidden}" +
-      ".kgh-panel{box-sizing:border-box;width:min(320px,calc(100dvw - 16px));max-width:calc(100dvw - 16px);" +
+      ".kgh-panel{--kgh-bg:#221a13;--kgh-card:#2d241b;--kgh-line:#ffffff14;--kgh-text:#f2e8d5;--kgh-dim:#b3a488;" +
+      "--kgh-accent:#8fd8c8;--kgh-good:#8ee6a0;--kgh-warn:#ffd489;--kgh-alert:#ff9d7a;" +
+      "box-sizing:border-box;width:min(340px,calc(100dvw - 16px));max-width:calc(100dvw - 16px);" +
       "max-height:calc(100dvh - 16px);overflow:auto;overflow-x:hidden;contain:layout style;" +
-      "user-select:text;-webkit-user-select:text}" +
+      "user-select:text;-webkit-user-select:text;scrollbar-width:thin}" +
       ".kgh-panel *{box-sizing:border-box;min-width:0;max-width:100%}" +
       ".kgh-panel small,.kgh-panel pre,.kgh-panel div{overflow-wrap:anywhere;word-break:normal}" +
-      ".kgh-panel select{width:100%;min-width:0;user-select:auto;-webkit-user-select:auto}" +
+      ".kgh-panel select{width:100%;min-width:0;user-select:auto;-webkit-user-select:auto;" +
+      "background:#1b140e;color:var(--kgh-text);border:1px solid var(--kgh-line);border-radius:6px;padding:3px 4px}" +
       ".kgh-row{display:flex;gap:6px;min-width:0}" +
       ".kgh-grow{flex:1 1 auto;min-width:0}" +
       // Buttons must never shrink or wrap their label ("Appl\ny"): the panel's
       // global min-width:0 lets flex squeeze them, so pin them to content size.
       ".kgh-panel button{white-space:nowrap;flex:0 0 auto}" +
+      // …except the full-width autopilot toggle, which must fill its row.
+      ".kgh-panel .kgh-autopilot{flex:1 1 auto;background:#2d6b3f;color:#f2e8d5}" +
+      ".kgh-card{background:var(--kgh-card);border:1px solid var(--kgh-line);border-radius:8px;padding:6px 8px;display:grid;gap:3px}" +
+      ".kgh-sect{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--kgh-dim);font-weight:700}" +
       ".kgh-note{display:block;color:#d9ccae;opacity:.78}" +
-      ".kgh-details{border-top:1px solid #9b7a4d50;padding-top:3px}" +
-      ".kgh-details>summary{cursor:pointer;opacity:.82;list-style:none}" +
+      ".kgh-details{border-top:1px solid var(--kgh-line);padding-top:4px}" +
+      ".kgh-details>summary{cursor:pointer;opacity:.82;list-style:none;font-size:11px;color:var(--kgh-dim)}" +
       ".kgh-details>summary::-webkit-details-marker{display:none}" +
-      ".kgh-details-body{display:grid;gap:4px;margin-top:4px}" +
+      ".kgh-details>summary::before{content:'▸ '}" +
+      ".kgh-details[open]>summary::before{content:'▾ '}" +
+      ".kgh-details-body{display:grid;gap:4px;margin-top:5px}" +
       ".kgh-log{overflow:hidden auto}" +
-      ".kgh-hbtn{cursor:pointer;background:transparent;color:#f7ead0;border:1px solid #9b7a4d;" +
-      "border-radius:3px;font-size:11px;padding:1px 6px;margin-left:4px;flex:0 0 auto}" +
+      ".kgh-hbtn{cursor:pointer;background:#ffffff0a;color:var(--kgh-text);border:1px solid #ffffff22;" +
+      "border-radius:5px;font-size:11px;padding:1px 7px;margin-left:4px;flex:0 0 auto}" +
+      ".kgh-hbtn:hover{background:#ffffff1c}" +
+      ".kgh-queue-item{gap:3px;align-items:center;justify-content:space-between;background:#ffffff08;border-radius:5px;padding:2px 5px}" +
+      ".kgh-queue-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+      // Live target ranking rows: rank · name · trend · score · readiness.
+      ".kgh-rk{display:grid;grid-template-columns:14px minmax(0,1fr) 12px auto auto;gap:5px;align-items:baseline;" +
+      "padding:2px 5px;border-radius:5px;font-size:11.5px}" +
+      ".kgh-rk-on{background:#8fd8c81a;box-shadow:inset 2px 0 0 var(--kgh-accent)}" +
+      ".kgh-rk-n{color:var(--kgh-dim);font-size:10px;text-align:right}" +
+      ".kgh-rk-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+      ".kgh-rk-plan{color:var(--kgh-accent);font-size:9px;letter-spacing:.08em;text-transform:uppercase;font-weight:700}" +
+      ".kgh-rk-tr{text-align:center;font-size:10px}" +
+      ".kgh-rk-up{color:var(--kgh-good)}.kgh-rk-down{color:var(--kgh-alert)}.kgh-rk-flat{color:var(--kgh-dim)}" +
+      ".kgh-rk-score{font-variant-numeric:tabular-nums;font-weight:700;color:var(--kgh-text)}" +
+      ".kgh-rk-eta{color:var(--kgh-dim);font-size:10px;font-variant-numeric:tabular-nums;min-width:34px;text-align:right}" +
+      ".kgh-rk-ready{color:var(--kgh-good);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;text-align:right}" +
+      ".kgh-rk-empty{color:var(--kgh-dim);font-size:11px}" +
+      // Reset advisor card: the verdict is a headline, colored by tone.
+      ".kgh-reset-head{font-weight:700;font-size:12px}" +
+      '.kgh-reset-card[data-tone="wait"] .kgh-reset-head{color:var(--kgh-dim)}' +
+      '.kgh-reset-card[data-tone="target"] .kgh-reset-head{color:var(--kgh-warn)}' +
+      '.kgh-reset-card[data-tone="ok"] .kgh-reset-head{color:var(--kgh-good)}' +
+      '.kgh-reset-card[data-tone="go"] .kgh-reset-head{color:var(--kgh-alert)}' +
       "@media (max-width:700px){.kgh-panel{left:8px!important;right:8px!important;bottom:8px!important;width:auto!important;max-height:45dvh}}";
     document.head.appendChild(style);
 
     const box = document.createElement("div");
     box.className = "kgh-panel";
     box.style.cssText =
-      "position:fixed;right:8px;bottom:8px;z-index:99999;padding:8px 9px;" +
-      "background:#2b2118;color:#f7ead0;border:1px solid #9b7a4d;border-radius:5px;" +
-      "font:12px/1.35 sans-serif;display:grid;gap:5px;box-shadow:0 2px 10px #0009";
+      "position:fixed;right:8px;bottom:8px;z-index:99999;padding:8px;" +
+      "background:linear-gradient(180deg,#241b14,#1e1712);color:#f2e8d5;border:1px solid #ffffff1f;border-radius:10px;" +
+      "font:12px/1.4 system-ui,-apple-system,'Segoe UI',sans-serif;display:grid;gap:6px;box-shadow:0 6px 24px #000a";
     box.innerHTML = [
       '<div class="kgh-row" style="justify-content:space-between;align-items:center">',
-      '<strong style="font-size:13px">🐱 Kittens Helper</strong><small style="opacity:.7;margin-left:4px">v' + HELPER_VERSION + '</small>',
-      '<span style="white-space:nowrap"><button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
-      '<div class="kgh-body" style="display:grid;gap:5px">',
-      '<div class="kgh-row"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer">Autopilot: ON</button></div>',
-      // Single autopilot — no goal modes.  The manual build queue lets you force
-      // specific buildings / research / workshop upgrades to the front of the plan.
-      '<div class="kgh-row" style="gap:4px"><select class="kgh-queue-select kgh-grow" aria-label="add to build queue" style="min-width:0"></select>',
-      '<button type="button" class="kgh-queue-add" style="cursor:pointer" title="Force this to the front of the plan">＋ Queue</button></div>',
-      '<div class="kgh-queue-list" style="display:grid;gap:2px"></div>',
-      '<small class="kgh-status" style="color:#9fd0ff">…</small>',
-      '<small class="kgh-goal-line" style="color:#d8b6ff"></small>',
-      '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
-      '<small class="kgh-science" style="color:#bfe6a0">…</small>',
+      '<span style="display:flex;align-items:baseline;gap:5px;min-width:0"><strong style="font-size:13px">🐱 Kittens Helper</strong>',
+      '<small style="opacity:.55">v' + HELPER_VERSION + '</small></span>',
+      '<span style="white-space:nowrap;display:flex;align-items:center"><small class="kgh-status" style="color:var(--kgh-dim)">…</small>',
+      '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
+      '<div class="kgh-body" style="display:grid;gap:6px">',
+      '<div class="kgh-row"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer;border-radius:6px;border:1px solid #ffffff22;padding:4px">Autopilot: ON</button></div>',
+
+      // PLAN — what the autopilot is doing and why, at a glance.
+      '<div class="kgh-card"><span class="kgh-sect">Plan</span>',
       '<small class="kgh-plan" style="color:#a7e8e0;font-weight:700">…</small>',
       '<small class="kgh-now" style="color:#e6d79a">…</small>',
-      '<details class="kgh-details"><summary>More automation details</summary><div class="kgh-details-body">',
+      '<small class="kgh-bottleneck" style="color:#f0b8a0">…</small>',
+      '<small class="kgh-science" style="color:#bfe6a0">…</small>',
+      '<small class="kgh-goal-line" style="color:#d8b6ff"></small></div>',
+
+      // TOP TARGETS — the live ranking with score trends.
+      '<div class="kgh-card"><span class="kgh-sect">Top targets · live score</span>',
+      '<div class="kgh-ranking" style="display:grid;gap:1px"></div></div>',
+
+      // RESET ADVISOR — an explicit verdict, always visible.
+      '<div class="kgh-card kgh-reset-card" data-tone="wait"><span class="kgh-sect">Reset advisor</span>',
+      '<span class="kgh-reset-head">…</span>',
+      '<small class="kgh-reset" style="color:#a7f0b4">…</small></div>',
+
+      // QUEUE — the manual override lane.
+      '<div class="kgh-card"><span class="kgh-sect">Manual queue</span>',
+      '<div class="kgh-row" style="gap:4px"><select class="kgh-queue-select kgh-grow" aria-label="add to build queue" style="min-width:0"></select>',
+      '<button type="button" class="kgh-queue-add" style="cursor:pointer" title="Force this to the front of the plan">＋ Queue</button></div>',
+      '<div class="kgh-queue-list" style="display:grid;gap:2px"></div></div>',
+
+      '<details class="kgh-details"><summary>Subsystems &amp; automation details</summary><div class="kgh-details-body">',
       '<small class="kgh-note"></small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
       '<small class="kgh-buy" style="color:#b8e2ff">…</small>',
-      '<small class="kgh-reset" style="color:#a7f0b4">…</small>',
       '<small class="kgh-leader" style="color:#ffd18f">…</small>',
       '<small class="kgh-craft" style="color:#cdb7ff">…</small>',
       '<small class="kgh-processing" style="color:#c8d0ff">…</small>',
@@ -9326,9 +9523,9 @@
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Manual override — the autopilot auto-adopts the ranked best side on its own; queue a policy to pin a different side">Policy</button></div>',
       '<small style="opacity:.65">Resets stay OFF. Back up your save (Options → Export) first.</small>',
       '</div></details>',
-      '<div style="opacity:.8;border-top:1px solid #9b7a4d50;padding-top:3px;display:flex;justify-content:space-between;align-items:center"><span>Recent actions:</span><button type="button" class="kgh-hbtn kgh-log-copy" title="Copy a full diagnostics report (plan, power, processing, resources, candidates, log) for debugging">Copy</button></div>',
-      '<pre class="kgh-log" style="margin:0;max-height:260px;white-space:pre-wrap;' +
-        'font:11px/1.35 monospace;color:#d9ccae;background:#0003;padding:4px;border-radius:3px">…</pre>',
+      '<div style="opacity:.8;display:flex;justify-content:space-between;align-items:center"><span class="kgh-sect">Recent actions</span><button type="button" class="kgh-hbtn kgh-log-copy" title="Copy a full diagnostics report (plan, power, processing, resources, candidates, log) for debugging">Copy</button></div>',
+      '<pre class="kgh-log" style="margin:0;max-height:220px;white-space:pre-wrap;' +
+        'font:11px/1.35 ui-monospace,monospace;color:#d9ccae;background:#00000038;padding:5px 6px;border-radius:6px;border:1px solid var(--kgh-line)">…</pre>',
       "</div>",
     ].join("");
 
@@ -9360,6 +9557,9 @@
     policyApplyEl = box.querySelector(".kgh-policy-apply");
     nowEl = box.querySelector(".kgh-now");
     noteEl = box.querySelector(".kgh-note");
+    rankingEl = box.querySelector(".kgh-ranking");
+    resetHeadEl = box.querySelector(".kgh-reset-head");
+    resetCardEl = box.querySelector(".kgh-reset-card");
     logBox = box.querySelector(".kgh-log");
 
     const syncToggle = () => {
@@ -9495,6 +9695,19 @@
     resetAdvisor() {
       computeResetAdvisor();
       return resetAdvisorText;
+    },
+    resetAdvisorState() {
+      computeResetAdvisor();
+      return resetAdvisorState;
+    },
+    rankingRows(goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
+      return rankingRows(resourceMap(), goalKey);
+    },
+    queuePickerEntries(goalKey = getGoal()) {
+      resetTickCache();
+      return queuePickerEntries(resourceMap(), goalKey);
     },
     candidateById(id, goalKey = getGoal()) {
       activePlanSnapshot = { cycleId: -1, target: undefined };

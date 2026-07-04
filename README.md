@@ -56,30 +56,24 @@ generic candidate and never touches alicorns.
 
 ## What the panel shows
 
-The bottom-right box is a live dashboard:
+The bottom-right box is a live dashboard, organized into cards (v2.14.0):
 
-- **Helper:** `running ✓` — the helper's own tick loop is alive (heartbeat); the title
-  also shows the installed version.
-- **⚖ Bottleneck:** the thing currently holding you back — a *capped* resource being
-  wasted (e.g. `science capped — build more storage`) or a *starved* one
-  (e.g. `wood starved (refining catnip)`).
-- **🔬 Next science:** the next tech to aim for and what you still need for it.
-- **🧭 Plan:** the concrete building/research/upgrade target, what is missing, a rough ETA
-  until it should be affordable, and a compact have/need resource sheet.
-- **👷 Jobs:** the resources jobs are currently balancing around and the target that caused it.
-- **🛒 Buy:** what the purchase loop is doing — `saving for Library (reserving Wood)` while
-  the plan accumulates, or the last surplus purchase it allowed.
-- **🛡 Reserve:** what resources are currently held for the plan (or for explorers).
-- **👑 Leader:** the currently selected leader trait/kitten chosen for the active bottleneck.
-- **🧰 Craft:** prerequisite crafting plus overflow conversions that prevent near-capped inputs from being wasted.
-- **☀ Religion / 🤝 Diplomacy:** what praise/upgrades and trade/explorers/embassies are doing.
-- **🦄 Unicorns:** what the ziggurat/unicorn planner is doing — banking unicorns, holding
-  the sacrifice for a cheaper tear rate, or which upgrade it just funded.
-- **🎉 Festival:** whether the happiness/birth-rate layer is active, saving, deferred by
-  the active reservation, or waiting for Drama & Poetry.
-- **🎯 Now:** what it can build/buy right this second.
-- **Recent actions:** a running log of what it actually built / researched / upgraded /
-  traded / praised, kept across the session so you can see it working.
+- **Plan card** — the concrete target, what is missing, a rough ETA and a compact
+  have/need sheet (**🧭 Plan**), what it can do right this second (**🎯 Now**), the
+  current **⚖ Bottleneck**, the **🔬 Next science**, and the goal line.
+- **Top targets card** — the LIVE score ranking: the plan's top rivals with their
+  current scores, per-tick ▲/▼ trend arrows, readiness (`ready`) or ETA, and the
+  active plan highlighted — so "why is X the plan?" is answered at a glance.
+- **Reset advisor card** — an explicit, color-coded verdict that is always visible
+  (see "When should I reset?" below).
+- **Manual queue card** — the queue picker (sorted by kind, then name — the list
+  never reshuffles while you browse it) and the current queue with reorder/remove.
+- **Subsystems & automation details** (collapsed) — one line per subsystem:
+  **👷 Jobs**, **🛒 Buy** (`saving for Library (reserving Wood)`), **🛡 Reserve**,
+  **👑 Leader**, **🧰 Craft**, **⚙ Processing**, **☀ Religion**, **🦄 Unicorns**,
+  **🎉 Festival**, **🤝 Diplomacy**, **📜 Policies**, plus the full details line.
+- **Recent actions** — a running log of what it actually built / researched /
+  traded / praised, with a **Copy** button that exports a full diagnostics report.
 
 ## One autopilot — no modes
 
@@ -295,9 +289,12 @@ logic feeds job balancing, so missing steel pushes work toward the raw inputs be
 If a resource is both craftable and directly job-produced, the job path stays primary:
 for example a Hut's missing **wood** is displayed and scored as Wood work, while
 Refine Catnip remains an optional surplus shortcut rather than turning the whole plan
-into a giant catnip target. Even when that wood price is above the current storage cap,
-the active plan still reserves the wood bank from side buys because crafting/refining can
-finish the purchase.
+into a giant catnip target. But when a final price sits **above the resource's storage
+cap**, the target is storage-blocked no matter how the resource is produced (v2.14.0):
+a capped bank clamps at its cap, so crafting can fill it *to* the cap but never hold
+more. The plan releases such a target, remembers not to re-pick it, and grows the cap
+(Barn/Warehouse) first — the fix for the post-reset "Library 202/200 wood, plan stuck
+forever" stall.
 
 It also watches resource storage pressure. If there is **no active reserve**, hot inputs
 can be converted into useful workshop goods such as beams, slabs, plates, steel, gears,
@@ -381,13 +378,27 @@ buildings.
 - The helper buys **as soon as affordable** and refines surplus catnip into wood, so there
   are no thresholds to tune.
 
-## Turning on resets later (advanced, optional)
+## When should I reset? (the Reset advisor card)
 
-Resets trade your current run for permanent bonuses (Paragon/Karma). This **wipes the
-current game**, so it is intentionally never automated here — reset/transcend/
+Resets trade your current run for permanent bonuses (Paragon/Karma). The panel's
+**Reset advisor card** (v2.14.0) is always visible and gives one explicit, color-coded
+verdict instead of a stat line you had to decode:
+
+- **Do NOT reset** (gray) — below 35 kittens nothing is banked at all.
+- **Too early** (gray) — 35–69 kittens bank a little karma but zero paragon; the
+  headline shows exactly what a reset now would bank.
+- **First reset target** (amber) — before your first reset, aim for **130+ kittens with
+  Concrete Huts** (live progress shown, e.g. `100/130`): that banks ~60 paragon, enough
+  for Diplomacy + the first price-ratio metaphysics next run.
+- **Keep pushing** (green) — kitten arrivals are still healthy; the card shows the live
+  paragon/day and what a reset now would bank anyway.
+- **Reset is beneficial NOW** (red) — paragon/day has flattened (arrivals no longer keep
+  up), so banking and restarting compounds faster than continuing this run.
+
+The reset itself is intentionally **never automated** — reset/transcend/
 alicorn-sacrifice/time-skip actions are filtered out of every decision the helper makes
 (the bounded unicorn→tears sacrifice above is the only exception, and it can't touch your
-prestige state). If you want a reset after you've **exported a backup**, do it yourself
+prestige state). When the card says GO and you've **exported a backup**, do it yourself
 in the game's **Time Control** tab.
 
 ## Files

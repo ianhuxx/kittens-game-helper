@@ -149,6 +149,21 @@ const required = [
   "fursHealthy",
   // The autopilot toggle button must never wrap its label.
   ".kgh-panel button{white-space:nowrap;flex:0 0 auto}",
+  // v2.14.0 — a final price above a CAPPED bank is storage-blocked even when
+  // the resource is craftable (banks clamp at their cap): the lock breaks with
+  // a cooldown and the storage layer grows the cap instead of re-picking the
+  // unattainable target forever (the post-reset Library stall).
+  "storage cap blocks the final price",
+  "directStorageBlockers",
+  // v2.14.0 UI: live top-target ranking with score trends, a stable
+  // kind-then-name queue picker, and an explicit reset-advisor verdict card.
+  "rankingRows",
+  "renderRankingControl",
+  "kgh-ranking",
+  "queuePickerEntries",
+  "QUEUE_KIND_ORDER",
+  "resetAdvisorState",
+  "kgh-reset-card",
   // Policies: non-exclusive auto-buy on sight; exclusive groups auto-adopt the
   // ranked best side, and the pending pick's bill is culture-chain state held
   // in every reservation ledger while it saves (v2.13.0). A researched side
