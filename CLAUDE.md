@@ -192,6 +192,29 @@ Key invariants (see comments in the source for the why):
   chain), and the lock follows the contract (`sprintRedirectTakeover`). The
   redirect releases on its own once production catches up. Test AE pins all of
   this against the live save that motivated it.
+  Two v2.15.0 amendments (the live 62.54K-science Chemistry/Temple stall):
+  **the conveyor keeps CRAFTING while redirected** — `craftTowardTarget` also
+  crafts the sprint tech's chain, flooring the plan target's own direct prices
+  (`sprintRedirectCraftTarget` + `directPriceFloors`), so a full culture bank
+  converts into manuscripts instead of pinning at its cap the moment the
+  producer's own manuscript bill happens to be banked — and **the booster pick
+  charges each option's own drain of the trickling resource**
+  (`boosterPacingSelfDrain`): `(missing + drain)/(prod + gain)` must beat the
+  plain wait, so a Temple priced in 81 manuscripts (≈11K culture) can never be
+  chosen to "grow culture" it consumes. Test AE pins both directions.
+- **Rank-order candidates form parallel tiers and are worked simultaneously**
+  (v2.15.0). While the plan target waits on a non-craftable trickle (Temple's
+  last 124 gold at +0.2/s), `craftTowardParallelCandidates` (runs after the
+  plan buy and overflow each tick) crafts the missing intermediates of the
+  top-ranked candidates strictly ABOVE `parallelReservationFloors` — the merged
+  reservation ledger PLUS the active target's and redirected sprint's BANKED
+  direct prices, which `buildTargetLedger` deliberately drops from `reserved` —
+  and buys a candidate (throttled, one per tick) once every floor survives the
+  spend. A candidate with a non-craftable deficit above its floor (a rival gold
+  bill) is skipped whole; cap-drain banks carrying a sprint's cumulative bill
+  read as permanent floors and are therefore never spendable here. Surfaced as
+  the `Parallel:` segment of the Craft line in the panel and report. Test AI
+  pins the floors, the surplus craft, the completing buy and the rival skip.
 - **A staffable resource is never "unreachable".** `capDrainReachabilityFor`
   treats a resource with a direct job path (minerals with every miner
   temporarily pulled elsewhere) as reachable, with one marginal worker's live

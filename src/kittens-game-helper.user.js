@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.14.0
+// @version      2.15.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.14.0";
+  const HELPER_VERSION = "2.15.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -1520,7 +1520,11 @@
   // Craft toward `targetAmount` of a resource, recursively crafting missing
   // inputs first. Partial fills are fine: if inputs only cover a third of the
   // deficit, craft that third now instead of stalling until everything fits.
-  const tryCraftResource = (name, targetAmount, depth = 0, target = null, topOutputName = name) => {
+  // `extraFloors` holds per-resource banks this craft may never dip below ON
+  // TOP of the computed floors — the redirected-sprint conveyor floors the
+  // plan target's direct prices with it, and the parallel-tier pass floors
+  // the whole reservation ledger.
+  const tryCraftResource = (name, targetAmount, depth = 0, target = null, topOutputName = name, extraFloors = null) => {
     if (depth > 5 || !isFinite(targetAmount) || targetAmount <= 0) return false;
     const resources = resourceMap();
     const current = getRes(resources, name);
@@ -1538,7 +1542,7 @@
       const neededInput = price.val * wantUnits;
       const input = getRes(resourceMap(), price.name);
       if (((input && input.value) || 0) < neededInput) {
-        tryCraftResource(price.name, neededInput, depth + 1, target, topOutputName); // best effort, clamp below
+        tryCraftResource(price.name, neededInput, depth + 1, target, topOutputName, extraFloors); // best effort, clamp below
       }
     }
 
@@ -1549,7 +1553,8 @@
       // This craft is serving the active plan's chain, so reserve only a minimal
       // luxury cushion (forPlanChain) — the plan must not be blocked by the idle
       // happiness reserve, but the catnip starvation reserve still holds.
-      const floor = target ? overflowInputFloor(target, fresh, price.name, topOutputName, true) : craftFloorFor(fresh, price.name);
+      let floor = target ? overflowInputFloor(target, fresh, price.name, topOutputName, true) : craftFloorFor(fresh, price.name);
+      if (extraFloors && (extraFloors[price.name] || 0) > floor) floor = extraFloors[price.name];
       const available = Math.max(0, ((input && input.value) || 0) - floor);
       units = Math.min(units, Math.floor(available / price.val));
     }
@@ -1717,23 +1722,75 @@
     }
   };
 
+  // While a sprint pacing redirect points the plan at a producer building, the
+  // sprint tech is no longer the plan target — but its chain must KEEP
+  // converting the trickling bank every time it fills (culture → manuscripts →
+  // compendiums).  v2.14.0 and earlier only crafted the plan target's own
+  // price deficits here, so the moment the producer's manuscript bill was
+  // banked every chain craft stopped, culture pinned at its cap, and the
+  // sprint's "≈38m" wait never shrank (the live 62.54K-science Chemistry
+  // stall).  This returns the sprint candidate whenever the redirect owns the
+  // plan through a different target.
+  const sprintRedirectCraftTarget = (target) => {
+    if (!activeSprint || !activeSprint.candidate) return null;
+    if (!lastStrategicDecision || !lastStrategicDecision.sprintRedirect) return null;
+    if (target && targetId(target) === activeSprint.id) return null;
+    return activeSprint.candidate;
+  };
+
+  // The plan target's DIRECT prices, as craft floors: the redirected sprint's
+  // chain crafts may consume everything ABOVE the producer's own bill, so the
+  // conveyor and the producer purchase advance in parallel instead of stealing
+  // from each other (Chemistry's compendium crafts leave Temple's 81
+  // manuscripts banked; manuscript crafts leave Amphitheatre's parchment).
+  const directPriceFloors = (candidate) => {
+    const floors = {};
+    if (!candidate || !candidate.meta) return floors;
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      floors[cost.name] = Math.max(floors[cost.name] || 0, cost.val);
+    }
+    return floors;
+  };
+
   const craftTowardTarget = (resources, goalKey) => {
     try {
       const target = getTargetCached(resources, goalKey);
-      if (!target || target.affordable) {
+      const redirectTech = sprintRedirectCraftTarget(target);
+      if (!target || (target.affordable && !redirectTech)) {
         craftPlanText = "Craft: no intermediate needed";
         return;
       }
       let planned = "";
-      for (const cost of pricesFor(target.kind, target.meta)) {
-        if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
-        const have = (getRes(resourceMap(), cost.name) || { value: 0 }).value || 0;
-        if (have < cost.val && craftByName(cost.name)) {
-          if (!planned) {
-            planned = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
-            craftPlanText = planned;
+      if (!target.affordable) {
+        for (const cost of pricesFor(target.kind, target.meta)) {
+          if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+          const have = (getRes(resourceMap(), cost.name) || { value: 0 }).value || 0;
+          if (have < cost.val && craftByName(cost.name)) {
+            if (!planned) {
+              planned = `Craft: ${craftLabel(cost.name)} for ${labelOf(target.meta)}`;
+              craftPlanText = planned;
+            }
+            tryCraftResource(cost.name, cost.val, 0, target, cost.name); // may overwrite plan text with "made N …"
           }
-          tryCraftResource(cost.name, cost.val, 0, target, cost.name); // may overwrite plan text with "made N …"
+        }
+      }
+      if (redirectTech) {
+        // Keep the redirected sprint's conveyor running: craft its chain from
+        // everything above the plan target's own direct bill, so the trickling
+        // bank (culture) is converted the moment it fills instead of wasting
+        // at its cap while the producer building saves toward gold.
+        const floors = directPriceFloors(target);
+        for (const cost of pricesFor(redirectTech.kind, redirectTech.meta)) {
+          if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+          const have = (getRes(resourceMap(), cost.name) || { value: 0 }).value || 0;
+          if (have < cost.val && craftByName(cost.name)) {
+            if (!planned) {
+              planned = `Craft: ${craftLabel(cost.name)} for redirected sprint ${labelOf(redirectTech.meta)}`;
+              craftPlanText = planned;
+            }
+            tryCraftResource(cost.name, cost.val, 0, redirectTech, cost.name, floors);
+          }
         }
       }
       if (!planned) craftPlanText = "Craft: gathering raw inputs";
@@ -4210,6 +4267,25 @@
   // shorten a production-bound wait.
   let activeSprintPacingBoostId = null;
 
+  // The producer's own bill in the trickling resource, direct or through its
+  // craft chain (a Temple priced in Manuscripts spends ~81 × 400 culture — the
+  // very bank the redirect is trying to grow).  Charged gross: even when the
+  // manuscripts are already banked, buying the producer consumes them and the
+  // sprint's cumulative bill must re-craft every one.
+  const boosterPacingSelfDrain = (candidate, pacingName) => {
+    let drain = 0;
+    for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
+      if (cost.name === pacingName) {
+        drain += cost.val;
+        continue;
+      }
+      if (!craftByName(cost.name)) continue;
+      drain += Math.max(0, rawPathRequirements(cost.name, cost.val)[pacingName] || 0);
+    }
+    return drain;
+  };
+
   const bestSprintPacingBooster = (candidates, resources, pacing) => {
     if (!pacing) {
       activeSprintPacingBoostId = null;
@@ -4225,6 +4301,15 @@
       if (!solver.reachable) continue;
       const eta = waitSecondsForCandidate(candidate, resources);
       if (!isFinite(eta) || eta >= pacing.wait) continue; // slower than just waiting → useless
+      // A booster must SHORTEN the total wait after paying its own bill in the
+      // trickling resource: (missing + drain) at the boosted rate must beat
+      // missing at the current rate, or the "booster" only sets the sprint
+      // back (the live Temple whose 81-manuscript price cost ~11K culture for
+      // a small culture/s gain).
+      const gainPerSecond = gain * ticksPerSecond();
+      const drain = boosterPacingSelfDrain(candidate, pacing.name);
+      const boostedWait = (pacing.missing + drain) / Math.max(1e-6, pacing.prod + gainPerSecond);
+      if (boostedWait >= pacing.wait) continue;
       options.push({ candidate, gain, eta });
     }
     if (!options.length) {
@@ -7245,10 +7330,8 @@
   // stay reserved — otherwise a surplus Temple buy could eat the manuscripts
   // the moment the plan target stops being the tech itself.
   const sprintRedirectChainLedger = (resources, target) => {
-    if (!activeSprint || !activeSprint.candidate) return null;
-    if (!lastStrategicDecision || !lastStrategicDecision.sprintRedirect) return null;
-    if (target && targetId(target) === activeSprint.id) return null;
-    return buildTargetLedger(activeSprint.candidate, resources);
+    const redirectTech = sprintRedirectCraftTarget(target);
+    return redirectTech ? buildTargetLedger(redirectTech, resources) : null;
   };
 
   const survivalReservationLedger = (resources) => {
@@ -7476,6 +7559,121 @@
       } else {
         noteBuyFailure(targetId(ready));
       }
+    } catch (error) {
+      /* ignore */
+    }
+  };
+
+  /* --------------------------- parallel-tier work ---------------------------
+   * While the active plan waits on a non-craftable trickle (Temple's last 124
+   * gold at +0.2/s), every other capped income stream used to idle: the top-
+   * ranked Harbour needed 6.75 Scaffold that nobody would craft while wood and
+   * minerals burned at their caps.  Rank-ordered candidates form parallel
+   * tiers: a candidate whose spend clears the COMPLETE reservation ledger —
+   * including the active target's banked direct prices and the redirected
+   * sprint's chain — is independent work, not a rival.  This pass crafts such
+   * a candidate's missing intermediates strictly ABOVE those floors and buys
+   * it once it is affordable with every floor intact.  Anything that would dip
+   * a held bank is skipped, so the plan's savings stay untouchable; cap-drain
+   * banks (culture/science/faith) carry the sprint's cumulative bill as a
+   * floor and are therefore never spendable here.
+   */
+  const PARALLEL_TIER_SCAN = 8;   // ranked candidates inspected per tick
+  const PARALLEL_TIER_CRAFTS = 2; // distinct candidates crafted toward per tick
+  let parallelPlanText = "Parallel: idle";
+
+  // Floors a parallel spender must leave intact: the merged reservation ledger
+  // (active plan, redirected sprint chain, manual queue, unicorn path, policy
+  // hold, survival) plus the active target's and the redirected sprint's
+  // BANKED direct prices.  buildTargetLedger deliberately drops satisfied
+  // costs from `reserved` (they need no saving), but a parallel buy eating
+  // Temple's banked 203 slabs would un-afford the plan just the same.
+  const parallelReservationFloors = (target, resources) => {
+    const merged = buildReservationLedger(target, resources);
+    const floors = { ...merged.reserved };
+    const raiseDirect = (ledger) => {
+      for (const [name, amount] of Object.entries((ledger && ledger.direct) || {})) {
+        floors[name] = Math.max(floors[name] || 0, amount);
+      }
+    };
+    raiseDirect(buildTargetLedger(target, resources));
+    raiseDirect(sprintRedirectChainLedger(resources, target));
+    return floors;
+  };
+
+  const priceClearsParallelFloor = (price, floors, resources) => {
+    const floor = floors[price.name] || (price.name === "catpower" ? floors.manpower || 0 : 0);
+    if (!(floor > 0)) return true;
+    return ((((getRes(resources, price.name) || {}).value) || 0) - price.val) >= floor;
+  };
+
+  const craftTowardParallelCandidates = (resources, goalKey) => {
+    try {
+      const target = getTargetCached(resources, goalKey);
+      if (!target || target.affordable) {
+        parallelPlanText = "Parallel: idle";
+        return;
+      }
+      if (isSprintCandidate(target, resources)) {
+        parallelPlanText = "Parallel: sprint holds all surplus";
+        return;
+      }
+      const floors = parallelReservationFloors(target, resources);
+      const candidates = getCandidatesCached(resources, goalKey);
+      const worked = [];
+      let boughtThisTick = false;
+      let inspected = 0;
+      for (let index = 0; index < candidates.length && inspected < PARALLEL_TIER_SCAN && worked.length < PARALLEL_TIER_CRAFTS; index += 1) {
+        const candidate = candidates[index];
+        if (!candidate || !candidate.meta) continue;
+        if (candidate.kind === "stage" || candidate.kind === "policy" || candidate.kind === "festival") continue;
+        if (targetId(candidate) === targetId(target)) continue;
+        if (activeSprint && activeSprint.id && targetId(candidate) === activeSprint.id) continue; // the sprint contract owns its tech
+        if (buyBenched(targetId(candidate))) continue;
+        inspected += 1;
+        const prices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && isFinite(price.val) && price.val > 0);
+        if (!prices.length) continue;
+        if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) continue;
+        // Every price must either be banked above its floor already or be
+        // craftable — a non-craftable deficit (a rival gold bill) means this
+        // candidate cannot be finished from surplus; skip it whole.
+        const shorts = prices.filter((price) => {
+          const floor = floors[price.name] || (price.name === "catpower" ? floors.manpower || 0 : 0);
+          const have = (((getRes(resources, price.name) || {}).value) || 0);
+          return have < price.val + Math.max(0, floor);
+        });
+        if (shorts.some((price) => !craftByName(price.name))) continue;
+        if (!shorts.length) {
+          // Fully banked above every floor: finish it, throttled like any buy.
+          if (boughtThisTick || !candidate.affordable) continue;
+          const now = Date.now();
+          if (now - lastAutoBuy < AUTOBUY_MIN_MS) continue;
+          if (!prices.every((price) => priceClearsParallelFloor(price, floors, resources))) continue;
+          lastAutoBuy = now;
+          if (buyCandidate(candidate)) {
+            boughtThisTick = true;
+            worked.push(`${labelOf(candidate.meta)} built`);
+            pushLog(`🏗 parallel ${candidate.kind} ${labelOf(candidate.meta)} (rank ${index + 1}; ${labelOf(target.meta)} keeps its reserves)`);
+          } else {
+            noteBuyFailure(targetId(candidate));
+          }
+          continue;
+        }
+        // Craft the missing intermediates above the ledger floors.  target=null
+        // keeps the conservative idle cushions on luxuries; the floors map
+        // carries every held bank, so this can only convert genuine surplus.
+        let craftedAny = false;
+        for (const price of shorts) {
+          const floor = Math.max(0, floors[price.name] || 0);
+          const before = (((getRes(resourceMap(), price.name) || {}).value) || 0);
+          tryCraftResource(price.name, price.val + floor, 0, null, price.name, floors);
+          if ((((getRes(resourceMap(), price.name) || {}).value) || 0) > before) craftedAny = true;
+        }
+        if (craftedAny) worked.push(`${craftLabel(shorts[0].name)} for ${labelOf(candidate.meta)} (rank ${index + 1})`);
+      }
+      parallelPlanText = worked.length
+        ? `Parallel: ${worked.join(" · ")}`
+        : `Parallel: top tiers wait (reserves for ${labelOf(target.meta)} intact)`;
     } catch (error) {
       /* ignore */
     }
@@ -8470,7 +8668,7 @@
       push("— SUBSYSTEMS —");
       push(`Jobs: ${jobPlanText}${jobSuppressText ? ` · ${jobSuppressText}` : ""}`);
       push(`  census: ${jobsReportLine()}`);
-      push(`Craft: ${craftPlanText} · ${overflowPlanText}`);
+      push(`Craft: ${craftPlanText} · ${overflowPlanText} · ${parallelPlanText}`);
       push(`Buy: ${buyPlanText}`);
       push(`Queue: ${queuePlanText}`);
       push(`Leader: ${leaderPlanText}`);
@@ -9342,6 +9540,13 @@
       craftOverflowResources(resources, goal);
       resetTickCache();
       resources = resourceMap();
+      // Parallel tiers run AFTER the plan buy and overflow: rank-order
+      // candidates whose full bill clears the reservation ledger are crafted
+      // toward and finished from genuine surplus while the plan waits on a
+      // non-craftable trickle.
+      craftTowardParallelCandidates(resources, goal);
+      resetTickCache();
+      resources = resourceMap();
       managePraise(resources);
       // Purchases can change resource stocks, caps, unlocks and per-tick effects;
       // re-read before diplomacy/jobs so later decisions are based on the board
@@ -9381,7 +9586,7 @@
       if (resetCardEl && resetCardEl.setAttribute) resetCardEl.setAttribute("data-tone", resetAdvisorState.tone);
       if (resetEl) resetEl.textContent = resetAdvisorState.detail || resetAdvisorText;
       if (leaderEl) leaderEl.textContent = `👑 ${leaderPlanText}`;
-      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText}`;
+      if (craftEl) craftEl.textContent = `🧰 ${craftPlanText} · ${overflowPlanText} · ${parallelPlanText}`;
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (reserveStatusEl) reserveStatusEl.textContent = `🛡 ${reservePlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
@@ -9740,6 +9945,23 @@
       executePlan(resourceMap(), goalKey);
       return buyPlanText;
     },
+    craftTowardTarget(goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
+      craftTowardTarget(resourceMap(), goalKey);
+      return craftPlanText;
+    },
+    craftTowardParallelCandidates(goalKey = getGoal()) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
+      craftTowardParallelCandidates(resourceMap(), goalKey);
+      return parallelPlanText;
+    },
+    parallelReservationFloors(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return parallelReservationFloors(getTargetCached(resources, goalKey), resources);
+    },
     sprintCapDrainPacing(candidate) {
       resetTickCache();
       return sprintCapDrainPacing(candidate, resourceMap());
@@ -9752,6 +9974,7 @@
       activeScienceUnlockId = null;
       activeScienceUnlockContext = null;
       activePowerRecoveryId = null;
+      activeSprintPacingBoostId = null;
       const startedAt = Date.now() - Math.max(0, ageMs);
       activeTarget = candidate ? {
         id: targetId(candidate),
