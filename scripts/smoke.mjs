@@ -2255,7 +2255,11 @@ setKittens(40);
 const adv40 = dbg.resetAdvisor();
 check("Test S: sub-70 advisor still shows karma, not a negative efficiency", /karma if reset now/.test(adv40) && !/paragon-eff/.test(adv40));
 storage.set("kgh.speedrun.lastRestartLog", JSON.stringify(0));
-const resetLogsBeforeS = (logText().match(/new run detected/g) || []).length;
+// Count only entries newer than the current head: the log buffer is bounded
+// (LOG_STORAGE_LIMIT), so whole-buffer counts silently under-read whenever a
+// new entry evicts an old identical one off the tail.
+fakeNow += 30000;
+const logHeadBeforeS = (JSON.parse(logText() || "[]")[0]) || "";
 storage.set("kgh.speedrun.lastResetCount", JSON.stringify(0));
 storage.set("kgh.speedrun.runStart", JSON.stringify(fakeNow - 3600000));
 for (let i = 0; i < 3; i += 1) {
@@ -2263,8 +2267,12 @@ for (let i = 0; i < 3; i += 1) {
   setKittens(10);
   dbg.resetAdvisor();
 }
-const resetLogsAfterS = (logText().match(/new run detected/g) || []).length;
-check("Test S: reset advisor logs one restart for a stale low-kitten run, not every tick", resetLogsAfterS - resetLogsBeforeS === 1);
+const newLogEntriesS = [];
+for (const entry of JSON.parse(logText() || "[]")) {
+  if (entry === logHeadBeforeS) break;
+  newLogEntriesS.push(entry);
+}
+check("Test S: reset advisor logs one restart for a stale low-kitten run, not every tick", newLogEntriesS.length === 1 && /new run detected/.test(newLogEntriesS[0]));
 kittensArr.length = 0; for (const k of savedKittens) kittensArr.push(k);
 delete gamePage.totalResets;
 
@@ -2454,6 +2462,11 @@ buildings.push(weakTempleV, ratioAcademyV, directVaultV);
 const savedScienceV = { value: res("science").value, maxValue: res("science").maxValue };
 res("science").value = 105000;
 res("science").maxValue = 105000;
+// Pin the ETA inputs: this check ranks options by closure speed, so the wood
+// and minerals banks are part of the fixture, not incidental suite state.
+const savedStocksV = { wood: res("wood").value, minerals: res("minerals").value };
+res("wood").value = 5000;   // directVaultV's 4×1000 wood is fully banked → fastest
+res("minerals").value = 0;  // ratioAcademyV's 10×100 minerals must still accrue
 const capCandidatesV = [
   { kind: "research", meta: capBlockTech, affordable: false, progress: 0.72, score: 50 },
   ...[weakTempleV, ratioAcademyV, directVaultV].map((meta) => ({ kind: "build", meta, affordable: true, progress: 1, score: 10 })),
@@ -2467,6 +2480,8 @@ buildings.splice(buildings.indexOf(ratioAcademyV), 1);
 buildings.splice(buildings.indexOf(directVaultV), 1);
 res("science").value = savedScienceV.value;
 res("science").maxValue = savedScienceV.maxValue;
+res("wood").value = savedStocksV.wood;
+res("minerals").value = savedStocksV.minerals;
 
 /* =====================================================================
  * REGRESSION — power-aware science storage + sticky power recovery (Test Z)
@@ -3381,6 +3396,38 @@ const aeDetails = dbg.detailsText("balanced");
 check("Test AE: Now action explains the redirect", /grow Culture/i.test(aeNow) && /Theology/i.test(aeNow));
 check("Test AE: details spell out the trickle leg with rate and ETA", /Trickle leg:/.test(aeDetails) && /Culture/i.test(aeDetails));
 
+// v2.15.0 — the conveyor must keep RUNNING while redirected: a full culture
+// bank converts into Manuscripts the moment it fills.  In the live 62.54K-
+// science Chemistry stall the redirect target (Temple) had its own manuscript
+// bill banked, so craftTowardTarget stopped crafting entirely and +20.58/s of
+// culture wasted at the cap for good.  The sprint chain must craft from
+// everything ABOVE the producer's own direct bill.
+res("culture").value = 1150;    // bank at cap
+res("parchment").value = 53.45; // two crafts' worth ABOVE the producer's own 3.45 parchment bill
+const aeCraftText = dbg.craftTowardTarget("balanced");
+check("Test AE: redirected sprint still converts the full culture bank into Manuscripts", res("manuscript").value >= 2 && res("culture").value < 1150 && /Manuscript/i.test(aeCraftText));
+check("Test AE: conveyor crafts leave the redirect producer's own parchment bill banked", res("parchment").value >= 3.44);
+
+// v2.15.0 — the booster pick charges the producer's OWN bill in the trickling
+// resource.  A culture producer priced in Manuscripts (the live Temple: 81
+// manuscripts ≈ 11K culture) sets the sprint BACK unless its rate gain repays
+// that drain within the wait it claims to shorten.
+dbg.forceActiveTarget(null); // clears the sprint AND the sticky booster pick
+res("culture").value = 33;
+res("manuscript").value = 25; // above the drainer's 20-manuscript bill, below Theology's 35
+const cathedralAE = { name: "cathedralAE", label: "Cathedral", unlocked: true, val: 0, on: 0, prices: [{ name: "manuscript", val: 20 }], effects: { culturePerTickBase: 0.01 } };
+buildings.push(cathedralAE);
+const aeDrainDecision = dbg.selectStrategicTarget("balanced");
+check("Test AE: a culture producer priced in the culture chain cannot be the redirect pick", aeDrainDecision.layer === "Research sprint" && !!aeDrainDecision.sprintRedirect && aeDrainDecision.target?.meta?.name === "amphitheatreAE");
+cathedralAE.effects.culturePerTickBase = 0.2; // now the gain repays the drain well inside the wait
+dbg.forceActiveTarget(null);
+const aeRepayDecision = dbg.selectStrategicTarget("balanced");
+check("Test AE: the same producer wins the redirect once its gain repays its own drain", !!aeRepayDecision.sprintRedirect && aeRepayDecision.target?.meta?.name === "cathedralAE");
+buildings.splice(buildings.indexOf(cathedralAE), 1);
+res("manuscript").value = 0;
+dbg.forceActiveTarget(null);
+dbg.selectStrategicTarget("balanced"); // re-establish the plain Amphitheatre redirect for the checks below
+
 // Manual-queue takeover: a 5-second-old sprint lock must yield to the
 // player's actionable queued pick immediately — no score/ETA gate.
 // (The Mine was retired earlier at 999,999 wood; lift the wood cap so the
@@ -3536,6 +3583,71 @@ check("Test AH: pre-first-reset verdict names the 130-kitten milestone with live
 check("Test AH: the verdict details always state what a reset banks right now", /reset now banks \+.*paragon, \+.*karma/i.test(advTargetAH.detail));
 buildings.splice(buildings.indexOf(atelierAH), 1);
 buildings.splice(buildings.indexOf(bakeryAH), 1);
+
+/* ---------- Test AI (v2.15.0): parallel tiers — rank-order candidates whose
+   chains clear the reservation ledger are worked SIMULTANEOUSLY ----------
+   Live regression: the plan waited ~10 minutes on Temple's last 124 gold at
+   +0.2/s while the #1-ranked Harbour only missed 6.75 craftable Scaffold and
+   minerals income burned at its cap.  A candidate is parallel work, not a
+   rival, when its buy leaves every held bank intact — including the active
+   target's BANKED direct prices, which the ledger's `reserved` set drops. */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+kittensArr.length = 0; for (const k of savedKittens) kittensArr.push(k);
+delete gamePage.totalResets;
+const savedTechAI = techs.map((t) => ({ unlocked: t.unlocked, researched: t.researched }));
+for (const tech of techs) tech.researched = true; // no research sprints in this fixture
+const savedUpgradeAI = workshopUpgrades.map((u) => ({ unlocked: u.unlocked, researched: u.researched }));
+for (const upgrade of workshopUpgrades) upgrade.researched = true;
+
+const goldAI = R("goldAI", 300, 1000, "Auron");
+resources.push(goldAI);
+perTick.goldAI = 0.05; // reachable, but a slow trickle — the plan just waits
+const gildedTempleAI = { name: "gildedTempleAI", label: "Gilded Temple", unlocked: true, val: 0, on: 0, prices: [{ name: "goldAI", val: 800 }, { name: "slab", val: 200 }], effects: {} };
+const harbourAI = { name: "harbourAI", label: "Grand Harbour", unlocked: true, val: 0, on: 0, prices: [{ name: "slab", val: 80 }, { name: "minerals", val: 100 }], effects: { mineralsMax: 4000, woodMax: 4000 } };
+const goldShrineAI = { name: "goldShrineAI", label: "Gold Shrine", unlocked: true, val: 0, on: 0, prices: [{ name: "goldAI", val: 100 }], effects: { cultureMax: 4000 } };
+buildings.push(gildedTempleAI, harbourAI, goldShrineAI);
+const savedStocksAI = {
+  slab: res("slab").value, minerals: res("minerals").value, mineralsMax: res("minerals").maxValue,
+  wood: res("wood").value, science: res("science").value, mineralsRate: perTick.minerals,
+};
+res("slab").value = 205;      // covers the Temple's banked 200 — but NOT Harbour's 80 on top
+res("minerals").value = 7900; // idle surplus for Slab crafting
+res("minerals").maxValue = 8000;
+perTick.minerals = 0;         // idle bank, not "wasting income" → no storage-layer takeover
+res("wood").value = 200;      // keep the cheap base buildings out of surplus reach
+res("science").value = 100;
+
+dbg.forceActiveTarget(dbg.candidateById("build:gildedTempleAI"), "Economy / normal growth", 5000);
+const aiFloors = dbg.parallelReservationFloors("balanced");
+check("Test AI: floors hold the target's missing trickle AND its banked direct slabs", (aiFloors.goldAI || 0) >= 800 && (aiFloors.slab || 0) >= 200);
+const aiText1 = dbg.craftTowardParallelCandidates("balanced");
+check("Test AI: parallel pass crafts Slab for the rank-top Harbour from idle minerals", res("slab").value > 205 && res("minerals").value < 7900 && /Slab/i.test(aiText1));
+check("Test AI: the diagnostics report carries the Parallel line", /Parallel: /.test(dbg.report()));
+
+res("slab").value = 280; // top the bank up to Harbour's bill ABOVE the banked 200
+fakeNow += 5000;
+dbg.craftTowardParallelCandidates("balanced");
+check("Test AI: the parallel buy completes Harbour while every floor stays intact", harbourAI.val === 1 && res("slab").value >= 200 && res("goldAI").value >= 300);
+check("Test AI: the parallel buy is logged with its rank and the protected plan", /parallel build .*Harbour/i.test(logText()));
+check("Test AI: a rival dipping the held gold bank is never parallel work", goldShrineAI.val === 0);
+check("Test AI: the plan target itself is untouched by the parallel pass", gildedTempleAI.val === 0);
+
+buildings.splice(buildings.indexOf(gildedTempleAI), 1);
+buildings.splice(buildings.indexOf(harbourAI), 1);
+buildings.splice(buildings.indexOf(goldShrineAI), 1);
+resources.splice(resources.indexOf(goldAI), 1);
+delete perTick.goldAI;
+res("slab").value = savedStocksAI.slab;
+res("minerals").value = savedStocksAI.minerals;
+res("minerals").maxValue = savedStocksAI.mineralsMax;
+res("wood").value = savedStocksAI.wood;
+res("science").value = savedStocksAI.science;
+perTick.minerals = savedStocksAI.mineralsRate;
+techs.forEach((t, i) => { t.unlocked = savedTechAI[i].unlocked; t.researched = savedTechAI[i].researched; });
+workshopUpgrades.forEach((u, i) => { u.unlocked = savedUpgradeAI[i].unlocked; u.researched = savedUpgradeAI[i].researched; });
+dbg.forceActiveTarget(null);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
