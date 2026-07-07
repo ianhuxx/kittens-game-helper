@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.16.0
+// @version      2.16.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.16.0";
+  const HELPER_VERSION = "2.16.1";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -3927,8 +3927,17 @@
       return { reachable: true, eta: prod > 0 ? deficit / prod : waitSecondsForZebraTitanium(deficit, resources), chain };
     }
     if (CAPPED_REFILL_RESOURCES.has(name)) {
-      if (max > 0 && amount > max) return { reachable: true, eta: prod > 0 ? deficit / prod : 0, chain };
-      return { reachable: prod > 0, eta: prod > 0 ? deficit / prod : Number.POSITIVE_INFINITY, reason: `no ${resTitle(resources, name)} refill`, chain };
+      // Faith has its own religion-banking safety rules (food stress, non-faith
+      // gates, background priest trickle). Do not make those long projects look
+      // structurally active just because priests could be reassigned; ordinary
+      // capped banks like science can use the generic job-path fallback.
+      const hasJobPath = name !== "faith" && resourceHasDirectJobPath(name);
+      const jobRate = hasJobPath ? directJobRatePerSecondFor(name) : 0;
+      const refillRate = prod > 0 ? prod : (jobRate > 0 ? jobRate : 0);
+      const reachable = prod > 0 || hasJobPath;
+      const eta = refillRate > 0 ? deficit / refillRate : (hasJobPath ? deficit : Number.POSITIVE_INFINITY);
+      if (max > 0 && amount > max) return { reachable, eta, reason: reachable ? undefined : `no ${resTitle(resources, name)} refill`, chain };
+      return { reachable, eta, reason: reachable ? undefined : `no ${resTitle(resources, name)} refill`, chain };
     }
     // A staffable resource (minerals with every miner temporarily pulled to
     // another job, catnip with no farmers in autumn, …) is never a dead end:

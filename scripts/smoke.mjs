@@ -3679,7 +3679,7 @@ techs.push(electricityAJ);
 const savedResAJ = ["science", "culture", "compedium", "manuscript", "parchment", "furs", "ivory", "manpower", "catnip", "wood", "minerals"].map((name) => ({
   name, value: res(name).value, maxValue: res(name).maxValue,
 }));
-const savedPerTickAJ = { culture: perTick.culture, catnip: perTick.catnip, manpower: perTick.manpower, wood: perTick.wood };
+const savedPerTickAJ = { culture: perTick.culture, catnip: perTick.catnip, manpower: perTick.manpower, wood: perTick.wood, science: perTick.science };
 const savedVillageAJ = {
   happiness: village.happiness,
   getKittens: village.getKittens,
@@ -3743,6 +3743,26 @@ dbg.selectStrategicTarget("balanced");
 const ajCycleNeeds = dbg.resourceNeeds("balanced");
 check("Test AJ: scholars keep cycling the science bank while intermediates consume it (bank > final price)", (ajCycleNeeds.needs?.science || 0) > 0);
 
+// A queued chain target must not become "impossible" just because the capped
+// refill bank's producing job is temporarily at zero workers. Live, a manual
+// Electricity chain can put all workers on hunters/culture while Compendia are
+// still missing; science then reads +0/s until the job balancer rotates scholars
+// back, but the target is still structurally reachable.
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+perTick.science = 0;
+job("scholar").value = 0;
+res("science").value = 30000;
+res("science").maxValue = 78000;
+res("compedium").value = 17.8;
+dbg.queueAdd("research:electricityAJ", 0);
+const ajZeroProdCandidate = dbg.candidateById("research:electricityAJ");
+const ajZeroProdSolver = dbg.solveChain(ajZeroProdCandidate);
+const ajZeroProdFeasibility = dbg.classifyTargetFeasibility(ajZeroProdCandidate);
+const ajZeroProdDecision = dbg.selectStrategicTarget("balanced");
+check("Test AJ: zero-current-production capped bank with a job path is still reachable", ajZeroProdSolver.reachable && ajZeroProdFeasibility.status !== "IMPOSSIBLE");
+check("Test AJ: manual queued chain target stays in Manual queue while its refill job is temporarily unstaffed", ajZeroProdDecision.layer === "Manual queue" && ajZeroProdDecision.target?.meta?.name === "electricityAJ");
+
 // Generic path (non-research target): a craftable price no job produces must
 // not become a dead "manuscript" bottleneck key either — its pressure flows
 // through the chain (culture/furs), so the leader/jobs report stays honest.
@@ -3777,6 +3797,7 @@ perTick.culture = savedPerTickAJ.culture;
 perTick.catnip = savedPerTickAJ.catnip;
 perTick.manpower = savedPerTickAJ.manpower;
 perTick.wood = savedPerTickAJ.wood;
+perTick.science = savedPerTickAJ.science;
 village.happiness = savedVillageAJ.happiness;
 village.getKittens = savedVillageAJ.getKittens;
 village.getFreeKittens = savedVillageAJ.getFreeKittens;
