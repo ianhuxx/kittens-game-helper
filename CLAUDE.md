@@ -202,6 +202,30 @@ Key invariants (see comments in the source for the why):
   (`boosterPacingSelfDrain`): `(missing + drain)/(prod + gain)` must beat the
   plain wait, so a Temple priced in 81 manuscripts (≈11K culture) can never be
   chosen to "grow culture" it consumes. Test AE pins both directions.
+- **Chain jobs follow a chain-gated research target across EVERY layer**
+  (v2.16.0). `researchSprintJobNeeds` used to engage only when the
+  Research-sprint LAYER owned the plan, so a manual-queue Electricity pick
+  (science capped, 67 Compendium → 1K Manuscript → 8K Parchment → ~450K furs)
+  fell through to the generic job scorer: 33 Woodcutters/19 Miners chased the
+  low wood bank and the rank-2 lookahead candidates while 9 Hunters starved
+  the fur chain that actually paced the plan. Now ANY unaffordable research
+  target still chain-gated (`researchChainGated`) gets the sprint's chain
+  jobs regardless of layer, with four supporting rules keeping the flood
+  honest: (1) `targetFurDeficit` (leaf-name `rawPathRequirements`) measures
+  the plan's outstanding fur bill, and while it is positive the
+  "furs stocked + happy village" busywork clamp and the catpower near-cap
+  hard-zero both yield — a 450K-fur bill is a pacer, not busywork; (2)
+  scholars keep cycling the science bank during the intermediate phase
+  (`sharedInputs` carries science) even when the bank exceeds the tech's
+  final price, since compendium/blueprint crafts spend far past it; (3) a
+  craftable intermediate no job produces (compendium/manuscript/parchment) is
+  NEVER written into `needs` by the climb push (sprint AND generic paths) —
+  dead keys staffed nobody but won the bottleneck sort and mislabeled the
+  leader/jobs lines; (4) when hunting is the top need the leader promotes the
+  Manager trait over the static research→Scientist preference, and the job
+  smoothing reset keys on `chainContext` so a queue takeover re-staffs
+  immediately instead of decaying the old wood-heavy split over many ticks.
+  Test AJ pins all of it against the live save.
 - **Rank-order candidates form parallel tiers and are worked simultaneously**
   (v2.15.0). While the plan target waits on a non-craftable trickle (Temple's
   last 124 gold at +0.2/s), `craftTowardParallelCandidates` (runs after the

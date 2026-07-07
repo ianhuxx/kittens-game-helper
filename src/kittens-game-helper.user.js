@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.15.0
+// @version      2.16.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.15.0";
+  const HELPER_VERSION = "2.16.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2460,17 +2460,20 @@
   const isFoodEmergency = (resources) =>
     !!resources && resRatio(resources, "catnip") < 0.05 && productionFor("catnip") < 0;
 
-  const rawPathRequirements = (name, amount, out = {}, depth = 0) => {
+  // keepLeafNames: key leaves by the resource itself ("furs") instead of the
+  // job-need name ("manpower") — callers that must tell a hunt-refilled fur
+  // bill apart from generic catpower pressure need the un-folded name.
+  const rawPathRequirements = (name, amount, out = {}, depth = 0, keepLeafNames = false) => {
     if (depth > 5 || !isFinite(amount) || amount <= 0) return out;
     const craft = craftByName(name);
     if (!craft || resourceHasDirectJobPath(name)) {
-      const raw = rawWorkNeedName(name);
+      const raw = keepLeafNames ? name : rawWorkNeedName(name);
       out[raw] = (out[raw] || 0) + amount;
       return out;
     }
     const prices = craftPricesFor(craft).filter((p) => p && p.name && p.val > 0);
     if (!prices.length) {
-      const raw = rawWorkNeedName(name);
+      const raw = keepLeafNames ? name : rawWorkNeedName(name);
       out[raw] = (out[raw] || 0) + amount;
       return out;
     }
@@ -2485,9 +2488,27 @@
       const inputStock = craftByName(price.name)
         ? Math.max(0, (((getRes(resources, price.name) || {}).value) || 0) - craftFloorFor(resources, price.name))
         : 0;
-      rawPathRequirements(price.name, Math.max(0, inputNeed - inputStock), out, depth + 1);
+      rawPathRequirements(price.name, Math.max(0, inputNeed - inputStock), out, depth + 1, keepLeafNames);
     }
     return out;
+  };
+
+  // The active plan's outstanding FURS bill beyond current stock.  A queued
+  // Electricity (67 Compendium → 1K Manuscript → 8K Parchment → ~450K furs)
+  // is paced by hunting even while the furs BANK looks "healthy" against the
+  // small luxury/mood target — so the busywork clamp that stands hunters down
+  // on a stocked fur bank must yield to a live chain deficit, and near-cap
+  // catpower must not hard-zero the hunters mid hunt-cycle.
+  const targetFurDeficit = (target, resources) => {
+    if (!target || target.affordable || !target.meta) return 0;
+    const raw = {};
+    for (const cost of pricesFor(target.kind, target.meta)) {
+      if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0 || !craftByName(cost.name)) continue;
+      const missing = cost.val - resValueOf(resources, cost.name);
+      if (missing > 0) rawPathRequirements(cost.name, missing, raw, 0, true);
+    }
+    if (!(raw.furs > 0)) return 0;
+    return Math.max(0, raw.furs - Math.max(0, resValueOf(resources, "furs")));
   };
 
   const scoreRawDeficits = (needs, resources, requirements, baseWeight) => {
@@ -5956,17 +5977,25 @@
 
     // Hunters: boosted when furs / parchment / manuscript / compendium is the
     // live bottleneck (catpower turns into furs turns into the whole chain).
+    // The passed chain can be sparse (a queue pick's solver may only carry the
+    // top-level craft), so the live fur bill is the authoritative signal.
     const hasShortCraftCost = pricesFor(target.kind, target.meta).some((c) =>
       c && c.name && c.val > 0 && craftByName(c.name) && resValueOf(resources, c.name) < c.val);
     const chainNeedsFurs = hasShortCraftCost &&
-      ["furs", "parchment", "manuscript", "compedium", "compendium"].some((name) => chain.has(name));
+      (["furs", "parchment", "manuscript", "compedium", "compendium"].some((name) => chain.has(name)) ||
+        targetFurDeficit(target, resources) > 0);
     if (chainNeedsFurs && jobByName("hunter")) scoreNeed(needs, "manpower", 26);
 
-    // Scholars: 0 while science is capped; allowed only when science is genuinely
-    // the refill bottleneck — below the final research cost AND not near cap.
+    // Scholars: 0 while science is capped; allowed when science is genuinely
+    // the refill bottleneck — below the final research cost — OR while the
+    // intermediate phase CYCLES science through crafts (a Compendium bill
+    // spends the bank far past the final cost, so the bank must be refilled
+    // between crafts even when it currently exceeds the tech's own price).
     const sciCost = researchScienceCost(target.meta);
     const sciHave = resValueOf(resources, "science");
-    if (jobByName("scholar") && !isNearResourceCap(resources, "science") && sciHave < sciCost) {
+    const phase = researchTargetPhase(target, resources);
+    const scienceCycles = phase.phase === "intermediate" && phase.sharedInputs.has("science");
+    if (jobByName("scholar") && !isNearResourceCap(resources, "science") && (sciHave < sciCost || scienceCycles)) {
       scoreNeed(needs, "science", 6);
     }
 
@@ -5991,12 +6020,18 @@
       if (resRatio(resources, name) > 0.94) needs[name] = 0;
     }
     for (const name of Object.keys(climbNeeds)) {
+      // A craftable intermediate NO job produces (compendium / manuscript /
+      // parchment) must never become a needs key: no job matches it, so the
+      // weight staffs nobody — but it wins the "bottleneck" sort and points
+      // the leader/diagnostics at a phantom job.  Its real pressure already
+      // flowed through the craft-chain scoring above (science/culture/furs).
+      if (craftByName(name) && !resourceHasDirectJobPath(name)) continue;
       if (resRatio(resources, name) > 0.9) {
         const key = name === "catpower" ? "manpower" : name;
         needs[key] = Math.max(needs[key] || 0, CLIMB_PUSH_WEIGHT);
       }
     }
-    return { needs, target };
+    return { needs, target, chainContext: `research-chain:${(target.meta && target.meta.name) || targetId(target)}` };
   };
 
   const resourceNeeds = (goalKey, resources) => {
@@ -6011,6 +6046,23 @@
     const sprintRedirected = lastStrategicDecision && lastStrategicDecision.sprintRedirect;
     if (sprint && sprint.candidate && !sprintRedirected && !target?.affordable) {
       return researchSprintJobNeeds(sprint, resources);
+    }
+    // A chain-gated research target owns the chain jobs no matter WHICH layer
+    // holds the plan.  The live v2.15 stall: a manual-queue Electricity pick
+    // (67 Compendium → 1K Manuscript → 8K Parchment → furs) fell through to
+    // this generic scorer, which staffed 33 woodcutters and 19 miners for the
+    // low wood bank and the rank-2 lookahead candidates while 9 hunters
+    // starved the fur chain that actually paced the plan.  Chain-gated
+    // research (a craftable price still short) gets the exact hunter/scholar
+    // chain jobs a sprint contract gets; plain science-bank techs keep the
+    // generic path below (its scholar clauses already cover them).
+    if (!sprintRedirected && target && !target.affordable && target.kind === "research" &&
+        target.meta && researchChainGated(target.meta, resources)) {
+      const contract = {
+        candidate: target,
+        protectedChain: (lastStrategicDecision && lastStrategicDecision.protectedChain) || candidateCraftChainResources(target),
+      };
+      return researchSprintJobNeeds(contract, resources);
     }
     jobSuppressText = "";
     if (target && !target.affordable) {
@@ -6186,6 +6238,13 @@
       if (resRatio(resources, name) > 0.96) needs[name] = Math.min(needs[name] || 0, 0.25);
     }
     for (const name of Object.keys(climbNeeds)) {
+      // Same phantom-key guard as the sprint path: a craftable intermediate
+      // no job produces (compendium / manuscript / parchment) staffs nobody,
+      // yet the uncapped-resource ratio fallback (1) always trips the >0.9
+      // test — the dead key then wins the bottleneck sort and mislabels the
+      // leader/jobs line.  Its pressure already flowed through the craft
+      // chain scoring above.
+      if (craftByName(name) && !resourceHasDirectJobPath(name)) continue;
       if (resRatio(resources, name) > 0.9) {
         const key = name === "catpower" ? "manpower" : name;
         needs[key] = Math.max(needs[key] || 0, CLIMB_PUSH_WEIGHT);
@@ -6261,11 +6320,15 @@
     const totalWorkers = Math.max(0, Math.floor(village.getDiligentKittens ? village.getDiligentKittens() : village.getKittens()));
     const reserved = (jobByName("engineer") && jobByName("engineer").value) || 0;
     const total = Math.max(0, totalWorkers - reserved);
-    const { needs, target } = resourceNeeds(goalKey, resources);
+    const { needs, target, chainContext } = resourceNeeds(goalKey, resources);
     // Resources the active target still needs to climb toward within the cap are
     // exempt from the per-job cap anti-waste below, so the producing job keeps
     // working through the final push instead of hard-zeroing a few units short.
     const climbNeeds = targetClimbNeeds(target, resources);
+    // A live fur bill in the plan's craft chain means hunting IS the plan:
+    // the "furs are stocked, stand hunters down" clamp and the catpower
+    // near-cap hard-zero must both yield while it is outstanding.
+    const planFurDeficit = targetFurDeficit(target, resources);
     const weights = {};
     // Jobs whose output bank is full are HARD-zeroed: a scholar on a capped
     // science bank produces pure waste, so it leaves immediately instead of
@@ -6290,12 +6353,17 @@
       // essentially full — unless the economy still wants it (hunting keeps
       // luxuries/mood up even when catpower is high).
       const keepForEconomy = needKey === "manpower" && huntingEconomyNeed(resources) > 0.5;
-      const climbing = !!(climbNeeds[needKey] || (needKey === "manpower" && climbNeeds.catpower));
+      const climbing = !!(climbNeeds[needKey] ||
+        (needKey === "manpower" && (climbNeeds.catpower || planFurDeficit > 0)));
       if (resRatio(resources, needKey, 0) > 0.94 && !keepForEconomy && !climbing) { weight = 0; cappedZeroJobs.add(job.name); }
       // Hunting beyond the luxury/mood need is busywork: when furs are well
       // stocked and the village is happy, crafting-chain pressure (parchment →
       // furs → catpower) must not march half the settlement into the woods.
-      if (job.name === "hunter" && huntingEconomyNeed(resources) <= 0.5) {
+      // EXCEPT when the active plan's chain still owes furs beyond the bank:
+      // a 450K-fur Compendium bill is a plan pacer, not busywork, and the
+      // clamp would freeze the flood the moment the bank passed the small
+      // luxury/mood target.
+      if (job.name === "hunter" && huntingEconomyNeed(resources) <= 0.5 && planFurDeficit <= 0) {
         const furs = getRes(resources, "furs");
         const fursHealthy = furs && (furs.value || 0) > luxuryStockTarget(resources, "furs") * 2;
         if (fursHealthy && currentHappinessRatio() >= 1) weight = Math.min(weight, 2.5);
@@ -6335,13 +6403,14 @@
       if (fallback) weights[fallback.name] = 1;
     }
 
-    // When entering, leaving, or switching a research sprint, the prior smoothed
-    // distribution must NOT linger — reset it so the new chain's jobs take over
-    // immediately instead of decaying the old priest/farmer-heavy split over many
-    // ticks.  (Within steady economy mode the sprint id stays "", so ordinary
-    // target changes never reset the smoothing and the village does not churn.)
-    const jobContext = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint && lastStrategicDecision.sprint
-      ? lastStrategicDecision.sprint.id : "";
+    // When entering, leaving, or switching a research chain-jobs contract
+    // (sprint OR a chain-gated research target under the manual queue), the
+    // prior smoothed distribution must NOT linger — reset it so the new
+    // chain's jobs take over immediately instead of decaying the old
+    // wood/miner-heavy split over many ticks.  (Within steady economy mode
+    // the context stays "", so ordinary target changes never reset the
+    // smoothing and the village does not churn.)
+    const jobContext = chainContext || "";
     if (jobContext !== lastJobContext) {
       smoothedJobWeights = {};
       lastJobContext = jobContext;
@@ -6422,9 +6491,7 @@
       }
     }
 
-    const sprint = lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.researchSprint
-      ? lastStrategicDecision.sprint : null;
-    if (sprint && (needs.manpower || 0) > 0) {
+    if (chainContext && (needs.manpower || 0) > 0) {
       jobPlanText = `Jobs: Hunters for furs/parchment/compendium`;
     } else {
       const needLine = Object.entries(needs)
@@ -9145,6 +9212,15 @@
     const bottleneck = bestNeed ? bestNeed[0] : "balanced";
     const targetJob = bestNeed ? (RES_JOB[bestNeed[0]] || bestNeed[0]) : "engineer";
     const traits = desiredLeaderTraits(goalKey, resources);
+    // When hunting paces the plan (the fur-chain flood makes manpower the top
+    // need), a Manager multiplies every hunt's yield, while the static
+    // research preference (Scientist) boosts scholars parked at 0 on a capped
+    // science bank — promote the hunting trait to the front of the list.
+    if (targetJob === "hunter") {
+      const managerAt = traits.indexOf("manager");
+      if (managerAt >= 0) traits.splice(managerAt, 1);
+      traits.unshift("manager");
+    }
     const kittens = village.sim.kittens.filter((kitten) => kitten && kitten.trait && kitten.trait.name && kitten.trait.name !== "none");
     const targetLabel = target ? labelOf(target.meta) : GOALS[goalKey].label;
     let best = null;
@@ -9881,6 +9957,14 @@
     resourceNeeds(goalKey = getGoal()) {
       resetTickCache();
       return resourceNeeds(goalKey, resourceMap());
+    },
+    desiredJobCounts(goalKey = getGoal()) {
+      resetTickCache();
+      return desiredJobCounts(goalKey, resourceMap());
+    },
+    leaderOpportunity(goalKey = getGoal()) {
+      resetTickCache();
+      return leaderOpportunity(goalKey, resourceMap());
     },
     solveChain(candidate) {
       return solveCraftChain(resourceMap(), candidate);
