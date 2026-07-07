@@ -3649,6 +3649,142 @@ techs.forEach((t, i) => { t.unlocked = savedTechAI[i].unlocked; t.researched = s
 workshopUpgrades.forEach((u, i) => { u.unlocked = savedUpgradeAI[i].unlocked; u.researched = savedUpgradeAI[i].researched; });
 dbg.forceActiveTarget(null);
 
+/* ---------------------------------------------------------------------
+ * Test AJ — chain jobs follow a research target across ALL layers (v2.16.0).
+ * Live regression: a manual-queue Electricity pick (science capped, 67
+ * Compendium → 1K Manuscript → 8K Parchment → ~450K furs) fell through to
+ * the GENERIC job scorer because only the Research-sprint LAYER routed into
+ * researchSprintJobNeeds.  The village kept 33 Woodcutters / 19 Miners for
+ * the low wood bank and the rank-2 lookahead candidates while 9 Hunters
+ * starved the fur chain that actually paced the plan; the leader read
+ * "bottleneck wood; job wood" and the jobs line showed a phantom
+ * "compendium" need no job can staff.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+
+const savedTechAJ = techs.map((t) => ({ unlocked: t.unlocked, researched: t.researched }));
+for (const tech of techs) tech.researched = true;
+const electricityAJ = {
+  name: "electricityAJ",
+  label: "Electricity",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 71250 }, { name: "compedium", val: 100 }],
+  unlocks: { buildings: ["factory"] },
+};
+techs.push(electricityAJ);
+
+const savedResAJ = ["science", "culture", "compedium", "manuscript", "parchment", "furs", "ivory", "manpower", "catnip", "wood", "minerals"].map((name) => ({
+  name, value: res(name).value, maxValue: res(name).maxValue,
+}));
+const savedPerTickAJ = { culture: perTick.culture, catnip: perTick.catnip, manpower: perTick.manpower, wood: perTick.wood };
+const savedVillageAJ = {
+  happiness: village.happiness,
+  getKittens: village.getKittens,
+  getFreeKittens: village.getFreeKittens,
+  jobs: jobs.map((j) => [j, j.value]),
+};
+res("science").value = 78000; res("science").maxValue = 78000;   // capped; 71250 still fits → not storage-blocked
+res("culture").value = 12000; res("culture").maxValue = 12000;   // capped cap-drain bank, refills passively
+res("compedium").value = 17.8;
+res("manuscript").value = 18;
+res("parchment").value = 10;
+res("furs").value = 5000;   // WELL above the ~324 luxury target ×2 — the busywork clamp would fire without the fur-bill exemption
+res("ivory").value = 5000;  // luxuries stocked + happy village → huntingEconomyNeed ≈ 0, so ONLY the chain justifies hunters
+res("manpower").value = 2800; res("manpower").maxValue = 4000;
+res("catnip").value = 111000; res("catnip").maxValue = 222000;
+res("wood").value = 223; res("wood").maxValue = 107000;          // near-empty wood bank — the old scorer's siren
+res("minerals").value = 19000; res("minerals").maxValue = 143000;
+perTick.culture = 11;
+perTick.catnip = 200;
+perTick.manpower = 2;
+perTick.wood = 0.1;
+village.happiness = 1.18;
+village.getKittens = () => 81;
+village.getFreeKittens = () => 0;
+job("woodcutter").value = 33; job("farmer").value = 17; job("hunter").value = 9;
+job("miner").value = 19; job("scholar").value = 0; job("priest").value = 2; job("geologist").value = 1;
+dbg.clearResourceTelemetry?.();
+
+dbg.queueAdd("research:electricityAJ", 0);
+const ajDecision = dbg.selectStrategicTarget("balanced");
+check("Test AJ: the queued chain-gated tech drives the plan through the Manual queue layer", ajDecision.layer === "Manual queue" && ajDecision.target?.meta?.name === "electricityAJ");
+const ajNeeds = dbg.resourceNeeds("balanced");
+check("Test AJ: a manual-queue research target gets the sprint's chain jobs (hunter flood)", (ajNeeds.needs?.manpower || 0) >= 26 && !!ajNeeds.chainContext);
+const ajTopNeed = Object.entries(ajNeeds.needs || {}).filter(([, w]) => w > 0).sort((a, b) => b[1] - a[1])[0];
+check("Test AJ: manpower (hunting) is the TOP need — wood/minerals no longer outrank the fur chain", ajTopNeed?.[0] === "manpower");
+check("Test AJ: no phantom craft-resource keys pollute the needs (compendium/manuscript/parchment)", !ajNeeds.needs?.compedium && !ajNeeds.needs?.manuscript && !ajNeeds.needs?.parchment);
+const ajDesired = dbg.desiredJobCounts("balanced");
+check("Test AJ: the village floods hunters despite a 'healthy' fur bank (chain deficit overrides the busywork clamp)", (ajDesired.hunter || 0) >= 40 && (ajDesired.hunter || 0) > (ajDesired.woodcutter || 0) + (ajDesired.miner || 0));
+check("Test AJ: the jobs line names the hunt chain, not wood", /Hunters for furs\/parchment\/compendium/.test(dbg.report()));
+const ajLeader = dbg.leaderOpportunity("balanced");
+check("Test AJ: leader bottleneck follows the chain — hunter job, Manager trait promoted first", ajLeader?.bottleneck === "manpower" && ajLeader?.targetJob === "hunter" && ajLeader?.traits?.[0] === "manager");
+
+// Scholar cap-cycling: a tech whose intermediate SPENDS science (Blueprint =
+// 25K science + 25 compendium) must keep scholars refilling the bank between
+// crafts even while the bank still exceeds the tech's own final price.
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+const roboticsAJ = {
+  name: "roboticsAJ",
+  label: "Robotics",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 71250 }, { name: "blueprint", val: 5 }],
+  unlocks: { buildings: ["factory"] },
+};
+techs.push(roboticsAJ);
+res("blueprint") && (res("blueprint").value = 0);
+res("science").value = 72000; // above the 71250 final price, below the 94% anti-waste line
+dbg.queueAdd("research:roboticsAJ", 0);
+dbg.selectStrategicTarget("balanced");
+const ajCycleNeeds = dbg.resourceNeeds("balanced");
+check("Test AJ: scholars keep cycling the science bank while intermediates consume it (bank > final price)", (ajCycleNeeds.needs?.science || 0) > 0);
+
+// Generic path (non-research target): a craftable price no job produces must
+// not become a dead "manuscript" bottleneck key either — its pressure flows
+// through the chain (culture/furs), so the leader/jobs report stays honest.
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+techs.forEach((t, i) => { if (i < savedTechAJ.length) { t.unlocked = savedTechAJ[i].unlocked; t.researched = savedTechAJ[i].researched; } });
+for (const tech of techs) if (tech !== electricityAJ && tech !== roboticsAJ) tech.researched = true;
+electricityAJ.researched = true; roboticsAJ.researched = true;
+const scriptoriumAJ = {
+  name: "scriptoriumAJ",
+  label: "Scriptorium",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "wood", val: 100 }, { name: "manuscript", val: 10 }],
+  effects: { cultureMax: 100 },
+};
+buildings.push(scriptoriumAJ);
+res("manuscript").value = 0;
+res("wood").value = 5000;
+dbg.forceActiveTarget(dbg.candidateById("build:scriptoriumAJ"), "Economy / normal growth", 0);
+const ajBuildNeeds = dbg.resourceNeeds("balanced");
+check("Test AJ: generic path drops the phantom manuscript key for a manuscript-priced building", !ajBuildNeeds.needs?.manuscript && !!ajBuildNeeds.target);
+buildings.splice(buildings.indexOf(scriptoriumAJ), 1);
+
+// Restore the board.
+techs.splice(techs.indexOf(roboticsAJ), 1);
+techs.splice(techs.indexOf(electricityAJ), 1);
+techs.forEach((t, i) => { if (i < savedTechAJ.length) { t.unlocked = savedTechAJ[i].unlocked; t.researched = savedTechAJ[i].researched; } });
+for (const saved of savedResAJ) { res(saved.name).value = saved.value; res(saved.name).maxValue = saved.maxValue; }
+perTick.culture = savedPerTickAJ.culture;
+perTick.catnip = savedPerTickAJ.catnip;
+perTick.manpower = savedPerTickAJ.manpower;
+perTick.wood = savedPerTickAJ.wood;
+village.happiness = savedVillageAJ.happiness;
+village.getKittens = savedVillageAJ.getKittens;
+village.getFreeKittens = savedVillageAJ.getFreeKittens;
+for (const [j, v] of savedVillageAJ.jobs) j.value = v;
+dbg.clearResourceTelemetry?.();
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);
