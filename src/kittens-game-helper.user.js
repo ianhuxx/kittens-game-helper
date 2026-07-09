@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.16.1
+// @version      2.17.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.16.1";
+  const HELPER_VERSION = "2.17.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4636,8 +4636,45 @@
 
   const STAGE_PAYBACK_HORIZON_SECONDS = 6 * 60 * 60;
   const STAGE_COOLDOWN_MS = 10 * 60 * 1000;
+  // A stage change burns half the old stack, so flapping back is genuinely
+  // expensive: after any transition the REVERSE direction stays blocked much
+  // longer than the general per-building cooldown. Seasonal pressure swings
+  // (winter catnip dips) must not churn Solar Farm ↔ Pasture every cycle —
+  // the farmer failsafe owns transient food dips, not the stage layer.
+  const STAGE_REVERSE_COOLDOWN_MS = 60 * 60 * 1000;
+  // Rebuild downtime model: with the net bill banked before the sell, parity
+  // copies go back up at roughly one executor buy per plan tick.
+  const STAGE_REBUILD_SECONDS_PER_COPY = 4;
+  const STAGE_GATHER_FLOOR_SECONDS = 30;
   const stageCooldownUntil = Object.create(null);
-  let pendingStageRebuild = null;
+  const stageReverseGuard = Object.create(null);
+  const STAGE_REBUILD_KEY = "kgh.stageRebuild";
+  // The sell half of a stage change must survive a page reload — otherwise
+  // the refunded bank loses its atomic-rebuild reservation and surplus buys
+  // eat it before effect parity is restored.
+  let pendingStageRebuild = (() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(STAGE_REBUILD_KEY) || "null");
+      return stored && typeof stored.buildingName === "string" && isFinite(stored.stage) && isFinite(stored.targetCount)
+        ? stored : null;
+    } catch (error) {
+      return null;
+    }
+  })();
+  const setPendingStageRebuild = (value) => {
+    pendingStageRebuild = value;
+    try {
+      if (value) {
+        localStorage.setItem(STAGE_REBUILD_KEY, JSON.stringify({
+          buildingName: value.buildingName, stage: value.stage, targetCount: value.targetCount, startedAt: value.startedAt,
+        }));
+      } else {
+        localStorage.removeItem(STAGE_REBUILD_KEY);
+      }
+    } catch (error) {
+      /* storage unavailable — the contract stays in-memory */
+    }
+  };
 
   const profileFromEffects = (effects) => {
     const profile = emptyEffectProfile();
@@ -4665,6 +4702,25 @@
       /* static stage metadata remains usable */
     }
     return { ...clone, ...(clone.stages[bounded] || {}), stage: bounded };
+  };
+
+  // Watts have utility only when the live grid actually consumes them —
+  // otherwise a Hydro Plant would outrank the Aqueduct's catnip before
+  // electricity even exists, and the free post-reset downgrade back to the
+  // catnip stage could never win. A strained grid values each new Wt far
+  // above an overbuilt one; the winter production floor keeps solar-style
+  // generators honest. Without this credit generator stages read as worth
+  // ~nothing, so Aqueduct→Hydro Plant could literally never pass the utility
+  // gate while a spurious generator DOWNGRADE could (held back only by the
+  // hard power veto).
+  const stageEnergyUtility = (watts) => {
+    if (!(watts > 0)) return 0;
+    const power = powerStatus();
+    const demand = Math.max(0, power.cons);
+    if (!(demand > 0)) return 0;
+    const supply = Math.max(0, Math.min(power.prod, power.winterProd));
+    const tightness = Math.min(2, demand / Math.max(1, supply));
+    return Math.min(30, (watts / Math.max(1, supply + watts)) * 12 * (0.5 + tightness));
   };
 
   const stageUnitUtility = (view, resources) => {
@@ -4704,6 +4760,7 @@
     }
     utility += Math.max(0, profile.housing || 0) * 8;
     utility += Math.max(0, profile.happiness || 0) * 5;
+    utility += stageEnergyUtility(profile.energyProduction || 0);
     const effects = (view && view.effects) || {};
     utility -= Math.max(0, effects.energyConsumption || 0) * 0.8;
     for (const [key, value] of Object.entries(effects)) {
@@ -4784,6 +4841,38 @@
     return refund;
   };
 
+  // Live seconds to fund ONE more copy at the given stage/count — the common
+  // denominator for comparing growth rates across stages. The floor keeps an
+  // already-banked price from reading as an infinite build rate.
+  const stageCopyGatherSeconds = (raw, stage, count, resources) => {
+    const view = stageMetaView(raw, stage) || {};
+    const model = currentStagePriceModel(raw);
+    const ratio = stage === model.stage ? model.ratio : Math.max(1, Number(view.priceRatio || raw.priceRatio) || 1);
+    let seconds = 0;
+    for (const price of view.prices || []) {
+      if (!price || !price.name || !(price.val > 0)) continue;
+      const modifier = Object.prototype.hasOwnProperty.call(model.modifiers, price.name) ? model.modifiers[price.name] : 1;
+      const reach = capDrainReachabilityFor(resources, price.name, price.val * Math.pow(ratio, Math.max(0, count)) * modifier);
+      if (!reach.reachable) return Number.POSITIVE_INFINITY;
+      seconds = Math.max(seconds, reach.eta || 0);
+    }
+    return Math.max(STAGE_GATHER_FLOOR_SECONDS, seconds);
+  };
+
+  // Seconds until remainder·t + ½·growth·t² covers `loss` utility-seconds —
+  // a standing utility surplus recoups linearly, a growth-rate advantage
+  // quadratically, and a decaying advantage may never get there.
+  const recoupSeconds = (loss, linearRate, growthRate) => {
+    if (!(loss > 0)) return 0;
+    const r = Math.max(0, linearRate || 0);
+    const g = isFinite(growthRate) ? growthRate : 0;
+    if (Math.abs(g) < 1e-9) return r > 1e-9 ? loss / r : Number.POSITIVE_INFINITY;
+    const disc = r * r + 2 * g * loss;
+    if (disc <= 0) return Number.POSITIVE_INFINITY;
+    const root = Math.sqrt(disc);
+    return g > 0 ? (root - r) / g : (r - root) / -g;
+  };
+
   const stageTransitionAnalysis = (raw, toStage, resources = resourceMap()) => {
     if (!raw || !Array.isArray(raw.stages)) return { actionable: false, reason: "not a staged building" };
     const fromStage = Math.max(0, Number(raw.stage) || 0);
@@ -4798,8 +4887,14 @@
     const currentUnitUtility = stageUnitUtility(currentView, resources);
     const targetUnitUtility = stageUnitUtility(targetView, resources);
     const currentUtility = currentUnitUtility * active;
+    // parityCount restores the aggregate utility the old stack provided. A
+    // stack that was never built (val 0) has nothing to restore — the switch
+    // itself is free and executes immediately. The 1e-6 slack keeps floating-
+    // point dust from buying a needless extra copy on an exact-ratio parity.
     const maxParity = Math.max(1, owned * 10 || 10);
-    const parityCount = Math.min(maxParity, Math.max(1, Math.ceil(currentUtility / Math.max(0.0001, targetUnitUtility))));
+    const parityCount = owned > 0
+      ? Math.min(maxParity, Math.max(1, Math.ceil(currentUtility / Math.max(0.0001, targetUnitUtility) - 1e-6)))
+      : 0;
     const targetUtility = targetUnitUtility * parityCount;
     const refund = refundableStagePrices(raw, fromStage, owned);
     const rebuild = cumulativeStagePrices(raw, targetStage, parityCount);
@@ -4818,6 +4913,18 @@
     for (const name of new Set([...Object.keys(rebuild), ...Object.keys(usableRefund)])) {
       net[name] = Math.max(0, (rebuild[name] || 0) - (usableRefund[name] || 0));
       if (!(net[name] > 0)) delete net[name];
+    }
+    // The switch only fires once the whole net bill is BANKED (the sell and
+    // the parity rebuild are one atomic transaction), so a net price above a
+    // live cap is storage-blocked no matter how the resource is produced —
+    // the same v2.14 final-cap invariant as ordinary purchases. Without this
+    // the layer kept re-picking a never-affordable transition, flapping the
+    // plan lock every reject-cooldown instead of yielding to the storage
+    // planner that could actually grow the cap.
+    const capBlockers = [];
+    for (const [name, amount] of Object.entries(net)) {
+      const cap = resMaxOf(resources, name);
+      if (cap > 0 && amount > cap) capBlockers.push(`${resTitle(resources, name)} storage ${fmt(cap)}/${fmt(amount)}`);
     }
     let reachable = true;
     let eta = 0;
@@ -4843,19 +4950,48 @@
         safetyVetoes.push("target stage would break power safety");
       }
     }
-    const incrementalUtility = targetUtility - currentUtility;
-    const lostUtility = currentUtility * Math.max(0, eta);
-    const payback = incrementalUtility > 0 ? eta + lostUtility / incrementalUtility : Number.POSITIVE_INFINITY;
-    const materiallyBetter = targetUtility > currentUtility * 1.05;
-    const actionable = owned > 0 && reachable && !safetyVetoes.length && materiallyBetter && payback <= STAGE_PAYBACK_HORIZON_SECONDS;
-    const reason = actionable ? `utility +${Math.round((targetUtility / Math.max(0.0001, currentUtility) - 1) * 100)}%, payback ${formatEta(payback)}`
-      : safetyVetoes.length ? `safety veto: ${safetyVetoes[0]}`
-        : (!reachable ? "rebuild chain unreachable" : !materiallyBetter ? "target stage utility is worse after rebuild" : `payback ${formatEta(payback)} exceeds planning horizon`);
+    // Parity equalizes aggregate utility BY CONSTRUCTION, so the old
+    // "targetUtility > currentUtility × 1.05" test only measured the ceil()
+    // remainder: an exact-ratio upgrade (15 Libraries → 5 Data Centers at 3×
+    // the unit) read "worse after rebuild" forever. The real question is
+    // unit-level — is one target building worth more than one current
+    // building right now? — with 5% hysteresis so the reverse transition can
+    // never qualify at the same time.
+    const unitAdvantage = targetUnitUtility - currentUnitUtility;
+    const unitBetter = targetUnitUtility > currentUnitUtility * 1.05;
+    // While the net bill accrues the old stack keeps producing, so gather
+    // time (eta) only DELAYS the payoff. The genuine downtime is the rebuild
+    // window after the sell — parity copies going back up one buy at a time.
+    const lostUtility = currentUtility * parityCount * STAGE_REBUILD_SECONDS_PER_COPY / 2;
+    // The lasting return is growth-rate: after parity the next copy is priced
+    // at ratio^parityCount instead of ratio^owned and carries the better
+    // unit. Compare utility per funding-second on both sides with the same
+    // live gather ETAs; the standing remainder (the ceil() surplus, when any)
+    // recoups linearly on top.
+    const remainder = Math.max(0, targetUtility - currentUtility);
+    const growthAdvantage = owned > 0
+      ? targetUnitUtility / stageCopyGatherSeconds(raw, targetStage, parityCount, resources) -
+        currentUnitUtility / stageCopyGatherSeconds(raw, fromStage, owned, resources)
+      : 0;
+    const payback = owned > 0 ? eta + recoupSeconds(lostUtility, remainder, growthAdvantage) : 0;
+    // Ranking gain keeps exact-parity transitions (remainder 0) sortable and
+    // gives free val-0 switches their unit advantage as the score.
+    const rankGain = remainder + Math.max(0, unitAdvantage);
+    const actionable = reachable && !capBlockers.length && !safetyVetoes.length && unitBetter && payback <= STAGE_PAYBACK_HORIZON_SECONDS;
+    const reason = actionable
+      ? (owned > 0
+        ? `unit utility +${Math.round((targetUnitUtility / Math.max(0.0001, currentUnitUtility) - 1) * 100)}%, payback ${formatEta(payback)}`
+        : "free switch — nothing built to sell")
+      : !unitBetter ? "target stage utility is worse per unit"
+        : safetyVetoes.length ? `safety veto: ${safetyVetoes[0]}`
+          : capBlockers.length ? `storage cap blocks the net rebuild bill (${capBlockers[0]})`
+            : !reachable ? "rebuild chain unreachable"
+              : `payback ${formatEta(payback)} exceeds planning horizon`;
     return {
       actionable, reason, raw, fromStage, toStage: targetStage, fromLabel: currentView.label || raw.name,
       toLabel: targetView.label || raw.name, owned, active, currentUnitUtility, targetUnitUtility,
       currentUtility, targetUtility, parityCount, refund, usableRefund, refundLoss, rebuild, net, eta, lostUtility,
-      incrementalUtility, payback, safetyVetoes,
+      incrementalUtility: remainder, unitAdvantage, growthAdvantage, rankGain, capBlockers, payback, safetyVetoes,
       currentEffects: { ...((currentView && currentView.effects) || {}) },
       targetEffects: { ...((targetView && targetView.effects) || {}) },
     };
@@ -4876,16 +5012,26 @@
       analysis,
       unlocked: true,
     };
-    return { kind: "stage", weight: 5, meta, ...evaluate("stage", meta, resources), score: 60 + Math.min(40, analysis.incrementalUtility) };
+    const evaluated = evaluate("stage", meta, resources);
+    // A val-0 switch has no net bill; evaluate() reads "no costs" as
+    // unaffordable, but a free transition is buyable on sight.
+    if (!prices.length) Object.assign(evaluated, { affordable: true, progress: 1, missing: "" });
+    return { kind: "stage", weight: 5, meta, ...evaluated, score: 60 + Math.min(40, analysis.rankGain) };
   };
 
   const stageTransitionCandidates = (resources = resourceMap()) => {
     const options = [];
+    const now = Date.now();
     for (const raw of buildingMetas()) {
-      if (!raw || !Array.isArray(raw.stages) || !(raw.val > 0) || (stageCooldownUntil[raw.name] || 0) > Date.now()) continue;
+      // val 0 is deliberately allowed: switching an empty stack is free (no
+      // refund, no downtime), which is exactly the post-reset "Hydro Plant
+      // stuck where an Aqueduct should be" fix.
+      if (!raw || !Array.isArray(raw.stages) || raw.unlocked === false || (stageCooldownUntil[raw.name] || 0) > now) continue;
       const stage = Math.max(0, Number(raw.stage) || 0);
+      const guard = stageReverseGuard[raw.name];
       for (const toStage of [stage - 1, stage + 1]) {
         if (toStage < 0 || toStage >= raw.stages.length) continue;
+        if (guard && guard.until > now && Math.sign(toStage - stage) === -Math.sign(guard.direction)) continue;
         const candidate = stageTransitionCandidate(raw, toStage, resources);
         if (candidate) options.push(candidate);
       }
@@ -4895,8 +5041,8 @@
 
   const bestStageTransition = (resources = resourceMap(), candidates = null) => {
     const options = candidates ? [...candidates] : stageTransitionCandidates(resources);
-    options.sort((a, b) => (b.meta.analysis.incrementalUtility / Math.max(1, b.meta.analysis.payback + 1)) -
-      (a.meta.analysis.incrementalUtility / Math.max(1, a.meta.analysis.payback + 1)));
+    options.sort((a, b) => (b.meta.analysis.rankGain / Math.max(1, b.meta.analysis.payback + 1)) -
+      (a.meta.analysis.rankGain / Math.max(1, a.meta.analysis.payback + 1)));
     return options[0] || null;
   };
 
@@ -4904,11 +5050,11 @@
     if (!pendingStageRebuild) return null;
     const raw = buildingMetas().find((building) => building && building.name === pendingStageRebuild.buildingName);
     if (!raw || (Number(raw.stage) || 0) !== pendingStageRebuild.stage) {
-      pendingStageRebuild = null;
+      setPendingStageRebuild(null);
       return null;
     }
     if ((raw.val || 0) >= pendingStageRebuild.targetCount) {
-      pendingStageRebuild = null;
+      setPendingStageRebuild(null);
       return null;
     }
     const candidate = candidates.find((item) => item.kind === "build" && item.meta === raw) ||
@@ -4933,14 +5079,21 @@
       if (!model || typeof controller.deltagrade !== "function") return false;
       controller.deltagrade(model, candidate.meta.delta);
       if ((Number(raw.stage) || 0) === beforeStage) return false;
-      pendingStageRebuild = {
-        buildingName: raw.name,
-        stage: Number(raw.stage) || 0,
-        targetCount: candidate.meta.analysis.parityCount,
-        startedAt: Date.now(),
-        analysis: candidate.meta.analysis,
-      };
+      // A free val-0 switch has no parity to restore — no rebuild contract
+      // (and it must not clobber another building's pending contract).
+      if (candidate.meta.analysis.parityCount > 0) {
+        setPendingStageRebuild({
+          buildingName: raw.name,
+          stage: Number(raw.stage) || 0,
+          targetCount: candidate.meta.analysis.parityCount,
+          startedAt: Date.now(),
+          analysis: candidate.meta.analysis,
+        });
+      } else if (pendingStageRebuild && pendingStageRebuild.buildingName === raw.name) {
+        setPendingStageRebuild(null);
+      }
       stageCooldownUntil[raw.name] = Date.now() + STAGE_COOLDOWN_MS;
+      stageReverseGuard[raw.name] = { direction: candidate.meta.delta, until: Date.now() + STAGE_REVERSE_COOLDOWN_MS };
       return true;
     } catch (error) {
       return false;
