@@ -51,6 +51,7 @@ const storage = new Map();
 const localStorageMock = {
   getItem: (k) => (storage.has(k) ? storage.get(k) : null),
   setItem: (k, v) => storage.set(k, String(v)),
+  removeItem: (k) => storage.delete(k),
 };
 
 /* ------------------------------ fake game ---------------------------------- */
@@ -2978,6 +2979,130 @@ perTick.catnip = savedX3.perTickCatnip;
 gamePage.resPool.energyProd = savedX3.energyProd;
 gamePage.resPool.energyCons = savedX3.energyCons;
 gamePage.resPool.energyWinterProd = savedX3.energyWinterProd;
+
+/* ---------------------------------------------------------------------
+ * Test X4 — perfected stage-transition triggers (v2.17.0).
+ * (a) watts are utility: Aqueduct→Hydro fires on a loaded grid, is rejected
+ *     when nothing consumes power, and the reverse downgrade is refused
+ *     while the grid needs the watts;
+ * (b) exact-parity upgrades (unit exactly 3×, ceil remainder 0) are
+ *     actionable — the old aggregate test read them "worse" forever;
+ * (c) a net rebuild bill above a bank cap is storage-blocked (v2.14
+ *     final-cap invariant), not picked-and-flapped;
+ * (d) a never-built (val 0) staged building switches for free with no
+ *     rebuild contract, and a real transition persists its contract.
+ * ------------------------------------------------------------------- */
+const savedX4 = {
+  energyProd: gamePage.resPool.energyProd,
+  energyCons: gamePage.resPool.energyCons,
+  energyWinterProd: gamePage.resPool.energyWinterProd,
+  catnip: [res("catnip").value, res("catnip").maxValue],
+  minerals: [res("minerals").value, res("minerals").maxValue],
+  wood: [res("wood").value, res("wood").maxValue],
+  perTickCatnip: perTick.catnip,
+  perTickWood: perTick.wood,
+};
+const stageGridX4 = {
+  name: "stageGridX4",
+  unlocked: true,
+  stage: 0,
+  val: 4,
+  on: 4,
+  priceRatio: 1,
+  stages: [
+    { label: "Aqueduct X4", prices: [{ name: "minerals", val: 10 }], effects: { catnipRatio: 0.03 }, stageUnlocked: true },
+    { label: "Hydro Plant X4", prices: [{ name: "minerals", val: 10 }], effects: { energyProduction: 5 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageGridX4);
+res("catnip").value = 4000; res("catnip").maxValue = 5000; perTick.catnip = 20;
+res("minerals").value = 100; res("minerals").maxValue = 5000;
+gamePage.resPool.energyProd = 20; gamePage.resPool.energyCons = 19; gamePage.resPool.energyWinterProd = 20;
+const upgradeX4 = dbg.stageTransitionAnalysis?.(stageGridX4, 1);
+check("Test X4: a loaded grid makes the watt stage materially better (Aqueduct→Hydro fires)", upgradeX4?.actionable === true && Number.isFinite(upgradeX4?.payback));
+gamePage.resPool.energyCons = 0;
+const idleGridX4 = dbg.stageTransitionAnalysis?.(stageGridX4, 1);
+check("Test X4: with no consumers the watt stage has no utility (upgrade rejected)", idleGridX4?.actionable === false && /worse per unit/i.test(idleGridX4?.reason || ""));
+gamePage.resPool.energyCons = 19;
+stageGridX4.stage = 1;
+const downgradeX4 = dbg.stageTransitionAnalysis?.(stageGridX4, 0);
+check("Test X4: the watt stage is not sold while the grid needs it", downgradeX4?.actionable === false && /worse per unit/i.test(downgradeX4?.reason || ""));
+stageGridX4.stage = 0;
+
+const stageParityX4 = {
+  name: "stageParityX4",
+  unlocked: true,
+  stage: 0,
+  val: 3,
+  on: 3,
+  priceRatio: 1,
+  stages: [
+    { label: "Small Archive X4", prices: [{ name: "wood", val: 10 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "Data Center X4", prices: [{ name: "wood", val: 30 }], effects: { scienceMax: 300 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageParityX4);
+res("wood").value = 1000; res("wood").maxValue = 5000; perTick.wood = 10;
+const parityX4 = dbg.stageTransitionAnalysis?.(stageParityX4, 1);
+check("Test X4: an exact-parity upgrade (ceil remainder 0) is still actionable", parityX4?.actionable === true && parityX4?.parityCount === 1 && (parityX4?.incrementalUtility || 0) < 1e-3 && Number.isFinite(parityX4?.payback));
+buildings.splice(buildings.indexOf(stageParityX4), 1);
+
+const stageCapX4 = {
+  name: "stageCapX4",
+  unlocked: true,
+  stage: 0,
+  val: 4,
+  on: 4,
+  priceRatio: 1,
+  stages: [
+    { label: "Shed X4", prices: [{ name: "wood", val: 10 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "Vault X4", prices: [{ name: "wood", val: 20000 }], effects: { scienceMax: 500 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageCapX4);
+const capX4 = dbg.stageTransitionAnalysis?.(stageCapX4, 1);
+check("Test X4: a net rebuild bill above the bank cap is storage-blocked", capX4?.actionable === false && /storage cap/i.test(capX4?.reason || ""));
+buildings.splice(buildings.indexOf(stageCapX4), 1);
+
+const stageFreeX4 = {
+  name: "stageFreeX4",
+  unlocked: true,
+  stage: 1,
+  val: 0,
+  on: 0,
+  priceRatio: 1,
+  stages: [
+    { label: "Aqueduct F4", prices: [{ name: "minerals", val: 10 }], effects: { catnipRatio: 0.03 }, stageUnlocked: true },
+    { label: "Hydro Plant F4", prices: [{ name: "minerals", val: 10 }], effects: { energyProduction: 5 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageFreeX4);
+gamePage.resPool.energyCons = 0; // nothing uses power → watts are worthless → the catnip stage wins
+const freeX4 = dbg.stageTransitionCandidate?.(stageFreeX4, 0);
+check("Test X4: a never-built staged building offers a free switch (no net bill, affordable on sight)", freeX4?.meta?.analysis?.actionable === true && freeX4?.affordable === true && freeX4?.meta?.analysis?.parityCount === 0 && (freeX4?.meta?.prices || []).length === 0);
+const freeExecutedX4 = dbg.executeStageTransitionCandidate?.(freeX4);
+check("Test X4: the free switch executes with no rebuild contract", freeExecutedX4 === true && stageFreeX4.stage === 0 && dbg.pendingStageRebuild?.() === null && localStorageMock.getItem("kgh.stageRebuild") == null);
+buildings.splice(buildings.indexOf(stageFreeX4), 1);
+
+gamePage.resPool.energyCons = 19; // reload the grid so the real upgrade fires
+const upgradeCandidateX4 = dbg.stageTransitionCandidate?.(stageGridX4, 1);
+const upgradeExecutedX4 = dbg.executeStageTransitionCandidate?.(upgradeCandidateX4);
+const storedRebuildX4 = JSON.parse(localStorageMock.getItem("kgh.stageRebuild") || "null");
+check("Test X4: a real transition persists its rebuild contract across reloads", upgradeExecutedX4 === true && stageGridX4.stage === 1 && storedRebuildX4?.buildingName === "stageGridX4" && storedRebuildX4?.targetCount >= 1);
+buildings.splice(buildings.indexOf(stageGridX4), 1);
+dbg.pendingStageRebuildCandidate?.(); // building is gone — clears the persisted contract
+res("catnip").value = savedX4.catnip[0]; res("catnip").maxValue = savedX4.catnip[1];
+res("minerals").value = savedX4.minerals[0]; res("minerals").maxValue = savedX4.minerals[1];
+res("wood").value = savedX4.wood[0]; res("wood").maxValue = savedX4.wood[1];
+perTick.catnip = savedX4.perTickCatnip;
+perTick.wood = savedX4.perTickWood;
+gamePage.resPool.energyProd = savedX4.energyProd;
+gamePage.resPool.energyCons = savedX4.energyCons;
+gamePage.resPool.energyWinterProd = savedX4.energyWinterProd;
 
 /* =====================================================================
  * REGRESSION - power/Wt is a first-class planner and toggle constraint

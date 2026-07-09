@@ -257,11 +257,31 @@ Key invariants (see comments in the source for the why):
   building's unlock source must be owned (`hiddenBuildingBootstrapAllowed`),
   and the reveal craft must be quick (`BOOTSTRAP_MAX_ETA_S`). Test U pins both
   directions.
-- **Stage changes are full transactions.** Evaluate adjacent unlocked stages using
-  the 50% refund, bank-limited usable refund, price-scaled parity rebuild,
-  downtime utility, energy/consumption penalties, cap safety and payback. Execute
-  only through `StagingBldBtnController.deltagrade`; then reserve and rebuild to
-  parity before any other plan, with cooldown/hysteresis preventing oscillation.
+- **Stage changes are full transactions, decided at the UNIT level** (v2.17.0).
+  Evaluate adjacent unlocked stages using the 50% refund, bank-limited usable
+  refund and price-scaled parity rebuild; execute only through
+  `StagingBldBtnController.deltagrade`; then reserve and rebuild to parity
+  before any other plan (`pendingStageRebuild`, persisted under
+  `kgh.stageRebuild` so a reload can't unguard the refunded bank). Four rules
+  keep the trigger honest — all pinned by Test X4: (1) **watts are utility**:
+  `stageEnergyUtility` credits `energyProduction` from the live grid
+  (demand-gated, tightness-scaled, winter-floored), so Aqueduct→Hydro Plant /
+  Pasture→Solar Farm can actually fire when power matters and a generator
+  downgrade reads as the utility loss it is — with no consumers, watts are
+  worth 0 and the food stage wins; (2) **unit hysteresis, not parity
+  remainder**: parity equalizes aggregate utility by construction, so the
+  decision is `targetUnitUtility > currentUnitUtility × 1.05` and payback =
+  gather delay + rebuild-downtime recouped by the ceil() remainder (linear)
+  plus the growth-rate advantage of the reset price curve (quadratic, via
+  `stageCopyGatherSeconds`); an exact-ratio upgrade (15 Libraries → 5 Data
+  Centers) no longer reads "worse after rebuild" forever; (3) **the net
+  rebuild bill is a final price**: any net cost above a live cap is
+  storage-blocked (v2.14 invariant) and the analysis reports it instead of
+  letting a never-affordable candidate flap the plan lock; (4) **a val-0
+  stack switches for free** (no parity, empty net bill, affordable on sight)
+  — the post-reset "Hydro Plant stuck where an Aqueduct should be" fix.
+  Per-building cooldown plus a longer reverse-direction guard
+  (`stageReverseGuard`) prevent refund-burning oscillation.
 - **Festivals and expansion are planning layers, not side effects.** Festival live
   prices must respect the active ledger. Housing checkpoints should interrupt
   research only under real population pressure / first-reset milestone pressure;
