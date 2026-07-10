@@ -239,6 +239,15 @@ Key invariants (see comments in the source for the why):
   read as permanent floors and are therefore never spendable here. Surfaced as
   the `Parallel:` segment of the Craft line in the panel and report. Test AI
   pins the floors, the surplus craft, the completing buy and the rival skip.
+  One v2.18.0 amendment: **the workshop-upgrade backlog stays eligible past
+  the ranked window** (`PARALLEL_UPGRADE_SCAN`). A one-shot upgrade compounds
+  permanently and never re-prices, but its modest score kept it below the
+  top-`PARALLEL_TIER_SCAN` slots while transient build candidates cycled
+  through them — live, Titanium Barns sat 157 craftable steel short for ages
+  because nothing would craft for a rank-12 candidate. A few `upgrade`-kind
+  candidates beyond the window now get the same floor-respecting craft/buy
+  treatment (reservations, storage blocks and the sprint's held banks all
+  still apply unchanged). Test AK pins it.
 - **A staffable resource is never "unreachable".** `capDrainReachabilityFor`
   treats a resource with a direct job path (minerals with every miner
   temporarily pulled elsewhere) as reachable, with one marginal worker's live
@@ -282,6 +291,20 @@ Key invariants (see comments in the source for the why):
   — the post-reset "Hydro Plant stuck where an Aqueduct should be" fix.
   Per-building cooldown plus a longer reverse-direction guard
   (`stageReverseGuard`) prevent refund-burning oscillation.
+  Two v2.18.0 amendments (the live 71-Library / 79-Aqueduct save where no
+  stage ever upgraded): **the gather ETA is bounded separately from the
+  payback horizon** — while the net bill accrues the old stack keeps
+  producing, so gather time is delay, not loss; charging it against the 6h
+  payback horizon made every mature stack's transition permanently
+  non-actionable (a 71-Library parity bill simply takes hours to fund). The
+  horizon now bounds only the true loss recovery (`recoup`: rebuild downtime
+  + refund burn), and a separate `STAGE_GATHER_HORIZON_SECONDS` (24h) keeps
+  the plan from chasing week-long bills. And **every staged building's
+  best-transition verdict is diagnostics** (`stagePlanText`): actionable or
+  the exact blocking reason (worse per unit / storage cap / gather horizon /
+  cooldown), shown as the `Stage:` subsystem line in the panel and report —
+  a silently vetoed transition is indistinguishable from a bug otherwise.
+  Test X5 pins both.
 - **Festivals and expansion are planning layers, not side effects.** Festival live
   prices must respect the active ledger. Housing checkpoints should interrupt
   research only under real population pressure / first-reset milestone pressure;

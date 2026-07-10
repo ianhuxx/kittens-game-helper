@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.17.0
+// @version      2.18.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.17.0";
+  const HELPER_VERSION = "2.18.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -4635,6 +4635,16 @@
   /* ---------------- opportunity-costed staged-building transitions --------- */
 
   const STAGE_PAYBACK_HORIZON_SECONDS = 6 * 60 * 60;
+  // The net-bill GATHER time gets its own (much longer) bound instead of being
+  // charged against the payback horizon.  While the bill accrues the old stack
+  // keeps producing — gathering costs nothing but delay — yet a mature stack
+  // (79 Aqueducts, 71 Libraries) has a parity rebuild bill whose gather ETA
+  // alone exceeds 6h, so folding it into payback made every big-stack upgrade
+  // (Aqueduct→Hydro Plant, Library→Data Center, …) permanently non-actionable.
+  // The 6h payback horizon now bounds only the true loss recovery (rebuild
+  // downtime + refund burn, recouped by remainder + growth advantage); the
+  // gather bound below merely keeps the plan from chasing a week-long bill.
+  const STAGE_GATHER_HORIZON_SECONDS = 24 * 60 * 60;
   const STAGE_COOLDOWN_MS = 10 * 60 * 1000;
   // A stage change burns half the old stack, so flapping back is genuinely
   // expensive: after any transition the REVERSE direction stays blocked much
@@ -4973,11 +4983,13 @@
       ? targetUnitUtility / stageCopyGatherSeconds(raw, targetStage, parityCount, resources) -
         currentUnitUtility / stageCopyGatherSeconds(raw, fromStage, owned, resources)
       : 0;
-    const payback = owned > 0 ? eta + recoupSeconds(lostUtility, remainder, growthAdvantage) : 0;
+    const recoup = owned > 0 ? recoupSeconds(lostUtility, remainder, growthAdvantage) : 0;
+    const payback = owned > 0 ? eta + recoup : 0;
     // Ranking gain keeps exact-parity transitions (remainder 0) sortable and
     // gives free val-0 switches their unit advantage as the score.
     const rankGain = remainder + Math.max(0, unitAdvantage);
-    const actionable = reachable && !capBlockers.length && !safetyVetoes.length && unitBetter && payback <= STAGE_PAYBACK_HORIZON_SECONDS;
+    const actionable = reachable && !capBlockers.length && !safetyVetoes.length && unitBetter &&
+      recoup <= STAGE_PAYBACK_HORIZON_SECONDS && eta <= STAGE_GATHER_HORIZON_SECONDS;
     const reason = actionable
       ? (owned > 0
         ? `unit utility +${Math.round((targetUnitUtility / Math.max(0.0001, currentUnitUtility) - 1) * 100)}%, payback ${formatEta(payback)}`
@@ -4986,19 +4998,20 @@
         : safetyVetoes.length ? `safety veto: ${safetyVetoes[0]}`
           : capBlockers.length ? `storage cap blocks the net rebuild bill (${capBlockers[0]})`
             : !reachable ? "rebuild chain unreachable"
-              : `payback ${formatEta(payback)} exceeds planning horizon`;
+              : recoup > STAGE_PAYBACK_HORIZON_SECONDS ? `payback ${formatEta(recoup)} exceeds planning horizon`
+                : `net bill gather ${formatEta(eta)} exceeds the ${formatEta(STAGE_GATHER_HORIZON_SECONDS)} funding horizon`;
     return {
       actionable, reason, raw, fromStage, toStage: targetStage, fromLabel: currentView.label || raw.name,
       toLabel: targetView.label || raw.name, owned, active, currentUnitUtility, targetUnitUtility,
       currentUtility, targetUtility, parityCount, refund, usableRefund, refundLoss, rebuild, net, eta, lostUtility,
-      incrementalUtility: remainder, unitAdvantage, growthAdvantage, rankGain, capBlockers, payback, safetyVetoes,
+      incrementalUtility: remainder, unitAdvantage, growthAdvantage, rankGain, capBlockers, recoup, payback, safetyVetoes,
       currentEffects: { ...((currentView && currentView.effects) || {}) },
       targetEffects: { ...((targetView && targetView.effects) || {}) },
     };
   };
 
-  const stageTransitionCandidate = (raw, toStage, resources = resourceMap()) => {
-    const analysis = stageTransitionAnalysis(raw, toStage, resources);
+  const stageTransitionCandidate = (raw, toStage, resources = resourceMap(), precomputed = null) => {
+    const analysis = precomputed || stageTransitionAnalysis(raw, toStage, resources);
     if (!analysis.actionable) return null;
     const prices = Object.entries(analysis.net).map(([name, val]) => ({ name, val }));
     const meta = {
@@ -5019,23 +5032,45 @@
     return { kind: "stage", weight: 5, meta, ...evaluated, score: 60 + Math.min(40, analysis.rankGain) };
   };
 
+  // Every staged building's best-transition verdict — actionable or the exact
+  // blocking reason.  Non-actionable analyses used to be dropped silently, so
+  // the panel/report could not answer "why hasn't Aqueduct→Hydro Plant /
+  // Library→Data Center happened yet?".  Surfaced as the `Stage:` subsystem
+  // line and pinned by Test X5.
+  let stagePlanText = "Stage: no staged buildings unlocked";
   const stageTransitionCandidates = (resources = resourceMap()) => {
     const options = [];
+    const verdicts = [];
     const now = Date.now();
     for (const raw of buildingMetas()) {
       // val 0 is deliberately allowed: switching an empty stack is free (no
       // refund, no downtime), which is exactly the post-reset "Hydro Plant
       // stuck where an Aqueduct should be" fix.
-      if (!raw || !Array.isArray(raw.stages) || raw.unlocked === false || (stageCooldownUntil[raw.name] || 0) > now) continue;
+      if (!raw || !Array.isArray(raw.stages) || raw.unlocked === false) continue;
+      if ((stageCooldownUntil[raw.name] || 0) > now) {
+        verdicts.push(`${labelOf(raw)} on cooldown ${formatEta(((stageCooldownUntil[raw.name] || 0) - now) / 1000)}`);
+        continue;
+      }
       const stage = Math.max(0, Number(raw.stage) || 0);
       const guard = stageReverseGuard[raw.name];
+      let best = null;
       for (const toStage of [stage - 1, stage + 1]) {
         if (toStage < 0 || toStage >= raw.stages.length) continue;
         if (guard && guard.until > now && Math.sign(toStage - stage) === -Math.sign(guard.direction)) continue;
-        const candidate = stageTransitionCandidate(raw, toStage, resources);
+        const analysis = stageTransitionAnalysis(raw, toStage, resources);
+        const candidate = analysis.actionable ? stageTransitionCandidate(raw, toStage, resources, analysis) : null;
         if (candidate) options.push(candidate);
+        if (!best ||
+            (analysis.actionable && !best.actionable) ||
+            (!!analysis.actionable === !!best.actionable && (analysis.rankGain || 0) > (best.rankGain || 0))) {
+          best = analysis;
+        }
+      }
+      if (best && best.fromLabel && best.toLabel) {
+        verdicts.push(`${best.fromLabel}→${best.toLabel}: ${best.actionable ? `GO — ${best.reason}` : best.reason}`);
       }
     }
+    stagePlanText = verdicts.length ? `Stage: ${verdicts.join(" · ")}` : "Stage: no staged buildings unlocked";
     return options;
   };
 
@@ -7808,6 +7843,13 @@
    * floor and are therefore never spendable here.
    */
   const PARALLEL_TIER_SCAN = 8;   // ranked candidates inspected per tick
+  // Workshop upgrades are one-shot compounding purchases that never re-price,
+  // but their modest scores keep them below the ranked window while transient
+  // build candidates cycle through it — live, Titanium Barns sat 157 steel
+  // short for ages because nothing would craft steel for a rank-12 candidate.
+  // A few backlog upgrades past the window stay eligible for the same
+  // floor-respecting craft/buy treatment.
+  const PARALLEL_UPGRADE_SCAN = 4;
   const PARALLEL_TIER_CRAFTS = 2; // distinct candidates crafted toward per tick
   let parallelPlanText = "Parallel: idle";
 
@@ -7852,14 +7894,21 @@
       const worked = [];
       let boughtThisTick = false;
       let inspected = 0;
-      for (let index = 0; index < candidates.length && inspected < PARALLEL_TIER_SCAN && worked.length < PARALLEL_TIER_CRAFTS; index += 1) {
+      let backlogInspected = 0;
+      for (let index = 0; index < candidates.length && worked.length < PARALLEL_TIER_CRAFTS; index += 1) {
+        if (inspected >= PARALLEL_TIER_SCAN && backlogInspected >= PARALLEL_UPGRADE_SCAN) break;
         const candidate = candidates[index];
         if (!candidate || !candidate.meta) continue;
         if (candidate.kind === "stage" || candidate.kind === "policy" || candidate.kind === "festival") continue;
         if (targetId(candidate) === targetId(target)) continue;
         if (activeSprint && activeSprint.id && targetId(candidate) === activeSprint.id) continue; // the sprint contract owns its tech
         if (buyBenched(targetId(candidate))) continue;
-        inspected += 1;
+        // Past the ranked window only the workshop-upgrade backlog stays
+        // eligible (see PARALLEL_UPGRADE_SCAN) — everything else waits for a
+        // ranked slot as before.
+        const inWindow = inspected < PARALLEL_TIER_SCAN;
+        if (!inWindow && (candidate.kind !== "upgrade" || backlogInspected >= PARALLEL_UPGRADE_SCAN)) continue;
+        if (inWindow) inspected += 1; else backlogInspected += 1;
         const prices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && isFinite(price.val) && price.val > 0);
         if (!prices.length) continue;
         if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) continue;
@@ -8900,6 +8949,7 @@
       push(`Craft: ${craftPlanText} · ${overflowPlanText} · ${parallelPlanText}`);
       push(`Buy: ${buyPlanText}`);
       push(`Queue: ${queuePlanText}`);
+      push(stagePlanText);
       push(`Leader: ${leaderPlanText}`);
       push(`Reserve: ${reservePlanText}`);
       push(`Religion: ${religionPlanText}`);
@@ -9515,6 +9565,7 @@
   let unicornEl;
   let festivalEl;
   let diplomacyEl;
+  let stageEl;
   let policyEl;
   let policySelectEl;
   let policyApplyEl;
@@ -9831,6 +9882,7 @@
       if (unicornEl) unicornEl.textContent = `🦄 ${unicornPlanText}`;
       if (festivalEl) festivalEl.textContent = `🎉 ${festivalPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
+      if (stageEl) stageEl.textContent = `🏭 ${stagePlanText}`;
       renderPolicyControl(resources, goal);
       renderQueueControl(resources, goal);
       renderRankingControl(resources, goal);
@@ -9961,6 +10013,7 @@
       '<small class="kgh-unicorn" style="color:#e8c7ff">…</small>',
       '<small class="kgh-festival" style="color:#ffd18f">…</small>',
       '<small class="kgh-diplomacy" style="color:#b7f0d0">…</small>',
+      '<small class="kgh-stage" style="color:#ffcfa8">…</small>',
       '<small class="kgh-policy" style="color:#ffc6e0">…</small>',
       '<div class="kgh-row" style="gap:4px"><select class="kgh-policy-select kgh-grow" aria-label="policy"></select>',
       '<button type="button" class="kgh-policy-apply" style="cursor:pointer" title="Manual override — the autopilot auto-adopts the ranked best side on its own; queue a policy to pin a different side">Policy</button></div>',
@@ -9995,6 +10048,7 @@
     unicornEl = box.querySelector(".kgh-unicorn");
     festivalEl = box.querySelector(".kgh-festival");
     diplomacyEl = box.querySelector(".kgh-diplomacy");
+    stageEl = box.querySelector(".kgh-stage");
     policyEl = box.querySelector(".kgh-policy");
     policySelectEl = box.querySelector(".kgh-policy-select");
     policyApplyEl = box.querySelector(".kgh-policy-apply");
@@ -10164,6 +10218,12 @@
       activePlanSnapshot = { cycleId: -1, target: undefined };
       resetTickCache();
       return findCandidateById(getCandidatesCached(resourceMap(), goalKey), id);
+    },
+    candidateRank(id, goalKey = getGoal()) {
+      resetTickCache();
+      const list = getCandidatesCached(resourceMap(), goalKey);
+      const found = findCandidateById(list, id);
+      return found ? list.indexOf(found) + 1 : -1;
     },
     queue: () => readQueue(),
     queueAdd: (id, val) => queueAdd(id, val),
@@ -10381,6 +10441,11 @@
     },
     executeStageTransitionCandidate,
     pendingStageRebuild: () => pendingStageRebuild,
+    stageStatus() {
+      resetTickCache();
+      stageTransitionCandidates(resourceMap());
+      return stagePlanText;
+    },
   };
 
   /* ------------------------------- bootstrap -------------------------------- */
