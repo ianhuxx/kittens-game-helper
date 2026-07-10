@@ -248,6 +248,21 @@ Key invariants (see comments in the source for the why):
   candidates beyond the window now get the same floor-respecting craft/buy
   treatment (reservations, storage blocks and the sprint's held banks all
   still apply unchanged). Test AK pins it.
+  Two v2.19.0 amendments: **a reservation-HELD price does not skip the
+  candidate whole** — a short whose bank already covers the price (the
+  sprint's cap-drain science bank carrying its cumulative bill) releases on
+  its own when the sprint completes, so the pass keeps crafting the
+  candidate's genuinely missing materials (Titanium Barns' steel) and only a
+  truly missing non-craftable price (a rival gold bill) still skips whole;
+  the buy still requires every floor to clear, so held banks stay untouched
+  (Test AK2). And **an affordable GO stage swap executes from the parallel
+  pass** — `executePlan`'s surplus/cap-relief paths skip kind `stage`, so a
+  fully banked transition could never fire while a research sprint or
+  science-storage layer owned the plan (live: Amphitheatre→Broadcast Tower
+  at "GO, payback ≈7s" sat frozen for the whole culture-paced Genetics
+  sprint it would have accelerated). The swap must clear every reservation
+  floor with its net bill; the atomic rebuild contract then outranks the
+  plan as usual (Test X6).
 - **A staffable resource is never "unreachable".** `capDrainReachabilityFor`
   treats a resource with a direct job path (minerals with every miner
   temporarily pulled elsewhere) as reachable, with one marginal worker's live
