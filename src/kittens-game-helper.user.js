@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.19.0
+// @version      2.20.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.19.0";
+  const HELPER_VERSION = "2.20.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -259,10 +259,22 @@
   const isMidGame = () => totalKittenCount() < 120;
   const speedrunMode = () => getGoal() === "speedrun" || getPriority() === "speedrun";
 
+  // Metaphysics perks live in the PRESTIGE manager, never in science.
+  // science.get(perkName) both misreads them — the "engineering" TECH made the
+  // unowned Engineering perk look researched, skipping it in the advisor — and
+  // console.errors "Failed to get tech for tech name 'goldenRatio'" on every
+  // advisor tick, flooding the browser console. Scan prestige.perks directly
+  // (a pure read that can never log); getPerk is only a fallback shape.
   const metaphysicsResearched = (name) => {
     try {
-      const meta = window.gamePage.science.get(name);
-      return !!(meta && meta.researched);
+      const prestige = window.gamePage.prestige;
+      if (!prestige) return false;
+      if (Array.isArray(prestige.perks)) {
+        const perk = prestige.perks.find((item) => item && item.name === name);
+        return !!(perk && (perk.researched || perk.owned || perk.on));
+      }
+      const perk = typeof prestige.getPerk === "function" ? prestige.getPerk(name) : null;
+      return !!(perk && (perk.researched || perk.owned || perk.on));
     } catch (error) {
       return false;
     }
@@ -8959,7 +8971,7 @@
       const cal = (window.gamePage && window.gamePage.calendar) || {};
       const seasonTitle = (cal.seasons && cal.seasons[cal.season] && cal.seasons[cal.season].title) || cal.season;
       const kittens = getRes(resources, "kittens");
-      push(`🐱 Kittens Helper v${HELPER_VERSION} — diagnostics @ ${new Date().toLocaleString()}`);
+      push(`🐱 Kittens Helper v${HELPER_VERSION} — diagnostics @ ${new Date().toLocaleString()}${tickSpeed > 1 ? ` · speed ${tickSpeed}×` : ""}`);
       if (isFinite(cal.year)) push(`Game: Year ${cal.year} — ${seasonTitle}, day ${Math.floor(cal.day || 0)} · ${kittens ? fmt(kittens.value) : "?"} kittens`);
       push("");
       push("— PLAN —");
@@ -9937,6 +9949,51 @@
     }
   };
 
+  /* ------------------------------ game speed ------------------------------- */
+
+  // Manual ticker boost — the community `setInterval(game.tick)` trick, made
+  // panel-controlled: the game's own scheduler keeps running at its native
+  // ~5 ticks/s and this adds (multiplier − 1) × 5 extra ticks per second on
+  // top, so 1× arms nothing and N× advances the game N× in wall-clock terms.
+  // Nothing inside the game is mutated (no game.rate override): clearing the
+  // interval instantly restores native speed, and the choice persists across
+  // reloads under kgh.tickSpeed. The helper's planning stays correct at any
+  // speed because every rate it uses is read live (observed resource deltas
+  // simply reflect the boosted wall clock, so ETAs remain wall-clock-true).
+  const TICK_SPEED_KEY = "kgh.tickSpeed";
+  const TICK_SPEED_OPTIONS = [1, 2, 3, 5, 10];
+  const TICK_SPEED_BEAT_MS = 200; // one beat per native tick at 5/s
+  let tickSpeedTimer = null;
+  let tickSpeed = (() => {
+    try {
+      const stored = Number(localStorage.getItem(TICK_SPEED_KEY));
+      return TICK_SPEED_OPTIONS.includes(stored) ? stored : 1;
+    } catch (error) {
+      return 1;
+    }
+  })();
+
+  const applyTickSpeed = (multiplier) => {
+    tickSpeed = TICK_SPEED_OPTIONS.includes(multiplier) ? multiplier : 1;
+    try { localStorage.setItem(TICK_SPEED_KEY, String(tickSpeed)); } catch (error) { /* keep the in-memory choice */ }
+    if (tickSpeedTimer !== null) {
+      try { clearInterval(tickSpeedTimer); } catch (error) { /* timer already gone */ }
+      tickSpeedTimer = null;
+    }
+    if (tickSpeed <= 1) return tickSpeed;
+    const extraPerBeat = tickSpeed - 1;
+    tickSpeedTimer = setInterval(() => {
+      try {
+        const game = window.gamePage;
+        if (!game || typeof game.tick !== "function") return;
+        for (let i = 0; i < extraPerBeat; i += 1) game.tick();
+      } catch (error) {
+        /* a bad tick must not kill the booster */
+      }
+    }, TICK_SPEED_BEAT_MS);
+    return tickSpeed;
+  };
+
   /* ------------------------------- the panel -------------------------------- */
 
   const MIN_KEY = "kgh.min";
@@ -10020,7 +10077,10 @@
       '<span style="white-space:nowrap;display:flex;align-items:center"><small class="kgh-status" style="color:var(--kgh-dim)">…</small>',
       '<button type="button" class="kgh-hbtn kgh-min" title="Minimize">–</button></span></div>',
       '<div class="kgh-body" style="display:grid;gap:6px">',
-      '<div class="kgh-row"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer;border-radius:6px;border:1px solid #ffffff22;padding:4px">Autopilot: ON</button></div>',
+      '<div class="kgh-row" style="gap:4px"><button type="button" class="kgh-autopilot kgh-grow" style="cursor:pointer;border-radius:6px;border:1px solid #ffffff22;padding:4px">Autopilot: ON</button>',
+      '<select class="kgh-speed" aria-label="game speed" title="Game speed: extra game.tick() calls on top of the native ticker. 1× is fully native; higher multiplies real-time progress. Reversible instantly.">' +
+        TICK_SPEED_OPTIONS.map((mult) => `<option value="${mult}">⏩ ${mult}×</option>`).join("") +
+      "</select></div>",
 
       // PLAN — what the autopilot is doing and why, at a glance.
       '<div class="kgh-card"><span class="kgh-sect">Plan</span>',
@@ -10102,6 +10162,16 @@
     resetHeadEl = box.querySelector(".kgh-reset-head");
     resetCardEl = box.querySelector(".kgh-reset-card");
     logBox = box.querySelector(".kgh-log");
+
+    const speedEl = box.querySelector(".kgh-speed");
+    if (speedEl) {
+      speedEl.value = String(tickSpeed);
+      speedEl.addEventListener("change", () => {
+        applyTickSpeed(Number(speedEl.value) || 1);
+        speedEl.value = String(tickSpeed);
+        pushLog(`⏩ game speed ${tickSpeed}× ${tickSpeed > 1 ? `(+${(tickSpeed - 1) * 5} extra ticks/s via game.tick)` : "(native ticker only)"}`);
+      });
+    }
 
     const syncToggle = () => {
       toggleBtn.textContent = `Autopilot: ${isAutopilotOn() ? "ON" : "OFF"}`;
@@ -10485,6 +10555,8 @@
     },
     executeStageTransitionCandidate,
     pendingStageRebuild: () => pendingStageRebuild,
+    tickSpeed: () => tickSpeed,
+    applyTickSpeed,
     stageStatus() {
       resetTickCache();
       stageTransitionCandidates(resourceMap());
@@ -10515,6 +10587,7 @@
     .then(() => {
       applyProfile(); // sets opts.noConfirm before any purchase can fire a dialog
       buildPanel();
+      applyTickSpeed(tickSpeed); // re-arm the persisted manual game speed
     })
     .catch((error) => console.error("[KGH] Failed to start:", error));
 })();
