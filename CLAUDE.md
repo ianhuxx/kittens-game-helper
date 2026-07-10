@@ -239,24 +239,20 @@ Key invariants (see comments in the source for the why):
   read as permanent floors and are therefore never spendable here. Surfaced as
   the `Parallel:` segment of the Craft line in the panel and report. Test AI
   pins the floors, the surplus craft, the completing buy and the rival skip.
-  One v2.18.0 amendment: **the workshop-upgrade backlog stays eligible past
-  the ranked window** (`PARALLEL_UPGRADE_SCAN`). A one-shot upgrade compounds
-  permanently and never re-prices, but its modest score kept it below the
-  top-`PARALLEL_TIER_SCAN` slots while transient build candidates cycled
-  through them — live, Titanium Barns sat 157 craftable steel short for ages
-  because nothing would craft for a rank-12 candidate. A few `upgrade`-kind
-  candidates beyond the window now get the same floor-respecting craft/buy
-  treatment (reservations, storage blocks and the sprint's held banks all
-  still apply unchanged). Test AK pins it.
-  Two v2.19.0 amendments: **a reservation-HELD price does not skip the
-  candidate whole** — a short whose bank already covers the price (the
-  sprint's cap-drain science bank carrying its cumulative bill) releases on
-  its own when the sprint completes, so the pass keeps crafting the
-  candidate's genuinely missing materials (Titanium Barns' steel) and only a
-  truly missing non-craftable price (a rival gold bill) still skips whole;
-  the buy still requires every floor to clear, so held banks stay untouched
-  (Test AK2). And **an affordable GO stage swap executes from the parallel
-  pass** — `executePlan`'s surplus/cap-relief paths skip kind `stage`, so a
+- **The Workshop roadmap is the sole owner of the deep upgrade backlog**
+  (v2.20.6). Ready upgrades enter immediately; non-ready upgrades enter only
+  when their cumulative craft-chain ETA is finite and within one hour. The
+  roadmap is sticky within the normal 25% hysteresis band, reserves and crafts
+  through the ordinary active-plan contract, and resumes after genuine safety
+  preemption. Parallel work never scans past its normal ranked window and never
+  executes a pending roadmap takeover while an older plan lock still owns the
+  tick. Craft-only ETAs multiply every recipe input by every required unit;
+  the one-step refill exception applies only to craft outputs with positive
+  direct production. Power-recovery locks release as soon as effective power
+  is healthy instead of finishing an obsolete generator project.
+  One v2.19.0 amendment remains: **an affordable GO stage swap executes from
+  the parallel pass** — `executePlan`'s surplus/cap-relief paths skip kind
+  `stage`, so a
   fully banked transition could never fire while a research sprint or
   science-storage layer owned the plan (live: Amphitheatre→Broadcast Tower
   at "GO, payback ≈7s" sat frozen for the whole culture-paced Genetics

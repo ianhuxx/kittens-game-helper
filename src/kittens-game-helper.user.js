@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.20.5
+// @version      2.20.6
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.20.5";
+  const HELPER_VERSION = "2.20.6";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2327,23 +2327,46 @@
     return options.length ? { ...options[0], pressure, options: options.slice(0, 3) } : null;
   };
 
-  // A full post-reset village can otherwise reserve the same shared bank for
-  // housing forever, starving workshop upgrades that are already fully paid
-  // for and materially more valuable (live: Mansion held all steel while Steel
-  // Saw and both titanium storage upgrades read READY). Keep the first-reset
-  // milestone absolute; after it, let the normal 25% score threshold choose a
-  // ready upgrade without bypassing any reservation or purchase safety rule.
-  const bestReadyWorkshopCheckpoint = (candidates, resources, expansion) => {
-    if (!expansion || !expansion.candidate || expansion.pressure.firstReset) return null;
-    const options = candidates
-      .filter((candidate) =>
-        candidate && candidate.kind === "upgrade" && candidate.meta &&
-        candidate.affordable && isOpen(candidate.meta) &&
-        !buyBenched(targetId(candidate)) &&
-        solveCraftChain(resources, candidate).reachable)
-      .sort((a, b) => (b.score || 0) - (a.score || 0));
-    const winner = options[0] || null;
-    return winner && candidateMeetsSwitchScoreGain(expansion.candidate, winner) ? winner : null;
+  const WORKSHOP_PROJECT_MAX_ETA_S = 3600;
+  let activeWorkshopRoadmapId = null;
+
+  // One owner for the whole workshop backlog. Ready upgrades enter
+  // immediately; non-ready upgrades enter only when their TRUE cumulative
+  // craft-chain bill fits a bounded funding horizon. The active-plan ledger
+  // then owns reservation, crafting and purchase like every other real plan.
+  const bestWorkshopRoadmap = (candidates, resources) => {
+    if (!hasPriorReset()) {
+      activeWorkshopRoadmapId = null;
+      return null;
+    }
+    const options = [];
+    for (const candidate of candidates || []) {
+      if (!candidate || candidate.kind !== "upgrade" || !candidate.meta || !isOpen(candidate.meta)) continue;
+      if (buyBenched(targetId(candidate))) continue;
+      if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) continue;
+      const solver = solveCraftChain(resources, candidate);
+      if (!solver.reachable || solver.hardBlocked) continue;
+      const ready = !!candidate.affordable;
+      const eta = ready ? 0 : waitSecondsForCandidate(candidate, resources);
+      if (!ready && (!isFinite(eta) || eta > WORKSHOP_PROJECT_MAX_ETA_S)) continue;
+      const numerator = Math.max(0, candidate.score || 0) + Math.max(0, gatewayValue(candidate.meta));
+      const value = numerator / (1 + Math.log10(eta + 1));
+      if (!ready && !(value > 0)) continue;
+      options.push({ candidate, eta, ready, value, solver });
+    }
+    if (!options.length) {
+      activeWorkshopRoadmapId = null;
+      return null;
+    }
+    options.sort((a, b) => Number(b.ready) - Number(a.ready) || b.value - a.value || a.eta - b.eta);
+    const best = options[0];
+    const prior = activeWorkshopRoadmapId
+      ? options.find((option) => targetId(option.candidate) === activeWorkshopRoadmapId)
+      : null;
+    const keepPrior = prior && (prior.ready || !best.ready) && best.value <= prior.value * PLAN_HYSTERESIS_MULT;
+    const chosen = keepPrior ? prior : best;
+    activeWorkshopRoadmapId = targetId(chosen.candidate);
+    return chosen;
   };
 
   const scaledEffectProfileFromEntries = (entries) => {
@@ -3726,7 +3749,7 @@
     researchSprint: "Research sprint",
     resourceBootstrap: "Resource bootstrap",
     expansion: "Expansion checkpoint",
-    workshopCheckpoint: "Workshop checkpoint",
+    workshopRoadmap: "Workshop roadmap",
     festival: "Festival maintenance",
     stageTransition: "Building stage transition",
     stageRebuild: "Stage rebuild",
@@ -3906,7 +3929,7 @@
   // but that is still reachable by spending a capped bank, waiting for refill,
   // and spending it again.  Reject only when one individual craft/research step
   // cannot fit in storage, or when an input has no production/craft/trade path.
-  const capDrainReachabilityFor = (resources, name, amount, depth = 0, stack = new Set()) => {
+  const capDrainReachabilityFor = (resources, name, amount, depth = 0, stack = new Set(), refillCycles = false) => {
     if (!isFinite(amount) || amount <= 0) return { reachable: true, eta: 0, chain: new Set([name]) };
     if (depth > 8 || stack.has(name)) return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `no path for ${name}`, chain: new Set([name]) };
     const chain = new Set([name]);
@@ -3914,7 +3937,7 @@
     const have = resValueOf(resources, name);
     const deficit = Math.max(0, amount - have);
     const prod = rawProductionForNeed(name);
-    if (max > 0 && amount > max && !CAPPED_REFILL_RESOURCES.has(name) && !craftByName(name)) {
+    if (!refillCycles && max > 0 && amount > max && !CAPPED_REFILL_RESOURCES.has(name) && !craftByName(name)) {
       return { reachable: false, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, name)} storage cap blocks ${fmt(amount)}`, chain };
     }
     if (deficit <= 0) return { reachable: true, eta: 0, chain };
@@ -3924,7 +3947,8 @@
     // workshop crafts.  Treat their full deficit as a time/producible bottleneck
     // instead of requiring enough input storage to craft the entire missing
     // amount in one batch.  Only one incremental craft step must fit.
-    if (prod > 0 && rawWorkNeedName(name) === name) {
+    const incrementalDirectCraft = prod > 0 && rawWorkNeedName(name) === name;
+    if (incrementalDirectCraft) {
       return { reachable: true, eta: deficit / prod, chain };
     }
     if (craft) {
@@ -3937,8 +3961,8 @@
         if (inputCap > 0 && price.val > inputCap) {
           return { reachable: false, perStepCapBlocked: true, eta: Number.POSITIVE_INFINITY, reason: `${resTitle(resources, price.name)} cap below one ${craftLabel(name)} craft`, chain };
         }
-        const childAmount = rawWorkNeedName(name) === name ? price.val : price.val * units;
-        const child = capDrainReachabilityFor(resources, price.name, childAmount, depth + 1, new Set([...stack, name]));
+        const childAmount = incrementalDirectCraft ? price.val : price.val * units;
+        const child = capDrainReachabilityFor(resources, price.name, childAmount, depth + 1, new Set([...stack, name]), true);
         for (const item of child.chain || []) chain.add(item);
         if (!child.reachable) return { ...child, chain };
         eta = Math.max(eta, child.eta || 0);
@@ -5720,20 +5744,28 @@
     }
 
     if (!activeSprint) {
+      const workshopRoadmap = bestWorkshopRoadmap(candidates, resources);
+      if (workshopRoadmap) {
+        const target = workshopRoadmap.candidate;
+        return {
+          candidates: [target, ...candidates.filter((candidate) => targetId(candidate) !== targetId(target))],
+          target,
+          layer: STRATEGIC_LAYERS.workshopRoadmap,
+          reason: workshopRoadmap.ready
+            ? `${labelOf(target.meta)} is ready for immediate workshop purchase`
+            : `${labelOf(target.meta)} is the best fundable workshop project (ETA ${formatEta(workshopRoadmap.eta)})`,
+          protectedChain: workshopRoadmap.solver.protectedChain.size
+            ? workshopRoadmap.solver.protectedChain
+            : candidateCraftChainResources(target),
+          workshopRoadmap,
+          rejectedTopCandidates: candidates
+            .filter((candidate) => candidate.kind === "upgrade" && targetId(candidate) !== targetId(target))
+            .slice(0, 2)
+            .map((candidate) => ({ target: candidate, reason: `lower workshop roadmap value or beyond ${formatEta(WORKSHOP_PROJECT_MAX_ETA_S)} horizon` })),
+        };
+      }
       const expansion = bestExpansionCheckpoint(candidates, resources);
       if (expansion) {
-        const workshopCheckpoint = bestReadyWorkshopCheckpoint(candidates, resources, expansion);
-        if (workshopCheckpoint) {
-          return {
-            candidates: [workshopCheckpoint, ...candidates.filter((candidate) => targetId(candidate) !== targetId(workshopCheckpoint))],
-            target: workshopCheckpoint,
-            layer: STRATEGIC_LAYERS.workshopCheckpoint,
-            reason: `${labelOf(workshopCheckpoint.meta)} is ready and materially outranks another ${labelOf(expansion.candidate.meta)} for population growth`,
-            protectedChain: candidateCraftChainResources(workshopCheckpoint),
-            workshopCheckpoint: { expansion },
-            rejectedTopCandidates: [{ target: expansion.candidate, reason: `deferred for ready workshop upgrade ${labelOf(workshopCheckpoint.meta)}` }],
-          };
-        }
         const target = expansion.candidate;
         return {
           candidates,
@@ -6056,6 +6088,10 @@
     tickCache.candidates = decision.candidates;
     const candidates = decision.candidates;
     const preferred = decision.target || candidates[0] || null;
+    // Preserve the selector's preferred target even when hysteresis returns the
+    // old lock as the active target. Side executors must not act on this pending
+    // takeover before it actually owns the plan.
+    lastStrategicDecision.preferredTarget = preferred;
     const now = Date.now();
     const summary = `${decision.layer || "?"}::${targetId(preferred) || "(none)"}`;
     if (summary !== lastLoggedPlanSummary) {
@@ -6124,6 +6160,12 @@
       // since the loss compounds every tick the fuel stays empty.
       const productionTakeover = preferred && decision.layer === STRATEGIC_LAYERS.production &&
         activeTarget.layer !== STRATEGIC_LAYERS.production;
+      // Power recovery is a conditional safety contract, not an ordinary
+      // six-minute project. The moment the effective grid is healthy the power
+      // layer yields; release its old generator lock on that same tick instead
+      // of finishing a now-unnecessary multi-hour Alloy bill.
+      const resolvedConditionalLock = activeTarget.layer === STRATEGIC_LAYERS.power &&
+        decision.layer !== STRATEGIC_LAYERS.power;
       const lockedIsStaleStorage = locked && isStorageMeta(locked.meta) && !locked.affordable && lockedWait > 900 &&
         !storageStillWanted(locked.meta, resources, getStoragePressureCached(resources, GOALS[goalKey], goalKey));
       // directStorageBlockers covers every capped final price (craftable or
@@ -6135,7 +6177,7 @@
       const etaBetter = preferredWait < lockedWait * 0.75;
       const muchBetter = preferred && locked && age >= getTargetLockMinMs() && scoreBetter && (etaBetter || !isFinite(lockedWait));
       const nearTechBreak = locked && preferred && preferred.kind === "research" && lockedWait > 900 && preferredWait < 900 && targetId(locked) !== targetId(preferred);
-      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || manualQueueTakeover || sprintRedirectTakeover || productionTakeover || age > TARGET_LOCK_MAX_MS ||
+      if (!locked || completed || impossible || noProgress || manualQueueChanged || emergency || structuralLayerTakeover || manualQueueTakeover || sprintRedirectTakeover || productionTakeover || resolvedConditionalLock || age > TARGET_LOCK_MAX_MS ||
           lockedIsStaleStorage || lockedIsStorageBlocked || nearTechBreak) {
         const reason = !locked ? "target unavailable" : completed ? "target completed" : impossible ? "target impossible" :
           noProgress ? "blocked with no measurable progress" : manualQueueChanged ? "manual queue changed" :
@@ -6143,6 +6185,7 @@
           sprintRedirectTakeover ? "sprint pacing redirect" :
           lockedIsStorageBlocked ? "storage cap blocks the final price" :
           structuralLayerTakeover ? "science storage emergency" : productionTakeover ? "converter-fuel starvation" :
+          resolvedConditionalLock ? "power recovery resolved" :
           emergency ? "emergency" : "lock timeout";
         pushPlanLog(`🔓 Plan switch accepted: ${reason}`, 20000);
         // A storage-blocked target must not be re-picked next tick (that was
@@ -7899,13 +7942,6 @@
    * floor and are therefore never spendable here.
    */
   const PARALLEL_TIER_SCAN = 8;   // ranked candidates inspected per tick
-  // Workshop upgrades are one-shot compounding purchases that never re-price,
-  // but their modest scores keep them below the ranked window while transient
-  // build candidates cycle through it — live, Titanium Barns sat 157 steel
-  // short for ages because nothing would craft steel for a rank-12 candidate.
-  // A few backlog upgrades past the window stay eligible for the same
-  // floor-respecting craft/buy treatment.
-  const PARALLEL_UPGRADE_SCAN = 4;
   const PARALLEL_TIER_CRAFTS = 2; // distinct candidates crafted toward per tick
   let parallelPlanText = "Parallel: idle";
 
@@ -7976,21 +8012,22 @@
       const worked = [];
       let boughtThisTick = false;
       let inspected = 0;
-      let backlogInspected = 0;
+      const strategicPreferredId = lastStrategicDecision && lastStrategicDecision.preferredTarget
+        ? targetId(lastStrategicDecision.preferredTarget)
+        : "";
       for (let index = 0; index < candidates.length && worked.length < PARALLEL_TIER_CRAFTS; index += 1) {
-        if (inspected >= PARALLEL_TIER_SCAN && backlogInspected >= PARALLEL_UPGRADE_SCAN) break;
+        if (inspected >= PARALLEL_TIER_SCAN) break;
         const candidate = candidates[index];
         if (!candidate || !candidate.meta) continue;
         if (candidate.kind === "stage" || candidate.kind === "policy" || candidate.kind === "festival") continue;
         if (targetId(candidate) === targetId(target)) continue;
+        // If hysteresis is still holding the old plan, the newly preferred
+        // roadmap target must wait to become the plan; parallel work is not a
+        // second executor for the pending takeover.
+        if (targetId(candidate) === strategicPreferredId) continue;
         if (activeSprint && activeSprint.id && targetId(candidate) === activeSprint.id) continue; // the sprint contract owns its tech
         if (buyBenched(targetId(candidate))) continue;
-        // Past the ranked window only the workshop-upgrade backlog stays
-        // eligible (see PARALLEL_UPGRADE_SCAN) — everything else waits for a
-        // ranked slot as before.
-        const inWindow = inspected < PARALLEL_TIER_SCAN;
-        if (!inWindow && (candidate.kind !== "upgrade" || backlogInspected >= PARALLEL_UPGRADE_SCAN)) continue;
-        if (inWindow) inspected += 1; else backlogInspected += 1;
+        inspected += 1;
         const prices = pricesFor(candidate.kind, candidate.meta).filter((price) => price && price.name && isFinite(price.val) && price.val > 0);
         if (!prices.length) continue;
         if (directStorageBlockers(candidate.kind, candidate.meta, resources).length) continue;
@@ -10353,6 +10390,10 @@
     classifyTargetFeasibility(candidate) {
       return classifyTargetFeasibility(candidate, resourceMap());
     },
+    waitSecondsForCandidate(candidate) {
+      resetTickCache();
+      return waitSecondsForCandidate(candidate, resourceMap());
+    },
     bestWoodJob() {
       return bestWoodJob();
     },
@@ -10445,6 +10486,7 @@
       activeScienceUnlockId = null;
       activeScienceUnlockContext = null;
       activePowerRecoveryId = null;
+      activeWorkshopRoadmapId = null;
       activeSprintPacingBoostId = null;
       const startedAt = Date.now() - Math.max(0, ageMs);
       activeTarget = candidate ? {

@@ -2617,6 +2617,10 @@ check("Test AA: a genuine raw-Wt deficit breaks the lock toward a generator", db
 gamePage.resPool.energyProd = 200; gamePage.resPool.energyCons = 10; gamePage.resPool.energyWinterProd = 200;
 const savedSciAA = { v: res("science").value, m: res("science").maxValue };
 res("science").value = 1000; res("science").maxValue = 1e9; // research fits → no science-storage layer
+dbg.forceActiveTarget(magnetoCandAA, "Power recovery", 10000);
+const resolvedPowerAA = dbg.chooseWorkTarget("balanced");
+check("Test AA: a recovered Power-recovery contract releases immediately instead of holding the generator",
+  dbg.targetId(resolvedPowerAA) !== "build:magnetoZ");
 dbg.forceActiveTarget(mineCandAA, "Economy / normal growth", LOCK_AGE_AA);
 res("catnip").value = 4000; res("catnip").maxValue = 5000; perTick.catnip = 5; // safe
 const decSafeAA = dbg.chooseWorkTarget("balanced");
@@ -2649,7 +2653,9 @@ const savedMaxKittensW = village.maxKittens;
 const savedHappinessW = village.happiness;
 const savedResetCountW = gamePage.totalResets;
 const savedTechFlagsW = techs.map((tech) => [tech, tech.researched]);
+const savedUpgradeFlagsW = workshopUpgrades.map((upgrade) => [upgrade, upgrade.researched]);
 for (const tech of techs) tech.researched = true;
+for (const upgrade of workshopUpgrades) upgrade.researched = true;
 const expansionTechW = { name: "expansionTechW", label: "Fresh Science", unlocked: true, researched: false, prices: [{ name: "science", val: 10000 }], unlocks: { tech: ["futureExpansionTechW"] } };
 const housingW = { name: "housingW", label: "Efficient Housing", unlocked: true, val: 22, on: 22, prices: [{ name: "wood", val: 100 }], effects: { maxKittens: 1 } };
 techs.push(expansionTechW);
@@ -2682,8 +2688,8 @@ gamePage.karmaKittens = 185;
 res("steel").value = 1000;
 dbg.forceActiveTarget(null);
 const workshopCheckpointW = dbg.selectStrategicTarget("balanced");
-check("Test W: ready high-value workshop upgrade preempts repeated post-reset housing expansion",
-  workshopCheckpointW.layer === "Workshop checkpoint" && workshopCheckpointW.target?.meta?.name === "readyWorkshopW");
+check("Test W: ready high-value upgrade owns the post-reset Workshop roadmap",
+  workshopCheckpointW.layer === "Workshop roadmap" && workshopCheckpointW.target?.meta?.name === "readyWorkshopW");
 gamePage.totalResets = 0;
 gamePage.paragonPoints = 0;
 gamePage.karmaKittens = 0;
@@ -2692,6 +2698,36 @@ const firstResetStillWinsW = dbg.selectStrategicTarget("balanced");
 check("Test W: first-reset expansion still outranks the same ready workshop upgrade",
   firstResetStillWinsW.layer === "Expansion checkpoint" && firstResetStillWinsW.target?.meta?.name === "housingW");
 workshopUpgrades.splice(workshopUpgrades.indexOf(readyWorkshopW), 1);
+
+// A non-ready but fundable production upgrade owns the roadmap; an enormous
+// higher-value Steel backlog is excluded by the one-hour project horizon.
+const savedWorkshopChainW = {
+  steel: res("steel").value,
+  iron: [res("iron").value, res("iron").maxValue, perTick.iron],
+  coal: [res("coal").value, res("coal").maxValue, perTick.coal],
+};
+const fundedWorkshopW = { name: "fundedWorkshopW", label: "Funded Drill W", unlocked: true, researched: false, prices: [{ name: "steel", val: 20 }], effects: { mineralsRatio: 10 } };
+const horizonWorkshopW = { name: "horizonWorkshopW", label: "Endless Alloy Plant W", unlocked: true, researched: false, prices: [{ name: "steel", val: 10000 }], effects: { mineralsRatio: 100 } };
+workshopUpgrades.push(fundedWorkshopW, horizonWorkshopW);
+gamePage.totalResets = 1;
+gamePage.paragonPoints = 74;
+gamePage.karmaKittens = 185;
+res("steel").value = 0;
+res("iron").value = 0; res("iron").maxValue = 1e7; perTick.iron = 1;
+res("coal").value = 0; res("coal").maxValue = 1e7; perTick.coal = 1;
+dbg.clearResourceTelemetry?.("iron"); dbg.clearResourceTelemetry?.("coal");
+dbg.forceActiveTarget(null);
+const fundedRoadmapW = dbg.selectStrategicTarget("balanced");
+check("Test W: a reachable non-ready upgrade within one hour owns the Workshop roadmap",
+  fundedRoadmapW.layer === "Workshop roadmap" && fundedRoadmapW.target?.meta?.name === "fundedWorkshopW");
+check("Test W: a multi-hour workshop backlog item is excluded from the active roadmap",
+  fundedRoadmapW.target?.meta?.name !== "horizonWorkshopW");
+workshopUpgrades.splice(workshopUpgrades.indexOf(fundedWorkshopW), 1);
+workshopUpgrades.splice(workshopUpgrades.indexOf(horizonWorkshopW), 1);
+res("steel").value = savedWorkshopChainW.steel;
+res("iron").value = savedWorkshopChainW.iron[0]; res("iron").maxValue = savedWorkshopChainW.iron[1]; perTick.iron = savedWorkshopChainW.iron[2];
+res("coal").value = savedWorkshopChainW.coal[0]; res("coal").maxValue = savedWorkshopChainW.coal[1]; perTick.coal = savedWorkshopChainW.coal[2];
+dbg.clearResourceTelemetry?.("iron"); dbg.clearResourceTelemetry?.("coal");
 res("steel").value = savedSteelW;
 if (savedPrestigeW.paragon === undefined) delete gamePage.paragonPoints; else gamePage.paragonPoints = savedPrestigeW.paragon;
 if (savedPrestigeW.karmaKittens === undefined) delete gamePage.karmaKittens; else gamePage.karmaKittens = savedPrestigeW.karmaKittens;
@@ -2740,6 +2776,7 @@ check("Test W: research remains eligible when housing has ample headroom", expan
 techs.splice(techs.indexOf(expansionTechW), 1);
 buildings.splice(buildings.indexOf(housingW), 1);
 for (const [tech, researched] of savedTechFlagsW) tech.researched = researched;
+for (const [upgrade, researched] of savedUpgradeFlagsW) upgrade.researched = researched;
 
 let dramaW = techs.find((tech) => tech.name === "drama");
 if (!dramaW) { dramaW = { name: "drama", label: "Drama and Poetry", unlocked: true, researched: true, prices: [], unlocks: {} }; techs.push(dramaW); }
@@ -4033,6 +4070,7 @@ const savedTechAK = techs.map((t) => ({ unlocked: t.unlocked, researched: t.rese
 for (const tech of techs) tech.researched = true; // no research sprints in this fixture
 const savedUpgradeAK = workshopUpgrades.map((u) => ({ unlocked: u.unlocked, researched: u.researched }));
 for (const upgrade of workshopUpgrades) upgrade.researched = true; // ours is the only open upgrade
+const savedResetAK = gamePage.totalResets;
 const savedStocksAK = {
   slab: res("slab").value, minerals: res("minerals").value, mineralsMax: res("minerals").maxValue,
   wood: res("wood").value, science: res("science").value, mineralsRate: perTick.minerals,
@@ -4052,8 +4090,9 @@ for (let i = 0; i < 8; i += 1) {
   decoysAK.push(decoy);
   buildings.push(decoy);
 }
-const backlogSawAK = { name: "backlogSawAK", label: "Backlog Saw", unlocked: true, researched: false, prices: [{ name: "slab", val: 80 }, { name: "minerals", val: 100 }], effects: {} };
+const backlogSawAK = { name: "backlogSawAK", label: "Backlog Saw", unlocked: true, researched: false, prices: [{ name: "slab", val: 20 }, { name: "minerals", val: 100 }], effects: { mineralsRatio: 5 } };
 workshopUpgrades.push(backlogSawAK);
+gamePage.totalResets = 1;
 
 res("slab").value = 0;
 res("minerals").value = 7900; // idle surplus for Slab crafting
@@ -4066,14 +4105,14 @@ dbg.forceActiveTarget(dbg.candidateById("build:trickleTempleAK"), "Economy / nor
 check("Test AK: fixture — the decoys hold the ranked window and the upgrade sits below it",
   decoysAK.every((decoy) => dbg.candidateRank(`build:${decoy.name}`) <= 8) && dbg.candidateRank("upgrade:backlogSawAK") > 8);
 const akText = dbg.craftTowardParallelCandidates("balanced");
-check("Test AK: the backlog upgrade's craftable short is crafted past the ranked window",
-  res("slab").value > 0 && /Slab/i.test(akText) && /Backlog Saw/i.test(akText));
+check("Test AK: deep upgrade receives no parallel craft output", res("slab").value === 0);
+check("Test AK: deep upgrade is not parallel-purchased", backlogSawAK.researched === false);
+check("Test AK: parallel status does not claim the deep upgrade", !/Backlog Saw/i.test(akText));
 
-res("slab").value = 200; // top the bank up to the full bill — minerals alone couldn't fund it
-fakeNow += 5000;
-dbg.craftTowardParallelCandidates("balanced");
-check("Test AK: the backlog upgrade completes from surplus with every floor intact", backlogSawAK.researched === true);
-check("Test AK: the backlog buy is logged as parallel work", /parallel upgrade .*Backlog Saw/i.test(logText()));
+dbg.forceActiveTarget(null);
+const roadmapAK = dbg.selectStrategicTarget("balanced");
+check("Test AK: the same fundable deep upgrade is selected by the Workshop roadmap",
+  roadmapAK.layer === "Workshop roadmap" && roadmapAK.target?.meta?.name === "backlogSawAK");
 check("Test AK: no decoy is bought or crafted for (non-craftable gold shorts skip whole)", decoysAK.every((decoy) => decoy.val === 0));
 check("Test AK: the plan target itself is untouched by the backlog pass", trickleTempleAK.val === 0);
 
@@ -4090,6 +4129,7 @@ res("science").value = savedStocksAK.science;
 perTick.minerals = savedStocksAK.mineralsRate;
 techs.forEach((t, i) => { if (i < savedTechAK.length) { t.unlocked = savedTechAK[i].unlocked; t.researched = savedTechAK[i].researched; } });
 workshopUpgrades.forEach((u, i) => { if (i < savedUpgradeAK.length) { u.unlocked = savedUpgradeAK[i].unlocked; u.researched = savedUpgradeAK[i].researched; } });
+if (savedResetAK === undefined) delete gamePage.totalResets; else gamePage.totalResets = savedResetAK;
 dbg.queueClear();
 dbg.forceActiveTarget(null);
 
@@ -4227,8 +4267,8 @@ check("Test AK2: fixture — the decoys hold the ranked window and the held upgr
 const ak2Floors = dbg.parallelReservationFloors("balanced");
 check("Test AK2: fixture — the plan's science bill is a reservation floor above the upgrade's banked 500", (ak2Floors.science || 0) > 500);
 const ak2Text = dbg.craftTowardParallelCandidates("balanced");
-check("Test AK2: the genuinely missing slab is still crafted while the science price is only reservation-held",
-  res("slab").value > 0 && /Slab/i.test(ak2Text) && /Held Saw/i.test(ak2Text));
+check("Test AK2: deep bank-held upgrade is untouched by parallel crafting",
+  res("slab").value === 0 && !/Held Saw/i.test(ak2Text));
 check("Test AK2: the held science bank is never spent and the upgrade is not bought",
   res("science").value === 600 && heldSawAK2.researched === false);
 
@@ -4299,6 +4339,42 @@ check("Test AL2: earned prestige prevents the first-reset milestone when totalRe
 if (savedResetEvidenceAL2.totalResets === undefined) delete gamePage.totalResets; else gamePage.totalResets = savedResetEvidenceAL2.totalResets;
 if (savedResetEvidenceAL2.paragonPoints === undefined) delete gamePage.paragonPoints; else gamePage.paragonPoints = savedResetEvidenceAL2.paragonPoints;
 if (savedResetEvidenceAL2.karmaKittens === undefined) delete gamePage.karmaKittens; else gamePage.karmaKittens = savedResetEvidenceAL2.karmaKittens;
+
+/* ---------------------------------------------------------------------
+ * Test AN — cumulative craft ETA and the workshop roadmap rewrite.
+ * A 100-Alloy upgrade has one Alloy craft banked, but must fund every
+ * remaining Steel input. The live v2.20.4 bug priced only one recipe step
+ * and displayed ETA now for hundreds of missing Alloy.
+ * ------------------------------------------------------------------- */
+const alloyAN = R("alloyAN", 0, 0, "Alloy AN");
+const alloyCraftAN = { name: "alloyAN", label: "Alloy AN", unlocked: true, prices: [{ name: "steel", val: 75 }, { name: "titanium", val: 10 }] };
+resources.push(alloyAN);
+crafts.push(alloyCraftAN);
+const savedChainAN = {
+  steel: [res("steel").value, res("steel").maxValue],
+  iron: [res("iron").value, res("iron").maxValue],
+  coal: [res("coal").value, res("coal").maxValue],
+  titanium: res("titanium").value,
+};
+res("steel").value = 75;
+res("iron").value = 0;
+res("iron").maxValue = 10000;
+res("coal").value = 0;
+res("coal").maxValue = 10000;
+res("titanium").value = 1000;
+const alloyUpgradeAN = { name: "alloyUpgradeAN", label: "Alloy Upgrade AN", unlocked: true, researched: false, prices: [{ name: "alloyAN", val: 100 }], effects: { woodRatio: 1 } };
+const alloyCandidateAN = { kind: "upgrade", meta: alloyUpgradeAN, affordable: false, progress: 0, score: 20 };
+const alloyEtaAN = dbg.waitSecondsForCandidate(alloyCandidateAN);
+check("Test AN: craft-only Alloy ETA counts every Steel craft instead of one incremental recipe", Number.isFinite(alloyEtaAN) && alloyEtaAN > 60);
+res("steel").value = savedChainAN.steel[0];
+res("steel").maxValue = savedChainAN.steel[1];
+res("iron").value = savedChainAN.iron[0];
+res("iron").maxValue = savedChainAN.iron[1];
+res("coal").value = savedChainAN.coal[0];
+res("coal").maxValue = savedChainAN.coal[1];
+res("titanium").value = savedChainAN.titanium;
+crafts.splice(crafts.indexOf(alloyCraftAN), 1);
+resources.splice(resources.indexOf(alloyAN), 1);
 
 /* ---------------------------------------------------------------------
  * Test AM — manual game speed (v2.20.0).  The community setInterval(
