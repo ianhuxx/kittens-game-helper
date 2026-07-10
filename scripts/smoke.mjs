@@ -4058,6 +4058,162 @@ workshopUpgrades.forEach((u, i) => { if (i < savedUpgradeAK.length) { u.unlocked
 dbg.queueClear();
 dbg.forceActiveTarget(null);
 
+/* ---------------------------------------------------------------------
+ * Test X6 — an affordable GO stage swap executes as parallel work
+ * (v2.19.0).  Live regression: Amphitheatre→Broadcast Tower read
+ * "GO — payback ≈7s" at candidate rank 1 while the culture-paced Genetics
+ * sprint owned the plan, but the stage layer sits below the sprint layer
+ * and executePlan's surplus/cap-relief paths skip kind "stage" — so the
+ * swap that would have ACCELERATED the sprint could never fire.  A fully
+ * banked swap whose net bill clears every reservation floor now executes
+ * from the parallel pass; a swap that would dip a held bank stays vetoed.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+const savedTechX6 = techs.map((t) => ({ unlocked: t.unlocked, researched: t.researched }));
+for (const tech of techs) tech.researched = true; // no research sprints in this fixture
+const savedStocksX6 = { minerals: res("minerals").value, mineralsMax: res("minerals").maxValue, mineralsRate: perTick.minerals };
+const goldX6 = R("goldX6", 300, 1000, "Aurum VI");
+resources.push(goldX6);
+perTick.goldX6 = 0.05; // slow trickle — the plan waits on it for a long time
+const trickleAltarX6 = { name: "trickleAltarX6", label: "Trickle Altar", unlocked: true, val: 0, on: 0, prices: [{ name: "goldX6", val: 800 }], effects: {} };
+buildings.push(trickleAltarX6);
+res("minerals").value = 100;
+res("minerals").maxValue = 5000;
+perTick.minerals = 0;
+
+// (a) Exact-parity swap whose refund covers the rebuild — net bill empty,
+// affordable on sight — must execute even though the plan is held elsewhere.
+const stageSwapX6 = {
+  name: "stageSwapX6",
+  unlocked: true,
+  stage: 0,
+  val: 4,
+  on: 4,
+  priceRatio: 1,
+  stages: [
+    { label: "Old Hall X6", prices: [{ name: "minerals", val: 10 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "New Hall X6", prices: [{ name: "minerals", val: 10 }], effects: { scienceMax: 400 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageSwapX6);
+dbg.forceActiveTarget(dbg.candidateById("build:trickleAltarX6"), "Economy / normal growth", 5000);
+dbg.craftTowardParallelCandidates("balanced");
+check("Test X6: a banked GO swap executes while the plan is held by another layer",
+  stageSwapX6.stage === 1 && dbg.pendingStageRebuild?.()?.buildingName === "stageSwapX6" && dbg.pendingStageRebuild?.()?.targetCount === 1);
+check("Test X6: the parallel stage execution is logged with the protected plan", /parallel stage .*New Hall X6/i.test(logText()));
+buildings.splice(buildings.indexOf(stageSwapX6), 1);
+dbg.pendingStageRebuildCandidate?.(); // building is gone — clears the persisted contract
+check("Test X6: fixture — the rebuild contract is cleared before the veto scenario", dbg.pendingStageRebuild?.() === null);
+
+// (b) A swap whose net bill dips the plan's held gold bank must stay vetoed.
+const stageVetoX6 = {
+  name: "stageVetoX6",
+  unlocked: true,
+  stage: 0,
+  val: 4,
+  on: 4,
+  priceRatio: 1,
+  stages: [
+    { label: "Old Den X6", prices: [{ name: "minerals", val: 10 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "Gilded Den X6", prices: [{ name: "goldX6", val: 50 }], effects: { scienceMax: 400 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageVetoX6);
+fakeNow += 5000;
+dbg.craftTowardParallelCandidates("balanced");
+check("Test X6: a swap that would dip the plan's held bank is never background-executed",
+  stageVetoX6.stage === 0 && res("goldX6").value === 300);
+buildings.splice(buildings.indexOf(stageVetoX6), 1);
+buildings.splice(buildings.indexOf(trickleAltarX6), 1);
+resources.splice(resources.indexOf(goldX6), 1);
+delete perTick.goldX6;
+res("minerals").value = savedStocksX6.minerals;
+res("minerals").maxValue = savedStocksX6.mineralsMax;
+perTick.minerals = savedStocksX6.mineralsRate;
+techs.forEach((t, i) => { if (i < savedTechX6.length) { t.unlocked = savedTechX6[i].unlocked; t.researched = savedTechX6[i].researched; } });
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
+ * Test AK2 — a reservation-HELD price does not skip the candidate whole
+ * (v2.19.0).  Live regression: every pending workshop upgrade costs
+ * 52-250K science, and the Genetics sprint's cumulative science
+ * reservation (2.73M against a 196K bank) made that price read as a
+ * non-craftable deficit — so the parallel pass skipped every upgrade
+ * whole and never readied their craftable steel.  A short whose bank
+ * already covers the price is only held (the hold releases when the
+ * sprint completes): keep crafting the genuinely missing materials, but
+ * never buy while any floor is short.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+const savedTechAK2 = techs.map((t) => ({ unlocked: t.unlocked, researched: t.researched }));
+for (const tech of techs) tech.researched = true;
+const savedUpgradeAK2 = workshopUpgrades.map((u) => ({ unlocked: u.unlocked, researched: u.researched }));
+for (const upgrade of workshopUpgrades) upgrade.researched = true;
+const savedStocksAK2 = {
+  slab: res("slab").value, minerals: res("minerals").value, mineralsMax: res("minerals").maxValue,
+  wood: res("wood").value, science: [res("science").value, res("science").maxValue], mineralsRate: perTick.minerals,
+};
+
+const goldAK2 = R("goldAK2", 0, 1000, "Aurum II");
+resources.push(goldAK2);
+perTick.goldAK2 = 0.05;
+// The plan holds BOTH a gold trickle and a fat science bill — the science
+// floor is what makes the upgrade's banked science read as "short".
+const trickleShrineAK2 = { name: "trickleShrineAK2", label: "Trickle Shrine", unlocked: true, val: 0, on: 0, prices: [{ name: "goldAK2", val: 800 }, { name: "science", val: 5000 }], effects: {} };
+buildings.push(trickleShrineAK2);
+const decoysAK2 = [];
+for (let i = 0; i < 8; i += 1) {
+  const decoy = { name: `decoyAK2v${i}`, label: `Decoy Manor ${i}`, unlocked: true, val: 0, on: 0, prices: [{ name: "goldAK2", val: 500 }], effects: { maxKittens: 25 } };
+  decoysAK2.push(decoy);
+  buildings.push(decoy);
+}
+// Science 600 covers the upgrade's 500 — the price is bank-HELD by the plan's
+// reservation, not missing; the slab is the genuinely missing craftable part.
+const heldSawAK2 = { name: "heldSawAK2", label: "Held Saw", unlocked: true, researched: false, prices: [{ name: "science", val: 500 }, { name: "slab", val: 80 }, { name: "minerals", val: 100 }], effects: {} };
+workshopUpgrades.push(heldSawAK2);
+
+res("slab").value = 0;
+res("minerals").value = 7900;
+res("minerals").maxValue = 8000;
+perTick.minerals = 0;
+res("wood").value = 200;
+res("science").value = 600;
+res("science").maxValue = 10000;
+
+dbg.forceActiveTarget(dbg.candidateById("build:trickleShrineAK2"), "Economy / normal growth", 5000);
+check("Test AK2: fixture — the decoys hold the ranked window and the held upgrade sits below it",
+  decoysAK2.every((decoy) => dbg.candidateRank(`build:${decoy.name}`) <= 8) && dbg.candidateRank("upgrade:heldSawAK2") > 8);
+const ak2Floors = dbg.parallelReservationFloors("balanced");
+check("Test AK2: fixture — the plan's science bill is a reservation floor above the upgrade's banked 500", (ak2Floors.science || 0) > 500);
+const ak2Text = dbg.craftTowardParallelCandidates("balanced");
+check("Test AK2: the genuinely missing slab is still crafted while the science price is only reservation-held",
+  res("slab").value > 0 && /Slab/i.test(ak2Text) && /Held Saw/i.test(ak2Text));
+check("Test AK2: the held science bank is never spent and the upgrade is not bought",
+  res("science").value === 600 && heldSawAK2.researched === false);
+
+buildings.splice(buildings.indexOf(trickleShrineAK2), 1);
+for (const decoy of decoysAK2) buildings.splice(buildings.indexOf(decoy), 1);
+workshopUpgrades.splice(workshopUpgrades.indexOf(heldSawAK2), 1);
+resources.splice(resources.indexOf(goldAK2), 1);
+delete perTick.goldAK2;
+res("slab").value = savedStocksAK2.slab;
+res("minerals").value = savedStocksAK2.minerals;
+res("minerals").maxValue = savedStocksAK2.mineralsMax;
+res("wood").value = savedStocksAK2.wood;
+res("science").value = savedStocksAK2.science[0];
+res("science").maxValue = savedStocksAK2.science[1];
+perTick.minerals = savedStocksAK2.mineralsRate;
+techs.forEach((t, i) => { if (i < savedTechAK2.length) { t.unlocked = savedTechAK2[i].unlocked; t.researched = savedTechAK2[i].researched; } });
+workshopUpgrades.forEach((u, i) => { if (i < savedUpgradeAK2.length) { u.unlocked = savedUpgradeAK2[i].unlocked; u.researched = savedUpgradeAK2[i].researched; } });
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);

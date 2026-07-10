@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.18.0
+// @version      2.19.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.18.0";
+  const HELPER_VERSION = "2.19.0";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -7890,6 +7890,32 @@
         return;
       }
       const floors = parallelReservationFloors(target, resources);
+      // A GO stage transition whose net bill is fully banked is parallel work
+      // too. The layers above the stage layer (research sprint, science-storage
+      // unlock) can hold the plan for hours, and executePlan's surplus and
+      // cap-relief paths deliberately skip kind "stage" — so an affordable
+      // swap could otherwise never fire while a structural layer owns the plan
+      // (live: Amphitheatre→Broadcast Tower read "GO, payback ≈7s" at rank 1
+      // for the whole culture-paced Genetics sprint it would have
+      // accelerated). Execute the best swap whose net prices clear every
+      // reservation floor; the atomic rebuild contract then outranks the plan
+      // as usual until parity is restored.
+      if (!pendingStageRebuild && Date.now() - lastAutoBuy >= AUTOBUY_MIN_MS) {
+        const swaps = stageTransitionCandidates(resources)
+          .filter((candidate) => candidate && candidate.affordable && !buyBenched(targetId(candidate)) &&
+            (candidate.meta.prices || []).every((price) => priceClearsParallelFloor(price, floors, resources)))
+          .sort((a, b) => (b.meta.analysis.rankGain / Math.max(1, b.meta.analysis.payback + 1)) -
+            (a.meta.analysis.rankGain / Math.max(1, a.meta.analysis.payback + 1)));
+        if (swaps.length) {
+          lastAutoBuy = Date.now();
+          if (executeStageTransitionCandidate(swaps[0])) {
+            parallelPlanText = `Parallel: staged ${labelOf(swaps[0].meta)}`;
+            pushLog(`🏭 parallel stage ${labelOf(swaps[0].meta)} (${swaps[0].meta.analysis.reason}; ${labelOf(target.meta)} keeps its reserves)`);
+            return;
+          }
+          noteBuyFailure(targetId(swaps[0]));
+        }
+      }
       const candidates = getCandidatesCached(resources, goalKey);
       const worked = [];
       let boughtThisTick = false;
@@ -7920,7 +7946,18 @@
           const have = (((getRes(resources, price.name) || {}).value) || 0);
           return have < price.val + Math.max(0, floor);
         });
-        if (shorts.some((price) => !craftByName(price.name))) continue;
+        // A short whose BANK already covers the price is only reservation-HELD
+        // (a sprint's cap-drain science bank carrying the cumulative bill):
+        // the hold releases on its own when the sprint completes, so the
+        // candidate can still finish from surplus later — keep readying its
+        // genuinely missing craftable materials instead of skipping it whole.
+        // Live, every science-priced workshop upgrade froze for the entire
+        // multi-hour Genetics sprint because 52-100K science read as a
+        // non-craftable deficit against the 2.73M reserved bank. Only a truly
+        // missing non-craftable price (a rival gold bill) still skips whole,
+        // and the buy below still requires EVERY floor to clear.
+        const trulyMissing = shorts.filter((price) => ((((getRes(resources, price.name) || {}).value) || 0) < price.val));
+        if (trulyMissing.some((price) => !craftByName(price.name))) continue;
         if (!shorts.length) {
           // Fully banked above every floor: finish it, throttled like any buy.
           if (boughtThisTick || !candidate.affordable) continue;
@@ -7937,17 +7974,24 @@
           }
           continue;
         }
-        // Craft the missing intermediates above the ledger floors.  target=null
-        // keeps the conservative idle cushions on luxuries; the floors map
-        // carries every held bank, so this can only convert genuine surplus.
+        // Craft every CRAFTABLE short above its floor — a craftable bank-held
+        // price (Harbour's slab above the Temple's banked 200) is completed by
+        // crafting MORE, never by dipping the held bank (the v2.15 contract).
+        // A non-craftable bank-held price (the sprint's science) just waits
+        // for its hold to release; when nothing is craftable there is nothing
+        // to do this tick.  target=null keeps the conservative idle cushions
+        // on luxuries; the floors map carries every held bank, so this can
+        // only convert genuine surplus.
+        const craftableShorts = shorts.filter((price) => craftByName(price.name));
+        if (!craftableShorts.length) continue;
         let craftedAny = false;
-        for (const price of shorts) {
+        for (const price of craftableShorts) {
           const floor = Math.max(0, floors[price.name] || 0);
           const before = (((getRes(resourceMap(), price.name) || {}).value) || 0);
           tryCraftResource(price.name, price.val + floor, 0, null, price.name, floors);
           if ((((getRes(resourceMap(), price.name) || {}).value) || 0) > before) craftedAny = true;
         }
-        if (craftedAny) worked.push(`${craftLabel(shorts[0].name)} for ${labelOf(candidate.meta)} (rank ${index + 1})`);
+        if (craftedAny) worked.push(`${craftLabel(craftableShorts[0].name)} for ${labelOf(candidate.meta)} (rank ${index + 1})`);
       }
       parallelPlanText = worked.length
         ? `Parallel: ${worked.join(" · ")}`
