@@ -380,4 +380,13 @@ Key invariants (see comments in the source for the why):
   wait/target/ok/go with headline + "reset now banks +P/+karma" detail) in an
   always-visible card instead of a stat line inside the collapsed details.
   Test AH pins all three through `__kghDebug`.
+- **Manual game speed is additive and reversible** (v2.20.0). The panel's ⏩
+  selector arms `setInterval(game.tick)` with (multiplier − 1) × 5 extra
+  ticks/s on top of the native scheduler — 1× arms nothing, nothing inside
+  the game is mutated (never override `game.rate`), and the choice persists
+  under `kgh.tickSpeed`. Planning stays speed-agnostic because every rate the
+  helper uses is read live. Relatedly, the reset advisor reads metaphysics
+  perks from `gamePage.prestige` — never `science.get`, whose tech/perk name
+  collision marked the unowned Engineering perk as researched AND
+  console.error'd "Failed to get tech" on every tick. Tests AL/AM pin both.
 - **Any non-target spender must evaluate expanded spend impact against the active target ledger.** Direct price checks are insufficient: surplus buys, cap relief, policies, diplomacy, trade, overflow crafting and other spenders must compare their direct costs plus crafted/raw chain impact against `buildTargetLedger()`/`violatesTargetLock()` so a ship/scaffold/plate/slab-style buy cannot consume the material chain being saved for the active focus.

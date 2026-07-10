@@ -511,8 +511,9 @@ const context = {
   clearTimeout,
   setInterval: (fn) => {
     intervalFns.push(fn);
-    return 0;
+    return intervalFns.length - 1;
   },
+  clearInterval: () => {},
   WeakMap,
   Map,
   Set,
@@ -4213,6 +4214,59 @@ techs.forEach((t, i) => { if (i < savedTechAK2.length) { t.unlocked = savedTechA
 workshopUpgrades.forEach((u, i) => { if (i < savedUpgradeAK2.length) { u.unlocked = savedUpgradeAK2[i].unlocked; u.researched = savedUpgradeAK2[i].researched; } });
 dbg.queueClear();
 dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
+ * Test AL — the reset advisor reads metaphysics from the PRESTIGE manager
+ * (v2.20.0).  Live regression: metaphysicsResearched called
+ * science.get(perkName), which (a) console.error'd "Failed to get tech for
+ * tech name 'goldenRatio'" on every advisor tick — 1000+ errors — and
+ * (b) collided with the researched "engineering" TECH, marking the unowned
+ * Engineering PERK as done so the advisor pointed at Golden Ratio instead.
+ * ------------------------------------------------------------------- */
+const engineeringTechAL = { name: "engineering", label: "Engineering (tech)", unlocked: true, researched: true, prices: [] };
+techs.push(engineeringTechAL);
+const scienceGetAL = gamePage.science.get;
+const perkLookupsAL = [];
+gamePage.science.get = (name) => { perkLookupsAL.push(name); return scienceGetAL(name); };
+gamePage.prestige = {
+  perks: [
+    { name: "engineering", researched: false },
+    { name: "goldenRatio", researched: false },
+  ],
+};
+let advAL = dbg.resetAdvisorState();
+check("Test AL: the tech/perk name collision no longer hides the unowned Engineering perk", /next meta: Engineering \(5P/.test(advAL?.detail || ""));
+check("Test AL: the advisor never asks the science manager for perk names", !perkLookupsAL.includes("goldenRatio") && !perkLookupsAL.includes("engineering"));
+gamePage.prestige.perks[0].researched = true;
+advAL = dbg.resetAdvisorState();
+check("Test AL: an owned prestige perk advances the next-meta pointer", /next meta: Golden Ratio \(15P/.test(advAL?.detail || ""));
+gamePage.science.get = scienceGetAL;
+techs.splice(techs.indexOf(engineeringTechAL), 1);
+delete gamePage.prestige;
+
+/* ---------------------------------------------------------------------
+ * Test AM — manual game speed (v2.20.0).  The community setInterval(
+ * game.tick) trick, panel-controlled: N× arms one interval adding
+ * (N − 1) extra ticks per beat on top of the native scheduler, 1× arms
+ * nothing, the choice persists under kgh.tickSpeed, and an unknown
+ * multiplier falls back to native.
+ * ------------------------------------------------------------------- */
+const intervalCountAM = intervalFns.length;
+let extraTicksAM = 0;
+gamePage.tick = () => { extraTicksAM += 1; };
+check("Test AM: default speed is native 1×", dbg.tickSpeed?.() === 1);
+dbg.applyTickSpeed?.(5);
+check("Test AM: choosing 5× persists and arms one booster interval",
+  dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && intervalFns.length === intervalCountAM + 1);
+intervalFns[intervalFns.length - 1]();
+check("Test AM: each booster beat adds (multiplier − 1) extra game ticks", extraTicksAM === 4);
+dbg.applyTickSpeed?.(99);
+check("Test AM: an unknown multiplier falls back to native 1×",
+  dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1");
+extraTicksAM = 0;
+delete gamePage.tick;
+intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
+check("Test AM: at 1× the game is left untouched", extraTicksAM === 0);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
