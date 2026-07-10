@@ -4245,6 +4245,28 @@ techs.splice(techs.indexOf(engineeringTechAL), 1);
 delete gamePage.prestige;
 
 /* ---------------------------------------------------------------------
+ * Test AL2 — prestige evidence overrides an unreliable totalResets field.
+ * Live regression: a 74-paragon / 14-karma save reported totalResets=0, so
+ * both the advisor and expansion layer treated every 130-kitten run as the
+ * first reset. Paragon or banked karma can only exist after a reset.
+ * ------------------------------------------------------------------- */
+const savedResetEvidenceAL2 = {
+  totalResets: gamePage.totalResets,
+  paragonPoints: gamePage.paragonPoints,
+  karmaKittens: gamePage.karmaKittens,
+};
+gamePage.totalResets = 0;
+gamePage.paragonPoints = 74;
+gamePage.karmaKittens = 185;
+setKittens(100);
+const advAL2 = dbg.resetAdvisorState();
+check("Test AL2: earned prestige prevents the first-reset milestone when totalResets is stale",
+  !/First reset target|130\+ kittens/i.test(`${advAL2?.headline || ""} ${advAL2?.detail || ""}`));
+if (savedResetEvidenceAL2.totalResets === undefined) delete gamePage.totalResets; else gamePage.totalResets = savedResetEvidenceAL2.totalResets;
+if (savedResetEvidenceAL2.paragonPoints === undefined) delete gamePage.paragonPoints; else gamePage.paragonPoints = savedResetEvidenceAL2.paragonPoints;
+if (savedResetEvidenceAL2.karmaKittens === undefined) delete gamePage.karmaKittens; else gamePage.karmaKittens = savedResetEvidenceAL2.karmaKittens;
+
+/* ---------------------------------------------------------------------
  * Test AM — manual game speed (v2.20.0).  The community setInterval(
  * game.tick) trick, panel-controlled: N× arms one interval adding
  * (N − 1) extra ticks per beat on top of the native scheduler, 1× arms
