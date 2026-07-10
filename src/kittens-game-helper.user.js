@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.20.0
+// @version      2.20.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.20.0";
+  const HELPER_VERSION = "2.20.1";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -9961,7 +9961,10 @@
   // speed because every rate it uses is read live (observed resource deltas
   // simply reflect the boosted wall clock, so ETAs remain wall-clock-true).
   const TICK_SPEED_KEY = "kgh.tickSpeed";
-  const TICK_SPEED_OPTIONS = [1, 2, 3, 5, 10];
+  // Very high multipliers are machine-bound: each beat runs its extra ticks
+  // synchronously, so when a burst takes longer than the 200ms beat the game
+  // simply runs as fast as the machine allows instead of stacking up work.
+  const TICK_SPEED_OPTIONS = [1, 2, 3, 5, 10, 20, 50];
   const TICK_SPEED_BEAT_MS = 200; // one beat per native tick at 5/s
   let tickSpeedTimer = null;
   let tickSpeed = (() => {
@@ -10027,6 +10030,10 @@
       ".kgh-panel button{white-space:nowrap;flex:0 0 auto}" +
       // …except the full-width autopilot toggle, which must fill its row.
       ".kgh-panel .kgh-autopilot{flex:1 1 auto;background:#2d6b3f;color:#f2e8d5}" +
+      // The speed selector shares the autopilot row: the panel-wide
+      // select{width:100%} rule would make it claim the whole row and overlap
+      // the toggle, so pin it to its content size.
+      ".kgh-panel .kgh-speed{width:auto;flex:0 0 auto}" +
       ".kgh-card{background:var(--kgh-card);border:1px solid var(--kgh-line);border-radius:8px;padding:6px 8px;display:grid;gap:3px}" +
       ".kgh-sect{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--kgh-dim);font-weight:700}" +
       ".kgh-note{display:block;color:#d9ccae;opacity:.78}" +
