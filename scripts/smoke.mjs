@@ -3931,6 +3931,133 @@ dbg.clearResourceTelemetry?.();
 dbg.queueClear();
 dbg.forceActiveTarget(null);
 
+/* ---------------------------------------------------------------------
+ * Test X5 — stage gather ETA is bounded separately from the payback
+ * horizon (v2.18.0).  Live regression: 79 Aqueducts / 71 Libraries /
+ * 66 Pastures / 48 Amphitheatres never staged up because the parity
+ * rebuild bill of a mature stack takes hours to fund, and that gather
+ * time was charged against the 6h payback horizon — every big-stack
+ * transition read "payback exceeds planning horizon" forever, silently.
+ * Now the horizon bounds only the true loss recovery (recoup); gather
+ * gets its own 24h bound, and every staged building's verdict is a
+ * diagnostics line (`Stage:`).
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+const graniteX5 = R("graniteX5", 0, 100000, "Granite");
+resources.push(graniteX5);
+// 3.33e-3/s: the 100-granite net bill takes ≈8h20m to gather — beyond the old
+// eta-inclusive 6h horizon, comfortably inside the 24h funding bound — while
+// the recoup itself (downtime + refund burn against the growth advantage) is
+// only ≈1h. Exact parity: 40×100 scienceMax == 10×400, remainder 0.
+perTick.graniteX5 = 6.67e-4;
+const stageBigX5 = {
+  name: "stageBigX5",
+  unlocked: true,
+  stage: 0,
+  val: 40,
+  on: 40,
+  priceRatio: 1,
+  stages: [
+    { label: "Old Archive X5", prices: [{ name: "graniteX5", val: 10 }], effects: { scienceMax: 100 }, stageUnlocked: true },
+    { label: "Data Center X5", prices: [{ name: "graniteX5", val: 30 }], effects: { scienceMax: 400 }, stageUnlocked: true },
+  ],
+  effects: {},
+};
+buildings.push(stageBigX5);
+const bigX5 = dbg.stageTransitionAnalysis?.(stageBigX5, 1);
+check("Test X5: a mature stack whose net bill takes >6h to gather is still actionable (recoup is the loss, gather is only delay)",
+  bigX5?.actionable === true && bigX5?.eta > 6 * 3600 && bigX5?.recoup < 6 * 3600 && bigX5?.payback > 6 * 3600);
+check("Test X5: the Stage line reports the actionable verdict", /Old Archive X5→Data Center X5: GO/.test(dbg.stageStatus?.() || ""));
+
+// 5e-4/s: recoup stays well under 6h but the 100-granite bill now takes ≈55h —
+// past the 24h funding bound → not actionable, with the gather reason.
+perTick.graniteX5 = 1e-4;
+const slowX5 = dbg.stageTransitionAnalysis?.(stageBigX5, 1);
+check("Test X5: a week-long net bill trips the funding horizon, not the payback horizon",
+  slowX5?.actionable === false && /funding horizon/i.test(slowX5?.reason || "") && slowX5?.recoup < 6 * 3600);
+check("Test X5: the Stage line carries the exact blocking reason", /Old Archive X5→Data Center X5: net bill gather .* funding horizon/i.test(dbg.stageStatus?.() || ""));
+check("Test X5: the diagnostics report carries the Stage line", /\nStage: /.test(dbg.report()));
+buildings.splice(buildings.indexOf(stageBigX5), 1);
+resources.splice(resources.indexOf(graniteX5), 1);
+delete perTick.graniteX5;
+
+/* ---------------------------------------------------------------------
+ * Test AK — the workshop-upgrade backlog is parallel work past the ranked
+ * window (v2.18.0).  Live regression: Titanium Barns sat 157 craftable
+ * steel short for ages (every other cost banked) because the parallel
+ * pass only scanned the top-8 ranked candidates and transient build
+ * candidates held every slot — nothing would craft for a rank-12 upgrade
+ * even though the buy would have cleared every reservation floor.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+const savedTechAK = techs.map((t) => ({ unlocked: t.unlocked, researched: t.researched }));
+for (const tech of techs) tech.researched = true; // no research sprints in this fixture
+const savedUpgradeAK = workshopUpgrades.map((u) => ({ unlocked: u.unlocked, researched: u.researched }));
+for (const upgrade of workshopUpgrades) upgrade.researched = true; // ours is the only open upgrade
+const savedStocksAK = {
+  slab: res("slab").value, minerals: res("minerals").value, mineralsMax: res("minerals").maxValue,
+  wood: res("wood").value, science: res("science").value, mineralsRate: perTick.minerals,
+};
+
+const goldAK = R("goldAK", 0, 1000, "Aurum");
+resources.push(goldAK);
+perTick.goldAK = 0.05; // reachable trickle — the plan and the decoys all wait on it
+const trickleTempleAK = { name: "trickleTempleAK", label: "Trickle Temple", unlocked: true, val: 0, on: 0, prices: [{ name: "goldAK", val: 800 }], effects: {} };
+buildings.push(trickleTempleAK);
+// Eight high-value decoys hold the whole ranked window; each is skipped whole
+// (their goldAK short is non-craftable), so under the old scan nothing below
+// rank 8 could ever be crafted for.
+const decoysAK = [];
+for (let i = 0; i < 8; i += 1) {
+  const decoy = { name: `decoyAK${i}`, label: `Decoy Estate ${i}`, unlocked: true, val: 0, on: 0, prices: [{ name: "goldAK", val: 500 }], effects: { maxKittens: 25 } };
+  decoysAK.push(decoy);
+  buildings.push(decoy);
+}
+const backlogSawAK = { name: "backlogSawAK", label: "Backlog Saw", unlocked: true, researched: false, prices: [{ name: "slab", val: 80 }, { name: "minerals", val: 100 }], effects: {} };
+workshopUpgrades.push(backlogSawAK);
+
+res("slab").value = 0;
+res("minerals").value = 7900; // idle surplus for Slab crafting
+res("minerals").maxValue = 8000;
+perTick.minerals = 0;
+res("wood").value = 200; // keep the cheap base buildings out of surplus reach
+res("science").value = 100;
+
+dbg.forceActiveTarget(dbg.candidateById("build:trickleTempleAK"), "Economy / normal growth", 5000);
+check("Test AK: fixture — the decoys hold the ranked window and the upgrade sits below it",
+  decoysAK.every((decoy) => dbg.candidateRank(`build:${decoy.name}`) <= 8) && dbg.candidateRank("upgrade:backlogSawAK") > 8);
+const akText = dbg.craftTowardParallelCandidates("balanced");
+check("Test AK: the backlog upgrade's craftable short is crafted past the ranked window",
+  res("slab").value > 0 && /Slab/i.test(akText) && /Backlog Saw/i.test(akText));
+
+res("slab").value = 200; // top the bank up to the full bill — minerals alone couldn't fund it
+fakeNow += 5000;
+dbg.craftTowardParallelCandidates("balanced");
+check("Test AK: the backlog upgrade completes from surplus with every floor intact", backlogSawAK.researched === true);
+check("Test AK: the backlog buy is logged as parallel work", /parallel upgrade .*Backlog Saw/i.test(logText()));
+check("Test AK: no decoy is bought or crafted for (non-craftable gold shorts skip whole)", decoysAK.every((decoy) => decoy.val === 0));
+check("Test AK: the plan target itself is untouched by the backlog pass", trickleTempleAK.val === 0);
+
+buildings.splice(buildings.indexOf(trickleTempleAK), 1);
+for (const decoy of decoysAK) buildings.splice(buildings.indexOf(decoy), 1);
+workshopUpgrades.splice(workshopUpgrades.indexOf(backlogSawAK), 1);
+resources.splice(resources.indexOf(goldAK), 1);
+delete perTick.goldAK;
+res("slab").value = savedStocksAK.slab;
+res("minerals").value = savedStocksAK.minerals;
+res("minerals").maxValue = savedStocksAK.mineralsMax;
+res("wood").value = savedStocksAK.wood;
+res("science").value = savedStocksAK.science;
+perTick.minerals = savedStocksAK.mineralsRate;
+techs.forEach((t, i) => { if (i < savedTechAK.length) { t.unlocked = savedTechAK[i].unlocked; t.researched = savedTechAK[i].researched; } });
+workshopUpgrades.forEach((u, i) => { if (i < savedUpgradeAK.length) { u.unlocked = savedUpgradeAK[i].unlocked; u.researched = savedUpgradeAK[i].researched; } });
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
   process.exit(1);
