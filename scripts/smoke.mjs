@@ -4260,6 +4260,10 @@ check("Test AM: choosing 5× persists and arms one booster interval",
   dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && intervalFns.length === intervalCountAM + 1);
 intervalFns[intervalFns.length - 1]();
 check("Test AM: each booster beat adds (multiplier − 1) extra game ticks", extraTicksAM === 4);
+extraTicksAM = 0;
+dbg.applyTickSpeed?.(50);
+intervalFns[intervalFns.length - 1]();
+check("Test AM: the 50× ceiling arms 49 extra ticks per beat", dbg.tickSpeed?.() === 50 && extraTicksAM === 49);
 dbg.applyTickSpeed?.(99);
 check("Test AM: an unknown multiplier falls back to native 1×",
   dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1");
