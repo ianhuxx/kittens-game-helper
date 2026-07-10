@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.20.3
+// @version      2.20.4
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -34,7 +34,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
-  const HELPER_VERSION = "2.20.3";
+  const HELPER_VERSION = "2.20.4";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
   // never clicks reset/transcend/sacrifice/time-skip actions.
@@ -2327,6 +2327,25 @@
     return options.length ? { ...options[0], pressure, options: options.slice(0, 3) } : null;
   };
 
+  // A full post-reset village can otherwise reserve the same shared bank for
+  // housing forever, starving workshop upgrades that are already fully paid
+  // for and materially more valuable (live: Mansion held all steel while Steel
+  // Saw and both titanium storage upgrades read READY). Keep the first-reset
+  // milestone absolute; after it, let the normal 25% score threshold choose a
+  // ready upgrade without bypassing any reservation or purchase safety rule.
+  const bestReadyWorkshopCheckpoint = (candidates, resources, expansion) => {
+    if (!expansion || !expansion.candidate || expansion.pressure.firstReset) return null;
+    const options = candidates
+      .filter((candidate) =>
+        candidate && candidate.kind === "upgrade" && candidate.meta &&
+        candidate.affordable && isOpen(candidate.meta) &&
+        !buyBenched(targetId(candidate)) &&
+        solveCraftChain(resources, candidate).reachable)
+      .sort((a, b) => (b.score || 0) - (a.score || 0));
+    const winner = options[0] || null;
+    return winner && candidateMeetsSwitchScoreGain(expansion.candidate, winner) ? winner : null;
+  };
+
   const scaledEffectProfileFromEntries = (entries) => {
     const profile = emptyEffectProfile();
     for (const [key, value, scale] of entries) parseEffectEntry(profile, key, value * scale);
@@ -3707,6 +3726,7 @@
     researchSprint: "Research sprint",
     resourceBootstrap: "Resource bootstrap",
     expansion: "Expansion checkpoint",
+    workshopCheckpoint: "Workshop checkpoint",
     festival: "Festival maintenance",
     stageTransition: "Building stage transition",
     stageRebuild: "Stage rebuild",
@@ -5702,6 +5722,18 @@
     if (!activeSprint) {
       const expansion = bestExpansionCheckpoint(candidates, resources);
       if (expansion) {
+        const workshopCheckpoint = bestReadyWorkshopCheckpoint(candidates, resources, expansion);
+        if (workshopCheckpoint) {
+          return {
+            candidates: [workshopCheckpoint, ...candidates.filter((candidate) => targetId(candidate) !== targetId(workshopCheckpoint))],
+            target: workshopCheckpoint,
+            layer: STRATEGIC_LAYERS.workshopCheckpoint,
+            reason: `${labelOf(workshopCheckpoint.meta)} is ready and materially outranks another ${labelOf(expansion.candidate.meta)} for population growth`,
+            protectedChain: candidateCraftChainResources(workshopCheckpoint),
+            workshopCheckpoint: { expansion },
+            rejectedTopCandidates: [{ target: expansion.candidate, reason: `deferred for ready workshop upgrade ${labelOf(workshopCheckpoint.meta)}` }],
+          };
+        }
         const target = expansion.candidate;
         return {
           candidates,

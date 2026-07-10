@@ -2651,7 +2651,7 @@ const savedResetCountW = gamePage.totalResets;
 const savedTechFlagsW = techs.map((tech) => [tech, tech.researched]);
 for (const tech of techs) tech.researched = true;
 const expansionTechW = { name: "expansionTechW", label: "Fresh Science", unlocked: true, researched: false, prices: [{ name: "science", val: 10000 }], unlocks: { tech: ["futureExpansionTechW"] } };
-const housingW = { name: "housingW", label: "Efficient Housing", unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 100 }], effects: { maxKittens: 5 } };
+const housingW = { name: "housingW", label: "Efficient Housing", unlocked: true, val: 22, on: 22, prices: [{ name: "wood", val: 100 }], effects: { maxKittens: 1 } };
 techs.push(expansionTechW);
 buildings.push(housingW);
 village.getKittens = () => 100;
@@ -2661,6 +2661,40 @@ res("science").value = Math.min(res("science").maxValue, res("science").maxValue
 dbg.forceActiveTarget(null);
 let expansionDecisionW = dbg.selectStrategicTarget("balanced");
 check("Test W: full pre-reset village chooses an Expansion checkpoint before another sprint", expansionDecisionW.layer === "Expansion checkpoint" && expansionDecisionW.target?.meta?.name === "housingW");
+
+// Post-reset, a materially better upgrade that is already fully banked must
+// not be starved by another housing reservation. This mirrors the live board:
+// Mansion held 1.62K steel while Steel Saw and two storage upgrades were READY.
+const savedPrestigeW = { paragon: gamePage.paragonPoints, karmaKittens: gamePage.karmaKittens };
+const savedSteelW = res("steel").value;
+const readyWorkshopW = {
+  name: "readyWorkshopW",
+  label: "Ready Workshop W",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "steel", val: 100 }],
+  effects: { woodRatio: 10 },
+};
+workshopUpgrades.push(readyWorkshopW);
+gamePage.totalResets = 1;
+gamePage.paragonPoints = 74;
+gamePage.karmaKittens = 185;
+res("steel").value = 1000;
+dbg.forceActiveTarget(null);
+const workshopCheckpointW = dbg.selectStrategicTarget("balanced");
+check("Test W: ready high-value workshop upgrade preempts repeated post-reset housing expansion",
+  workshopCheckpointW.layer === "Workshop checkpoint" && workshopCheckpointW.target?.meta?.name === "readyWorkshopW");
+gamePage.totalResets = 0;
+gamePage.paragonPoints = 0;
+gamePage.karmaKittens = 0;
+dbg.forceActiveTarget(null);
+const firstResetStillWinsW = dbg.selectStrategicTarget("balanced");
+check("Test W: first-reset expansion still outranks the same ready workshop upgrade",
+  firstResetStillWinsW.layer === "Expansion checkpoint" && firstResetStillWinsW.target?.meta?.name === "housingW");
+workshopUpgrades.splice(workshopUpgrades.indexOf(readyWorkshopW), 1);
+res("steel").value = savedSteelW;
+if (savedPrestigeW.paragon === undefined) delete gamePage.paragonPoints; else gamePage.paragonPoints = savedPrestigeW.paragon;
+if (savedPrestigeW.karmaKittens === undefined) delete gamePage.karmaKittens; else gamePage.karmaKittens = savedPrestigeW.karmaKittens;
 const savedWoodCapW = { value: res("wood").value, maxValue: res("wood").maxValue };
 const savedHousingPricesW = housingW.prices;
 housingW.prices = [{ name: "wood", val: 500 }];
