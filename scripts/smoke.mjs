@@ -271,6 +271,16 @@ let sacrificeChunks = 0; // 2500-unicorn batches converted to tears
 const calendar = {
   festivalDays: 0,
   daysPerSeason: 100,
+  season: 1,
+  seasons: [
+    { name: "spring", title: "Spring" },
+    { name: "summer", title: "Summer" },
+    { name: "autumn", title: "Autumn" },
+    { name: "winter", title: "Winter" },
+  ],
+  getCurSeason() {
+    return this.seasons[this.season];
+  },
   observeRemainingTime: 0,
   observeHandler() {
     observeCalls += 1;
@@ -327,11 +337,21 @@ const resourcePerTickCalls = [];
 
 const diplomacy = {
   races: [
-    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], sells: [{ name: "minerals", value: 100, chance: 100 }] },
+    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], standing: 0, energy: 0, sells: [{ name: "minerals", value: 100, chance: 1 }] },
   ],
   get: (name) => diplomacy.races.find((race) => race.name === name),
   getManpowerCost: () => 50,
   getGoldCost: () => 15,
+  getTradeRatio: () => 0,
+  getFinalStanding: (race) => (Number.isFinite(race?.standing) ? race.standing : 0),
+  isValidTrade(sell, race) {
+    const resource = res(sell?.name);
+    return !!sell && !!race && (!sell.minLevel || (race.embassyLevel || 0) >= sell.minLevel) &&
+      (!!resource?.unlocked || sell.name === "uranium" || race.name === "leviathans");
+  },
+  getResourceTradeChance(sell, race) {
+    return this.isValidTrade(sell, race) ? sell.chance : 0;
+  },
   getMaxTradeAmt: () => 1,
   tradeAll(race) {
     tradeCalls += 1;
@@ -639,6 +659,7 @@ techs.push({
   unlocks: {},
 });
 const astronomy = techs.find((tech) => tech.name === "astronomy");
+techs.find((tech) => tech.name === "theology").researched = true; // live prerequisite for an open Astronomy
 astronomy.unlocked = true;
 astronomy.researched = false;
 astronomy.prices = [{ name: "science", val: 30000 }, { name: "manuscript", val: 65 }];
@@ -657,6 +678,9 @@ res("gear").value = 45;
 res("manuscript").value = 16;
 tickFn();
 check("space focus: hidden building-upgrade production is valued (Printing Press for manuscripts)", printingPress.researched === true && /Printing Press/.test(logText()));
+// This stage tests fresh Rush Space ranking, not persistence of the Theology
+// sprint that the newly modeled owned Steamworks producer now keeps reachable.
+context.window.__kghDebug.forceActiveTarget(null);
 gamePage.workshop.upgrades.push({
   name: "crossbow",
   label: "Crossbow",
@@ -675,7 +699,7 @@ res("beam").value = 55;
 res("slab").value = 342;
 tickFn();
 check("space focus: manuscript-gated Astronomy stays ahead of side catpower Warehouse", /Astronomy/.test(panelText(".kgh-plan")) && !/warehouse/i.test(panelText(".kgh-plan")));
-check("goal line: milestone progress counted from the tech tree (0/3 toward Rocketry)", /0\/3 techs/.test(panelText(".kgh-goal-line")) && /Astronomy/.test(panelText(".kgh-goal-line")));
+check("goal line: milestone progress counted from the tech tree (1/3 toward Rocketry)", /1\/3 techs/.test(panelText(".kgh-goal-line")) && /Astronomy/.test(panelText(".kgh-goal-line")));
 
 /* Stage 6 — overflow crafting must not steal resources the focus still reserves */
 techs.forEach((tech) => { tech.researched = true; });
@@ -1371,7 +1395,7 @@ const setupAcoustics = () => {
   res("iron").value = 250; res("iron").maxValue = 300;
   let sharks = diplomacy.races.find((race) => race.name === "sharks");
   if (!sharks) {
-    sharks = { name: "sharks", title: "Sharks", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], buys: [{ name: "iron", val: 100 }], sells: [{ name: "parchment", value: 7, chance: 100 }, { name: "manuscript", value: 4.8, chance: 100 }, { name: "compedium", value: 1.4, chance: 100 }] };
+    sharks = { name: "sharks", title: "Sharks", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], standing: 0, energy: 0, buys: [{ name: "iron", val: 100 }], sells: [{ name: "parchment", value: 7, chance: 1 }, { name: "manuscript", value: 4.8, chance: 1 }, { name: "compedium", value: 1.4, chance: 1 }] };
     diplomacy.races.push(sharks);
   }
   sharks.unlocked = true; sharks.tradeTotal = 0;
@@ -2105,9 +2129,10 @@ check("Test L: panel ships a 'Copy' button for the action log", /kgh-log-copy/.t
  * worth more than Winter Furs).  This is a unit-level check on the
  * exposed pieces; the wider scoring still runs through targetTradeScore.
  * ------------------------------------------------------------------- */
-check("Test M: tradeSellExpected hook accepts a race so embassy bonus applies", /tradeSellExpected = \(sell, race = null\)/.test(source));
+check("Test M: tradeSellExpected hook accepts a race", /tradeSellExpected = \(sell, race = null\)/.test(source));
 check("Test M: trade scoring reads current calendar season", /currentTradeSeasonName/.test(source));
-check("Test M: trade scoring folds embassy level into expected yield", /tradeEmbassyBonus/.test(source));
+check("Test M: trade scoring delegates live chance to diplomacy", /getResourceTradeChance/.test(source));
+check("Test M: trade scoring has no fabricated flat embassy payout multiplier", !/const tradeEmbassyBonus/.test(source));
 
 /* ---------------------------------------------------------------------
  * Test N — v2.4.0 trade-vs-craft pathway analysis: the planner can
@@ -3347,7 +3372,7 @@ dbg.forceActiveTarget(null);
  * without an existing uranium income/trade path it is hard-blocked and must
  * not head the planner's consideration list.
  * ------------------------------------------------------------------- */
-const uraniumAE = R("uranium", 0, 2250, "Uranium");
+const uraniumAE = R("uranium", 0, 2250, "Uranium", { unlocked: false });
 const acceleratorAE = {
   name: "acceleratorAE",
   label: "Accelerator AE",
@@ -3380,12 +3405,66 @@ workshopUpgrades.push(nuclearSmeltersAE);
 perTick.uranium = 0;
 dbg.clearResourceTelemetry?.("uranium");
 dbg.forceActiveTarget(null);
+const dragonUraniumSellAE = { name: "uranium", value: 1, chance: 0.95, width: 0, seasons: { summer: 0.35 } };
+const dragonThoriumSellAE = { name: "thorium", value: 1, chance: 0.5, width: 0.25, minLevel: 5 };
+const dragonsAE = {
+  name: "dragons",
+  title: "Dragons",
+  hidden: true,
+  unlocked: true,
+  embassyLevel: 0,
+  standing: 0,
+  energy: 0,
+  buys: [{ name: "titanium", val: 250 }],
+  sells: [dragonUraniumSellAE, dragonThoriumSellAE],
+};
+check("late game B: uranium trade is eligible before the resource unlocks", typeof dbg.validRaceSell === "function" && dbg.validRaceSell(dragonsAE, dragonUraniumSellAE));
+check("late game B: live fractional trade chance", typeof dbg.expectedTradeYield === "function" && Math.abs(dbg.expectedTradeYield(dragonsAE, dragonUraniumSellAE) - 1.2825) < 1e-6);
+check("late game B: embassy-gated thorium stays invalid below level five", typeof dbg.validRaceSell === "function" && !dbg.validRaceSell(dragonsAE, dragonThoriumSellAE));
 const acceleratorCandidateAE = dbg.candidateById("build:acceleratorAE", "balanced");
 const acceleratorChainAE = dbg.solveChain(acceleratorCandidateAE);
 const uraniumDecisionAE = dbg.selectStrategicTarget("balanced");
-check("Test AE: first uranium producer is hard-blocked when it also costs uranium", acceleratorChainAE.hardBlocked && /no path for Uranium/i.test((acceleratorChainAE.blockers || []).map((b) => b.text).join(" ")));
+check("Test AE: first uranium producer is hard-blocked when it also costs uranium", acceleratorChainAE.hardBlocked && /no (?:acquisition )?path for Uranium/i.test((acceleratorChainAE.blockers || []).map((b) => b.text).join(" ")));
 check("Test AE: hard-blocked first-uranium producer is scored below viable work", acceleratorCandidateAE.score < 0);
 check("Test AE: hard-blocked uranium bootstrap does not head the ranked candidates", uraniumDecisionAE.candidates?.[0]?.meta?.name !== "acceleratorAE");
+
+diplomacy.races.push(dragonsAE);
+const tradeFundingAE = {
+  gold: [res("gold").value, res("gold").maxValue],
+  manpower: [res("manpower").value, res("manpower").maxValue],
+  titanium: [res("titanium").value, res("titanium").maxValue],
+};
+res("gold").value = 1000; res("gold").maxValue = Math.max(1000, res("gold").maxValue || 0);
+res("manpower").value = 5000; res("manpower").maxValue = 10000;
+res("titanium").value = 6750; res("titanium").maxValue = 10000;
+const dragonUraniumPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.acquisitionPathFor("uranium", 25) : null;
+const acceleratorTradeChainAE = dbg.solveChain(acceleratorCandidateAE);
+check("Test AE: Dragons make the first uranium producer reachable", !!dragonUraniumPathAE?.reachable && dragonUraniumPathAE.kind === "trade" && Number.isFinite(dragonUraniumPathAE.eta) && dragonUraniumPathAE.nextStep?.race?.name === "dragons" && acceleratorTradeChainAE.reachable);
+
+const unobtainiumAE = R("unobtainium", 10000, 0, "Unobtainium");
+const timeCrystalAE = R("timeCrystal", 0, 0, "Time Crystal", { unlocked: false });
+const leviathansAE = {
+  name: "leviathans",
+  title: "Leviathans",
+  hidden: true,
+  unlocked: true,
+  embassyLevel: 0,
+  standing: 0,
+  energy: 0,
+  buys: [{ name: "unobtainium", val: 5000 }],
+  sells: [{ name: "timeCrystal", value: 0.25, chance: 0.98, width: 0.15 }],
+};
+resources.push(unobtainiumAE, timeCrystalAE);
+diplomacy.races.push(leviathansAE);
+const leviathanTimeCrystalPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.acquisitionPathFor("timeCrystal", 0.25) : null;
+check("Test AE: Leviathans provide a finite time-crystal acquisition route", !!leviathanTimeCrystalPathAE?.reachable && leviathanTimeCrystalPathAE.kind === "trade" && Number.isFinite(leviathanTimeCrystalPathAE.eta) && leviathanTimeCrystalPathAE.nextStep?.race?.name === "leviathans");
+diplomacy.races.splice(diplomacy.races.indexOf(leviathansAE), 1);
+resources.splice(resources.indexOf(timeCrystalAE), 1);
+resources.splice(resources.indexOf(unobtainiumAE), 1);
+diplomacy.races.splice(diplomacy.races.indexOf(dragonsAE), 1);
+[res("gold").value, res("gold").maxValue] = tradeFundingAE.gold;
+[res("manpower").value, res("manpower").maxValue] = tradeFundingAE.manpower;
+[res("titanium").value, res("titanium").maxValue] = tradeFundingAE.titanium;
 workshopUpgrades.splice(workshopUpgrades.indexOf(nuclearSmeltersAE), 1);
 buildings.splice(buildings.indexOf(acceleratorAE), 1);
 buildings.splice(buildings.indexOf(reactorAE), 1);
