@@ -105,6 +105,8 @@ All mutations flow through a semantic action broker. Each action has an explicit
 
 The broker is the final execution boundary. Candidate filtering remains defense in depth, but a denied or unknown action passed directly to the purchase function must still produce zero controller calls.
 
+The helper panel exposes a persistent `Prestige automation` arm control. It defaults off for new installs because repository users have not supplied the authorization given in this task. Arming requires one deliberate click, records the exact authorization flag in helper-owned local storage, and immediately changes the panel status to `ARMED`. Disarming is always available and takes effect before the next planner tick. Transcend, Adore, and alicorn sacrifice require this flag; ordinary transcendence-upgrade purchases do not.
+
 Global `gamePage.opts.noConfirm = true` will be removed. Repeatable controllers are invoked through their public APIs. Before an irreversible action, the broker must:
 
 1. Verify persistent user authorization.
