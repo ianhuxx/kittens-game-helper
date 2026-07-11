@@ -101,31 +101,35 @@ Converter control must preserve resources reserved by the active acquisition rou
 
 Candidate discovery must distinguish metadata that exists in memory from content the live game has made actionable. A normalized `candidateGate` reads the owning manager, source building/tab, native unlock state, automatic unlock threshold, required technology, and controller availability before a candidate may enter a strategic layer.
 
-- Workshop upgrades and workshop crafts cannot become plans, roadmap items, queues, or bootstrap chains until at least one Workshop exists and the Workshop source is unlocked.
+- Research requires the native Science surface (or its Library source fallback), and Workshop upgrades/non-core workshop crafts require the native Workshop surface (or Workshop ×1 fallback). Persisted/open metadata after a reset cannot bypass a missing source building.
 - Ziggurat buildings/upgrades and unicorn sacrifice logic cannot become plans until their live technology/resource/source gates are satisfied. A raw `unlocked` default or a future price alone is insufficient.
-- Automatically unlockable Bonfire buildings must satisfy the same `isUnlockable`/`isUnlocked` and `unlockRatio` semantics used by the live Buildings manager; the helper must not fabricate an early focus from raw metadata.
+- Automatically unlockable Bonfire buildings must satisfy the same `isUnlockable`/`isUnlocked` and `unlockRatio` semantics used by the live Buildings manager. A hidden-building precursor aggregates every active-stage threshold price and requires every leg to have an acquisition route; it never creates one misleading focus per price. The helper must not fabricate an early focus from raw metadata.
 - A blocked source reports the missing source rather than reserving its future resources or redirecting jobs.
 
-The same gate interface applies from fresh start through Space so future metadata additions cannot bypass source availability.
+The same gate interface applies to discovery, storage pressure, producer demand, novelty, queue lookup, lock feasibility, diagnostics, and a fresh execution-time check from fresh start through Space. A gate that closes releases the plan immediately without benching a failed purchase.
 
 ### 8. Speed-aware automation clock
 
-The game-speed multiplier accelerates game state but the current helper scheduler and most cooldowns use unscaled wall time. Replace those scattered comparisons with one automation clock.
+The game-speed multiplier accelerates game state but the current helper scheduler and most cooldowns use unscaled wall time. Replace those scattered comparisons with one automation clock that measures delivered game ticks rather than assuming the selected multiplier is achieved.
 
-- `gameElapsedMs(timestamp)` multiplies safe planner elapsed time by the active speed.
+- The clock tracks wall time, requested multiplier, executed booster ticks, native ticks, and measured delivered ticks per second. `gameElapsedMs(timestamp)` integrates measured game progress and falls back conservatively to the requested multiplier only before a sample exists.
 - `automationDelayMs(base, floor)` converts a logical game-time delay to wall time with a subsystem-specific CPU/safety floor.
-- The helper planner timer is re-armed when speed changes and runs no faster than a 250 ms wall-clock floor. It must not create overlapping ticks.
+- Scheduling has two lanes: a cheap action lane rechecks affordability, unlocks, safety, and the active route every 100–250 ms; a full planning/render lane runs at `max(250 ms, 2,000 ms / measuredMultiplier)` and renders no faster than twice per second. Neither lane may overlap itself or the other mutation boundary.
+- The speed booster processes bounded chunks under a per-frame CPU budget, yields between chunks, and drops rather than accumulates backlog. Requested and delivered multipliers are reported separately.
+- Timer ownership lives on `window`; reinjection cancels predecessor helper, action, render, and speed timers before starting replacements.
 - Trade, autobuy, job rebalance, plan-rejection, processor hysteresis, unicorn batching, sticky-route expiry, and ordinary log pacing advance in logical game time.
 - Irreversible-action cooldown, UI feedback timers, copy-button feedback, and checkpoint failure suppression remain real wall time.
 - Stage reversal protection is expressed in game/calendar progress when available, with speed-scaled elapsed time as a fallback.
 
-At 50× the planner therefore responds several times per second without attempting fifty complete planning passes per native beat. Tests use a controllable clock and assert identical logical behavior at every supported multiplier.
+Production telemetry and ETA reconciliation use measured delivered TPS, so a machine-bound requested 50× mode does not publish fictional 50× ETAs. At high speed the planner responds several times per second without attempting fifty complete planning passes per native beat. Tests use a controllable clock and assert identical logical behavior at every supported multiplier.
 
 ### 9. Pollution-aware long-run control
 
 Add a read-only pollution model based on the live Buildings manager: current `cathPollution`, `cathPollutionPerTick`, pollution level, equilibrium, clean-energy ratio, current pollution effects, next-level threshold, and ETA in game time.
 
 Candidate marginal profiles include `cathPollutionPerTickProd` and `cathPollutionPerTickCon`. Economic scoring converts projected pollution into its actual downstream costs: catnip production loss, happiness loss, kitten-arrival slowdown, and Solar Revolution penalty. The penalty grows near a new pollution level and when food/happiness margins are already weak. Carbon sequestration and cleaner power receive the corresponding measured benefit; pollution is not a flat name-based penalty.
+
+Pollution effect keys are excluded from generic resource production parsing. Producing pollution can never earn the normal positive-production score, and consuming pollution can never be discarded merely because `cathPollution` is not a resource-pool row.
 
 Add a Pollution recovery layer below immediate food/power survival but above ordinary economy repetition. It activates only when pollution is rising toward a materially harmful level/equilibrium and a reachable action improves the projected outcome. It may enable carbon-sequestering Factories, prefer clean generators, and throttle nonessential polluters. It cannot disable a converter required by the active safety or acquisition route, and it must preserve minimum production needed to escape the pollution state.
 
@@ -196,6 +200,7 @@ The unlock watcher must include Space missions, planet buildings, transcendence 
 - Cycles in acquisition routes are detected and reported as blockers.
 - A storage-blocked output cannot trigger a trade or transformation batch beyond current headroom.
 - A failed purchase invalidates the cached plan and forces a fresh metadata read.
+- A subsystem exception is recorded with subsystem/action context, appears in diagnostics, and does not prevent later independent subsystems or the next tick from running.
 
 ## Testing Strategy
 
@@ -222,6 +227,7 @@ Required regression groups:
 17. Fresh-start lifecycle gates proving no Workshop upgrade is considered before Workshop ×1 and no Ziggurat path is considered before the native source gate.
 18. Controllable-clock timing parity at 1×/5×/10×/25×/50×, including non-overlapping planner ticks and real-time irreversible cooldowns.
 19. Pollution projections, threshold ETA, marginal scoring, sequestration, clean-energy preference, protected critical converters, and long-run bounded-pollution simulations.
+20. Requested-versus-delivered speed, cooperative slow-tick yielding, reinjection timer ownership, measured-TPS ETAs, bounded render rate, and recoverable subsystem-error diagnostics.
 
 The final gate runs validation, smoke tests, simulations, and any focused new suites. A broad code review must verify the full diff before merge.
 
