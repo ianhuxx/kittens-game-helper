@@ -20,6 +20,9 @@
 - Every trade and rare-capital action must respect the complete reservation ledger and output storage headroom.
 - In the supplied 39.85-alicorn/1-time-crystal state, no alicorn sacrifice may execute or be recommended while Alicorn Stable still requires 20 alicorns.
 - Preserve early-game safety, genuine power recovery, first-reset population milestones, active research contracts, and bounded unicorn-to-tears behavior.
+- Workshop upgrades/crafts require Workshop ×1; Ziggurat/unicorn planning requires the live native source gate; raw future metadata cannot create a focus.
+- At 5×/10×/25×/50×, ordinary automation delays follow logical game time with a 250 ms planner floor; irreversible cooldowns remain real wall time.
+- Pollution decisions use live cathPollution, delta, equilibrium, levels, clean-energy ratio, and measured downstream effects; critical target/safety converters cannot be pollution-throttled.
 - Update `@version`, `HELPER_VERSION`, and `package.json` together from `2.20.6` to `2.21.0` only in the release task.
 
 ---
@@ -243,7 +246,43 @@ The shown object is the required blocked return shape; replace its fields with t
 
 - [ ] **Step 8: Rerun smoke, run `git diff --check`, and commit with `fix: coordinate late-game fuel and diagnostics`.**
 
-### Task 7: Add end-to-end simulations, release documentation, and final verification
+### Task 7: Gate lifecycle content, accelerate automation safely, and manage pollution
+
+**Files:**
+- Modify: `scripts/smoke.mjs` fresh-start, speed-clock, pollution, and processor fixtures
+- Modify: `scripts/simulate.mjs` long-run speed/pollution phases
+- Modify: `src/kittens-game-helper.user.js` candidate gathering, source gates, scheduling/cooldowns, scoring, processor control, strategic layers, and diagnostics
+
+**Interfaces:**
+- Produces: `candidateGate(kind, meta) -> { open, reason, source }`
+- Produces: `gameElapsedMs(since) -> number`
+- Produces: `automationDelayMs(baseMs, floorMs) -> number`
+- Produces: `pollutionStatus() -> { current, perTick, level, equilibrium, nextThreshold, nextEta, cleanEnergyRatio, effects }`
+- Produces: `bestPollutionRecoveryTarget(candidates, resources, status) -> candidate | null`
+
+- [ ] **Step 1: Add failing fresh-start gates.** With Workshop ×0 but upgrade metadata present/open, assert no upgrade candidate, Workshop roadmap, craft bootstrap, queue resolution, reservation, or workshop job pressure appears. After buying Workshop ×1, assert the same upgrade becomes eligible. Add the equivalent Ziggurat fixture: raw metadata and future prices are ignored until the native technology/resource/source gate passes, then the building/unicorn path becomes eligible.
+
+- [ ] **Step 2: Run `npm.cmd run smoke` and confirm the premature Workshop and Ziggurat assertions fail for the current raw-metadata scans.**
+
+- [ ] **Step 3: Implement `candidateGate`.** For ordinary buildings call native `bld.isUnlockable`/`bld.isUnlocked` when available and honor live `unlocked`, `unlockRatio`, and required-tech state. Gate Workshop upgrades/crafts on Workshop ×1 and gate Ziggurat/unicorn behavior on its researched source plus live actionability. Apply the gate in gathering, queue lookup, bootstrap discovery, roadmaps, jobs, reservations, unlock watching, and diagnostics.
+
+- [ ] **Step 4: Add failing controllable-clock tests.** Stub `Date.now`, select each supported speed, and assert trade/autobuy/jobs/plan rejection/processor hysteresis/unicorn batching produce the same logical-game schedule. Assert the planner interval never drops below 250 ms, ticks never overlap, speed changes re-arm exactly one timer, and irreversible cooldown still requires 30 real seconds.
+
+- [ ] **Step 5: Run the timing tests and confirm 50× remains tied to the old wall-clock delays.**
+
+- [ ] **Step 6: Implement the speed-aware automation clock.** Replace ordinary `Date.now() - stamp < constant` comparisons with `gameElapsedMs` or `automationDelayMs`; centralize timer re-arming on speed changes; use a `tickInFlight` guard; keep UI/irreversible timers real-time. Preserve 1× behavior exactly.
+
+- [ ] **Step 7: Add failing pollution-model and scoring tests.** Build live-style manager fixtures for pollution current/delta/equilibrium/level/effects and clean/polluting energy. Assert next-threshold ETA, growing penalty near a harmful level, Carbon Sequestration benefit, clean-generator preference when utility is comparable, and no penalty when pollution is falling to a safe equilibrium.
+
+- [ ] **Step 8: Add failing pollution-control tests.** Rising harmful pollution selects a reachable cleaner/sequestering action; nonessential polluters throttle only after protected target/safety demand is satisfied; a critical Calciner/Smelter stays at its minimum viable target count; falling/bounded pollution yields the layer. Diagnostics name level, delta, equilibrium, threshold ETA, clean-energy share, and top contributors.
+
+- [ ] **Step 9: Implement the pollution model, marginal scoring, and recovery layer.** Read native Buildings manager methods first, calculate only documented fallbacks, include pollution production/consumption in effect profiles, and insert recovery below food/power/fuel safety but above repeated economy growth.
+
+- [ ] **Step 10: Add 1× and 50× unattended simulations covering fresh start through Workshop/Ziggurat and industry through pollution mitigation.** Assert equivalent progression ordering, no premature focus, no overlapping helper ticks, and either bounded pollution or a visible active mitigation plan.
+
+- [ ] **Step 11: Run smoke and simulate, run `git diff --check`, and commit with `feat: harden lifecycle speed and pollution`.**
+
+### Task 8: Add end-to-end simulations, release documentation, and final verification
 
 **Files:**
 - Modify: `scripts/simulate.mjs`
@@ -266,6 +305,8 @@ The shown object is the required blocked return shape; replace its fields with t
 - [ ] **Step 4: Update validation invariants.** Require the action broker, persistent arm key, acquisition graph, one diplomacy owner, normalized descriptor adapters, correct Time controllers, and version parity. Remove assertions that require global `noConfirm` or encode alicorn sacrifice as universally denied.
 
 - [ ] **Step 5: Update README.** Document Space dependency planning, Dragon/Leviathan routes, one-time prestige arming, exact irreversible safeguards, rare-capital floors, diagnostics, and the still-forbidden reset/shatter/time-skip actions.
+
+Document native lifecycle gates, speed-aware automation timing, and pollution recovery/diagnostics in the same release section.
 
 - [ ] **Step 6: Bump `@version`, `HELPER_VERSION`, and `package.json` to `2.21.0`.**
 
