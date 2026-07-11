@@ -28,8 +28,15 @@ const makeEl = () => ({
   className: "",
   disabled: false,
   selectors: new Map(),
+  listeners: new Map(),
   classList: { toggle() {}, contains: () => false, add() {}, remove() {} },
-  addEventListener() {},
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  },
+  click() {
+    for (const listener of this.listeners.get("click") || []) listener({ target: this });
+  },
   appendChild(child) {
     this.children.push(child);
   },
@@ -539,9 +546,15 @@ const panelText = (sel) => {
   }
   return "";
 };
+const panelEl = (sel) => {
+  for (const child of documentMock.body.children) {
+    if (child.selectors && child.selectors.has(sel)) return child.selectors.get(sel);
+  }
+  return null;
+};
 const logText = () => (localStorageMock.getItem("kgh.log") || "[]").toString();
 
-check("script bootstrapped natively (noConfirm set; no external engine)", gamePage.opts.noConfirm === true && typeof tickFn === "function");
+check("script bootstrapped natively without mutating confirmation settings", gamePage.opts.noConfirm === false && typeof tickFn === "function");
 
 /* Stage 1 — native ownership + reservation holds (mine must NOT eat library wood) */
 calendar.observeRemainingTime = 100; // a star event is available this tick
@@ -1245,6 +1258,65 @@ craft("compedium").prices = [{ name: "science", val: 10000 }, { name: "manuscrip
  * precisely because they only checked one snapshot.
  * =================================================================== */
 const dbg = context.window.__kghDebug;
+
+/* ---------- Late game A: fail-closed action broker + explicit prestige arm ---------- */
+const hasActionBroker = typeof dbg.actionPolicyFor === "function" && typeof dbg.executeSemanticAction === "function";
+const hasPrestigeArm = typeof dbg.prestigeAutomationArmed === "function" && typeof dbg.setPrestigeAutomationArmed === "function";
+check("late game A: semantic broker debug API exists", hasActionBroker);
+check("late game A: prestige arm defaults OFF in storage and panel", hasPrestigeArm && dbg.prestigeAutomationArmed() === false && localStorageMock.getItem("kgh.prestigeArmed") === null && /Prestige automation: OFF/.test(panelText(".kgh-prestige-arm")));
+
+let forbiddenCalls = 0;
+if (hasPrestigeArm) dbg.setPrestigeAutomationArmed(false);
+const forbiddenResults = hasActionBroker
+  ? ["resetWorld", "shatter", "timeSkip", "unknownAction"].map((id) => dbg.executeSemanticAction({ id, invoke: () => { forbiddenCalls += 1; } }))
+  : [];
+check("late game A: forbidden and unknown execution is fail-closed", forbiddenResults.length === 4 && forbiddenResults.every((result) => !result.ok) && forbiddenCalls === 0);
+const disarmed = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { forbiddenCalls += 1; } })
+  : { ok: false };
+check("late game A: prestige requires explicit arm", hasActionBroker && !disarmed.ok && forbiddenCalls === 0);
+check("late game A: exact and structured action policies are classified", hasActionBroker &&
+  dbg.actionPolicyFor("candidate:build:library") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("craft:beam") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("trade:zebras") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("praise") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("sacrificeUnicorns") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("sacrificeAlicorns") === dbg.ACTION_POLICY.RARE_CAPITAL &&
+  dbg.actionPolicyFor("transcend") === dbg.ACTION_POLICY.AUTHORIZED_PRESTIGE &&
+  dbg.actionPolicyFor("resetWorld") === dbg.ACTION_POLICY.FORBIDDEN);
+
+let safeCalls = 0;
+const safeResult = hasActionBroker
+  ? dbg.executeSemanticAction({
+      id: "candidate:build:library",
+      policy: dbg.ACTION_POLICY.SAFE_REPEATABLE,
+      invoke: () => { safeCalls += 1; },
+      snapshot: () => safeCalls,
+      verify: (before, after) => before === 0 && after === 1,
+    })
+  : { ok: false };
+const mismatched = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "candidate:build:library", policy: dbg.ACTION_POLICY.RARE_CAPITAL, invoke: () => { safeCalls += 1; } })
+  : { ok: false };
+const thrown = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "craft:beam", invoke: () => { throw new Error("boom"); } })
+  : { ok: false };
+check("late game A: safe execution snapshots and verifies postconditions", safeResult.ok && safeResult.before === 0 && safeResult.after === 1 && safeCalls === 1);
+check("late game A: mismatched policy and invocation errors fail closed", !mismatched.ok && !thrown.ok && safeCalls === 1);
+
+const armButton = panelEl(".kgh-prestige-arm");
+if (armButton) armButton.click();
+check("late game A: one panel click deliberately arms and persists prestige automation", hasPrestigeArm && dbg.prestigeAutomationArmed() === true && localStorageMock.getItem("kgh.prestigeArmed") === "1" && /Prestige automation: ARMED/.test(panelText(".kgh-prestige-arm")));
+let prestigeCalls = 0;
+const firstPrestige = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { prestigeCalls += 1; } })
+  : { ok: false };
+const cooldownPrestige = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "adore", invoke: () => { prestigeCalls += 1; } })
+  : { ok: false };
+check("late game A: irreversible actions enforce a shared cooldown", firstPrestige.ok && !cooldownPrestige.ok && prestigeCalls === 1);
+if (hasPrestigeArm) dbg.setPrestigeAutomationArmed(false);
+check("late game A: prestige arm disarms and round-trips through storage", hasPrestigeArm && dbg.prestigeAutomationArmed() === false && localStorageMock.getItem("kgh.prestigeArmed") === "0");
 const acoustics = {
   name: "acoustics",
   label: "Acoustics",

@@ -21,12 +21,11 @@
  * API directly (no Kitten Scientists, no third-party engine to fight).
  * On every page load it:
  *   1. waits for the game (window.gamePage.resPool + bld),
- *   2. sets gamePage.opts.noConfirm so automation is never blocked by a dialog,
- *   3. runs ONE tick loop that plans, reserves, buys, crafts, trades, manages
+ *   2. runs ONE tick loop that plans, reserves, buys, crafts, trades, manages
  *      jobs/leader/hunting/religion/festivals and claims star events — every
  *      spender consulting the same reservation so they never undercut the plan,
- *   4. keeps irreversible actions out of every candidate/trade list (isDeniedKey),
- *   5. shows a panel: bottleneck, next science, plan, and a live action log.
+ *   3. keeps irreversible actions out of every candidate/trade list (isDeniedKey),
+ *   4. shows a panel: bottleneck, next science, plan, and a live action log.
  */
 
 (function kittensGameHelper() {
@@ -34,6 +33,7 @@
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
+  const PRESTIGE_ARM_KEY = "kgh.prestigeArmed";
   const HELPER_VERSION = "2.20.6";
 
   // Speedrun helpers are advisory and scoring nudges only: the helper still
@@ -79,6 +79,27 @@
     // candidate lists, so any raw button/key named "policies" stays denied.
     "policies",
   ]);
+  const ACTION_POLICY = Object.freeze({
+    SAFE_REPEATABLE: "safe-repeatable",
+    RARE_CAPITAL: "rare-capital",
+    AUTHORIZED_PRESTIGE: "authorized-prestige",
+    FORBIDDEN: "forbidden",
+  });
+  const ACTION_IDS = new Map([
+    ["transcend", ACTION_POLICY.AUTHORIZED_PRESTIGE],
+    ["adore", ACTION_POLICY.AUTHORIZED_PRESTIGE],
+    ["sacrificeAlicorns", ACTION_POLICY.RARE_CAPITAL],
+    ["resetWorld", ACTION_POLICY.FORBIDDEN],
+    ["shatter", ACTION_POLICY.FORBIDDEN],
+    ["timeSkip", ACTION_POLICY.FORBIDDEN],
+  ]);
+  const SAFE_CANDIDATE_KINDS = new Set([
+    "build", "research", "upgrade", "religion", "ziggurat",
+    "transcendence", "space", "time", "policy", "stage",
+  ]);
+  const SAFE_ACTION_NAME = /^[A-Za-z0-9_.-]+$/;
+  const IRREVERSIBLE_ACTION_COOLDOWN_MS = 30000;
+  let lastIrreversibleActionAt = 0;
 
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -87,6 +108,20 @@
   const isAutopilotOn = () => {
     const stored = localStorage.getItem(STORAGE_KEY);
     return stored !== "0";
+  };
+
+  let syncPrestigeArmControl = () => {};
+  const prestigeAutomationArmed = () => localStorage.getItem(PRESTIGE_ARM_KEY) === "1";
+  const setPrestigeAutomationArmed = (value) => {
+    const armed = value === true;
+    try {
+      localStorage.setItem(PRESTIGE_ARM_KEY, armed ? "1" : "0");
+    } catch (error) {
+      return false;
+    }
+    invalidatePlannerState();
+    syncPrestigeArmControl();
+    return prestigeAutomationArmed();
   };
 
   // Goals steer the advisor toward a destination you pick (autopilot still
@@ -204,22 +239,73 @@
     return DENY_SUBSTRINGS.some((needle) => lower.includes(needle));
   };
 
+  const actionPolicyFor = (actionId) => {
+    if (typeof actionId !== "string" || !actionId) return ACTION_POLICY.FORBIDDEN;
+    if (ACTION_IDS.has(actionId)) return ACTION_IDS.get(actionId);
+    if (actionId === "praise" || actionId === "sacrificeUnicorns") return ACTION_POLICY.SAFE_REPEATABLE;
+    const candidate = /^candidate:([^:]+):([^:]+)$/.exec(actionId);
+    if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[1]) && SAFE_ACTION_NAME.test(candidate[2])) {
+      return ACTION_POLICY.SAFE_REPEATABLE;
+    }
+    const repeatable = /^(craft|trade):([^:]+)$/.exec(actionId);
+    if (repeatable && SAFE_ACTION_NAME.test(repeatable[2])) return ACTION_POLICY.SAFE_REPEATABLE;
+    return ACTION_POLICY.FORBIDDEN;
+  };
+
+  const executeSemanticAction = ({ id, policy, invoke, snapshot, verify } = {}) => {
+    const resolvedPolicy = actionPolicyFor(id);
+    const result = { ok: false, reason: "", before: null, after: null };
+    if (resolvedPolicy === ACTION_POLICY.FORBIDDEN) {
+      result.reason = ACTION_IDS.has(id) ? "action forbidden" : "unknown action";
+      return result;
+    }
+    if (policy != null && policy !== resolvedPolicy) {
+      result.reason = "action policy mismatch";
+      return result;
+    }
+    if (typeof invoke !== "function") {
+      result.reason = "missing action invoker";
+      return result;
+    }
+    const irreversible = resolvedPolicy === ACTION_POLICY.RARE_CAPITAL || resolvedPolicy === ACTION_POLICY.AUTHORIZED_PRESTIGE;
+    if (irreversible && !prestigeAutomationArmed()) {
+      result.reason = "prestige automation is not armed";
+      return result;
+    }
+    const now = Date.now();
+    if (irreversible && lastIrreversibleActionAt && now - lastIrreversibleActionAt < IRREVERSIBLE_ACTION_COOLDOWN_MS) {
+      result.reason = "irreversible action cooldown";
+      return result;
+    }
+    if (irreversible) lastIrreversibleActionAt = now;
+    try {
+      if (typeof snapshot === "function") result.before = snapshot();
+      invoke();
+      if (typeof snapshot === "function") result.after = snapshot();
+      if (typeof verify === "function" && !verify(result.before, result.after)) {
+        result.reason = "postcondition failed";
+        return result;
+      }
+    } catch (error) {
+      result.reason = `action invocation failed: ${error && error.message ? error.message : String(error)}`;
+      return result;
+    }
+    result.ok = true;
+    result.reason = "executed";
+    return result;
+  };
+
   // Praise the Sun converts the whole faith bank into worship, so we only do it
   // when faith is near its storage cap and no faith-priced upgrade is pending.
   const RELIGION_PRAISE_TRIGGER = 0.95;
 
   // The helper drives the game's own API directly — there is no external engine
-  // to configure, enable or fight. "Applying" the profile just makes sure the
-  // game will not pop a confirmation dialog mid-automation (build-all, policy,
-  // Adore the Galaxy) and kicks an immediate tick. Irreversible actions
+  // to configure, enable or fight. "Applying" the profile kicks an immediate
+  // tick without weakening the game's global confirmation setting.
+  // Irreversible actions
   // (reset/transcend/sacrifice/shatter/timeskip) never enter any candidate or
   // trade list — isDeniedKey() filters them out — so they can never fire.
   const applyProfile = () => {
-    try {
-      if (window.gamePage && window.gamePage.opts) window.gamePage.opts.noConfirm = true;
-    } catch (error) {
-      /* a missing opts object just means dialogs stay manual; harmless */
-    }
     pushLog(`▶ Autopilot applied — ${isAutopilotOn() ? "ON" : "OFF"}`);
     tick();
   };
@@ -1293,6 +1379,12 @@
       goalSupport: null,
       fxRefreshed: new WeakSet(),
     };
+  };
+
+  const invalidatePlannerState = () => {
+    activePlanSnapshot = { cycleId: -1, target: undefined };
+    activeTarget = null;
+    resetTickCache();
   };
 
   const getCandidatesCached = (resources, goalKey) => {
@@ -7555,28 +7647,42 @@
   };
 
   const buyCandidate = (candidate) => {
-    const before = resourceSnapshot();
     if (candidate && candidate.kind === "festival") {
+      const before = resourceSnapshot();
       const bought = buyFestivalCandidate();
       if (bought) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
       return bought;
     }
-    if (candidate && candidate.kind === "stage") {
-      const changed = executeStageTransitionCandidate(candidate);
-      if (changed) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
-      return changed;
-    }
+    if (!candidate || !candidate.meta || !candidate.meta.name) return false;
     const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
-    for (const attempt of purchaseAttemptsFor(candidate)) {
-      try {
-        attempt();
-      } catch (error) {
-        /* try the next API shape */
-      }
-      if (purchaseComplete(candidate, initialVal)) {
-        markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
-        return true;
-      }
+    let stageChanged = false;
+    const result = executeSemanticAction({
+      id: `candidate:${candidate.kind}:${candidate.meta.name}`,
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot: resourceSnapshot,
+      invoke: () => {
+        if (candidate.kind === "stage") {
+          stageChanged = executeStageTransitionCandidate(candidate);
+          return;
+        }
+        for (const attempt of purchaseAttemptsFor(candidate)) {
+          try {
+            attempt();
+          } catch (error) {
+            /* try the next public API shape */
+          }
+          if (purchaseComplete(candidate, initialVal)) return;
+        }
+      },
+      verify: () => candidate.kind === "stage" ? stageChanged : purchaseComplete(candidate, initialVal),
+    });
+    if (result.ok) {
+      markTelemetryDiscontinuity(resourceDeltasBetween(result.before, result.after));
+      return true;
+    }
+    if (actionPolicyFor(`candidate:${candidate.kind}:${candidate.meta.name}`) !== ACTION_POLICY.FORBIDDEN) {
+      activePlanSnapshot = { cycleId: -1, target: undefined };
+      resetTickCache();
     }
     return false;
   };
@@ -10194,6 +10300,7 @@
       '<div class="kgh-queue-list" style="display:grid;gap:2px"></div></div>',
 
       '<details class="kgh-details"><summary>Subsystems &amp; automation details</summary><div class="kgh-details-body">',
+      '<button type="button" class="kgh-prestige-arm" style="cursor:pointer;border-radius:6px;border:1px solid #ffffff22;padding:4px;color:var(--kgh-text)" title="Explicitly authorize Transcend, Adore, and alicorn sacrifice automation">Prestige automation: OFF</button>',
       '<small class="kgh-note"></small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
       '<small class="kgh-buy" style="color:#b8e2ff">…</small>',
@@ -10220,6 +10327,7 @@
     const toggleBtn = box.querySelector(".kgh-autopilot");
     const minBtn = box.querySelector(".kgh-min");
     const logCopyBtn = box.querySelector(".kgh-log-copy");
+    const prestigeArmBtn = box.querySelector(".kgh-prestige-arm");
     queueSelectEl = box.querySelector(".kgh-queue-select");
     queueAddEl = box.querySelector(".kgh-queue-add");
     queueListEl = box.querySelector(".kgh-queue-list");
@@ -10265,6 +10373,15 @@
       toggleBtn.textContent = `Autopilot: ${isAutopilotOn() ? "ON" : "OFF"}`;
       toggleBtn.style.background = isAutopilotOn() ? "#2d6b3f" : "#5a3a3a";
     };
+    syncPrestigeArmControl = () => {
+      const armed = prestigeAutomationArmed();
+      prestigeArmBtn.textContent = `Prestige automation: ${armed ? "ARMED" : "OFF"}`;
+      prestigeArmBtn.style.background = armed ? "#7a3f2f" : "#2d241b";
+    };
+    prestigeArmBtn.addEventListener("click", () => {
+      setPrestigeAutomationArmed(!prestigeAutomationArmed());
+    });
+    syncPrestigeArmControl();
     toggleBtn.addEventListener("click", () => {
       const next = isAutopilotOn() ? "0" : "1";
       localStorage.setItem(STORAGE_KEY, next);
@@ -10332,6 +10449,11 @@
   };
 
   window.__kghDebug = {
+    ACTION_POLICY,
+    actionPolicyFor,
+    executeSemanticAction,
+    prestigeAutomationArmed,
+    setPrestigeAutomationArmed,
     selectStrategicTarget(goalKey = getGoal()) {
       activePlanSnapshot = { cycleId: -1, target: undefined };
       resetTickCache();
@@ -10678,7 +10800,7 @@
 
   waitForGame()
     .then(() => {
-      applyProfile(); // sets opts.noConfirm before any purchase can fire a dialog
+      applyProfile();
       buildPanel();
       applyTickSpeed(tickSpeed); // re-arm the persisted manual game speed
     })
