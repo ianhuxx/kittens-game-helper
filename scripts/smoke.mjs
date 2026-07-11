@@ -3433,6 +3433,7 @@ const tradeFundingAE = {
   gold: [res("gold").value, res("gold").maxValue],
   manpower: [res("manpower").value, res("manpower").maxValue],
   titanium: [res("titanium").value, res("titanium").maxValue],
+  slab: [res("slab").value, res("slab").maxValue],
   rates: { gold: perTick.gold, manpower: perTick.manpower, titanium: perTick.titanium, unobtainium: perTick.unobtainium, faith: perTick.faith },
   faith: [res("faith").value, res("faith").maxValue],
   priest: job("priest").value,
@@ -3502,6 +3503,83 @@ const routeObeyedAE = typeof dbg.maybeTradeForTargetChain === "function" && !dbg
 check("Test AE review: targeted diplomacy obeys a selected craft route", !!sharksRouteAE && parchmentRouteAE.kind === "craft" && routeObeyedAE && tradeCalls === tradeCallsBeforeRouteGateAE);
 [res("parchment").value, res("furs").value, res("iron").value] = [savedCraftTradeAE.parchment, savedCraftTradeAE.furs, savedCraftTradeAE.iron];
 
+/* Re-review: acquisition consumers must follow the actionable trade node even
+   when the selected root is a craft, producer, or storage bridge. */
+const nestedCraftAE = R("nestedCraftAE", 0, 100, "Nested Craft AE");
+const nestedProducerAE = R("nestedProducerAE", 0, 100, "Nested Producer AE");
+const nestedStorageAE = R("nestedStorageAE", 0, 1, "Nested Storage AE");
+resources.push(nestedCraftAE, nestedProducerAE, nestedStorageAE);
+const nestedCraftRecipeAE = { name: "nestedCraftAE", label: "Nested Craft AE", unlocked: true, prices: [{ name: "uranium", val: 1 }] };
+crafts.push(nestedCraftRecipeAE);
+const nestedProducerBridgeAE = { name: "nestedProducerBridgeAE", label: "Nested Producer Bridge AE", unlocked: true, val: 0, on: 0, prices: [{ name: "uranium", val: 1 }], effects: { nestedProducerAEPerTickProd: 0.1 } };
+const nestedStorageBridgeAE = { name: "nestedStorageBridgeAE", label: "Nested Storage Bridge AE", unlocked: true, val: 0, on: 0, prices: [{ name: "uranium", val: 1 }], effects: { nestedStorageAEMax: 20 } };
+const nestedCraftTargetAE = { name: "nestedCraftTargetAE", label: "Nested Craft Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "nestedCraftAE", val: 1 }], effects: {} };
+const nestedProducerTargetAE = { name: "nestedProducerTargetAE", label: "Nested Producer Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "nestedProducerAE", val: 1 }], effects: {} };
+const nestedStorageTargetAE = { name: "nestedStorageTargetAE", label: "Nested Storage Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "nestedStorageAE", val: 10 }], effects: {} };
+buildings.push(nestedProducerBridgeAE, nestedStorageBridgeAE, nestedCraftTargetAE, nestedProducerTargetAE, nestedStorageTargetAE);
+res("gold").value = 0;
+res("manpower").value = 0;
+res("titanium").value = 0;
+perTick.gold = 1;
+perTick.manpower = 2;
+perTick.titanium = 0.5;
+dbg.clearResourceTelemetry?.();
+const nestedRouteCasesAE = [
+  ["craft", "nestedCraftAE", 1, "nestedCraftTargetAE"],
+  ["producer", "nestedProducerAE", 1, "nestedProducerTargetAE"],
+  ["storage", "nestedStorageAE", 10, "nestedStorageTargetAE"],
+];
+for (const [rootKind, resourceName, amount, targetName] of nestedRouteCasesAE) {
+  const nestedRootAE = dbg.acquisitionPathFor(resourceName, amount, { finalPurchase: true });
+  const nestedTargetCandidateAE = dbg.candidateById(`build:${targetName}`, "balanced");
+  dbg.forceActiveTarget(nestedTargetCandidateAE, "Economy / normal growth", 0);
+  const nestedNeedsAE = dbg.resourceNeeds("balanced").needs;
+  check(`Test AE re-review: ${rootKind} root pressures its nested Dragon trade inputs`, nestedRootAE.kind === rootKind && (nestedNeedsAE.manpower || 0) > 0 && (nestedNeedsAE.gold || 0) > 0 && (nestedNeedsAE.titanium || 0) > 0);
+}
+dbg.forceActiveTarget(null);
+for (const meta of [nestedProducerBridgeAE, nestedStorageBridgeAE, nestedCraftTargetAE, nestedProducerTargetAE, nestedStorageTargetAE]) buildings.splice(buildings.indexOf(meta), 1);
+crafts.splice(crafts.indexOf(nestedCraftRecipeAE), 1);
+for (const resource of [nestedCraftAE, nestedProducerAE, nestedStorageAE]) resources.splice(resources.indexOf(resource), 1);
+
+/* Re-review integration: exercise the real tick dispatcher. A passive titanium
+   route must suppress every Zebra fast path; a Dragon route whose titanium
+   price is itself supplied by Zebras must execute the nested Zebra step first. */
+const passiveTitaniumTargetAE = { name: "passiveTitaniumTargetAE", label: "Passive Titanium Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 500 }], effects: {} };
+buildings.push(passiveTitaniumTargetAE);
+zebras.unlocked = true;
+zebras.hidden = false;
+res("titanium").value = 0;
+res("titanium").maxValue = 1000;
+perTick.titanium = 1;
+res("gold").value = 10000;
+res("gold").maxValue = Math.max(10000, res("gold").maxValue || 0);
+res("manpower").value = 30000;
+res("manpower").maxValue = Math.max(30000, res("manpower").maxValue || 0);
+res("slab").value = 30000;
+dbg.clearResourceTelemetry?.();
+const passiveTitaniumCandidateAE = dbg.candidateById("build:passiveTitaniumTargetAE", "balanced");
+dbg.forceActiveTarget(passiveTitaniumCandidateAE, "Economy / normal growth", 0);
+const passiveTitaniumRouteAE = dbg.acquisitionPathFor("titanium", 500, { finalPurchase: true });
+const zebraTradesBeforePassiveAE = zebras.tradeTotal || 0;
+fakeNow += 30000;
+tickFn();
+check("Test AE re-review: actual diplomacy dispatcher does not Zebra-trade over a passive titanium route", passiveTitaniumRouteAE.kind === "passive" && (zebras.tradeTotal || 0) === zebraTradesBeforePassiveAE);
+buildings.splice(buildings.indexOf(passiveTitaniumTargetAE), 1);
+
+perTick.titanium = 0;
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 10000;
+res("manpower").value = 30000;
+res("slab").value = 30000;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const nestedZebraDragonRouteAE = dbg.acquisitionPathFor("uranium", 25, { finalPurchase: true });
+const zebraTradesBeforeNestedAE = zebras.tradeTotal || 0;
+fakeNow += 30000;
+tickFn();
+check("Test AE re-review: actual diplomacy dispatcher executes nested Zebra before Dragon", nestedZebraDragonRouteAE.kind === "trade" && nestedZebraDragonRouteAE.nextStep?.race?.name === "dragons" && nestedZebraDragonRouteAE.inputs.some((input) => input.nextStep?.kind === "trade" && input.nextStep?.race?.name === "zebras") && (zebras.tradeTotal || 0) > zebraTradesBeforeNestedAE);
+
 res("faith").value = 0;
 res("faith").maxValue = Math.max(100, res("faith").maxValue || 0);
 perTick.faith = 0;
@@ -3516,6 +3594,7 @@ diplomacy.races.splice(diplomacy.races.indexOf(dragonsAE), 1);
 [res("gold").value, res("gold").maxValue] = tradeFundingAE.gold;
 [res("manpower").value, res("manpower").maxValue] = tradeFundingAE.manpower;
 [res("titanium").value, res("titanium").maxValue] = tradeFundingAE.titanium;
+[res("slab").value, res("slab").maxValue] = tradeFundingAE.slab;
 [res("faith").value, res("faith").maxValue] = tradeFundingAE.faith;
 job("priest").value = tradeFundingAE.priest;
 for (const [name, value] of Object.entries(tradeFundingAE.rates)) {

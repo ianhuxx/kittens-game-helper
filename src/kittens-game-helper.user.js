@@ -1210,7 +1210,8 @@
       const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
       refreshStickyTargetChainReserve(target, resources);
       const zebras = races.find((race) => race.name === "zebras");
-      if (zebras && (targetMissingResource(target, resources, "titanium") || titaniumDemandAmount(resources, goalKey) > 0) && !shouldSaveForExplorers(resources, goalKey)) {
+      const selectedTradeRoute = selectedTradeRouteForTarget(target, resources);
+      if (zebras && isZebraTitaniumTradeRoute(selectedTradeRoute) && !shouldSaveForExplorers(resources, goalKey)) {
         const prices = tradePricesForRace(zebras);
         if (prices.length && canPayPrices(prices) && pricesRespectReservations(prices, reserved, resources)) {
           const amt = Math.max(1, affordableTradeCount(prices, reserved, resources));
@@ -6267,7 +6268,8 @@
       if (resValueOf(resources, cost.name) >= cost.val) continue;
       if (cost.name === "science") continue; // cap-aware scholar handling below
       const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
-      if (route.reachable && route.kind === "trade") scoreAcquisitionRouteInputs(needs, resources, route, 22);
+      const actionableTrade = actionableTradeRouteFor(route);
+      if (route.reachable && actionableTrade) scoreAcquisitionRouteInputs(needs, resources, actionableTrade, 22);
       else scoreResourcePathNeed(needs, cost.name, 22);
     }
 
@@ -6375,7 +6377,8 @@
           const missing = cost.val - have;
           const weight = 4 * (1 - Math.min(0.98, have / cost.val)) + 1;
           const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
-          if (route.reachable && route.kind === "trade") scoreAcquisitionRouteInputs(needs, resources, route, weight);
+          const actionableTrade = actionableTradeRouteFor(route);
+          if (route.reachable && actionableTrade) scoreAcquisitionRouteInputs(needs, resources, actionableTrade, weight);
           else {
             scoreResourcePathNeed(needs, cost.name, weight);
             rawPathRequirements(cost.name, missing, rawRequirements);
@@ -8530,10 +8533,10 @@
 
   const maybeTradeForTitanium = (resources, reserved, goalKey) => {
     const titanium = getRes(resources, "titanium");
-    const targetNeedsTitanium = titaniumNeededSoon(resources, goalKey);
-    if (!targetNeedsTitanium) return false;
+    const target = getTargetCached(resources, goalKey);
+    const selectedTradeRoute = selectedTradeRouteForTarget(target, resources);
+    if (!isZebraTitaniumTradeRoute(selectedTradeRoute)) return false;
     if (titanium && titanium.maxValue > 0 && titanium.value >= titanium.maxValue * 0.995) {
-      const target = getTargetCached(resources, goalKey);
       const stillMissingTitanium = targetMissingResource(target, resources, "titanium");
       diplomacyPlanText = stillMissingTitanium
         ? "Diplomacy: titanium capped below the plan cost — build storage before more Zebra trades"
@@ -8927,10 +8930,31 @@
       .map((cost) => ({ cost, route: acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true }) }));
   };
 
-  const selectedTradeRouteForTarget = (target, resources) => acquisitionRoutesForTarget(target, resources)
-    .map(({ route }) => route)
-    .filter((route) => route && route.reachable && route.kind === "trade" && route.nextStep && route.nextStep.kind === "trade" && route.nextStep.race)
+  // A selected acquisition root can be a craft, producer, or storage bridge
+  // whose prerequisite is itself traded. Walk prerequisites before the root so
+  // the first returned trade is the one executable now (for example, trade
+  // Zebras for titanium before attempting the Dragon trade that spends it).
+  const actionableTradeRoutesIn = (route, seen = new Set()) => {
+    if (!route || !route.reachable || seen.has(route)) return [];
+    seen.add(route);
+    const nested = [];
+    for (const input of route.inputs || []) nested.push(...actionableTradeRoutesIn(input, seen));
+    if (nested.length) return nested;
+    const step = route.nextStep;
+    return step && step.kind === "trade" && step.race ? [route] : [];
+  };
+
+  const actionableTradeRouteFor = (route) => actionableTradeRoutesIn(route)
     .sort((a, b) => b.eta - a.eta)[0] || null;
+
+  const selectedTradeRouteForTarget = (target, resources) => acquisitionRoutesForTarget(target, resources)
+    .map(({ route }) => actionableTradeRouteFor(route))
+    .filter(Boolean)
+    .sort((a, b) => b.eta - a.eta)[0] || null;
+
+  const isZebraTitaniumTradeRoute = (route) => !!(route && route.nextStep &&
+    route.nextStep.kind === "trade" && route.nextStep.resource === "titanium" &&
+    route.nextStep.race && route.nextStep.race.name === "zebras");
 
   const scoreAcquisitionRouteInputs = (needs, resources, route, weight, seen = new Set()) => {
     if (!route || !route.reachable || seen.has(route)) return;
