@@ -3433,6 +3433,9 @@ const tradeFundingAE = {
   gold: [res("gold").value, res("gold").maxValue],
   manpower: [res("manpower").value, res("manpower").maxValue],
   titanium: [res("titanium").value, res("titanium").maxValue],
+  rates: { gold: perTick.gold, manpower: perTick.manpower, titanium: perTick.titanium, unobtainium: perTick.unobtainium, faith: perTick.faith },
+  faith: [res("faith").value, res("faith").maxValue],
+  priest: job("priest").value,
 };
 res("gold").value = 1000; res("gold").maxValue = Math.max(1000, res("gold").maxValue || 0);
 res("manpower").value = 5000; res("manpower").maxValue = 10000;
@@ -3441,7 +3444,21 @@ const dragonUraniumPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.a
 const acceleratorTradeChainAE = dbg.solveChain(acceleratorCandidateAE);
 check("Test AE: Dragons make the first uranium producer reachable", !!dragonUraniumPathAE?.reachable && dragonUraniumPathAE.kind === "trade" && Number.isFinite(dragonUraniumPathAE.eta) && dragonUraniumPathAE.nextStep?.race?.name === "dragons" && acceleratorTradeChainAE.reachable);
 
-const unobtainiumAE = R("unobtainium", 10000, 0, "Unobtainium");
+res("gold").value = 0;
+res("manpower").value = 0;
+res("titanium").value = 0;
+perTick.gold = 1;
+perTick.manpower = 2;
+perTick.titanium = 0.5;
+dbg.clearResourceTelemetry?.();
+const unbankedDragonPathAE = dbg.acquisitionPathFor("uranium", 25);
+const unbankedDragonSlowestAE = Math.max(...(unbankedDragonPathAE.inputs || []).map((input) => input.eta));
+check("Test AE review: unbanked Dragon prices recurse and the slowest input owns ETA", unbankedDragonPathAE.reachable && unbankedDragonPathAE.kind === "trade" && ["manpower", "gold", "titanium"].every((name) => unbankedDragonPathAE.inputs.some((input) => input.resource === name && input.reachable)) && Math.abs(unbankedDragonPathAE.eta - unbankedDragonSlowestAE) < 1e-6);
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const dragonRouteNeedsAE = dbg.resourceNeeds("balanced");
+check("Test AE review: uranium target pressures Dragon route inputs, not phantom uranium work", (dragonRouteNeedsAE.needs.manpower || 0) > 0 && (dragonRouteNeedsAE.needs.gold || 0) > 0 && (dragonRouteNeedsAE.needs.titanium || 0) > 0 && !(dragonRouteNeedsAE.needs.uranium > 0));
+
+const unobtainiumAE = R("unobtainium", 0, 0, "Unobtainium");
 const timeCrystalAE = R("timeCrystal", 0, 0, "Time Crystal", { unlocked: false });
 const leviathansAE = {
   name: "leviathans",
@@ -3456,8 +3473,42 @@ const leviathansAE = {
 };
 resources.push(unobtainiumAE, timeCrystalAE);
 diplomacy.races.push(leviathansAE);
+perTick.unobtainium = 4;
+dbg.clearResourceTelemetry?.();
 const leviathanTimeCrystalPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.acquisitionPathFor("timeCrystal", 0.25) : null;
 check("Test AE: Leviathans provide a finite time-crystal acquisition route", !!leviathanTimeCrystalPathAE?.reachable && leviathanTimeCrystalPathAE.kind === "trade" && Number.isFinite(leviathanTimeCrystalPathAE.eta) && leviathanTimeCrystalPathAE.nextStep?.race?.name === "leviathans");
+const timeCrystalConsumerAE = { name: "timeCrystalConsumerAE", label: "Time Crystal Consumer AE", unlocked: true, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 0.25 }], effects: {} };
+buildings.push(timeCrystalConsumerAE);
+dbg.queueClear();
+dbg.queueAdd("build:timeCrystalConsumerAE", 0);
+dbg.forceActiveTarget(null);
+dbg.selectStrategicTarget("balanced");
+const leviathanRouteNeedsAE = dbg.resourceNeeds("balanced");
+check("Test AE review: time-crystal target pressures Leviathan unobtainium input", (leviathanRouteNeedsAE.needs.unobtainium || 0) > 0 && (leviathanRouteNeedsAE.needs.manpower || 0) > 0 && (leviathanRouteNeedsAE.needs.gold || 0) > 0 && !(leviathanRouteNeedsAE.needs.timeCrystal > 0));
+dbg.queueClear();
+buildings.splice(buildings.indexOf(timeCrystalConsumerAE), 1);
+
+const sharksRouteAE = diplomacy.races.find((race) => race && race.name === "sharks");
+const savedCraftTradeAE = { parchment: res("parchment").value, furs: res("furs").value, iron: res("iron").value };
+res("parchment").value = 0;
+res("furs").value = 0;
+res("iron").value = 1000;
+res("manpower").value = 5000;
+res("gold").value = 1000;
+const parchmentTargetAE = { kind: "build", meta: { name: "parchmentTargetAE", label: "Parchment Target AE", prices: [{ name: "parchment", val: 1 }] }, affordable: false };
+const parchmentRouteAE = dbg.acquisitionPathFor("parchment", 1);
+const tradeCallsBeforeRouteGateAE = tradeCalls;
+const routeObeyedAE = typeof dbg.maybeTradeForTargetChain === "function" && !dbg.maybeTradeForTargetChain(parchmentTargetAE);
+check("Test AE review: targeted diplomacy obeys a selected craft route", !!sharksRouteAE && parchmentRouteAE.kind === "craft" && routeObeyedAE && tradeCalls === tradeCallsBeforeRouteGateAE);
+[res("parchment").value, res("furs").value, res("iron").value] = [savedCraftTradeAE.parchment, savedCraftTradeAE.furs, savedCraftTradeAE.iron];
+
+res("faith").value = 0;
+res("faith").maxValue = Math.max(100, res("faith").maxValue || 0);
+perTick.faith = 0;
+job("priest").value = 0;
+dbg.clearResourceTelemetry?.("faith");
+const zeroRateFaithPathAE = dbg.acquisitionPathFor("faith", 10);
+check("Test AE review: zero-rate direct job does not invent deficit-seconds ETA", !zeroRateFaithPathAE.reachable && !Number.isFinite(zeroRateFaithPathAE.eta) && (zeroRateFaithPathAE.blockers || []).length > 0);
 diplomacy.races.splice(diplomacy.races.indexOf(leviathansAE), 1);
 resources.splice(resources.indexOf(timeCrystalAE), 1);
 resources.splice(resources.indexOf(unobtainiumAE), 1);
@@ -3465,6 +3516,12 @@ diplomacy.races.splice(diplomacy.races.indexOf(dragonsAE), 1);
 [res("gold").value, res("gold").maxValue] = tradeFundingAE.gold;
 [res("manpower").value, res("manpower").maxValue] = tradeFundingAE.manpower;
 [res("titanium").value, res("titanium").maxValue] = tradeFundingAE.titanium;
+[res("faith").value, res("faith").maxValue] = tradeFundingAE.faith;
+job("priest").value = tradeFundingAE.priest;
+for (const [name, value] of Object.entries(tradeFundingAE.rates)) {
+  if (value === undefined) delete perTick[name];
+  else perTick[name] = value;
+}
 workshopUpgrades.splice(workshopUpgrades.indexOf(nuclearSmeltersAE), 1);
 buildings.splice(buildings.indexOf(acceleratorAE), 1);
 buildings.splice(buildings.indexOf(reactorAE), 1);

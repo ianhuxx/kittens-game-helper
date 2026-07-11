@@ -1229,18 +1229,7 @@
         const skipReason = (reserved.manpower || reserved.gold) ? "Trade skipped: catpower/gold below reserve." : "Trade skipped: Zebra trade costs unavailable.";
         diplomacyPlanText = `${skipReason} · ${zebraTitaniumOddsText(resources, goalKey)}`;
       }
-      const targeted = races
-        .map((race) => targetTradeScore(race, target, resources, reserved))
-        .filter((item) => item && item.score > 0.0005)
-        .sort((a, b) => b.score - a.score)[0];
-      if (targeted && !shouldSaveForExplorers(resources, goalKey)) {
-        const race = targeted.race;
-        const measured = withActionResourceDeltas(() => diplomacy.tradeAll(race), tradeDeltaNamesForRace(race, targeted.prices));
-        lastTradeAt = Date.now();
-        diplomacyPlanText = `Targeted trade: ${race.title || race.name || "partner"} for ${labelOf(target.meta)} ${targetTradeChainLabel(target, resources)}`;
-        pushLog(`🤝 ${race.title || race.name || "partner"} trade: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}`);
-        return;
-      }
+      if (!shouldSaveForExplorers(resources, goalKey) && maybeTradeForTargetChain(resources, reserved, goalKey, target)) return;
       if ((reserved.manpower || 0) > 0 || (reserved.gold || 0) > 0) return; // plan owns these
       if (shouldSaveForExplorers(resources, goalKey)) return; // explorers get first call on catpower
       const catpowerHot = catpower.maxValue > 0 && catpower.value / catpower.maxValue > 0.9;
@@ -1965,10 +1954,10 @@
       // count, so the average equals the marginal, and this already reflects live
       // happiness, leader and production-ratio bonuses — not a baked-in base rate.
       const village = window.gamePage && window.gamePage.village;
-      if (count > 0 && village && typeof village.getResProduction === "function") {
+      if (village && typeof village.getResProduction === "function") {
         const prod = village.getResProduction() || {};
         const total = prod[key];
-        if (isFinite(total) && total > 0) return (total * ticksPerSecond()) / count;
+        if (isFinite(total) && total > 0) return count > 0 ? (total * ticksPerSecond()) / count : total * ticksPerSecond();
       }
       // Unstaffed (or no live signal yet): fall back to the base per-tick modifier.
       if (job.modifiers && isFinite(job.modifiers[key])) return job.modifiers[key] * ticksPerSecond();
@@ -4008,8 +3997,8 @@
       const hasJobPath = name !== "faith" && resourceHasDirectJobPath(name);
       const jobRate = hasJobPath ? directJobRatePerSecondFor(name) : 0;
       const refillRate = prod > 0 ? prod : (jobRate > 0 ? jobRate : 0);
-      const reachable = prod > 0 || hasJobPath;
-      const eta = refillRate > 0 ? deficit / refillRate : (hasJobPath ? deficit : Number.POSITIVE_INFINITY);
+      const reachable = prod > 0 || jobRate > 0;
+      const eta = refillRate > 0 ? deficit / refillRate : Number.POSITIVE_INFINITY;
       if (max > 0 && amount > max) return { reachable, eta, reason: reachable ? undefined : `no ${resTitle(resources, name)} refill`, chain };
       return { reachable, eta, reason: reachable ? undefined : `no ${resTitle(resources, name)} refill`, chain };
     }
@@ -4022,7 +4011,7 @@
     // as the conservative rate floor instead.
     if (resourceHasDirectJobPath(name)) {
       const jobRate = directJobRatePerSecondFor(name);
-      return { reachable: true, eta: jobRate > 0 ? deficit / jobRate : deficit, chain };
+      if (jobRate > 0) return { reachable: true, eta: deficit / jobRate, chain };
     }
     // Tears have no production/craft path: they arrive through the bounded
     // unicorn→tears sacrifice, batch by batch, so a tears deficit is reachable
@@ -6277,7 +6266,9 @@
       if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
       if (resValueOf(resources, cost.name) >= cost.val) continue;
       if (cost.name === "science") continue; // cap-aware scholar handling below
-      scoreResourcePathNeed(needs, cost.name, 22);
+      const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
+      if (route.reachable && route.kind === "trade") scoreAcquisitionRouteInputs(needs, resources, route, 22);
+      else scoreResourcePathNeed(needs, cost.name, 22);
     }
 
     // Hunters: boosted when furs / parchment / manuscript / compendium is the
@@ -6382,8 +6373,13 @@
         const have = (res && res.value) || 0;
         if (have < cost.val) {
           const missing = cost.val - have;
-          scoreResourcePathNeed(needs, cost.name, 4 * (1 - Math.min(0.98, have / cost.val)) + 1);
-          rawPathRequirements(cost.name, missing, rawRequirements);
+          const weight = 4 * (1 - Math.min(0.98, have / cost.val)) + 1;
+          const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
+          if (route.reachable && route.kind === "trade") scoreAcquisitionRouteInputs(needs, resources, route, weight);
+          else {
+            scoreResourcePathNeed(needs, cost.name, weight);
+            rawPathRequirements(cost.name, missing, rawRequirements);
+          }
         }
       }
       scoreRawDeficits(needs, resources, rawRequirements, 14);
@@ -7772,6 +7768,8 @@
       const cap = res.maxValue || 0;
       if (cap > 0 && amount > cap) continue;
       if ((res.value || 0) >= amount) continue;
+      const route = acquisitionPathFor(resources, name, amount, { finalPurchase: true });
+      if (route.reachable && (route.kind === "trade" || route.kind === "discovery")) continue;
       climb[name] = amount;
     }
     return climb;
@@ -8770,7 +8768,8 @@
 
     if (resourceHasDirectJobPath(name)) {
       const jobRate = directJobRatePerSecondFor(name);
-      routes.push(reachableAcquisitionPath(name, requested, "job", jobRate > 0 ? deficit / jobRate : deficit));
+      if (jobRate > 0) routes.push(reachableAcquisitionPath(name, requested, "job", deficit / jobRate));
+      else rejected.push(`no positive direct job rate for ${resTitle(resources, name)}`);
     }
 
     const craft = craftByName(name);
@@ -8919,6 +8918,36 @@
       ]);
     }
     return routes.sort((a, b) => acquisitionRoutePriority(a) - acquisitionRoutePriority(b) || a.eta - b.eta)[0];
+  };
+
+  const acquisitionRoutesForTarget = (target, resources) => {
+    if (!target || target.affordable) return [];
+    return pricesFor(target.kind, target.meta)
+      .filter((cost) => cost && cost.name && isFinite(cost.val) && cost.val > resValueOf(resources, cost.name))
+      .map((cost) => ({ cost, route: acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true }) }));
+  };
+
+  const selectedTradeRouteForTarget = (target, resources) => acquisitionRoutesForTarget(target, resources)
+    .map(({ route }) => route)
+    .filter((route) => route && route.reachable && route.kind === "trade" && route.nextStep && route.nextStep.kind === "trade" && route.nextStep.race)
+    .sort((a, b) => b.eta - a.eta)[0] || null;
+
+  const scoreAcquisitionRouteInputs = (needs, resources, route, weight, seen = new Set()) => {
+    if (!route || !route.reachable || seen.has(route)) return;
+    seen.add(route);
+    for (const input of route.inputs || []) {
+      if (!input || !input.resource) continue;
+      const required = Math.max(0, Number(input.amount) || 0);
+      const have = resValueOf(resources, input.resource);
+      const shortage = Math.max(0, required - have);
+      if (shortage > 0) {
+        const shortageRatio = shortage / Math.max(required, 1);
+        scoreNeed(needs, input.resource, weight * (0.5 + shortageRatio));
+      }
+      if (input.inputs && input.inputs.length) {
+        scoreAcquisitionRouteInputs(needs, resources, input, weight * 0.75, seen);
+      }
+    }
   };
 
   const targetTradeChainDemand = (target, resources) => {
@@ -9112,33 +9141,20 @@
   };
 
   const maybeTradeForTargetChain = (resources, reserved, goalKey, target) => {
-    const options = unlockedRaces()
-      .map((race) => targetTradeScore(race, target, resources, reserved))
-      .filter((item) => item && item.score > 0.0005)
-      .sort((a, b) => b.score - a.score);
-    const best = options[0];
-    if (!best) return false;
-    // Hard gate: if crafting is materially faster for EVERY demand resource
-    // this race could sell us, do not waste catpower/gold on the trade —
-    // just let the craft chain run.  The trade-vs-craft analysis already
-    // honored chance/season/embassy bonuses, so this is honest about
-    // expected wall-clock time, not just raw chain coverage.
-    const analysis = targetPathwayAnalysis(target, resources);
-    const racesSellNames = new Set((best.race.sells || []).map((s) => s && s.name).filter(Boolean));
-    const relevant = analysis.filter((row) => racesSellNames.has(row.name));
-    const craftEverywhereFaster = relevant.length > 0 && relevant.every((row) => isFinite(row.craftSeconds) && row.craftSeconds * 1.5 < row.tradeSeconds);
-    if (craftEverywhereFaster) {
-      const raceName = best.race.title || best.race.name || "civilization";
-      diplomacyPlanText = `Diplomacy: skipping ${raceName} trade — crafting ${targetTradeChainLabel(target, resources)} is faster (${relevant.map((r) => `${resTitle(resources, r.name)} craft ${formatEta(r.craftSeconds)} vs trade ${formatEta(r.tradeSeconds)}`).slice(0, 2).join("; ")})`;
-      return false;
-    }
-    const batch = Math.max(1, Math.min(best.affordable, 10));
-    const measured = withActionResourceDeltas(() => tradeWithRace(best.race, batch), tradeDeltaNamesForRace(best.race, best.prices));
+    const route = selectedTradeRouteForTarget(target, resources);
+    if (!route || !route.nextStep || shouldSaveForExplorers(resources, goalKey)) return false;
+    const race = route.nextStep.race;
+    const prices = tradePricesForRace(race);
+    if (!prices.length || !pricesRespectReservations(prices, reserved, resources)) return false;
+    const affordable = affordableTradeCount(prices, reserved, resources);
+    if (affordable <= 0) return false;
+    const batch = Math.max(1, Math.min(affordable, route.nextStep.trades || 1, 10));
+    const measured = withActionResourceDeltas(() => tradeWithRace(race, batch), tradeDeltaNamesForRace(race, prices));
     if (!measured.result) return false;
-    const raceName = best.race.title || best.race.name || "civilization";
-    const speedBlurb = relevant.length ? ` · path ${formatEta(relevant[0].tradeSeconds)} trade vs ${formatEta(relevant[0].craftSeconds)} craft for ${resTitle(resources, relevant[0].name)}` : "";
-    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${targetTradeChainLabel(target, resources)}${speedBlurb}`;
-    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason target-chain ${labelOf(target.meta)}${speedBlurb}`);
+    lastTradeAt = Date.now();
+    const raceName = race.title || race.name || "civilization";
+    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${resTitle(resources, route.resource)} route`;
+    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason selected ${resTitle(resources, route.resource)} route for ${labelOf(target.meta)}`);
     return true;
   };
 
@@ -10744,6 +10760,11 @@
     acquisitionPathFor(name, amount, context = {}) {
       resetTickCache();
       return acquisitionPathFor(resourceMap(), name, amount, context);
+    },
+    maybeTradeForTargetChain(target, goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return maybeTradeForTargetChain(resources, reservedNeedsFor(target, resources), goalKey, target);
     },
     classifyTargetFeasibility(candidate) {
       return classifyTargetFeasibility(candidate, resourceMap());
