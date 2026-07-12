@@ -619,6 +619,28 @@
     return null;
   };
 
+  const spaceNativeAdapter = (descriptor) => {
+    const mission = descriptor && descriptor.subtype === "mission";
+    const controllerName = mission ? "SpaceProgramBtnController" : "PlanetBuildingBtnController";
+    const path = mission
+      ? ["com", "nuclearunicorn", "game", "ui", controllerName]
+      : ["classes", "ui", "space", controllerName];
+    const Controller = getGlobalPath(path);
+    if (typeof Controller !== "function") return { available: false, reason: `native ${controllerName} unavailable` };
+    try {
+      const controller = new Controller(window.gamePage);
+      if (!controller || typeof controller.fetchModel !== "function") return { available: false, reason: `native ${controllerName} model unavailable` };
+      const model = controller.fetchModel({ id: descriptor.meta.name, controller });
+      if (!model) return { available: false, reason: `native ${controllerName} model unavailable` };
+      if (typeof controller.getPrices !== "function") return { available: false, reason: `native ${controllerName} getPrices unavailable` };
+      const prices = controller.getPrices(model);
+      if (!Array.isArray(prices)) return { available: false, reason: `native ${controllerName} getPrices unavailable` };
+      return { available: true, controller, model, prices };
+    } catch (error) {
+      return { available: false, reason: `native ${controllerName} unavailable` };
+    }
+  };
+
   const spaceGateState = (descriptor) => {
     const closed = (reason, details = {}) => ({
       open: false,
@@ -641,6 +663,8 @@
         const inTransit = !(Number(meta.on) > 0);
         return closed(inTransit ? `${rawSpaceLabel(meta)} is already launched and in transit` : `${rawSpaceLabel(meta)} is complete`);
       }
+      const nativeAdapter = spaceNativeAdapter(descriptor);
+      if (!nativeAdapter.available) return closed(nativeAdapter.reason, { controllerUnavailable: true });
       return { open: true, reason: "mission ready", predecessor: null, transitEta: 0, requiredTech: null, requiredUpgrade: null };
     }
     if (!planet) return closed("owning planet unavailable");
@@ -674,6 +698,8 @@
       return closed(`requires Space building ${rawSpaceLabel(requiredUpgrade)} via upgrades.spaceBuilding`, { requiredUpgrade });
     }
     if (meta.unlocked === false) return closed("planet building is not unlocked");
+    const nativeAdapter = spaceNativeAdapter(descriptor);
+    if (!nativeAdapter.available) return closed(nativeAdapter.reason, { controllerUnavailable: true });
     return { open: true, reason: "planet reached; building ready", predecessor: null, transitEta: 0, requiredTech: null, requiredUpgrade: null };
   };
 
@@ -745,33 +771,14 @@
   const spaceTimeOpen = (meta) =>
     meta && meta.unlocked !== false && meta.researched !== true && !(meta.noStackable && (meta.on || meta.val || 0) >= 1);
 
-  // Space missions and planet buildings scale price differently in the live
-  // game (missions: flat priceRatio^val; planet buildings: priceRatio^val with
-  // a special 1.05 oil ratio, PLUS live *CostReduction effects), so read the
-  // real controller's getPrices when available instead of re-deriving the
-  // formula — same reasoning as `religionUpgradePrices`. Falls back to the
-  // naive scaled formula (also what the test harness, which has no dojo
-  // controllers, exercises).
+  // Space prices are native-controller data. If the controller, model, or
+  // getPrices provider is missing, descriptor gating closes the candidate and
+  // this returns no guessed price.
   const spacePricesFor = (meta) => {
-    try {
-      const game = window.gamePage;
-      const Controller = getGlobalPath(
-        isSpacePlanetBuilding(meta)
-          ? ["classes", "ui", "space", "PlanetBuildingBtnController"]
-          : ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"],
-      );
-      if (typeof Controller === "function") {
-        const controller = new Controller(game);
-        const model = controller.fetchModel({ id: meta.name, controller });
-        if (model && typeof controller.getPrices === "function") {
-          const live = controller.getPrices(model);
-          if (Array.isArray(live) && live.length) return live;
-        }
-      }
-    } catch (error) {
-      /* fall through to the scaled fallback */
-    }
-    return scaledStackablePrices(meta);
+    const descriptor = spaceDescriptorFor(meta);
+    if (!descriptor) return [];
+    const adapter = spaceNativeAdapter(descriptor);
+    return adapter.available ? adapter.prices : [];
   };
 
   const pricesFor = (kind, meta) => {
@@ -2573,7 +2580,13 @@
     if (meta.name === "hydroponics") {
       const station = spaceMetas().find((item) => item && item.name === "terraformingStation");
       const count = Math.max(0, Number(station && (station.on || station.val)) || 0);
-      profile.housing += count * Math.max(0, Number(effects.terraformingMaxKittensRatio) || 0);
+      const owned = Math.max(0, Number(meta.on || meta.val) || 0);
+      const projectedTotal = (copies) => {
+        const copy = { ...meta, val: copies, on: copies, effects: { ...(meta.effects || {}) } };
+        if (typeof meta.updateEffects === "function" && copies > 0) meta.updateEffects(copy, window.gamePage);
+        return Math.max(0, Number(copy.effects.terraformingMaxKittensRatio) || 0) * copies;
+      };
+      profile.housing += count * Math.max(0, projectedTotal(owned + 1) - projectedTotal(owned));
     }
     if (meta.name === "entangler") {
       const conversion = Math.max(0, Number(effects.gflopsConsumption) || 0);
@@ -2995,10 +3008,7 @@
 
   const candidateGatewayValue = (kind, meta) => {
     if (!meta) return 0;
-    let value = kind === "research" ? gatewayValue(meta) : unlockListsOf(meta).reduce((sum, list) => sum + list.length, 0);
-    const spaceUpgrades = meta.upgrades && meta.upgrades.spaceBuilding;
-    if (Array.isArray(spaceUpgrades)) value += spaceUpgrades.length;
-    return value;
+    return kind === "research" ? gatewayValue(meta) : unlockListsOf(meta).reduce((sum, list) => sum + list.length, 0);
   };
 
   // Unlocked, unresearched ancestors of a locked tech — the researchable steps
@@ -3859,24 +3869,29 @@
 
   let lastStrategicDecision = null;
 
+  const LATE_GAME_FRONTIER_HORIZON_S = 6 * 60 * 60;
   const bestLateGameFrontier = (candidates, resources, goalKey) => {
-    const all = candidates || [];
+    const all = (candidates || []).filter(Boolean);
     const liveCapBlockers = new Set();
     for (const target of all) {
+      if (!target.meta) continue;
       for (const cost of pricesFor(target.kind, target.meta)) {
         if (!cost || !cost.name || !(cost.val > 0)) continue;
         const cap = resMaxOf(resources, cost.name);
         if (cap > 0 && cost.val > cap) liveCapBlockers.add(cost.name);
       }
     }
-    const options = [];
+    const withinHorizon = (candidate) => {
+      const eta = waitSecondsForCandidate(candidate, resources);
+      return isFinite(eta) && eta <= LATE_GAME_FRONTIER_HORIZON_S;
+    };
+    const direct = [];
     for (const candidate of all) {
-      if (!candidate || candidate.kind !== "space" || !candidate.meta) continue;
+      if (candidate.kind !== "space" || !candidate.meta || !withinHorizon(candidate)) continue;
       const descriptor = candidate.descriptor || spaceDescriptorFor(candidate.meta);
       if (!descriptor || !descriptor.gateState.open) continue;
-      const owned = Math.max(0, Number(candidate.meta.val) || 0);
-      if (descriptor.subtype === "mission" && descriptor.completionState.purchased) continue;
-      const firstCopy = owned <= 0;
+      const firstCopy = (Number(candidate.meta.val) || 0) <= 0;
+      if (!firstCopy || (descriptor.subtype === "mission" && descriptor.completionState.purchased)) continue;
       const gateway = candidateGatewayValue("space", candidate.meta);
       const profile = spaceMarginalProfile(descriptor, resources);
       const missingProducers = Object.entries(profile.perTick || {})
@@ -3885,34 +3900,43 @@
       const storageBridges = Object.entries(profile.max || {})
         .filter(([name, amount]) => amount > 0 && liveCapBlockers.has(name))
         .map(([name]) => name);
-      const infrastructure = (profile.globalProductionRatio || 0) > 0 || (profile.productionTransfer || 0) > 0 ||
-        (profile.travelSpeed || 0) > 0 || (profile.baseStorageRatio || 0) > 0 || gateway > 0;
-      let priority = 0;
-      let reason = "";
-      if (firstCopy && descriptor.subtype === "mission" && gateway > 0) {
-        priority = 1000 + gateway * 20;
-        reason = `${rawSpaceLabel(candidate.meta)} is the first reachable mission gateway`;
-      } else if (firstCopy && gateway > 0) {
-        priority = 900 + gateway * 20;
-        reason = `${rawSpaceLabel(candidate.meta)} unlocks downstream Space infrastructure`;
-      } else if (firstCopy && missingProducers.length) {
-        priority = 800 + missingProducers.length * 10;
-        reason = `${rawSpaceLabel(candidate.meta)} creates the missing ${missingProducers.join("/")} production path`;
-      } else if (firstCopy && storageBridges.length) {
-        priority = 700 + storageBridges.length * 10;
-        reason = `${rawSpaceLabel(candidate.meta)} removes the live ${storageBridges.join("/")} storage cap`;
-      } else if (firstCopy && infrastructure) {
-        priority = 600;
-        reason = `${rawSpaceLabel(candidate.meta)} is required Space infrastructure`;
+      if (descriptor.subtype === "mission" && gateway > 0) {
+        direct.push({ candidate, route: { kind: "bank", reachable: true, eta: waitSecondsForCandidate(candidate, resources) }, reason: `${rawSpaceLabel(candidate.meta)} is the first reachable mission gateway`, priority: 1000 + gateway * 20 });
+      } else if (gateway > 0) {
+        direct.push({ candidate, route: { kind: "bank", reachable: true, eta: waitSecondsForCandidate(candidate, resources) }, reason: `${rawSpaceLabel(candidate.meta)} unlocks downstream Space infrastructure`, priority: 900 + gateway * 20 });
+      } else if (missingProducers.length) {
+        direct.push({ candidate, route: { kind: "producer", reachable: true, eta: waitSecondsForCandidate(candidate, resources) }, reason: `${rawSpaceLabel(candidate.meta)} creates the missing ${missingProducers.join("/")} production path`, priority: 800 + missingProducers.length * 10 });
+      } else if (storageBridges.length) {
+        direct.push({ candidate, route: { kind: "storage", reachable: true, eta: waitSecondsForCandidate(candidate, resources) }, reason: `${rawSpaceLabel(candidate.meta)} removes the live ${storageBridges.join("/")} storage cap`, priority: 700 + storageBridges.length * 10 });
       }
-      if (priority <= 0) continue;
-      const routes = acquisitionRoutesForTarget(candidate, resources);
-      if (routes.some((entry) => !entry.route || !entry.route.reachable)) continue;
-      const route = routes.find((entry) => entry.route && entry.route.reachable)?.route || { kind: "bank", reachable: true, eta: 0 };
-      options.push({ candidate, route, reason, priority });
     }
-    options.sort((a, b) => b.priority - a.priority || Number(b.candidate.affordable) - Number(a.candidate.affordable) || (b.candidate.score || 0) - (a.candidate.score || 0));
-    return options[0] || null;
+    direct.sort((a, b) => b.priority - a.priority || Number(b.candidate.affordable) - Number(a.candidate.affordable) || (b.candidate.score || 0) - (a.candidate.score || 0));
+    if (direct.length) return direct[0];
+
+    const routeTargets = all
+      .filter((candidate) => candidate.kind === "space" && candidate.meta && (Number(candidate.meta.val) || 0) <= 0 && withinHorizon(candidate))
+      .map((candidate) => ({ candidate, routes: acquisitionRoutesForTarget(candidate, resources) }))
+      .filter(({ routes }) => routes.length > 0 && routes.every(({ route }) => route && route.reachable && route.eta <= LATE_GAME_FRONTIER_HORIZON_S))
+      .sort((a, b) => (b.candidate.score || 0) - (a.candidate.score || 0));
+    const selected = routeTargets[0];
+    if (!selected) return null;
+    const requiredMetas = new Set();
+    const collectRequired = (route) => {
+      if (!route) return;
+      if (route.nextStep && route.nextStep.meta) requiredMetas.add(route.nextStep.meta);
+      for (const input of route.inputs || []) collectRequired(input);
+    };
+    for (const { route } of selected.routes) collectRequired(route);
+    const infrastructure = all
+      .filter((candidate) => candidate.kind === "space" && candidate.meta && requiredMetas.has(candidate.meta) && candidate.meta !== selected.candidate.meta && withinHorizon(candidate))
+      .sort((a, b) => Number(b.affordable) - Number(a.affordable) || (b.score || 0) - (a.score || 0))[0];
+    if (!infrastructure) return null;
+    return {
+      candidate: infrastructure,
+      route: selected.routes[0].route,
+      reason: `${rawSpaceLabel(infrastructure.meta)} is required by ${rawSpaceLabel(selected.candidate.meta)}'s selected acquisition route`,
+      priority: 600,
+    };
   };
 
   // Sticky power-recovery choice.  net÷ETA is the right ranking (fastest Wt per
@@ -11196,6 +11220,7 @@
     foodHelpingCandidate,
     targetId,
     candidateScoreGain,
+    candidateGatewayValue,
     candidateMeetsSwitchScoreGain,
     buildTargetLedger(target) { return buildTargetLedger(target, resourceMap()); },
     spendImpactForCandidate(candidate) { return spendImpactForCandidate(candidate, resourceMap()); },

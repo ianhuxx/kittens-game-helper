@@ -4085,6 +4085,8 @@ for (const [name, value, maxValue] of [
   ["unobtainium", 150, 150], ["antimatter", 0, 100], ["gflops", 100, 1000],
   ["hashrates", 0, 100000],
 ]) ensureResourceT4(name, value, maxValue);
+const savedUnlimitedDRT4 = gamePage.getUnlimitedDR;
+gamePage.getUnlimitedDR = (value, stripe) => value / (1 + value / stripe);
 
 const nanoTechT4 = { name: "nanotechnologyT4", label: "Nanotechnology", unlocked: true, researched: false, prices: [], unlocks: {} };
 techs.push(nanoTechT4);
@@ -4107,7 +4109,14 @@ const heatsinkT4 = bT4("heatsink", "Heatsink", {}, { upgrades: { spaceBuilding: 
 const sunforgeT4 = bT4("sunforge", "Sunforge", { baseMetalMaxRatio: 0.01 });
 const navigationRelayT4 = bT4("navigationRelay", "Navigation Relay", { routeSpeed: 0.25 });
 const terraformingT4 = bT4("terraformingStation", "Terraforming Station", { maxKittens: 1 }, { val: 2, on: 2 });
-const hydroponicsT4 = bT4("hydroponics", "Hydroponics", { catnipRatio: 0.025, catnipMaxRatio: 0.1, terraformingMaxKittensRatio: 0.5 }, { upgrades: { spaceBuilding: ["terraformingStation"] } });
+const hydroponicsT4 = bT4("hydroponics", "Hydroponics", { catnipRatio: 0.025, catnipMaxRatio: 0.1, terraformingMaxKittensRatio: 0 }, {
+  val: 2,
+  on: 2,
+  upgrades: { spaceBuilding: ["terraformingStation"] },
+  updateEffects(self, game) {
+    self.effects.terraformingMaxKittensRatio = game.getUnlimitedDR(self.on, 100) / self.on;
+  },
+});
 const harvesterT4 = bT4("hrHarvester", "HR Harvester", { energyProduction: 4 });
 const entanglerT4 = bT4("entangler", "Entangler", { gflopsConsumption: 0.1, energyConsumption: 25 });
 const tectonicT4 = bT4("tectonic", "Tectonic", { energyProduction: 25 }, { val: 3, on: 3 });
@@ -4139,6 +4148,30 @@ check("Task 4: predecessor mission gate is explicit", /predecessor mission.*Pred
 check("Task 4: planet transit gate reports ETA", /Moon.*transit/i.test(descriptorT4(moonOutpostT4)?.gateState?.reason || "") && (descriptorT4(moonOutpostT4)?.gateState?.transitEta || 0) > 0);
 check("Task 4: required technology gate is explicit", /technology.*Nanotechnology/i.test(descriptorT4(elevatorT4)?.gateState?.reason || ""));
 check("Task 4: upgrades.spaceBuilding dependency gate is explicit", /Space building.*Heatsink/i.test(descriptorT4(containmentT4)?.gateState?.reason || ""));
+check("Task 4 review: upgrades.spaceBuilding gateway edge is counted once", typeof dbg.candidateGatewayValue === "function" && dbg.candidateGatewayValue("space", heatsinkT4) === 1);
+
+const nativePlanetControllerT4 = context.classes.ui.space.PlanetBuildingBtnController;
+const unavailableSpaceAdaptersT4 = [
+  ["controller", null],
+  ["model", class extends nativePlanetControllerT4 { fetchModel() { return null; } }],
+  ["getPrices", class {
+    constructor(game) { this.game = game; }
+    fetchModel(options) {
+      const metadata = this.game.space.getBuilding(options.id);
+      return metadata ? { options, metadata } : null;
+    }
+    buyItem() { return { itemBought: false }; }
+  }],
+];
+for (const [missing, Controller] of unavailableSpaceAdaptersT4) {
+  if (Controller) context.classes.ui.space.PlanetBuildingBtnController = Controller;
+  else delete context.classes.ui.space.PlanetBuildingBtnController;
+  const gate = descriptorT4(ordinaryT4)?.gateState;
+  const candidate = dbg.candidateById("space:ordinarySpaceT4");
+  const diagnostic = dbg.report();
+  check(`Task 4 review: missing native Space ${missing} fails closed`, gate?.open === false && !candidate && /native PlanetBuildingBtnController.*unavailable/i.test(gate?.reason || "") && /native PlanetBuildingBtnController.*unavailable/i.test(diagnostic));
+}
+context.classes.ui.space.PlanetBuildingBtnController = nativePlanetControllerT4;
 
 res("science").value = 5000; res("science").maxValue = 5000;
 const controllerMissionCandidateT4 = dbg.candidateById("space:controllerMissionT4");
@@ -4175,6 +4208,36 @@ const allowedFrontierT4 = new Set(["piscineMission", "heliosMission", "planetCra
 check("Task 4: supplied state selects Late-game progression frontier", frontierT4?.layer === "Late-game progression frontier");
 check("Task 4: mission/producer/storage bridge beats repeat Accelerator", allowedFrontierT4.has(frontierT4?.target?.meta?.name) && frontierT4?.target?.meta !== acceleratorT4);
 
+ensureResourceT4("producerNeedT4", 0, 100);
+ensureResourceT4("capNeedT4", 100, 100);
+ensureResourceT4("routeFuelT4", 1, 1000);
+ensureResourceT4("remoteFuelT4", 0, 1000);
+perTick.remoteFuelT4 = 0.000001;
+const orderedMissionT4 = { name: "orderedMissionT4", label: "Ordered Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 1 }], unlocks: { planet: ["orderedPlanetT4"] }, effects: {} };
+const remoteMissionT4 = { name: "remoteMissionT4", label: "Remote Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "remoteFuelT4", val: 10 }], unlocks: { planet: ["remotePlanetT4"] }, effects: {} };
+programsT4.push(orderedMissionT4, remoteMissionT4);
+const missingProducerT4 = bT4("missingProducerT4", "Missing Producer", { producerNeedT4PerTickSpace: 1 });
+const capStorageT4 = bT4("capStorageT4", "Cap Storage", { capNeedT4Max: 100 });
+const capBlockedTargetT4 = bT4("capBlockedTargetT4", "Cap-blocked Target", {}, { prices: [{ name: "capNeedT4", val: 200 }] });
+const selectedRouteTargetT4 = bT4("selectedRouteTargetT4", "Selected Route Target", {}, { prices: [{ name: "routeFuelT4", val: 100 }] });
+const requiredRouteInfraT4 = bT4("requiredRouteInfraT4", "Required Route Infrastructure", { routeFuelT4PerTickSpace: 1 });
+const unrelatedInfraT4 = bT4("unrelatedInfraT4", "Unrelated Infrastructure", { spaceRatio: 0.5 });
+techPlanetT4.buildings.push(missingProducerT4, capStorageT4, capBlockedTargetT4, selectedRouteTargetT4, requiredRouteInfraT4, unrelatedInfraT4);
+const candidateT4 = (meta) => dbg.candidateById(`space:${meta.name}`);
+const orderedMissionCandidateT4 = candidateT4(orderedMissionT4);
+const producerCandidateT4 = candidateT4(missingProducerT4);
+const storageCandidateT4 = candidateT4(capStorageT4);
+const capTargetCandidateT4 = candidateT4(capBlockedTargetT4);
+const selectedRouteCandidateT4 = { ...candidateT4(selectedRouteTargetT4), score: 10000 };
+const requiredInfraCandidateT4 = candidateT4(requiredRouteInfraT4);
+const unrelatedInfraCandidateT4 = { ...candidateT4(unrelatedInfraT4), score: 9000 };
+const remoteMissionCandidateT4 = { ...candidateT4(remoteMissionT4), score: 11000 };
+check("Task 4 review: frontier order starts with first mission gateway", dbg.bestLateGameFrontier([storageCandidateT4, producerCandidateT4, orderedMissionCandidateT4, capTargetCandidateT4])?.candidate?.meta === orderedMissionT4);
+check("Task 4 review: missing-resource producer follows mission tier", dbg.bestLateGameFrontier([storageCandidateT4, producerCandidateT4, capTargetCandidateT4])?.candidate?.meta === missingProducerT4);
+check("Task 4 review: live cap bridge follows producer tier", dbg.bestLateGameFrontier([storageCandidateT4, capTargetCandidateT4])?.candidate?.meta === capStorageT4);
+check("Task 4 review: infrastructure must belong to selected acquisition route", dbg.bestLateGameFrontier([selectedRouteCandidateT4, requiredInfraCandidateT4, unrelatedInfraCandidateT4])?.candidate?.meta === requiredRouteInfraT4);
+check("Task 4 review: remote/unrelated first copies beyond horizon yield to repeat economy", dbg.bestLateGameFrontier([remoteMissionCandidateT4, unrelatedInfraCandidateT4, dbg.candidateById("build:acceleratorT4")]) === null);
+
 const marginalCasesT4 = [
   ["Space Elevator", elevatorT4, (p) => p.globalProductionRatio > 0 && p.productionTransfer > 0 && p.costReduction?.oil > 0],
   ["Sunlifter", sunlifterT4, (p) => p.perTick?.antimatter === 1 && p.energyProduction === 30],
@@ -4190,14 +4253,21 @@ const marginalCasesT4 = [
   ["Molten Core synergy", moltenCoreT4, (p) => p.energyProduction > 0],
   ["ordinary resource/storage", ordinaryT4, (p) => p.perTick?.wood === 2 && p.max?.wood === 100],
 ];
+hydroponicsT4.updateEffects(hydroponicsT4, gamePage);
 for (const [label, meta, assertion] of marginalCasesT4) {
   const descriptor = descriptorT4(meta);
   const profile = descriptor && typeof dbg.spaceMarginalProfile === "function" ? dbg.spaceMarginalProfile(descriptor) : {};
   check(`Task 4 marginal: ${label}`, !!descriptor && assertion(profile));
 }
+const hydroBeforeT4 = { val: hydroponicsT4.val, on: hydroponicsT4.on, effects: { ...hydroponicsT4.effects } };
+const hydroProfileT4 = dbg.spaceMarginalProfile(descriptorT4(hydroponicsT4));
+const hydroExpectedT4 = terraformingT4.on * (gamePage.getUnlimitedDR(hydroponicsT4.on + 1, 100) - gamePage.getUnlimitedDR(hydroponicsT4.on, 100));
+check("Task 4 review: Hydroponics projects exact nonlinear next-copy terraforming gain without mutation", Math.abs(hydroProfileT4.housing - hydroExpectedT4) < 1e-9 && hydroponicsT4.val === hydroBeforeT4.val && hydroponicsT4.on === hydroBeforeT4.on && JSON.stringify(hydroponicsT4.effects) === JSON.stringify(hydroBeforeT4.effects));
 nanoTechT4.researched = false;
 const reportT4 = dbg.report();
 check("Task 4: diagnostics include planet ownership and exact gate", /Moon.*Lunar Outpost.*transit/i.test(reportT4) && /Tech Planet.*Space Elevator.*technology.*Nanotechnology/i.test(reportT4) && /Helios.*Containment Chamber.*Space building.*Heatsink/i.test(reportT4));
+if (savedUnlimitedDRT4 === undefined) delete gamePage.getUnlimitedDR;
+else gamePage.getUnlimitedDR = savedUnlimitedDRT4;
 
 buildings.splice(buildings.indexOf(acceleratorT4), 1);
 buildings.forEach((building, index) => { building.unlocked = savedBuildingUnlockedT4[index]; });
@@ -4208,6 +4278,7 @@ calendar.festivalDays = savedFestivalT4;
 techs.splice(techs.indexOf(nanoTechT4), 1);
 delete perTick.uranium;
 delete perTick.unobtainium;
+delete perTick.remoteFuelT4;
 for (const snapshot of resourceSnapshotsT4.values()) {
   if (snapshot.added) resources.splice(resources.indexOf(snapshot.resource), 1);
   else {
