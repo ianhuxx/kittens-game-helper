@@ -4212,6 +4212,9 @@ ensureResourceT4("producerNeedT4", 0, 100);
 ensureResourceT4("capNeedT4", 100, 100);
 ensureResourceT4("routeFuelT4", 1, 1000);
 ensureResourceT4("remoteFuelT4", 0, 1000);
+ensureResourceT4("remoteCapNeedT4", 100, 100);
+perTick.capNeedT4 = 1;
+perTick.remoteCapNeedT4 = 1;
 perTick.remoteFuelT4 = 0.000001;
 const orderedMissionT4 = { name: "orderedMissionT4", label: "Ordered Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 1 }], unlocks: { planet: ["orderedPlanetT4"] }, effects: {} };
 const remoteMissionT4 = { name: "remoteMissionT4", label: "Remote Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "remoteFuelT4", val: 10 }], unlocks: { planet: ["remotePlanetT4"] }, effects: {} };
@@ -4222,21 +4225,26 @@ const capBlockedTargetT4 = bT4("capBlockedTargetT4", "Cap-blocked Target", {}, {
 const selectedRouteTargetT4 = bT4("selectedRouteTargetT4", "Selected Route Target", {}, { prices: [{ name: "routeFuelT4", val: 100 }] });
 const requiredRouteInfraT4 = bT4("requiredRouteInfraT4", "Required Route Infrastructure", { routeFuelT4PerTickSpace: 1 });
 const unrelatedInfraT4 = bT4("unrelatedInfraT4", "Unrelated Infrastructure", { spaceRatio: 0.5 });
-techPlanetT4.buildings.push(missingProducerT4, capStorageT4, capBlockedTargetT4, selectedRouteTargetT4, requiredRouteInfraT4, unrelatedInfraT4);
+const remoteCapStorageT4 = bT4("remoteCapStorageT4", "Remote Cap Storage", { remoteCapNeedT4Max: 100 });
+const remoteCapTargetT4 = bT4("remoteCapTargetT4", "Remote Cap Target", {}, { prices: [{ name: "remoteCapNeedT4", val: 200 }, { name: "remoteFuelT4", val: 10 }] });
+techPlanetT4.buildings.push(missingProducerT4, capStorageT4, capBlockedTargetT4, selectedRouteTargetT4, requiredRouteInfraT4, unrelatedInfraT4, remoteCapStorageT4, remoteCapTargetT4);
 const candidateT4 = (meta) => dbg.candidateById(`space:${meta.name}`);
 const orderedMissionCandidateT4 = candidateT4(orderedMissionT4);
 const producerCandidateT4 = candidateT4(missingProducerT4);
 const storageCandidateT4 = candidateT4(capStorageT4);
-const capTargetCandidateT4 = candidateT4(capBlockedTargetT4);
+const capTargetCandidateT4 = { ...candidateT4(capBlockedTargetT4), score: 1000 };
 const selectedRouteCandidateT4 = { ...candidateT4(selectedRouteTargetT4), score: 10000 };
 const requiredInfraCandidateT4 = candidateT4(requiredRouteInfraT4);
 const unrelatedInfraCandidateT4 = { ...candidateT4(unrelatedInfraT4), score: 9000 };
 const remoteMissionCandidateT4 = { ...candidateT4(remoteMissionT4), score: 11000 };
+const remoteCapStorageCandidateT4 = candidateT4(remoteCapStorageT4);
+const remoteCapTargetCandidateT4 = { ...candidateT4(remoteCapTargetT4), score: 12000 };
 check("Task 4 review: frontier order starts with first mission gateway", dbg.bestLateGameFrontier([storageCandidateT4, producerCandidateT4, orderedMissionCandidateT4, capTargetCandidateT4])?.candidate?.meta === orderedMissionT4);
 check("Task 4 review: missing-resource producer follows mission tier", dbg.bestLateGameFrontier([storageCandidateT4, producerCandidateT4, capTargetCandidateT4])?.candidate?.meta === missingProducerT4);
 check("Task 4 review: live cap bridge follows producer tier", dbg.bestLateGameFrontier([storageCandidateT4, capTargetCandidateT4])?.candidate?.meta === capStorageT4);
 check("Task 4 review: infrastructure must belong to selected acquisition route", dbg.bestLateGameFrontier([selectedRouteCandidateT4, requiredInfraCandidateT4, unrelatedInfraCandidateT4])?.candidate?.meta === requiredRouteInfraT4);
 check("Task 4 review: remote/unrelated first copies beyond horizon yield to repeat economy", dbg.bestLateGameFrontier([remoteMissionCandidateT4, unrelatedInfraCandidateT4, dbg.candidateById("build:acceleratorT4")]) === null);
+check("Task 4 re-review: remote cap-blocked target does not make storage monopolize frontier", dbg.bestLateGameFrontier([remoteCapStorageCandidateT4, remoteCapTargetCandidateT4, dbg.candidateById("build:acceleratorT4")]) === null);
 
 const marginalCasesT4 = [
   ["Space Elevator", elevatorT4, (p) => p.globalProductionRatio > 0 && p.productionTransfer > 0 && p.costReduction?.oil > 0],
@@ -4278,6 +4286,8 @@ calendar.festivalDays = savedFestivalT4;
 techs.splice(techs.indexOf(nanoTechT4), 1);
 delete perTick.uranium;
 delete perTick.unobtainium;
+delete perTick.capNeedT4;
+delete perTick.remoteCapNeedT4;
 delete perTick.remoteFuelT4;
 for (const snapshot of resourceSnapshotsT4.values()) {
   if (snapshot.added) resources.splice(resources.indexOf(snapshot.resource), 1);

@@ -3872,19 +3872,44 @@
   const LATE_GAME_FRONTIER_HORIZON_S = 6 * 60 * 60;
   const bestLateGameFrontier = (candidates, resources, goalKey) => {
     const all = (candidates || []).filter(Boolean);
-    const liveCapBlockers = new Set();
-    for (const target of all) {
-      if (!target.meta) continue;
-      for (const cost of pricesFor(target.kind, target.meta)) {
-        if (!cost || !cost.name || !(cost.val > 0)) continue;
-        const cap = resMaxOf(resources, cost.name);
-        if (cap > 0 && cost.val > cap) liveCapBlockers.add(cost.name);
-      }
-    }
     const withinHorizon = (candidate) => {
       const eta = waitSecondsForCandidate(candidate, resources);
       return isFinite(eta) && eta <= LATE_GAME_FRONTIER_HORIZON_S;
     };
+    const storageOptions = all
+      .filter((candidate) => candidate.kind === "space" && candidate.meta && withinHorizon(candidate))
+      .map((candidate) => ({ candidate, profile: spaceMarginalProfile(candidate.descriptor || spaceDescriptorFor(candidate.meta), resources) }))
+      .filter(({ profile }) => Object.values(profile.max || {}).some((amount) => amount > 0));
+    const liveCapBlockers = new Set();
+    for (const target of all) {
+      if (!target.meta || !((target.score || 0) > 0 || candidateGatewayValue(target.kind, target.meta) > 0)) continue;
+      const costs = pricesFor(target.kind, target.meta).filter((cost) => cost && cost.name && cost.val > 0);
+      const blockers = costs.filter((cost) => {
+        const cap = resMaxOf(resources, cost.name);
+        return cap > 0 && cost.val > cap;
+      });
+      for (const blocker of blockers) {
+        for (const { candidate: bridge, profile } of storageOptions) {
+          const gain = Number(profile.max && profile.max[blocker.name]) || 0;
+          if (!(gain > 0) || resMaxOf(resources, blocker.name) + gain < blocker.val) continue;
+          const projected = new Map(resources);
+          for (const [name, amount] of Object.entries(profile.max || {})) {
+            const resource = getRes(projected, name);
+            if (!resource || !(amount > 0)) continue;
+            projected.set(name, { ...resource, maxValue: Math.max(0, Number(resource.maxValue) || 0) + amount });
+            if (name === "manpower") projected.set("catpower", projected.get(name));
+          }
+          let eta = waitSecondsForCandidate(bridge, resources);
+          let reachable = isFinite(eta) && eta <= LATE_GAME_FRONTIER_HORIZON_S;
+          for (const cost of costs) {
+            const route = acquisitionPathFor(projected, cost.name, cost.val, { finalPurchase: true });
+            if (!route.reachable) reachable = false;
+            else eta = Math.max(eta, route.eta);
+          }
+          if (reachable && eta <= LATE_GAME_FRONTIER_HORIZON_S) liveCapBlockers.add(blocker.name);
+        }
+      }
+    }
     const direct = [];
     for (const candidate of all) {
       if (candidate.kind !== "space" || !candidate.meta || !withinHorizon(candidate)) continue;
