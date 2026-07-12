@@ -247,7 +247,7 @@
     if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[1]) && SAFE_ACTION_NAME.test(candidate[2])) {
       return ACTION_POLICY.SAFE_REPEATABLE;
     }
-    const repeatable = /^(craft|trade):([^:]+)$/.exec(actionId);
+    const repeatable = /^(craft|trade|explore|embassy):([^:]+)$/.exec(actionId);
     if (repeatable && SAFE_ACTION_NAME.test(repeatable[2])) return ACTION_POLICY.SAFE_REPEATABLE;
     return ACTION_POLICY.FORBIDDEN;
   };
@@ -8280,9 +8280,7 @@
       invoke: () => {
         if (preferAll && typeof diplomacy.tradeAll === "function") diplomacy.tradeAll(race);
         else if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, amount);
-        else if (typeof diplomacy.trade === "function") {
-          for (let i = 0; i < amount; i += 1) diplomacy.trade(race);
-        } else if (amount === 1 && typeof diplomacy.tradeAll === "function") diplomacy.tradeAll(race);
+        else if (typeof diplomacy.trade === "function") diplomacy.trade(race);
       },
       verify: changed,
     });
@@ -8338,7 +8336,8 @@
       ? Math.max(0, output.maxValue - current)
       : Number.POSITIVE_INFINITY;
     if (headroom <= 0) return 0;
-    const headroomBound = isFinite(headroom) ? Math.max(1, Math.ceil(headroom / expected)) : Number.POSITIVE_INFINITY;
+    const headroomBound = isFinite(headroom) ? Math.max(0, Math.floor(headroom / expected)) : Number.POSITIVE_INFINITY;
+    if (headroomBound <= 0) return 0;
     const routeBound = step.trades > 0 ? Math.ceil(step.trades) : Number.POSITIVE_INFINITY;
     return Math.max(0, Math.min(affordable, deficitBound, headroomBound, routeBound, MAX_TRADE_BATCH));
   };
@@ -8454,24 +8453,25 @@
 
   const buyEmbassyForRace = (race) => {
     const game = window.gamePage;
-    const before = race.embassyLevel || 0;
     try {
       const Controller = getGlobalPath(["classes", "diplomacy", "ui", "EmbassyButtonController"]);
-      if (game && typeof Controller === "function") {
-        const controller = new Controller(game);
-        const model = controller.fetchModel({ prices: race.embassyPrices, race, controller });
-        if (model && typeof controller.buyItem === "function") controller.buyItem(model, { boughtByQueue: true });
-        if ((race.embassyLevel || 0) > before) return true;
-      }
+      if (!game || typeof Controller !== "function") return null;
+      const controller = new Controller(game);
+      if (typeof controller.fetchModel !== "function" || typeof controller.buyItem !== "function") return null;
+      const model = controller.fetchModel({ prices: race.embassyPrices, race, controller });
+      if (!model) return null;
+      const snapshot = () => ({ level: race.embassyLevel || 0, resources: resourceSnapshot() });
+      const result = executeSemanticAction({
+        id: `embassy:${race.name}`,
+        policy: ACTION_POLICY.SAFE_REPEATABLE,
+        snapshot,
+        invoke: () => controller.buyItem(model, { boughtByQueue: true }),
+        verify: (before, after) => after.level !== before.level || resourceDeltasBetween(before.resources, after.resources).length > 0,
+      });
+      return result.ok;
     } catch (error) {
-      /* try raw metadata below */
+      return false;
     }
-    const prices = embassyPricesForRace(race).filter((price) => price && price.name && price.val > 0);
-    if (!prices.length || !canPayPrices(prices) || !rawPayPrices(prices)) return false;
-    race.embassyLevel = before + 1;
-    if (game && game.diplomacy && typeof game.diplomacy.triggerOnEmbassyCountChanged === "function") game.diplomacy.triggerOnEmbassyCountChanged();
-    if (game && typeof game.render === "function") game.render();
-    return (race.embassyLevel || 0) > before;
   };
 
   // The live "Send explorers" fee (1000 catpower stock) read from the game's
@@ -8494,18 +8494,31 @@
   // would then never be sent for the rest of the run.)
   const maybeSendExplorers = (resources, reserved) => {
     const game = window.gamePage;
-    const diplomacy = game && game.diplomacy;
-    if (!diplomacy || typeof diplomacy.unlockRandomRace !== "function") return false;
+    const button = game && game.tradeTab && game.tradeTab.exploreBtn;
+    const controller = button && button.controller;
+    const model = button && button.model;
     const price = explorerPrices();
     if (!hasLockedDiscoverableRace() || !canPayPrices(price) || !pricesRespectReservations(price, reserved, resources)) return false;
-    const before = unlockedRaces().length;
-    if (!rawPayPrices(price)) return false;
-    const race = diplomacy.unlockRandomRace();
-    if (!race && game.resPool && typeof game.resPool.addResEvent === "function") game.resPool.addResEvent("manpower", price[0].val * 0.95);
-    if (game && typeof game.render === "function") game.render();
-    const after = unlockedRaces().length;
-    if (after > before || race) {
-      diplomacyPlanText = `Diplomacy: sent explorers; met ${(race && (race.title || race.name)) || "a civilization"}`;
+    if (!controller || !model || typeof controller.buyItem !== "function") {
+      diplomacyPlanText = "Diplomacy: explorer controller unavailable; no action taken";
+      return null;
+    }
+    const snapshot = () => ({
+      unlocked: new Set(unlockedRaces()),
+      resources: resourceSnapshot(),
+    });
+    const result = executeSemanticAction({
+      id: "explore:races",
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot,
+      invoke: () => controller.buyItem(model, { boughtByQueue: true }),
+      verify: (before, after) => after.unlocked.size !== before.unlocked.size || resourceDeltasBetween(before.resources, after.resources).length > 0,
+    });
+    if (result.ok) {
+      const race = [...result.after.unlocked].find((item) => !result.before.unlocked.has(item)) || null;
+      diplomacyPlanText = race
+        ? `Diplomacy: sent explorers; met ${race.title || race.name || "a civilization"}`
+        : "Diplomacy: explorer action used resources; no race revealed";
       pushLog(`🧭 ${diplomacyPlanText}`);
       return true;
     }
@@ -9121,12 +9134,14 @@
     const prices = tradePricesForRace(race);
     const batch = boundedTradeBatch(route, liveLedger, liveResources);
     if (!prices.length || batch <= 0 || !pricesRespectReservations(prices, liveLedger.reserved || {}, liveResources)) return false;
-    const measured = withActionResourceDeltas(() => tradeWithRace(race, batch), tradeDeltaNamesForRace(race, prices));
+    const diplomacy = window.gamePage && window.gamePage.diplomacy;
+    const nativeBatch = diplomacy && typeof diplomacy.tradeMultiple === "function" ? batch : 1;
+    const measured = withActionResourceDeltas(() => tradeWithRace(race, nativeBatch), tradeDeltaNamesForRace(race, prices));
     if (!measured.result) return false;
     const raceName = race.title || race.name || "civilization";
     const odds = isZebraTitaniumTradeRoute(route) ? ` · ${zebraTitaniumOddsText(liveResources, goalKey)}` : "";
     diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${resTitle(liveResources, route.resource)} route${odds}`;
-    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason selected ${resTitle(liveResources, route.resource)} route for ${labelOf(target.meta)}`);
+    pushLog(`🤝 ${raceName} trade${nativeBatch > 1 ? ` ×${nativeBatch}` : ""}: ${measured.suffix}; reason selected ${resTitle(liveResources, route.resource)} route for ${labelOf(target.meta)}`);
     return true;
   };
 
@@ -9139,7 +9154,7 @@
       const expected = expectedTradeYield(race, sell);
       if (!output || !(output.maxValue > 0) || !(expected > 0)) continue;
       const headroom = Math.max(0, output.maxValue - output.value);
-      batch = Math.min(batch, headroom > 0 ? Math.max(1, Math.ceil(headroom / expected)) : 0);
+      batch = Math.min(batch, headroom > 0 ? Math.max(0, Math.floor(headroom / expected)) : 0);
     }
     return Math.max(0, batch);
   };
@@ -9165,16 +9180,10 @@
       }
     }
     if (!best) return false;
-    let nativeMax = Number.POSITIVE_INFINITY;
-    try {
-      if (typeof diplomacy.getMaxTradeAmt === "function") nativeMax = Math.max(0, Number(diplomacy.getMaxTradeAmt(best)) || 0);
-    } catch (error) {
-      /* use bounded multiple trade */
-    }
-    if (nativeMax <= 0) return false;
+    const nativeBatch = typeof diplomacy.tradeMultiple === "function" ? bestBatch : 1;
     const prices = tradePricesForRace(best);
     const measured = withActionResourceDeltas(
-      () => tradeWithRace(best, bestBatch, nativeMax <= bestBatch),
+      () => tradeWithRace(best, nativeBatch),
       tradeDeltaNamesForRace(best, prices),
     );
     if (!measured.result) return false;
@@ -9193,10 +9202,18 @@
       .sort((a, b) => Number(b.race === relevantRace) - Number(a.race === relevantRace) || (a.race.embassyLevel || 0) - (b.race.embassyLevel || 0));
     const next = races[0];
     if (!next) return false;
+    const beforeLevel = next.race.embassyLevel || 0;
     const measured = withActionResourceDeltas(() => buyEmbassyForRace(next.race), new Set(next.prices.map((price) => price.name)));
+    if (measured.result === null) {
+      diplomacyPlanText = "Diplomacy: embassy controller unavailable; no action taken";
+      return null;
+    }
     if (measured.result) {
-      diplomacyPlanText = `Diplomacy: built embassy with ${next.race.title || next.race.name} (level ${next.race.embassyLevel || 1})`;
-      pushLog(`🏛 embassy with ${next.race.title || next.race.name}: ${measured.spent || "cost paid"}; level ${next.race.embassyLevel || 1}; reason diplomacy`);
+      const built = (next.race.embassyLevel || 0) > beforeLevel;
+      diplomacyPlanText = built
+        ? `Diplomacy: built embassy with ${next.race.title || next.race.name} (level ${next.race.embassyLevel || 1})`
+        : `Diplomacy: embassy action with ${next.race.title || next.race.name} changed resources; level unchanged`;
+      pushLog(`🏛 ${diplomacyPlanText}${measured.spent ? `; ${measured.spent}` : ""}`);
       return true;
     }
     return false;
@@ -9249,16 +9266,24 @@
       // One owner, one mutation, one cooldown: reveal/preparation first, then
       // the selected acquisition route, safe overflow, and only then embassies.
       if (craftDiplomacyPrerequisites(resources, goalKey) ||
-          maybeAdoptZebraTradePolicy(resources, reserved, goalKey) ||
-          maybeSendExplorers(resources, reserved)) {
+          maybeAdoptZebraTradePolicy(resources, reserved, goalKey)) {
         lastDiplomacyAction = Date.now();
+        return;
+      }
+      const explorerResult = maybeSendExplorers(resources, reserved);
+      if (explorerResult !== false) {
+        if (explorerResult === true) lastDiplomacyAction = Date.now();
         return;
       }
       const route = activeAcquisitionRoute(target, resources);
       if (maybeTradeForTargetChain(resources, ledger, goalKey, target) ||
-          maybeTradeSurplus(resources, ledger, goalKey) ||
-          maybeBuildEmbassy(resources, reserved, route)) {
+          maybeTradeSurplus(resources, ledger, goalKey)) {
         lastDiplomacyAction = Date.now();
+        return;
+      }
+      const embassyResult = maybeBuildEmbassy(resources, reserved, route);
+      if (embassyResult !== false) {
+        if (embassyResult === true) lastDiplomacyAction = Date.now();
         return;
       }
       const raceCount = unlockedRaces().length;

@@ -266,6 +266,7 @@ let observeCalls = 0;
 let praiseCalls = 0;
 let festivalCalls = 0;
 let tradeCalls = 0;
+const diplomacyApiCalls = [];
 let sacrificeChunks = 0; // 2500-unicorn batches converted to tears
 
 const calendar = {
@@ -355,6 +356,7 @@ const diplomacy = {
   getMaxTradeAmt: () => 1,
   tradeAll(race) {
     tradeCalls += 1;
+    diplomacyApiCalls.push({ api: "tradeAll", race: race?.name, amount: 1 });
     if (race && race.name === "sharks" && canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "iron", val: 100 }])) {
       res("manpower").value -= 50;
       res("gold").value -= 15;
@@ -456,6 +458,19 @@ const gamePage = {
   village,
   calendar,
   diplomacy,
+  tradeTab: {
+    exploreBtn: {
+      model: { prices: [{ name: "manpower", val: 1000 }] },
+      controller: {
+        buyItem(model) {
+          diplomacyApiCalls.push({ api: "explore", amount: 1 });
+          if (!pay(model?.prices || [])) return { itemBought: false };
+          const race = typeof diplomacy.unlockRandomRace === "function" ? diplomacy.unlockRandomRace() : null;
+          return { itemBought: !!race, race };
+        },
+      },
+    },
+  },
   // Religion tab with the game's real button shapes: the sacrifice button's
   // controller._transform (unicorns→tears at one tear per ziggurat per 2500)
   // and the zgUpgradeButtons the helper falls back to for purchases.
@@ -524,6 +539,23 @@ class FakeDate extends Date {
 }
 
 const intervalFns = [];
+class FakeEmbassyButtonController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    return options;
+  }
+  getPrices(model) {
+    return model?.prices || [];
+  }
+  buyItem(model) {
+    diplomacyApiCalls.push({ api: "embassy", race: model?.race?.name, amount: 1 });
+    if (!model?.race || !pay(this.getPrices(model))) return { itemBought: false };
+    model.race.embassyLevel = (model.race.embassyLevel || 0) + 1;
+    return { itemBought: true };
+  }
+}
 const context = {
   console,
   Date: FakeDate,
@@ -547,6 +579,7 @@ const context = {
   Promise,
   Array,
   Object,
+  classes: { diplomacy: { ui: { EmbassyButtonController: FakeEmbassyButtonController } } },
 };
 context.window = context;
 vm.createContext(context);
@@ -899,6 +932,16 @@ diplomacy.unlockRandomRace = () => {
   return race || null;
 };
 diplomacy.tradeMultiple = (race, amt) => {
+  diplomacyApiCalls.push({ api: "tradeMultiple", race: race?.name, amount: amt });
+  if (race.name === "lizards") {
+    const prices = [{ name: "manpower", val: 50 * amt }, { name: "gold", val: 15 * amt }];
+    if (!canPay(prices)) return;
+    tradeCalls += 1;
+    pay(prices);
+    res("minerals").value += 100 * amt;
+    race.tradeTotal = (race.tradeTotal || 0) + amt;
+    return;
+  }
   if (race.name !== "zebras") return;
   if (res("gold").value < 15 * amt || res("manpower").value < 50 * amt || res("slab").value < 50 * amt) return;
   res("gold").value -= 15 * amt;
@@ -3685,6 +3728,170 @@ const leviathanBoundedBatchAE = typeof dbg.boundedTradeBatch === "function"
   ? dbg.boundedTradeBatch(cappedLeviathanRouteAE, completeTradeLedgerAE)
   : null;
 check("Task 3: trade batches stop at uranium/time-crystal output headroom and unobtainium floor", uraniumHeadroomBatchAE === 0 && leviathanFloorBatchAE === 0 && leviathanBoundedBatchAE === 0);
+
+/* Task 3 review: a partial output slot smaller than one expected yield is not
+   permission to overflow, and each Dragon input floor must bind on its own. */
+const savedCultureReviewAE = res("culture").value;
+res("titanium").value = 10000;
+res("manpower").value = 10000;
+res("gold").value = 10000;
+res("uranium").value = 99.5;
+res("uranium").maxValue = 100;
+const partialHeadroomDragonRouteAE = { ...directDragonRouteAE, amount: 125 };
+const partialHeadroomBatchAE = dbg.boundedTradeBatch(partialHeadroomDragonRouteAE, { reserved: {} });
+check("Task 3 review: positive uranium headroom below one expected yield permits zero trades", partialHeadroomBatchAE === 0);
+
+const isolatedFloorBatchAE = (floorName, floor, stock) => {
+  res("titanium").value = 10000;
+  res("manpower").value = 10000;
+  res("gold").value = 10000;
+  res(floorName).value = stock;
+  res("uranium").value = 0;
+  return dbg.boundedTradeBatch(directDragonRouteAE, { reserved: { [floorName]: floor } });
+};
+const isolatedTitaniumFloorAE = isolatedFloorBatchAE("titanium", 275, 524);
+const isolatedManpowerFloorAE = isolatedFloorBatchAE("manpower", 150, 199);
+const isolatedGoldFloorAE = isolatedFloorBatchAE("gold", 60, 74);
+check("Task 3 review: titanium, catpower, and gold floors independently stop Dragon trades", isolatedTitaniumFloorAE === 0 && isolatedManpowerFloorAE === 0 && isolatedGoldFloorAE === 0);
+
+check("Task 3 review: explorer and embassy semantic IDs are safe repeatable actions",
+  dbg.actionPolicyFor("explore:races") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("embassy:reviewers") === dbg.ACTION_POLICY.SAFE_REPEATABLE);
+
+/* The real dispatcher must end after one public diplomacy API mutation. Exercise
+   native explorer, single-trade fallback, and embassy controller paths while
+   observing every diplomacy API family in the fixture. */
+const reviewExplorerRaceAE = { name: "reviewExplorersAE", title: "Review Explorers", unlocked: false, hidden: false, embassyLevel: 0, embassyPrices: [] };
+diplomacy.races.push(reviewExplorerRaceAE);
+const savedUnlockRandomRaceAE = diplomacy.unlockRandomRace;
+diplomacy.unlockRandomRace = () => {
+  reviewExplorerRaceAE.unlocked = true;
+  return reviewExplorerRaceAE;
+};
+res("manpower").value = 1100;
+res("manpower").maxValue = 1200;
+dbg.forceActiveTarget(null);
+const explorerAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+tickFn();
+const explorerAuditAE = diplomacyApiCalls.slice(explorerAuditStartAE);
+check("Task 3 review: real dispatcher uses one native explorer API and stops", reviewExplorerRaceAE.unlocked && explorerAuditAE.length === 1 && explorerAuditAE[0].api === "explore");
+diplomacy.races.splice(diplomacy.races.indexOf(reviewExplorerRaceAE), 1);
+diplomacy.unlockRandomRace = savedUnlockRandomRaceAE;
+
+const reviewTitaniumTargetAE = { name: "reviewTitaniumTargetAE", label: "Review Titanium Target", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 100 }], effects: {} };
+buildings.push(reviewTitaniumTargetAE);
+const savedTradeMultipleReviewAE = diplomacy.tradeMultiple;
+const savedTradeReviewAE = diplomacy.trade;
+const savedShipReviewAE = [res("ship").value, res("ship").maxValue];
+delete diplomacy.tradeMultiple;
+let fallbackTradeCallsAE = 0;
+diplomacy.trade = (race) => {
+  diplomacyApiCalls.push({ api: "trade", race: race?.name, amount: 1 });
+  fallbackTradeCallsAE += 1;
+  if (race?.name === "lizards" && canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }])) {
+    pay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }]);
+    res("minerals").value += 100;
+    return true;
+  }
+  if (race?.name !== "zebras" || !canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "slab", val: 50 }])) return false;
+  pay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "slab", val: 50 }]);
+  res("titanium").value += 12;
+  return true;
+};
+res("ship").value = 1;
+res("ship").maxValue = 1;
+res("titanium").value = 0;
+res("titanium").maxValue = 100;
+res("manpower").value = 5000;
+res("manpower").maxValue = 10000;
+res("gold").value = 1000;
+res("slab").value = 1000;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(dbg.candidateById("build:reviewTitaniumTargetAE"), "Economy / normal growth", 0);
+const tradeAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+tickFn();
+const tradeAuditAE = diplomacyApiCalls.slice(tradeAuditStartAE);
+check("Task 3 review: missing tradeMultiple permits one native trade call, never a loop", fallbackTradeCallsAE === 1 && tradeAuditAE.length === 1 && tradeAuditAE[0].api === "trade");
+
+const overflowPassiveTargetAE = { name: "overflowPassiveTargetAE", label: "Overflow Passive Target", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 100 }], effects: {} };
+buildings.push(overflowPassiveTargetAE);
+perTick.titanium = 1;
+res("titanium").value = 0;
+res("titanium").maxValue = 1000;
+res("manpower").value = 985;
+res("manpower").maxValue = 1000;
+res("gold").value = 600;
+res("minerals").value = 0;
+dbg.clearResourceTelemetry?.("titanium");
+dbg.forceActiveTarget(dbg.candidateById("build:overflowPassiveTargetAE"), "Economy / normal growth", 0);
+const overflowFallbackAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+tickFn();
+const overflowFallbackAuditAE = diplomacyApiCalls.slice(overflowFallbackAuditStartAE);
+check("Task 3 review: overflow fallback also uses one native trade call at batch one", overflowFallbackAuditAE.length === 1 && overflowFallbackAuditAE[0].api === "trade");
+buildings.splice(buildings.indexOf(overflowPassiveTargetAE), 1);
+perTick.titanium = 0;
+diplomacy.tradeMultiple = savedTradeMultipleReviewAE;
+if (savedTradeReviewAE === undefined) delete diplomacy.trade; else diplomacy.trade = savedTradeReviewAE;
+[res("ship").value, res("ship").maxValue] = savedShipReviewAE;
+buildings.splice(buildings.indexOf(reviewTitaniumTargetAE), 1);
+
+const reviewEmbassyRaceAE = { name: "reviewEmbassyAE", title: "Review Embassy", unlocked: true, hidden: false, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 10 }], sells: [] };
+const savedEmbassyPricesAE = diplomacy.races.map((race) => [race, race.embassyPrices]);
+for (const race of diplomacy.races) race.embassyPrices = [];
+diplomacy.races.push(reviewEmbassyRaceAE);
+res("culture").value = 100;
+res("manpower").value = 0;
+dbg.forceActiveTarget(null);
+const embassyAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+tickFn();
+const embassyAuditAE = diplomacyApiCalls.slice(embassyAuditStartAE);
+check("Task 3 review: real dispatcher uses one native embassy API and stops", reviewEmbassyRaceAE.embassyLevel === 1 && embassyAuditAE.length === 1 && embassyAuditAE[0].api === "embassy");
+diplomacy.races.splice(diplomacy.races.indexOf(reviewEmbassyRaceAE), 1);
+for (const [race, prices] of savedEmbassyPricesAE) race.embassyPrices = prices;
+
+/* With the public controller unavailable, no raw pay/unlock/level fallback is
+   allowed. The manager reports unavailable and leaves the board unchanged. */
+const unavailableExplorerRaceAE = { name: "unavailableExplorerAE", title: "Unavailable Explorer", unlocked: false, hidden: false, embassyLevel: 0, embassyPrices: [] };
+diplomacy.races.push(unavailableExplorerRaceAE);
+const savedExploreControllerAE = gamePage.tradeTab.exploreBtn.controller;
+gamePage.tradeTab.exploreBtn.controller = null;
+let rawUnlockCallsAE = 0;
+diplomacy.unlockRandomRace = () => {
+  rawUnlockCallsAE += 1;
+  unavailableExplorerRaceAE.unlocked = true;
+  return unavailableExplorerRaceAE;
+};
+res("manpower").value = 1100;
+const manpowerBeforeUnavailableExploreAE = res("manpower").value;
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+check("Task 3 review: unavailable explorer controller performs no raw payment or race mutation", rawUnlockCallsAE === 0 && !unavailableExplorerRaceAE.unlocked && res("manpower").value === manpowerBeforeUnavailableExploreAE);
+gamePage.tradeTab.exploreBtn.controller = savedExploreControllerAE;
+diplomacy.unlockRandomRace = savedUnlockRandomRaceAE;
+diplomacy.races.splice(diplomacy.races.indexOf(unavailableExplorerRaceAE), 1);
+
+const unavailableEmbassyRaceAE = { name: "unavailableEmbassyAE", title: "Unavailable Embassy", unlocked: true, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 10 }], sells: [] };
+const savedEmbassyPricesUnavailableAE = diplomacy.races.map((race) => [race, race.embassyPrices]);
+for (const race of diplomacy.races) race.embassyPrices = [];
+diplomacy.races.push(unavailableEmbassyRaceAE);
+const savedEmbassyControllerAE = context.classes.diplomacy.ui.EmbassyButtonController;
+delete context.classes.diplomacy.ui.EmbassyButtonController;
+res("culture").value = 100;
+res("manpower").value = 0;
+const cultureBeforeUnavailableEmbassyAE = res("culture").value;
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+check("Task 3 review: unavailable embassy controller performs no raw payment or level mutation", unavailableEmbassyRaceAE.embassyLevel === 0 && res("culture").value === cultureBeforeUnavailableEmbassyAE);
+context.classes.diplomacy.ui.EmbassyButtonController = savedEmbassyControllerAE;
+diplomacy.races.splice(diplomacy.races.indexOf(unavailableEmbassyRaceAE), 1);
+for (const [race, prices] of savedEmbassyPricesUnavailableAE) race.embassyPrices = prices;
+res("culture").value = savedCultureReviewAE;
 
 res("faith").value = 0;
 res("faith").maxValue = Math.max(100, res("faith").maxValue || 0);
