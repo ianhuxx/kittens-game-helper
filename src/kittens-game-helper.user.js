@@ -594,23 +594,124 @@
     }
   };
 
-  const spacePlanetBuildingMetas = () => {
-    const out = [];
+  const spacePlanets = () => {
     try {
       const space = window.gamePage && window.gamePage.space;
-      const planets = Array.isArray(space && space.planets) ? space.planets : [];
-      for (const planet of planets) {
-        if (Array.isArray(planet && planet.buildings)) out.push(...planet.buildings);
-      }
+      return Array.isArray(space && space.planets) ? space.planets : [];
     } catch (error) {
-      /* ignore */
+      return [];
     }
-    return out;
   };
 
-  const spaceMetas = () => [...spaceProgramMetas(), ...spacePlanetBuildingMetas()];
+  const rawSpaceLabel = (meta) => (meta && (meta.label || meta.title || meta.name)) || "?";
 
-  const isSpacePlanetBuilding = (meta) => spacePlanetBuildingMetas().includes(meta);
+  const predecessorMissionFor = (name, field = "spaceMission") => spaceProgramMetas().find((program) =>
+    program && program.unlocks && Array.isArray(program.unlocks[field]) && program.unlocks[field].includes(name)) || null;
+
+  const spaceBuildingUpgradeDependency = (meta) => {
+    if (!meta || !meta.name) return null;
+    for (const planet of spacePlanets()) {
+      for (const source of (planet && planet.buildings) || []) {
+        const targets = source && source.upgrades && source.upgrades.spaceBuilding;
+        if (Array.isArray(targets) && targets.includes(meta.name) && (Number(source.val) || 0) <= 0) return source;
+      }
+    }
+    return null;
+  };
+
+  const spaceGateState = (descriptor) => {
+    const closed = (reason, details = {}) => ({
+      open: false,
+      reason,
+      predecessor: null,
+      transitEta: 0,
+      requiredTech: null,
+      requiredUpgrade: null,
+      ...details,
+    });
+    if (!descriptor || !descriptor.meta) return closed("Space metadata unavailable");
+    const { meta, planet, subtype } = descriptor;
+    if (subtype === "mission") {
+      if (meta.unlocked === false) {
+        const predecessor = predecessorMissionFor(meta.name);
+        if (predecessor) return closed(`predecessor mission ${rawSpaceLabel(predecessor)} is not complete`, { predecessor });
+        return closed("mission is not unlocked");
+      }
+      if ((Number(meta.val) || 0) > 0) {
+        const inTransit = !(Number(meta.on) > 0);
+        return closed(inTransit ? `${rawSpaceLabel(meta)} is already launched and in transit` : `${rawSpaceLabel(meta)} is complete`);
+      }
+      return { open: true, reason: "mission ready", predecessor: null, transitEta: 0, requiredTech: null, requiredUpgrade: null };
+    }
+    if (!planet) return closed("owning planet unavailable");
+    if (!planet.reached) {
+      if (!planet.unlocked) {
+        const predecessor = predecessorMissionFor(planet.name, "planet");
+        return closed(
+          predecessor ? `predecessor mission ${rawSpaceLabel(predecessor)} must unlock planet ${rawSpaceLabel(planet)}` : `planet ${rawSpaceLabel(planet)} is not unlocked`,
+          { predecessor },
+        );
+      }
+      const routeSpeed = (() => {
+        try {
+          const value = window.gamePage.getEffect && window.gamePage.getEffect("routeSpeed");
+          return value > 0 ? value : 1;
+        } catch (error) {
+          return 1;
+        }
+      })();
+      const transitEta = Math.max(0, Number(planet.routeDays) || 0) / routeSpeed;
+      return closed(`planet ${rawSpaceLabel(planet)} in transit (ETA ${Math.ceil(transitEta)} days)`, { transitEta });
+    }
+    const requiredTech = (Array.isArray(meta.requiredTech) ? meta.requiredTech : [])
+      .map((name) => techByName(name))
+      .filter((tech) => tech && !tech.researched);
+    if (requiredTech.length) {
+      return closed(`requires technology ${requiredTech.map(rawSpaceLabel).join(", ")}`, { requiredTech });
+    }
+    const requiredUpgrade = meta.unlocked === false ? spaceBuildingUpgradeDependency(meta) : null;
+    if (requiredUpgrade) {
+      return closed(`requires Space building ${rawSpaceLabel(requiredUpgrade)} via upgrades.spaceBuilding`, { requiredUpgrade });
+    }
+    if (meta.unlocked === false) return closed("planet building is not unlocked");
+    return { open: true, reason: "planet reached; building ready", predecessor: null, transitEta: 0, requiredTech: null, requiredUpgrade: null };
+  };
+
+  const spaceCompletionState = (descriptor) => {
+    const meta = descriptor && descriptor.meta;
+    if (!meta) return { purchased: false, complete: false, inTransit: false, repeatable: false, owned: 0 };
+    const owned = Math.max(0, Number(meta.val) || 0);
+    if (descriptor.subtype === "mission") {
+      const purchased = owned > 0;
+      return { purchased, complete: purchased && Number(meta.on) > 0, inTransit: purchased && !(Number(meta.on) > 0), repeatable: false, owned };
+    }
+    return { purchased: owned > 0, complete: false, inTransit: false, repeatable: true, owned };
+  };
+
+  const spaceDescriptors = () => {
+    const descriptors = [];
+    for (const meta of spaceProgramMetas()) {
+      if (!meta) continue;
+      const descriptor = { subtype: "mission", meta, planet: null };
+      descriptor.completionState = spaceCompletionState(descriptor);
+      descriptor.gateState = spaceGateState(descriptor);
+      descriptors.push(descriptor);
+    }
+    for (const planet of spacePlanets()) {
+      for (const meta of (planet && planet.buildings) || []) {
+        if (!meta) continue;
+        const descriptor = { subtype: "planetBuilding", meta, planet };
+        descriptor.completionState = spaceCompletionState(descriptor);
+        descriptor.gateState = spaceGateState(descriptor);
+        descriptors.push(descriptor);
+      }
+    }
+    return descriptors;
+  };
+
+  const spaceDescriptorFor = (meta) => spaceDescriptors().find((descriptor) => descriptor.meta === meta) || null;
+  const spaceMetas = () => spaceDescriptors().map((descriptor) => descriptor.meta);
+  const isSpacePlanetBuilding = (meta) => spaceDescriptorFor(meta)?.subtype === "planetBuilding";
 
   const timeMetas = () => {
     const out = [];
@@ -2163,7 +2264,12 @@
     return best;
   };
 
-  const emptyEffectProfile = () => ({ perTick: {}, max: {}, ratio: {}, demand: {}, housing: 0, happiness: 0, craft: 0, energyProduction: 0, energyConsumption: 0 });
+  const emptyEffectProfile = () => ({
+    perTick: {}, max: {}, ratio: {}, demand: {}, costReduction: {},
+    housing: 0, happiness: 0, craft: 0,
+    energyProduction: 0, energyConsumption: 0,
+    globalProductionRatio: 0, productionTransfer: 0, travelSpeed: 0, baseStorageRatio: 0,
+  });
 
   const addEffectProfile = (target, source, scale = 1) => {
     if (!source || !isFinite(scale) || scale <= 0) return target;
@@ -2173,11 +2279,19 @@
         target[group][name] = (target[group][name] || 0) + amount * scale;
       }
     }
+    for (const [name, amount] of Object.entries(source.costReduction || {})) {
+      if (!isFinite(amount) || amount === 0) continue;
+      target.costReduction[name] = (target.costReduction[name] || 0) + amount * scale;
+    }
     target.housing += (source.housing || 0) * scale;
     target.happiness += (source.happiness || 0) * scale;
     target.craft += (source.craft || 0) * scale;
     target.energyProduction += (source.energyProduction || 0) * scale;
     target.energyConsumption += (source.energyConsumption || 0) * scale;
+    target.globalProductionRatio += (source.globalProductionRatio || 0) * scale;
+    target.productionTransfer += (source.productionTransfer || 0) * scale;
+    target.travelSpeed += (source.travelSpeed || 0) * scale;
+    target.baseStorageRatio += (source.baseStorageRatio || 0) * scale;
     return target;
   };
 
@@ -2437,8 +2551,48 @@
     return profile;
   };
 
+  const spaceMarginalProfile = (descriptor, resources = resourceMap()) => {
+    const profile = metaEffectProfile(descriptor && descriptor.meta);
+    const meta = descriptor && descriptor.meta;
+    if (!meta) return profile;
+    const effects = meta.effects || {};
+    if (isFinite(effects.spaceRatio)) profile.globalProductionRatio += effects.spaceRatio;
+    if (isFinite(effects.prodTransferBonus)) profile.productionTransfer += effects.prodTransferBonus;
+    if (isFinite(effects.oilReductionRatio) && effects.oilReductionRatio > 0) profile.costReduction.oil = effects.oilReductionRatio;
+    if (isFinite(effects.routeSpeed) && effects.routeSpeed > 0) profile.travelSpeed += effects.routeSpeed;
+    if (isFinite(effects.baseMetalMaxRatio) && effects.baseMetalMaxRatio > 0) profile.baseStorageRatio += effects.baseMetalMaxRatio;
+    if (isFinite(effects.antimatterProduction) && effects.antimatterProduction !== 0) {
+      profile.perTick.antimatter = (profile.perTick.antimatter || 0) + effects.antimatterProduction;
+    }
+    if (meta.name === "heatsink") {
+      const containment = spaceMetas().find((item) => item && item.name === "containmentChamber");
+      const count = Math.max(0, Number(containment && (containment.on || containment.val)) || 0);
+      profile.max.antimatter = (profile.max.antimatter || 0) + count * 2;
+      profile.energyConsumption += count * 0.5;
+    }
+    if (meta.name === "hydroponics") {
+      const station = spaceMetas().find((item) => item && item.name === "terraformingStation");
+      const count = Math.max(0, Number(station && (station.on || station.val)) || 0);
+      profile.housing += count * Math.max(0, Number(effects.terraformingMaxKittensRatio) || 0);
+    }
+    if (meta.name === "entangler") {
+      const conversion = Math.max(0, Number(effects.gflopsConsumption) || 0);
+      if (conversion > 0) {
+        profile.perTick.gflops = (profile.perTick.gflops || 0) - conversion;
+        profile.perTick.hashrates = (profile.perTick.hashrates || 0) + conversion;
+      }
+    }
+    if (meta.name === "moltenCore") {
+      const tectonic = spaceMetas().find((item) => item && item.name === "tectonic");
+      const count = Math.max(0, Number(tectonic && (tectonic.on || tectonic.val)) || 0);
+      const baseEnergy = Math.max(0, Number(tectonic && tectonic.effects && tectonic.effects.energyProduction) || 25);
+      profile.energyProduction += count * baseEnergy * Math.max(0, Number(effects.tectonicBonus) || 0);
+    }
+    return profile;
+  };
+
   const candidateEffectProfile = (kind, meta) => {
-    const profile = metaEffectProfile(meta);
+    const profile = kind === "space" ? spaceMarginalProfile(spaceDescriptorFor(meta)) : metaEffectProfile(meta);
     if (kind === "upgrade") addEffectProfile(profile, affectedBuildingDeltaProfile(meta));
     return profile;
   };
@@ -2839,6 +2993,14 @@
     return value;
   };
 
+  const candidateGatewayValue = (kind, meta) => {
+    if (!meta) return 0;
+    let value = kind === "research" ? gatewayValue(meta) : unlockListsOf(meta).reduce((sum, list) => sum + list.length, 0);
+    const spaceUpgrades = meta.upgrades && meta.upgrades.spaceBuilding;
+    if (Array.isArray(spaceUpgrades)) value += spaceUpgrades.length;
+    return value;
+  };
+
   // Unlocked, unresearched ancestors of a locked tech — the researchable steps
   // that move toward it. Empty when the tech is already open or researched.
   const frontierFor = (techName, depth = 0, seen = new Set()) => {
@@ -3085,6 +3247,11 @@
     for (const [name, amount] of Object.entries(profile.demand)) {
       if (amount < 0) value += Math.min(6, -amount * 10 * (0.35 + scarcityWeight(resources, name)));
     }
+    value += Math.max(0, profile.globalProductionRatio || 0) * 80;
+    value += Math.max(0, profile.productionTransfer || 0) * 120;
+    value += Math.max(0, profile.travelSpeed || 0) * 12;
+    value += Math.max(0, profile.baseStorageRatio || 0) * 80;
+    for (const amount of Object.values(profile.costReduction || {})) value += Math.max(0, amount || 0) * 40;
     if (profile.housing > 0) value += TUNING.housingValue * Math.max(1, profile.housing) * (0.6 + housingSaturation() * 1.8);
     if (profile.happiness > 0) {
       value += Math.min(TUNING.happinessScale, profile.happiness * (0.5 + Math.max(0, 1 - currentHappinessRatio()) * 4));
@@ -3572,14 +3739,15 @@
       const unlocksContent = (meta.unlocks && meta.unlocks.length) || (profile.unlocks && profile.unlocks.length);
       score += TUNING.earlyGameBonus * (firstInstance ? 1.4 : 1) * (unlocksContent ? TUNING.earlyGameUnlockMult : 1);
     }
+    const gateway = candidateGatewayValue(kind, meta);
+    if (gateway > 0) score += Math.min(TUNING.gatewayCap, gateway * TUNING.gatewayScale);
     if (kind === "research") {
-      score += Math.min(TUNING.gatewayCap, gatewayValue(meta) * TUNING.gatewayScale);
       if (goalFrontierNames(goalKey).has(meta.name)) score += TUNING.frontierBoost;
     }
     // Producer prerequisite: if this building makes a resource a focused target
     // needs but can't produce or craft (oil for a Calciner), lift it so it is
     // built first — the generic version of the titanium ship/trade path.
-    if (kind === "build" && !unreachableHardBlocked) {
+    if ((kind === "build" || kind === "space") && !unreachableHardBlocked) {
       const prodDemand = getProductionDemandCached(resources, goalKey);
       if (Object.keys(prodDemand).length) {
         const buildProfile = candidateEffectProfile(kind, meta);
@@ -3633,8 +3801,10 @@
       /* ignore */
     }
     try {
-      for (const p of spaceMetas()) {
-        if (spaceTimeOpen(p)) candidates.push({ kind: "space", weight: 2, meta: p });
+      for (const descriptor of spaceDescriptors()) {
+        if (descriptor.gateState.open && (descriptor.subtype !== "mission" || !descriptor.completionState.purchased)) {
+          candidates.push({ kind: "space", weight: 2, meta: descriptor.meta, descriptor });
+        }
       }
     } catch (error) {
       /* ignore */
@@ -3680,6 +3850,7 @@
     storage: "Storage blocker",
     power: "Power recovery",
     production: "Production bottleneck",
+    lateGameFrontier: "Late-game progression frontier",
     housing: "Housing / population",
     unicornPath: "Ziggurat / unicorn path",
     economy: "Economy / normal growth",
@@ -3687,6 +3858,62 @@
   };
 
   let lastStrategicDecision = null;
+
+  const bestLateGameFrontier = (candidates, resources, goalKey) => {
+    const all = candidates || [];
+    const liveCapBlockers = new Set();
+    for (const target of all) {
+      for (const cost of pricesFor(target.kind, target.meta)) {
+        if (!cost || !cost.name || !(cost.val > 0)) continue;
+        const cap = resMaxOf(resources, cost.name);
+        if (cap > 0 && cost.val > cap) liveCapBlockers.add(cost.name);
+      }
+    }
+    const options = [];
+    for (const candidate of all) {
+      if (!candidate || candidate.kind !== "space" || !candidate.meta) continue;
+      const descriptor = candidate.descriptor || spaceDescriptorFor(candidate.meta);
+      if (!descriptor || !descriptor.gateState.open) continue;
+      const owned = Math.max(0, Number(candidate.meta.val) || 0);
+      if (descriptor.subtype === "mission" && descriptor.completionState.purchased) continue;
+      const firstCopy = owned <= 0;
+      const gateway = candidateGatewayValue("space", candidate.meta);
+      const profile = spaceMarginalProfile(descriptor, resources);
+      const missingProducers = Object.entries(profile.perTick || {})
+        .filter(([name, amount]) => amount > 0 && (!getRes(resources, name) || (resValueOf(resources, name) <= 0 && productionFor(name) <= 0)))
+        .map(([name]) => name);
+      const storageBridges = Object.entries(profile.max || {})
+        .filter(([name, amount]) => amount > 0 && liveCapBlockers.has(name))
+        .map(([name]) => name);
+      const infrastructure = (profile.globalProductionRatio || 0) > 0 || (profile.productionTransfer || 0) > 0 ||
+        (profile.travelSpeed || 0) > 0 || (profile.baseStorageRatio || 0) > 0 || gateway > 0;
+      let priority = 0;
+      let reason = "";
+      if (firstCopy && descriptor.subtype === "mission" && gateway > 0) {
+        priority = 1000 + gateway * 20;
+        reason = `${rawSpaceLabel(candidate.meta)} is the first reachable mission gateway`;
+      } else if (firstCopy && gateway > 0) {
+        priority = 900 + gateway * 20;
+        reason = `${rawSpaceLabel(candidate.meta)} unlocks downstream Space infrastructure`;
+      } else if (firstCopy && missingProducers.length) {
+        priority = 800 + missingProducers.length * 10;
+        reason = `${rawSpaceLabel(candidate.meta)} creates the missing ${missingProducers.join("/")} production path`;
+      } else if (firstCopy && storageBridges.length) {
+        priority = 700 + storageBridges.length * 10;
+        reason = `${rawSpaceLabel(candidate.meta)} removes the live ${storageBridges.join("/")} storage cap`;
+      } else if (firstCopy && infrastructure) {
+        priority = 600;
+        reason = `${rawSpaceLabel(candidate.meta)} is required Space infrastructure`;
+      }
+      if (priority <= 0) continue;
+      const routes = acquisitionRoutesForTarget(candidate, resources);
+      if (routes.some((entry) => !entry.route || !entry.route.reachable)) continue;
+      const route = routes.find((entry) => entry.route && entry.route.reachable)?.route || { kind: "bank", reachable: true, eta: 0 };
+      options.push({ candidate, route, reason, priority });
+    }
+    options.sort((a, b) => b.priority - a.priority || Number(b.candidate.affordable) - Number(a.candidate.affordable) || (b.candidate.score || 0) - (a.candidate.score || 0));
+    return options[0] || null;
+  };
 
   // Sticky power-recovery choice.  net÷ETA is the right ranking (fastest Wt per
   // second of wait), but ETA rides live trade luck and craft progress, so the raw
@@ -5674,6 +5901,26 @@
       };
     }
 
+    // Space dependencies are a frontier, not a pile of isolated ROI items.
+    // Preserve an active research contract, but otherwise complete the first
+    // reachable mission/producer/storage bridge before workshop repetition,
+    // population expansion, and ordinary economy growth can consume its inputs.
+    const lateGameFrontier = !activeSprint ? bestLateGameFrontier(candidates, resources, goalKey) : null;
+    if (lateGameFrontier && lateGameFrontier.candidate) {
+      const target = lateGameFrontier.candidate;
+      return {
+        candidates: [target, ...candidates.filter((candidate) => targetId(candidate) !== targetId(target))],
+        target,
+        layer: STRATEGIC_LAYERS.lateGameFrontier,
+        reason: lateGameFrontier.reason,
+        protectedChain: candidateCraftChainResources(target),
+        lateGameFrontier,
+        rejectedTopCandidates: candidates.slice(0, 3)
+          .filter((candidate) => targetId(candidate) !== targetId(target))
+          .map((candidate) => ({ target: candidate, reason: `deferred behind ${rawSpaceLabel(target.meta)} Space frontier` })),
+      };
+    }
+
     if (!activeSprint) {
       const workshopRoadmap = bestWorkshopRoadmap(candidates, resources);
       if (workshopRoadmap) {
@@ -7349,7 +7596,8 @@
       // Missions (space.programs, e.g. orbitalLaunch) and planet buildings
       // (space.planets[].buildings, e.g. Cath's Satellite) share the "space"
       // candidate kind but are bought through different game controllers.
-      return isSpacePlanetBuilding(meta)
+      const descriptor = spaceDescriptorFor(meta);
+      return descriptor && descriptor.subtype === "planetBuilding"
         ? { path: ["classes", "ui", "space", "PlanetBuildingBtnController"], opts: (name) => ({ id: name }) }
         : { path: ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"], opts: (name) => ({ id: name }) };
     }
@@ -7489,14 +7737,6 @@
         () => game.bld && typeof game.bld.build === "function" && game.bld.build(name),
         () => game.bld && typeof game.bld.build === "function" && game.bld.build(name, 1),
         () => game.bld && typeof game.bld.construct === "function" && game.bld.construct(name),
-      );
-    }
-    if (candidate.kind === "space") {
-      attempts.push(
-        () => game.space && typeof game.space.build === "function" && game.space.build(name),
-        () => game.space && typeof game.space.build === "function" && game.space.build(candidate.meta),
-        () => game.space && typeof game.space.buildProgram === "function" && game.space.buildProgram(name),
-        () => game.space && typeof game.space.buildProgram === "function" && game.space.buildProgram(candidate.meta),
       );
     }
     if (candidate.kind === "time") {
@@ -9395,37 +9635,27 @@
     return lines;
   };
 
-  // Planet buildings gate on `requiredTech` (tech names) directly, unlike
-  // workshop upgrades which are gated indirectly via `unlocks.upgrades` lists.
-  const spaceUnlockGate = (meta) => {
-    if (!meta || !Array.isArray(meta.requiredTech) || !meta.requiredTech.length) return null;
-    const names = meta.requiredTech
-      .map((techName) => {
-        const tech = techByName(techName);
-        return tech && !tech.researched ? labelOf(tech) : null;
-      })
-      .filter(Boolean);
-    return names.length ? names.join(", ") : null;
-  };
-
   // Space missions (space.programs) AND planet buildings (space.planets[].buildings,
   // e.g. Cath's Satellite) — separate from the WORKSHOP section above, which only
   // covers workshop upgrades like Solar Satellites / Satellite Navigation / Satellite
   // Radio and must never be confused with an actual buildable space structure.
   const spaceReportLines = (resources) => {
     const lines = [];
-    for (const meta of spaceMetas()) {
+    for (const descriptor of spaceDescriptors()) {
+      const meta = descriptor.meta;
       if (!meta || !meta.name || isDeniedKey(meta.name)) continue;
-      if (meta.noStackable && (meta.on || meta.val || 0) >= 1) continue; // one-time mission already complete
-      if (meta.unlocked === false) {
-        const gate = spaceUnlockGate(meta);
-        lines.push(`  ${labelOf(meta)} · LOCKED${gate ? ` — needs ${gate}` : ""} · costs ${formatPriceList(resources, "space", meta)}`);
+      if (descriptor.subtype === "mission" && descriptor.completionState.complete) continue;
+      if (!descriptor.gateState.open) {
+        const owner = descriptor.planet ? rawSpaceLabel(descriptor.planet) : "Mission";
+        lines.push(`  ${owner} | ${labelOf(meta)} | LOCKED -- ${descriptor.gateState.reason} | costs ${formatPriceList(resources, "space", meta)}`);
         continue;
       }
+      if (meta.noStackable && (meta.on || meta.val || 0) >= 1) continue; // one-time mission already complete
       const val = meta.val || 0;
       const ev = evaluate("space", meta, resources);
       const status = ev.affordable ? "buildable now" : (ev.missing ? `need ${ev.missing}` : "—");
-      lines.push(`  ${labelOf(meta)} ×${fmt(val)} · next ${formatPriceList(resources, "space", meta)} · ${status}`);
+      const owner = descriptor.planet ? rawSpaceLabel(descriptor.planet) : "Mission";
+      lines.push(`  ${owner} | ${labelOf(meta)} ×${fmt(val)} · next ${formatPriceList(resources, "space", meta)} · ${status}`);
     }
     return lines;
   };
@@ -10979,6 +11209,15 @@
     labelOf,
     metaEffectProfile,
     candidateEffectProfile,
+    spaceDescriptors,
+    spaceDescriptorFor,
+    spaceGateState,
+    spaceMarginalProfile(descriptor) { return spaceMarginalProfile(descriptor, resourceMap()); },
+    bestLateGameFrontier(candidates, goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return bestLateGameFrontier(candidates || gatherCandidates(resources, goalKey), resources, goalKey);
+    },
     powerStatus,
     effectivePowerStatus,
     latentPowerDemand,

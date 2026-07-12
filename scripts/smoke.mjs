@@ -556,6 +556,57 @@ class FakeEmbassyButtonController {
     return { itemBought: true };
   }
 }
+class FakeSpaceProgramBtnController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    const metadata = this.game.space?.getProgram(options.id);
+    return metadata ? { options, metadata } : null;
+  }
+  getPrices(model) {
+    return (model?.metadata?.prices || []).map((price) => ({ ...price }));
+  }
+  updateEnabled() {}
+  buyItem(model) {
+    if (!model || model.metadata.val) return { itemBought: false, reason: "already-bought" };
+    if (!pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
+    model.metadata.val = 1;
+    model.metadata.on = 0; // official mission controller: in transit until its planet is reached
+    for (const planetName of model.metadata.unlocks?.planet || []) {
+      const planet = this.game.space.planets.find((item) => item.name === planetName);
+      if (planet) planet.unlocked = true;
+    }
+    for (const missionName of model.metadata.unlocks?.spaceMission || []) {
+      const mission = this.game.space.getProgram(missionName);
+      if (mission) mission.unlocked = true;
+    }
+    return { itemBought: true };
+  }
+}
+class FakePlanetBuildingBtnController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    const metadata = this.game.space?.getBuilding(options.id);
+    return metadata ? { options, metadata } : null;
+  }
+  getPrices(model) {
+    const meta = model.metadata;
+    return (meta.prices || []).map((price) => ({
+      ...price,
+      val: price.val * Math.pow(meta.priceRatio || 1.15, meta.val || 0),
+    }));
+  }
+  updateEnabled() {}
+  buyItem(model) {
+    if (!model || !pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
+    model.metadata.val = (model.metadata.val || 0) + 1;
+    model.metadata.on = (model.metadata.on || 0) + 1;
+    return { itemBought: true };
+  }
+}
 const context = {
   console,
   Date: FakeDate,
@@ -579,7 +630,11 @@ const context = {
   Promise,
   Array,
   Object,
-  classes: { diplomacy: { ui: { EmbassyButtonController: FakeEmbassyButtonController } } },
+  com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController: FakeSpaceProgramBtnController } } } },
+  classes: {
+    diplomacy: { ui: { EmbassyButtonController: FakeEmbassyButtonController } },
+    ui: { space: { PlanetBuildingBtnController: FakePlanetBuildingBtnController } },
+  },
 };
 context.window = context;
 vm.createContext(context);
@@ -3936,28 +3991,20 @@ dbg.queueClear();
 dbg.forceActiveTarget(null);
 const orbitalEngineeringAC = { name: "orbitalEngineeringAC", label: "Orbital Engineering", unlocked: true, researched: false, prices: [{ name: "science", val: 1000 }], unlocks: {} };
 techs.push(orbitalEngineeringAC);
-const satelliteAC = { name: "satelliteAC", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, requiredTech: [], prices: [{ name: "titanium", val: 50 }, { name: "science", val: 500 }], effects: { observatoryRatio: 0.05 } };
-const spaceElevatorAC = { name: "spaceElevatorAC", label: "Space Elevator", unlocked: false, val: 0, on: 0, priceRatio: 1.15, requiredTech: ["orbitalEngineeringAC"], prices: [{ name: "titanium", val: 6000 }, { name: "science", val: 75000 }], effects: {} };
-const cathAC = { name: "cathAC", label: "Cath", buildings: [satelliteAC, spaceElevatorAC] };
-const orbitalLaunchAC = { name: "orbitalLaunchAC", label: "Orbital Launch", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 400 }], effects: {} };
+const satelliteAC = { name: "sattelite", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, requiredTech: [], prices: [{ name: "titanium", val: 50 }, { name: "science", val: 500 }], effects: { observatoryRatio: 0.05 } };
+const spaceElevatorAC = { name: "spaceElevator", label: "Space Elevator", unlocked: false, val: 0, on: 0, priceRatio: 1.15, requiredTech: ["orbitalEngineeringAC"], prices: [{ name: "titanium", val: 6000 }, { name: "science", val: 75000 }], effects: {} };
+const cathAC = { name: "cath", label: "Cath", unlocked: true, reached: true, routeDays: 0, buildings: [satelliteAC, spaceElevatorAC] };
+const orbitalLaunchAC = { name: "orbitalLaunch", label: "Orbital Launch", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 400 }], effects: {} };
 gamePage.space = {
   programs: [orbitalLaunchAC],
   planets: [cathAC],
   getProgram: (id) => [orbitalLaunchAC].find((p) => p.name === id),
   getBuilding: (id) => [satelliteAC, spaceElevatorAC].find((b) => b.name === id),
-  build(item) {
-    const name = typeof item === "string" ? item : item && item.name;
-    const meta = [orbitalLaunchAC, satelliteAC, spaceElevatorAC].find((m) => m.name === name);
-    if (!meta || !pay(meta.prices || [])) return false;
-    meta.val = (meta.val || 0) + 1;
-    meta.on = (meta.on || 0) + 1;
-    return true;
-  },
 };
 
-check("Test AC: an unlocked Cath planet building (Satellite) is scanned as a candidate", dbg.candidateById("space:satelliteAC")?.kind === "space");
-check("Test AC: the space mission (Orbital Launch) is ALSO still scanned", !!dbg.candidateById("space:orbitalLaunchAC"));
-check("Test AC: a locked planet building (needs Orbital Engineering) is NOT yet a candidate", !dbg.candidateById("space:spaceElevatorAC"));
+check("Test AC: an unlocked Cath planet building (Satellite) is scanned as a candidate", dbg.candidateById("space:sattelite")?.kind === "space");
+check("Test AC: the space mission (Orbital Launch) is ALSO still scanned", !!dbg.candidateById("space:orbitalLaunch"));
+check("Test AC: a locked planet building (needs Orbital Engineering) is NOT yet a candidate", !dbg.candidateById("space:spaceElevator"));
 
 const solarSatellitesAC = { name: "solarSatellitesAC", label: "Solar Satellites", unlocked: false, researched: false, prices: [{ name: "science", val: 225000 }, { name: "alloy", val: 750 }], effects: {} };
 workshopUpgrades.push(solarSatellitesAC);
@@ -3965,9 +4012,9 @@ workshopUpgrades.push(solarSatellitesAC);
 const reportAC = dbg.report();
 check(
   "Test AC: report SPACE section lists the buildable Satellite distinctly from the LOCKED workshop 'Solar Satellites' upgrade",
-  /— SPACE /.test(reportAC) && /\n {2}Satellite ×0 · next .*(buildable now|need )/.test(reportAC) && /Solar Satellites · LOCKED/.test(reportAC),
+  /— SPACE /.test(reportAC) && /Cath.*Satellite ×0 · next .*(buildable now|need )/.test(reportAC) && /Solar Satellites · LOCKED/.test(reportAC),
 );
-check("Test AC: report SPACE section shows the locked Space Elevator gated on Orbital Engineering", /Space Elevator · LOCKED — needs Orbital Engineering/.test(reportAC));
+check("Test AC: report SPACE section shows Cath ownership and the Space Elevator technology gate", /Cath.*Space Elevator.*technology.*Orbital Engineering/i.test(reportAC));
 
 // Fund and buy the Satellite through the native planner path (kind "space",
 // planet-building sub-type) — proves purchase EXECUTION, not just scanning,
@@ -4011,6 +4058,166 @@ gamePage.resPool.energyCons = savedPowerY.energyCons;
 gamePage.resPool.energyWinterProd = savedPowerY.energyWinterProd;
 res("science").value = savedScienceY.value;
 res("science").maxValue = savedScienceY.maxValue;
+
+/* ---------------------------------------------------------------------
+ * Task 4 RED regressions - normalized ownership/gates, controller-only
+ * mission execution, dependency-frontier ranking, and marginal Space effects.
+ * ------------------------------------------------------------------- */
+const resourceSnapshotsT4 = new Map();
+const ensureResourceT4 = (name, value, maxValue) => {
+  let resource = res(name);
+  if (resource) {
+    resourceSnapshotsT4.set(name, { resource, value: resource.value, maxValue: resource.maxValue, unlocked: resource.unlocked, added: false });
+    resource.value = value;
+    resource.maxValue = maxValue;
+    resource.unlocked = true;
+  } else {
+    resource = R(name, value, maxValue);
+    resources.push(resource);
+    resourceSnapshotsT4.set(name, { resource, added: true });
+  }
+  return resource;
+};
+for (const [name, value, maxValue] of [
+  ["oil", 20000, 25000], ["starchart", 10000, 10000], ["kerosene", 10000, 10000],
+  ["alloy", 10000, 10000], ["thorium", 100000, 100000], ["relic", 100, 100],
+  ["eludium", 10000, 10000], ["concrate", 10000, 10000], ["uranium", 5000, 5000],
+  ["unobtainium", 150, 150], ["antimatter", 0, 100], ["gflops", 100, 1000],
+  ["hashrates", 0, 100000],
+]) ensureResourceT4(name, value, maxValue);
+
+const nanoTechT4 = { name: "nanotechnologyT4", label: "Nanotechnology", unlocked: true, researched: false, prices: [], unlocks: {} };
+techs.push(nanoTechT4);
+const missionT4 = { name: "controllerMissionT4", label: "Controller Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], unlocks: { planet: ["controllerPlanetT4"], spaceMission: ["downstreamMissionT4"] }, effects: {} };
+const downstreamMissionT4 = { name: "downstreamMissionT4", label: "Downstream Mission", unlocked: false, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], effects: {} };
+const predecessorMissionT4 = { name: "predecessorMissionT4", label: "Predecessor Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], unlocks: { spaceMission: ["lockedMissionT4"] }, effects: {} };
+const lockedMissionT4 = { name: "lockedMissionT4", label: "Locked Mission", unlocked: false, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], effects: {} };
+const piscineMissionT4 = { name: "piscineMission", label: "Piscine Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 100 }], unlocks: { planet: ["piscine"] }, effects: {} };
+const heliosMissionT4 = { name: "heliosMission", label: "Helios Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 100 }], unlocks: { planet: ["helios"] }, effects: {} };
+
+const bT4 = (name, label, effects = {}, extra = {}) => ({ name, label, unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "science", val: 100 }], effects, ...extra });
+const satteliteT4 = bT4("sattelite", "Satellite", { starchartPerTickBaseSpace: 0.001 });
+const elevatorT4 = bT4("spaceElevator", "Space Elevator", { oilReductionRatio: 0.05, spaceRatio: 0.01, prodTransferBonus: 0.001 }, { unlocked: false, requiredTech: ["nanotechnologyT4"] });
+const moonOutpostT4 = bT4("moonOutpost", "Lunar Outpost", { uraniumPerTickCon: -0.35, unobtainiumPerTickSpace: 0.007, energyConsumption: 5 }, { unlocked: false });
+const moonBaseT4 = bT4("moonBase", "Moon Base", { unobtainiumMax: 150, energyConsumption: 10 });
+const planetCrackerT4 = bT4("planetCracker", "Planet Cracker", { uraniumPerTickSpace: 0.3, uraniumMax: 1750 });
+const sunlifterT4 = bT4("sunlifter", "Sunlifter", { antimatterProduction: 1, energyProduction: 30 });
+const containmentT4 = bT4("containmentChamber", "Containment Chamber", { antimatterMax: 108, energyConsumption: 52 }, { unlocked: false, val: 2, on: 2 });
+const heatsinkT4 = bT4("heatsink", "Heatsink", {}, { upgrades: { spaceBuilding: ["containmentChamber"] } });
+const sunforgeT4 = bT4("sunforge", "Sunforge", { baseMetalMaxRatio: 0.01 });
+const navigationRelayT4 = bT4("navigationRelay", "Navigation Relay", { routeSpeed: 0.25 });
+const terraformingT4 = bT4("terraformingStation", "Terraforming Station", { maxKittens: 1 }, { val: 2, on: 2 });
+const hydroponicsT4 = bT4("hydroponics", "Hydroponics", { catnipRatio: 0.025, catnipMaxRatio: 0.1, terraformingMaxKittensRatio: 0.5 }, { upgrades: { spaceBuilding: ["terraformingStation"] } });
+const harvesterT4 = bT4("hrHarvester", "HR Harvester", { energyProduction: 4 });
+const entanglerT4 = bT4("entangler", "Entangler", { gflopsConsumption: 0.1, energyConsumption: 25 });
+const tectonicT4 = bT4("tectonic", "Tectonic", { energyProduction: 25 }, { val: 3, on: 3 });
+const moltenCoreT4 = bT4("moltenCore", "Molten Core", { tectonicBonus: 0.05 }, { upgrades: { spaceBuilding: ["tectonic"] } });
+const ordinaryT4 = bT4("ordinarySpaceT4", "Ordinary Space", { woodPerTickSpace: 2, woodMax: 100 });
+
+const controllerPlanetT4 = { name: "controllerPlanetT4", label: "Controller Planet", unlocked: false, reached: false, routeDays: 10, buildings: [satteliteT4] };
+const techPlanetT4 = { name: "techPlanetT4", label: "Tech Planet", unlocked: true, reached: true, routeDays: 0, buildings: [elevatorT4, ordinaryT4] };
+const moonPlanetT4 = { name: "moon", label: "Moon", unlocked: true, reached: false, routeDays: 12, buildings: [moonOutpostT4, moonBaseT4] };
+const dunePlanetT4 = { name: "dune", label: "Dune", unlocked: true, reached: true, routeDays: 0, buildings: [planetCrackerT4] };
+const heliosPlanetT4 = { name: "helios", label: "Helios", unlocked: true, reached: true, routeDays: 0, buildings: [sunlifterT4, containmentT4, heatsinkT4, sunforgeT4] };
+const yarnPlanetT4 = { name: "yarn", label: "Yarn", unlocked: true, reached: true, routeDays: 0, buildings: [terraformingT4, hydroponicsT4] };
+const umbraPlanetT4 = { name: "umbra", label: "Umbra", unlocked: true, reached: true, routeDays: 0, buildings: [harvesterT4, navigationRelayT4] };
+const charonPlanetT4 = { name: "charon", label: "Charon", unlocked: true, reached: true, routeDays: 0, buildings: [entanglerT4] };
+const centaurusPlanetT4 = { name: "centaurusSystem", label: "Centaurus", unlocked: true, reached: true, routeDays: 0, buildings: [tectonicT4, moltenCoreT4] };
+const planetsT4 = [controllerPlanetT4, techPlanetT4, moonPlanetT4, dunePlanetT4, heliosPlanetT4, yarnPlanetT4, umbraPlanetT4, charonPlanetT4, centaurusPlanetT4];
+const programsT4 = [missionT4, downstreamMissionT4, predecessorMissionT4, lockedMissionT4, piscineMissionT4, heliosMissionT4];
+gamePage.space = {
+  programs: programsT4,
+  planets: planetsT4,
+  getProgram: (id) => programsT4.find((program) => program.name === id),
+  getBuilding: (id) => planetsT4.flatMap((planet) => planet.buildings).find((building) => building.name === id),
+};
+
+const descriptorsT4 = typeof dbg.spaceDescriptors === "function" ? dbg.spaceDescriptors() : [];
+const descriptorT4 = (meta) => typeof dbg.spaceDescriptorFor === "function" ? dbg.spaceDescriptorFor(meta) : descriptorsT4.find((descriptor) => descriptor.meta === meta);
+check("Task 4: descriptors preserve mission/building subtype and owning planet", descriptorT4(missionT4)?.subtype === "mission" && descriptorT4(satteliteT4)?.subtype === "planetBuilding" && descriptorT4(satteliteT4)?.planet === controllerPlanetT4);
+check("Task 4: predecessor mission gate is explicit", /predecessor mission.*Predecessor Mission/i.test(descriptorT4(lockedMissionT4)?.gateState?.reason || ""));
+check("Task 4: planet transit gate reports ETA", /Moon.*transit/i.test(descriptorT4(moonOutpostT4)?.gateState?.reason || "") && (descriptorT4(moonOutpostT4)?.gateState?.transitEta || 0) > 0);
+check("Task 4: required technology gate is explicit", /technology.*Nanotechnology/i.test(descriptorT4(elevatorT4)?.gateState?.reason || ""));
+check("Task 4: upgrades.spaceBuilding dependency gate is explicit", /Space building.*Heatsink/i.test(descriptorT4(containmentT4)?.gateState?.reason || ""));
+
+res("science").value = 5000; res("science").maxValue = 5000;
+const controllerMissionCandidateT4 = dbg.candidateById("space:controllerMissionT4");
+dbg.forceActiveTarget(controllerMissionCandidateT4, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 4: controller-only mission unlocks its planet/downstream mission", missionT4.val === 1 && missionT4.on === 0 && controllerPlanetT4.unlocked && downstreamMissionT4.unlocked);
+check("Task 4: in-transit one-time mission is not repeatable", !dbg.candidateById("space:controllerMissionT4"));
+controllerPlanetT4.reached = true;
+const satteliteCandidateT4 = dbg.candidateById("space:sattelite");
+dbg.forceActiveTarget(satteliteCandidateT4, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 4: controller-only sattelite increments", satteliteT4.val === 1 && satteliteT4.on === 1);
+
+const savedBuildingUnlockedT4 = buildings.map((building) => building.unlocked);
+const savedTechStateT4 = techs.map((tech) => [tech.unlocked, tech.researched]);
+const savedUpgradeStateT4 = workshopUpgrades.map((upgrade) => upgrade.researched);
+const savedReligionStateT4 = religionUpgrades.map((upgrade) => upgrade.unlocked);
+const savedFestivalT4 = calendar.festivalDays;
+for (const building of buildings) building.unlocked = false;
+for (const tech of techs) tech.researched = true;
+for (const upgrade of workshopUpgrades) upgrade.researched = true;
+for (const upgrade of religionUpgrades) upgrade.unlocked = false;
+calendar.festivalDays = calendar.daysPerSeason + 1;
+downstreamMissionT4.unlocked = false;
+predecessorMissionT4.unlocked = false;
+res("antimatter").value = res("antimatter").maxValue;
+const acceleratorT4 = { name: "acceleratorT4", label: "Accelerator", unlocked: true, val: 8, on: 8, priceRatio: 1.15, prices: [{ name: "uranium", val: 50 }], effects: { uraniumMax: 250 } };
+buildings.push(acceleratorT4);
+perTick.uranium = 0;
+perTick.unobtainium = 0;
+dbg.forceActiveTarget(null);
+const frontierT4 = dbg.selectStrategicTarget("balanced");
+const allowedFrontierT4 = new Set(["piscineMission", "heliosMission", "planetCracker", "moonOutpost", "moonBase"]);
+check("Task 4: supplied state selects Late-game progression frontier", frontierT4?.layer === "Late-game progression frontier");
+check("Task 4: mission/producer/storage bridge beats repeat Accelerator", allowedFrontierT4.has(frontierT4?.target?.meta?.name) && frontierT4?.target?.meta !== acceleratorT4);
+
+const marginalCasesT4 = [
+  ["Space Elevator", elevatorT4, (p) => p.globalProductionRatio > 0 && p.productionTransfer > 0 && p.costReduction?.oil > 0],
+  ["Sunlifter", sunlifterT4, (p) => p.perTick?.antimatter === 1 && p.energyProduction === 30],
+  ["Containment Chamber", containmentT4, (p) => p.max?.antimatter >= 100 && p.energyConsumption > 0],
+  ["Heatsink synergy", heatsinkT4, (p) => p.max?.antimatter > 0],
+  ["Sunforge", sunforgeT4, (p) => p.baseStorageRatio > 0],
+  ["Navigation Relay", navigationRelayT4, (p) => p.travelSpeed > 0],
+  ["Terraforming Station", terraformingT4, (p) => p.housing >= 1],
+  ["Hydroponics synergy", hydroponicsT4, (p) => p.ratio?.catnip > 0 && p.max?.catnip > 0 && p.housing > 0],
+  ["HR Harvester", harvesterT4, (p) => p.energyProduction > 0],
+  ["Entangler", entanglerT4, (p) => p.perTick?.gflops < 0 && p.perTick?.hashrates > 0 && p.energyConsumption > 0],
+  ["Tectonic", tectonicT4, (p) => p.energyProduction > 0],
+  ["Molten Core synergy", moltenCoreT4, (p) => p.energyProduction > 0],
+  ["ordinary resource/storage", ordinaryT4, (p) => p.perTick?.wood === 2 && p.max?.wood === 100],
+];
+for (const [label, meta, assertion] of marginalCasesT4) {
+  const descriptor = descriptorT4(meta);
+  const profile = descriptor && typeof dbg.spaceMarginalProfile === "function" ? dbg.spaceMarginalProfile(descriptor) : {};
+  check(`Task 4 marginal: ${label}`, !!descriptor && assertion(profile));
+}
+nanoTechT4.researched = false;
+const reportT4 = dbg.report();
+check("Task 4: diagnostics include planet ownership and exact gate", /Moon.*Lunar Outpost.*transit/i.test(reportT4) && /Tech Planet.*Space Elevator.*technology.*Nanotechnology/i.test(reportT4) && /Helios.*Containment Chamber.*Space building.*Heatsink/i.test(reportT4));
+
+buildings.splice(buildings.indexOf(acceleratorT4), 1);
+buildings.forEach((building, index) => { building.unlocked = savedBuildingUnlockedT4[index]; });
+techs.forEach((tech, index) => { [tech.unlocked, tech.researched] = savedTechStateT4[index]; });
+workshopUpgrades.forEach((upgrade, index) => { upgrade.researched = savedUpgradeStateT4[index]; });
+religionUpgrades.forEach((upgrade, index) => { upgrade.unlocked = savedReligionStateT4[index]; });
+calendar.festivalDays = savedFestivalT4;
+techs.splice(techs.indexOf(nanoTechT4), 1);
+delete perTick.uranium;
+delete perTick.unobtainium;
+for (const snapshot of resourceSnapshotsT4.values()) {
+  if (snapshot.added) resources.splice(resources.indexOf(snapshot.resource), 1);
+  else {
+    snapshot.resource.value = snapshot.value;
+    snapshot.resource.maxValue = snapshot.maxValue;
+    snapshot.resource.unlocked = snapshot.unlocked;
+  }
+}
+dbg.forceActiveTarget(null);
+delete gamePage.space;
 
 /* ---------------------------------------------------------------------
  * Test AD — ziggurat / unicorn path (v2.11.0).  The player used to run the

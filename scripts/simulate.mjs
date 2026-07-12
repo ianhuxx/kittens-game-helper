@@ -341,21 +341,18 @@ const applyPhase = (st, phase) => {
     for (const t of st.techs) if (!t.researched) t.unlocked = false;
     for (const u of st.workshopUpgrades) u.researched = true;
     const programs = [
-      { name: "satellite", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, prices: [{ name: "starchart", val: 325 }, { name: "science", val: 50000 }], effects: { scienceMax: 5000, scienceRatio: 0.05 } },
+      { name: "orbitalLaunch", label: "Orbital Launch", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "starchart", val: 325 }, { name: "science", val: 50000 }], unlocks: { planet: ["cath"] }, effects: {} },
+    ];
+    const cathBuildings = [
+      { name: "sattelite", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, prices: [{ name: "starchart", val: 325 }, { name: "science", val: 50000 }], effects: { scienceMax: 5000, scienceRatio: 0.05 } },
       { name: "spaceElevator", label: "Space Elevator", unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "science", val: 75000 }, { name: "titanium", val: 50 }], effects: { prodTransferBonus: 1 } },
     ];
+    const planets = [{ name: "cath", label: "Cath", unlocked: true, reached: true, routeDays: 0, buildings: cathBuildings }];
     st.gamePage.space = {
       programs,
+      planets,
       getProgram: (id) => programs.find((p) => p.name === id),
-      build(item) {
-        const program = typeof item === "string" ? programs.find((p) => p.name === item) : item;
-        if (!program) return false;
-        for (const p of program.prices) if ((res(p.name) || {}).value < p.val) return false;
-        for (const p of program.prices) res(p.name).value -= p.val;
-        program.val = (program.val || 0) + 1;
-        program.on = (program.on || 0) + 1;
-        return true;
-      },
+      getBuilding: (id) => cathBuildings.find((p) => p.name === id),
     };
     st.onTick = () => { const sc = res("starchart"); sc.value = Math.min(sc.maxValue, sc.value + 8); };
   }
@@ -377,12 +374,57 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
   let fakeNow = Date.now();
   class FakeDate extends Date { constructor(...a) { if (a.length) super(...a); else super(fakeNow); } static now() { return fakeNow; } }
 
+  class SpaceProgramBtnController {
+    constructor(game) { this.game = game; }
+    fetchModel(options) {
+      const metadata = this.game.space?.getProgram(options.id);
+      return metadata ? { options, metadata } : null;
+    }
+    getPrices(model) { return model.metadata.prices || []; }
+    updateEnabled() {}
+    buyItem(model) {
+      if (!model || model.metadata.val) return { itemBought: false };
+      const prices = this.getPrices(model);
+      if (prices.some((price) => (res(price.name)?.value || 0) < price.val)) return { itemBought: false };
+      for (const price of prices) res(price.name).value -= price.val;
+      model.metadata.val = 1;
+      model.metadata.on = 0;
+      for (const planetName of model.metadata.unlocks?.planet || []) {
+        const planet = this.game.space.planets.find((item) => item.name === planetName);
+        if (planet) planet.unlocked = true;
+      }
+      return { itemBought: true };
+    }
+  }
+  class PlanetBuildingBtnController {
+    constructor(game) { this.game = game; }
+    fetchModel(options) {
+      const metadata = this.game.space?.getBuilding(options.id);
+      return metadata ? { options, metadata } : null;
+    }
+    getPrices(model) {
+      const meta = model.metadata;
+      return (meta.prices || []).map((price) => ({ ...price, val: price.val * Math.pow(meta.priceRatio || 1.15, meta.val || 0) }));
+    }
+    updateEnabled() {}
+    buyItem(model) {
+      const prices = this.getPrices(model);
+      if (prices.some((price) => (res(price.name)?.value || 0) < price.val)) return { itemBought: false };
+      for (const price of prices) res(price.name).value -= price.val;
+      model.metadata.val = (model.metadata.val || 0) + 1;
+      model.metadata.on = (model.metadata.on || 0) + 1;
+      return { itemBought: true };
+    }
+  }
+
   let tickFn = null;
   const context = {
     console: { log() {}, warn() {}, error() {} }, Date: FakeDate, Math, JSON, Number, isFinite,
     document: documentMock, localStorage: localStorageMock, gamePage,
     setTimeout, clearTimeout, setInterval: (fn) => { tickFn = fn; return 1; },
     WeakMap, Map, Set, Promise, Array, Object,
+    com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController } } } },
+    classes: { ui: { space: { PlanetBuildingBtnController } } },
   };
   context.window = context;
   const sandbox = vm.createContext(context);
@@ -465,10 +507,12 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
         check(`blocked target becomes reachable once its producer exists: Calciner val ${calciner.val}`, calciner.val > 0);
       }
       if (phase === "space") {
-        const sat = gamePage.space.programs.find((p) => p.name === "satellite");
-        const boughtAny = gamePage.space.programs.some((p) => (p.val || 0) > 0);
-        check(`space program bought by the native planner (satellite val ${sat.val}, any ${boughtAny})`, boughtAny);
-        check(`space focus shown in the plan line`, /SPACE PROGRAM|Satellite|Space Elevator/i.test(panel(".kgh-plan")));
+        const sat = gamePage.space.planets.flatMap((planet) => planet.buildings).find((p) => p.name === "sattelite");
+        const boughtMission = gamePage.space.programs.some((p) => (p.val || 0) > 0);
+        const boughtBuilding = gamePage.space.planets.some((planet) => planet.buildings.some((p) => (p.val || 0) > 0));
+        const boughtAny = boughtMission || boughtBuilding;
+        check(`space mission/building bought by the native planner (sattelite val ${sat.val}, any ${boughtAny})`, boughtAny);
+        check(`official Space shapes preserved (missions in programs; sattelite under Cath)`, !gamePage.space.programs.some((item) => item.name === "sattelite" || item.name === "spaceElevator") && !!sat);
       }
 
       resolve({ name, failures, metrics: { gained, coherenceViolations, maxNoPurchaseGap, focusCount: focusNames.size, spies } });
