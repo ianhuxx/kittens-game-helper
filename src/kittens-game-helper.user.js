@@ -1174,14 +1174,9 @@
     }
   };
 
-  // --- native surplus trading -------------------------------------------------
-  // KS used to own general trade; now we trade directly. tradeAll() pays its own
-  // catpower+gold+goods cost, so this only decides WHEN to trade: when catpower
-  // is near its cap (otherwise wasted at the ceiling), nothing is reserved, the
-  // explorer/zebra-titanium path isn't saving catpower, and a trade partner
-  // actually sells something we still have room to store.
-  let lastTradeAt = 0;
-
+  // --- native surplus trade scoring ------------------------------------------
+  // Execution lives exclusively in manageDiplomacy; this scorer only ranks a
+  // safe overflow partner after the active acquisition route has had first call.
   const tradeWantScore = (race, resources) => {
     let score = 0;
     for (const sell of (race && race.sells) || []) {
@@ -1193,69 +1188,6 @@
       score += (1 - fill) * expectedTradeYield(race, sell);
     }
     return score;
-  };
-
-  const manageTrade = (resources, goalKey) => {
-    try {
-      if (Date.now() - lastTradeAt < 12000) return; // pace trading
-      const game = window.gamePage;
-      const diplomacy = game && game.diplomacy;
-      if (!diplomacy || typeof diplomacy.tradeAll !== "function" || typeof diplomacy.getMaxTradeAmt !== "function") return;
-      const races = (diplomacy.races || []).filter((race) => race && race.unlocked && !race.collapsed);
-      if (!races.length) return;
-      const catpower = getRes(resources, "manpower");
-      const gold = getRes(resources, "gold");
-      if (!catpower || !gold) return;
-      const target = getTargetCached(resources, goalKey);
-      const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
-      refreshStickyTargetChainReserve(target, resources);
-      const zebras = races.find((race) => race.name === "zebras");
-      const selectedTradeRoute = selectedTradeRouteForTarget(target, resources);
-      if (zebras && isZebraTitaniumTradeRoute(selectedTradeRoute) && !shouldSaveForExplorers(resources, goalKey)) {
-        const prices = tradePricesForRace(zebras);
-        if (prices.length && canPayPrices(prices) && pricesRespectReservations(prices, reserved, resources)) {
-          const amt = Math.max(1, affordableTradeCount(prices, reserved, resources));
-          const measured = withActionResourceDeltas(() => {
-            if (typeof diplomacy.tradeMultiple === "function") return diplomacy.tradeMultiple(zebras, amt);
-            return diplomacy.tradeAll(zebras);
-          }, tradeDeltaNamesForRace(zebras, prices));
-          lastTradeAt = Date.now();
-          diplomacyPlanText = `Trade executed: expected titanium ETA improved for ${labelOf(target.meta)} · ${zebraTitaniumOddsText(resources, goalKey)}`;
-          pushLog(`🤝 Trade executed: ${measured.suffix}; expected titanium ETA improved for ${labelOf(target.meta)}`);
-          return;
-        }
-        // Keep the ship-fleet odds visible even when a trade is skipped/executed,
-        // so the panel always shows the Zebra titanium economics (ships → % × Ti,
-        // build-toward target), not just a terse executed/skipped status line.
-        const skipReason = (reserved.manpower || reserved.gold) ? "Trade skipped: catpower/gold below reserve." : "Trade skipped: Zebra trade costs unavailable.";
-        diplomacyPlanText = `${skipReason} · ${zebraTitaniumOddsText(resources, goalKey)}`;
-      }
-      if (!shouldSaveForExplorers(resources, goalKey) && maybeTradeForTargetChain(resources, reserved, goalKey, target)) return;
-      if ((reserved.manpower || 0) > 0 || (reserved.gold || 0) > 0) return; // plan owns these
-      if (shouldSaveForExplorers(resources, goalKey)) return; // explorers get first call on catpower
-      const catpowerHot = catpower.maxValue > 0 && catpower.value / catpower.maxValue > 0.9;
-      if (!catpowerHot) return; // only convert near-capped (otherwise-wasted) catpower
-      // A trade also pays the race's "buys" goods, so never trade with a partner
-      // whose buy good the plan is reserving.
-      const buysReserved = (race) => (race.buys || []).some((buy) => buy && (reserved[buy.name] || 0) > 0);
-      let best = null;
-      let bestScore = 0;
-      for (const race of races) {
-        if (buysReserved(race)) continue;
-        const score = tradeWantScore(race, resources);
-        if (score > bestScore && diplomacy.getMaxTradeAmt(race) >= 1) {
-          best = race;
-          bestScore = score;
-        }
-      }
-      if (best) {
-        const measured = withActionResourceDeltas(() => diplomacy.tradeAll(best), tradeDeltaNamesForRace(best));
-        lastTradeAt = Date.now();
-        pushLog(`🤝 ${best.title || best.name || "partner"} trade: ${measured.suffix}; reason surplus catpower near cap`);
-      }
-    } catch (error) {
-      /* ignore trade failures */
-    }
   };
 
   /* ------------------------------ per-tick cache ----------------------------- */
@@ -6269,7 +6201,7 @@
       if (cost.name === "science") continue; // cap-aware scholar handling below
       const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
       const actionableTrade = actionableTradeRouteFor(route);
-      if (route.reachable && actionableTrade) scoreAcquisitionRouteInputs(needs, resources, actionableTrade, 22);
+      if (route.reachable && actionableTrade) scoreAcquisitionRouteInputs(needs, resources, route, 22);
       else scoreResourcePathNeed(needs, cost.name, 22);
     }
 
@@ -6378,7 +6310,7 @@
           const weight = 4 * (1 - Math.min(0.98, have / cost.val)) + 1;
           const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
           const actionableTrade = actionableTradeRouteFor(route);
-          if (route.reachable && actionableTrade) scoreAcquisitionRouteInputs(needs, resources, actionableTrade, weight);
+          if (route.reachable && actionableTrade) scoreAcquisitionRouteInputs(needs, resources, route, weight);
           else {
             scoreResourcePathNeed(needs, cost.name, weight);
             rawPathRequirements(cost.name, missing, rawRequirements);
@@ -6420,18 +6352,26 @@
       if (candidate.affordable || candidate.score <= 0) continue;
       if (target && targetId(candidate) === targetId(target)) continue;
       const raw = {};
+      let acquisitionWork = false;
       for (const cost of pricesFor(candidate.kind, candidate.meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         if (cost.name === "faith") continue; // dedicated faith gating below owns priest pressure
         const res = getRes(resources, cost.name);
         if (res && res.maxValue > 0 && cost.val > res.maxValue) continue; // storage planner's job
         const have = (res && res.value) || 0;
-        if (have < cost.val) rawPathRequirements(cost.name, cost.val - have, raw);
+        if (have >= cost.val) continue;
+        const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
+        if (route.reachable && actionableTradeRouteFor(route)) {
+          scoreAcquisitionRouteInputs(needs, resources, route, 1.5);
+          acquisitionWork = true;
+        } else {
+          rawPathRequirements(cost.name, cost.val - have, raw);
+        }
       }
       if (Object.keys(raw).length) {
         scoreRawDeficits(needs, resources, raw, 4);
-        lookaheads += 1;
       }
+      if (acquisitionWork || Object.keys(raw).length) lookaheads += 1;
     }
 
     // Discretionary faith banking (priests filling faith toward a future religion
@@ -6555,7 +6495,7 @@
         needs[key] = Math.max(needs[key] || 0, CLIMB_PUSH_WEIGHT);
       }
     }
-    const mineralSubNeed = (needs.iron || 0) + (needs.titanium || 0) + (needs.uranium || 0);
+    const mineralSubNeed = (needs.iron || 0) + (needs.titanium || 0);
     if (mineralSubNeed > 0) {
       needs.minerals = Math.max(needs.minerals || 0, mineralSubNeed * 0.7);
     }
@@ -6945,6 +6885,11 @@
       const discount = typeof window.gamePage.getEffect === "function" ? window.gamePage.getEffect("huntCatpowerDiscount") : 0;
       const huntCost = Math.max(1, 100 - discount);
       const target = getTargetCached(resources, getGoal());
+      const tradeRoute = activeAcquisitionRoute(target, resources);
+      if (tradeRoute && tradeRoute.nextStep && tradeRoute.nextStep.kind === "trade" &&
+          tradePricesForRace(tradeRoute.nextStep.race).some((price) => price && (price.name === "manpower" || price.name === "catpower"))) {
+        return;
+      }
       // A research sprint whose chain still needs furs/parchment/manuscript/
       // compendium turns hunting into plan work: drop the threshold so we hunt
       // as soon as a hunt is affordable, instead of waiting near the cap.
@@ -6961,6 +6906,11 @@
       // enough that it can never permanently starve "Send explorers"
       // (diplomacy runs earlier in the tick, so explorers get first claim).
       const exploreCost = (hasLockedDiscoverableRace() || titaniumDiscoveryPending(resources, getGoal())) ? explorerPrices()[0].val : 0;
+      // A preparation mutation (for example crafting the first Zebra-reveal
+      // ship) consumes diplomacy's one action for this tick. Keep an already
+      // funded explorer bank intact so the next cooldown slot can reveal the
+      // race instead of hunting the fee away in the same tick.
+      if (exploreCost > 0 && cp.value >= exploreCost) return;
       if (exploreCost > 0 && cp.maxValue > exploreCost * 1.15) {
         threshold = Math.max(threshold, Math.min(cp.maxValue * 0.95, exploreCost + huntCost));
       }
@@ -8315,22 +8265,28 @@
     return prices;
   };
 
-  const tradeWithRace = (race, count = 1) => {
+  const tradeWithRace = (race, count = 1, preferAll = false) => {
     const diplomacy = window.gamePage && window.gamePage.diplomacy;
     const amount = Math.max(1, Math.floor(count) || 1);
-    const beforeTitanium = resourceValue(resourceMap(), "titanium");
-    const costsBefore = tradePricesForRace(race).map((price) => ({ name: price.name, value: resourceValue(resourceMap(), price.name) }));
     if (!diplomacy || !race) return false;
-    try {
-      if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, amount);
-      else if (typeof diplomacy.trade === "function") {
-        for (let i = 0; i < amount; i += 1) diplomacy.trade(race);
-      } else if (typeof diplomacy.tradeAll === "function") diplomacy.tradeAll(race);
-    } catch (error) {
-      return false;
-    }
-    if (resourceValue(resourceMap(), "titanium") > beforeTitanium) return true;
-    return costsBefore.some(({ name, value }) => resourceValue(resourceMap(), name) < value);
+    const prices = tradePricesForRace(race);
+    const names = tradeDeltaNamesForRace(race, prices);
+    const snapshot = () => Object.fromEntries([...names].map((name) => [name, resourceValue(resourceMap(), name)]));
+    const changed = (before, after) => Object.keys(before || {}).some((name) => after[name] !== before[name]);
+    const result = executeSemanticAction({
+      id: `trade:${race.name}`,
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot,
+      invoke: () => {
+        if (preferAll && typeof diplomacy.tradeAll === "function") diplomacy.tradeAll(race);
+        else if (typeof diplomacy.tradeMultiple === "function") diplomacy.tradeMultiple(race, amount);
+        else if (typeof diplomacy.trade === "function") {
+          for (let i = 0; i < amount; i += 1) diplomacy.trade(race);
+        } else if (amount === 1 && typeof diplomacy.tradeAll === "function") diplomacy.tradeAll(race);
+      },
+      verify: changed,
+    });
+    return result.ok;
   };
 
   // How many Zebra trades we can fire in one batch.  Single-trade-per-tick is
@@ -8339,40 +8295,60 @@
   // plan reservations) can pay, but never more than is needed to cover the
   // current titanium demand, and never enough to overflow the titanium cap.
   const MAX_TRADE_BATCH = 50;
+  const reservationFloorFor = (reserved, name) => {
+    if (!reserved || !name) return 0;
+    if (name === "manpower" || name === "catpower") {
+      return Math.max(0, reserved.manpower || 0, reserved.catpower || 0);
+    }
+    return Math.max(0, reserved[name] || 0);
+  };
+
   const affordableTradeCount = (prices, reserved, resources) => {
     let count = Infinity;
     for (const price of prices) {
       if (!price || !price.name || !isFinite(price.val) || price.val <= 0) continue;
       const stock = resourceValue(resources, price.name);
-      const hold = reserved[price.name] || (price.name === "catpower" ? reserved.manpower || 0 : 0);
+      const hold = reservationFloorFor(reserved, price.name);
       const spendable = Math.max(0, stock - Math.max(0, hold));
       count = Math.min(count, Math.floor(spendable / price.val));
     }
     return isFinite(count) ? Math.max(0, count) : 0;
   };
 
-  const zebraTradeBatchSize = (resources, reserved, goalKey, prices) => {
-    const affordable = affordableTradeCount(prices, reserved, resources);
+  const boundedTradeBatch = (route, ledger, resources) => {
+    const step = route && route.nextStep;
+    const race = step && step.kind === "trade" ? step.race : null;
+    if (!route || !route.reachable || !race) return 0;
+    const liveResources = resources || resourceMap();
+    const prices = tradePricesForRace(race);
+    const affordable = affordableTradeCount(prices, (ledger && ledger.reserved) || {}, liveResources);
     if (affordable <= 0) return 0;
-    const stats = zebraTitaniumStats(resources);
-    const perTrade = Math.max(0.1, stats.expected); // expected titanium per trade
-    const demand = titaniumDemandAmount(resources, goalKey);
-    const titanium = getRes(resources, "titanium");
-    // Enough trades to expect to cover the demand (at least one), capped so a
-    // lucky all-hit batch cannot blow far past the storage cap.
-    let batch = Math.max(1, Math.ceil(Math.max(demand, perTrade) / perTrade));
-    if (titanium && titanium.maxValue > 0) {
-      const headroom = Math.max(0, titanium.maxValue - titanium.value);
-      batch = Math.min(batch, Math.max(1, Math.ceil(headroom / Math.max(0.1, stats.amount))));
-    }
-    return Math.max(1, Math.min(batch, affordable, MAX_TRADE_BATCH));
+
+    const outputName = step.resource || route.resource;
+    const output = getRes(liveResources, outputName);
+    const current = resourceValue(liveResources, outputName);
+    const deficit = Math.max(0, (Number(route.amount) || 0) - current);
+    if (!(deficit > 0)) return 0;
+    const expected = Math.max(0, Number(step.expectedYield) || Number(route.expectedYield) ||
+      (step.sell ? expectedTradeYield(race, step.sell) : 0));
+    if (!(expected > 0)) return 0;
+
+    const deficitBound = Math.max(1, Math.ceil(deficit / expected));
+    const headroom = output && output.maxValue > 0
+      ? Math.max(0, output.maxValue - current)
+      : Number.POSITIVE_INFINITY;
+    if (headroom <= 0) return 0;
+    const headroomBound = isFinite(headroom) ? Math.max(1, Math.ceil(headroom / expected)) : Number.POSITIVE_INFINITY;
+    const routeBound = step.trades > 0 ? Math.ceil(step.trades) : Number.POSITIVE_INFINITY;
+    return Math.max(0, Math.min(affordable, deficitBound, headroomBound, routeBound, MAX_TRADE_BATCH));
   };
 
   const craftDiplomacyPrerequisites = (resources, goalKey) => {
+    const before = resourceSnapshot();
     try {
       if (!titaniumNeededSoon(resources, goalKey)) {
         diplomacyPrepText = "Diplomacy prep: watching trade unlocks";
-        return;
+        return false;
       }
       const zebras = raceByName("zebras");
       const ships = resourceValue(resources, "ship");
@@ -8400,8 +8376,10 @@
           tryCraftResource("ship", targetShips);
         }
       }
+      return resourceDeltasBetween(before, resourceSnapshot()).length > 0;
     } catch (error) {
       /* ignore diplomacy prerequisite crafting failures */
+      return false;
     }
   };
 
@@ -8422,10 +8400,14 @@
 
     if (shouldSaveForExplorers(resources, goalKey)) addPriceDeficits(explorerPrices(), 1.4);
 
-    if (titaniumNeededSoon(resources, goalKey)) {
-      const zebras = raceByName("zebras");
-      if (zebras && zebras.unlocked) {
-        addPriceDeficits(tradePricesForRace(zebras), 1.8);
+    const target = getTargetCached(resources, goalKey);
+    const route = activeAcquisitionRoute(target, resources);
+    if (route && route.nextStep && route.nextStep.race) {
+      addPriceDeficits(tradePricesForRace(route.nextStep.race), 1.8);
+      if (isZebraTitaniumTradeRoute(route)) {
+        const wantedShips = desiredZebraShipCount(resources, goalKey);
+        const fleetShort = resourceValue(resources, "ship") < wantedShips;
+        pressure.ship = Math.max(pressure.ship || 0, fleetShort ? 8 : 2);
       }
     }
 
@@ -8434,7 +8416,7 @@
 
   const pricesRespectReservations = (prices, reserved, resources) => prices.every((price) => {
     if (!price || !price.name || !isFinite(price.val) || price.val <= 0) return true;
-    const hold = reserved[price.name] || (price.name === "catpower" ? reserved.manpower || 0 : 0);
+    const hold = reservationFloorFor(reserved, price.name);
     if (hold <= 0) return true;
     const stock = ((getRes(resources, price.name) || {}).value) || 0;
     return stock - price.val >= hold;
@@ -8530,43 +8512,6 @@
     diplomacyPlanText = "Diplomacy: explorers need later unlock conditions";
     return false;
   };
-
-  const maybeTradeForTitanium = (resources, reserved, goalKey) => {
-    const titanium = getRes(resources, "titanium");
-    const target = getTargetCached(resources, goalKey);
-    const selectedTradeRoute = selectedTradeRouteForTarget(target, resources);
-    if (!isZebraTitaniumTradeRoute(selectedTradeRoute)) return false;
-    if (titanium && titanium.maxValue > 0 && titanium.value >= titanium.maxValue * 0.995) {
-      const stillMissingTitanium = targetMissingResource(target, resources, "titanium");
-      diplomacyPlanText = stillMissingTitanium
-        ? "Diplomacy: titanium capped below the plan cost — build storage before more Zebra trades"
-        : "Diplomacy: titanium is full; saving the other plan costs before spending it";
-      return false;
-    }
-    const zebras = raceByName("zebras");
-    if (!zebras || !zebras.unlocked) return false;
-    const prices = tradePricesForRace(zebras);
-    const odds = zebraTitaniumOddsText(resources, goalKey);
-    if (!prices.length || !canPayPrices(prices) || !pricesRespectReservations(prices, reserved, resources)) {
-      const missing = prices
-        .filter((price) => price && price.name && resourceValue(resources, price.name) < price.val)
-        .map((price) => `${fmt(price.val - resourceValue(resources, price.name))} ${resTitle(resources, price.name)}`)
-        .slice(0, 3)
-        .join(", ");
-      diplomacyPlanText = missing ? `Diplomacy: Zebra titanium trade needs ${missing} · ${odds}` : `Diplomacy: holding Zebra trade for plan reservations · ${odds}`;
-      return false;
-    }
-    const batch = zebraTradeBatchSize(resources, reserved, goalKey, prices);
-    const measured = withActionResourceDeltas(() => tradeWithRace(zebras, batch), tradeDeltaNamesForRace(zebras, prices));
-    if (measured.result) {
-      const batchNote = batch > 1 ? `×${batch}` : "";
-      diplomacyPlanText = `Diplomacy: traded with Zebras${batchNote} for titanium path · ${odds}`;
-      pushLog(`🦓 Zebras trade${batchNote ? ` ${batchNote}` : ""}: ${measured.suffix}; reason titanium path`);
-      return true;
-    }
-    return false;
-  };
-
 
   // Live season name read from the game's calendar.  Used to fold the per-sell
   // season multiplier into the expected yield, which the game already applies
@@ -8947,7 +8892,7 @@
   const actionableTradeRouteFor = (route) => actionableTradeRoutesIn(route)
     .sort((a, b) => b.eta - a.eta)[0] || null;
 
-  const selectedTradeRouteForTarget = (target, resources) => acquisitionRoutesForTarget(target, resources)
+  const activeAcquisitionRoute = (target, resources) => acquisitionRoutesForTarget(target, resources)
     .map(({ route }) => actionableTradeRouteFor(route))
     .filter(Boolean)
     .sort((a, b) => b.eta - a.eta)[0] || null;
@@ -9164,31 +9109,88 @@
     return { race, prices, affordable, goods, score: (value - scarcePenalty) * speedMultiplier, value, speedMultiplier };
   };
 
-  const maybeTradeForTargetChain = (resources, reserved, goalKey, target) => {
-    const route = selectedTradeRouteForTarget(target, resources);
-    if (!route || !route.nextStep || shouldSaveForExplorers(resources, goalKey)) return false;
+  const maybeTradeForTargetChain = (resources, ledger, goalKey, target) => {
+    if (shouldSaveForExplorers(resources, goalKey)) return false;
+    // Recompute from the live board immediately before funding and execution;
+    // earlier preparation may have changed prices, stocks, or the nested step.
+    const liveResources = resourceMap();
+    const route = activeAcquisitionRoute(target, liveResources);
+    if (!route || !route.nextStep) return false;
+    const liveLedger = buildReservationLedger(target, liveResources);
     const race = route.nextStep.race;
     const prices = tradePricesForRace(race);
-    if (!prices.length || !pricesRespectReservations(prices, reserved, resources)) return false;
-    const affordable = affordableTradeCount(prices, reserved, resources);
-    if (affordable <= 0) return false;
-    const batch = Math.max(1, Math.min(affordable, route.nextStep.trades || 1, 10));
+    const batch = boundedTradeBatch(route, liveLedger, liveResources);
+    if (!prices.length || batch <= 0 || !pricesRespectReservations(prices, liveLedger.reserved || {}, liveResources)) return false;
     const measured = withActionResourceDeltas(() => tradeWithRace(race, batch), tradeDeltaNamesForRace(race, prices));
     if (!measured.result) return false;
-    lastTradeAt = Date.now();
     const raceName = race.title || race.name || "civilization";
-    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${resTitle(resources, route.resource)} route`;
-    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason selected ${resTitle(resources, route.resource)} route for ${labelOf(target.meta)}`);
+    const odds = isZebraTitaniumTradeRoute(route) ? ` · ${zebraTitaniumOddsText(liveResources, goalKey)}` : "";
+    diplomacyPlanText = `Targeted trade: ${raceName} for ${labelOf(target.meta)} ${resTitle(liveResources, route.resource)} route${odds}`;
+    pushLog(`🤝 ${raceName} trade${batch > 1 ? ` ×${batch}` : ""}: ${measured.suffix}; reason selected ${resTitle(liveResources, route.resource)} route for ${labelOf(target.meta)}`);
     return true;
   };
 
-  const maybeBuildEmbassy = (resources, reserved) => {
+  const safeOverflowTradeBatch = (race, ledger, resources) => {
+    const prices = tradePricesForRace(race);
+    let batch = Math.min(MAX_TRADE_BATCH, affordableTradeCount(prices, (ledger && ledger.reserved) || {}, resources));
+    for (const sell of (race && race.sells) || []) {
+      if (!validRaceSell(race, sell)) continue;
+      const output = getRes(resources, sell.name);
+      const expected = expectedTradeYield(race, sell);
+      if (!output || !(output.maxValue > 0) || !(expected > 0)) continue;
+      const headroom = Math.max(0, output.maxValue - output.value);
+      batch = Math.min(batch, headroom > 0 ? Math.max(1, Math.ceil(headroom / expected)) : 0);
+    }
+    return Math.max(0, batch);
+  };
+
+  const maybeTradeSurplus = (resources, ledger, goalKey) => {
+    const game = window.gamePage;
+    const diplomacy = game && game.diplomacy;
+    if (!diplomacy || shouldSaveForExplorers(resources, goalKey)) return false;
+    const catpower = getRes(resources, "manpower");
+    if (!catpower || !(catpower.maxValue > 0) || catpower.value / catpower.maxValue <= 0.9) return false;
+    let best = null;
+    let bestScore = 0;
+    let bestBatch = 0;
+    for (const race of unlockedRaces().filter((item) => item && !item.collapsed)) {
+      const prices = tradePricesForRace(race);
+      if (!prices.length || !pricesRespectReservations(prices, ledger.reserved || {}, resources)) continue;
+      const batch = safeOverflowTradeBatch(race, ledger, resources);
+      const score = tradeWantScore(race, resources);
+      if (batch > 0 && score > bestScore) {
+        best = race;
+        bestScore = score;
+        bestBatch = batch;
+      }
+    }
+    if (!best) return false;
+    let nativeMax = Number.POSITIVE_INFINITY;
+    try {
+      if (typeof diplomacy.getMaxTradeAmt === "function") nativeMax = Math.max(0, Number(diplomacy.getMaxTradeAmt(best)) || 0);
+    } catch (error) {
+      /* use bounded multiple trade */
+    }
+    if (nativeMax <= 0) return false;
+    const prices = tradePricesForRace(best);
+    const measured = withActionResourceDeltas(
+      () => tradeWithRace(best, bestBatch, nativeMax <= bestBatch),
+      tradeDeltaNamesForRace(best, prices),
+    );
+    if (!measured.result) return false;
+    diplomacyPlanText = `Diplomacy: surplus trade with ${best.title || best.name || "partner"}`;
+    pushLog(`🤝 ${best.title || best.name || "partner"} trade: ${measured.suffix}; reason surplus catpower near cap`);
+    return true;
+  };
+
+  const maybeBuildEmbassy = (resources, reserved, route = null) => {
     if (!writingResearched()) return false;
+    const relevantRace = route && route.nextStep && route.nextStep.race;
     const races = unlockedRaces()
       .filter((race) => race.embassyPrices && race.embassyPrices.length)
       .map((race) => ({ race, prices: embassyPricesForRace(race) }))
       .filter((item) => item.prices.length && canPayPrices(item.prices) && pricesRespectReservations(item.prices, reserved, resources))
-      .sort((a, b) => (a.race.embassyLevel || 0) - (b.race.embassyLevel || 0));
+      .sort((a, b) => Number(b.race === relevantRace) - Number(a.race === relevantRace) || (a.race.embassyLevel || 0) - (b.race.embassyLevel || 0));
     const next = races[0];
     if (!next) return false;
     const measured = withActionResourceDeltas(() => buyEmbassyForRace(next.race), new Set(next.prices.map((price) => price.name)));
@@ -9240,9 +9242,22 @@
     try {
       if (Date.now() - lastDiplomacyAction < 10000) return;
       const target = getTargetCached(resources, goalKey);
-      const reserved = reservedNeedsFor(target, resources);
+      const ledger = buildReservationLedger(target, resources);
+      const reserved = ledger.reserved;
       refreshStickyTargetChainReserve(target, resources);
-      if (maybeAdoptZebraTradePolicy(resources, reserved, goalKey) || maybeSendExplorers(resources, reserved) || maybeTradeForTitanium(resources, reserved, goalKey) || maybeTradeForTargetChain(resources, reserved, goalKey, target) || maybeBuildEmbassy(resources, reserved)) {
+
+      // One owner, one mutation, one cooldown: reveal/preparation first, then
+      // the selected acquisition route, safe overflow, and only then embassies.
+      if (craftDiplomacyPrerequisites(resources, goalKey) ||
+          maybeAdoptZebraTradePolicy(resources, reserved, goalKey) ||
+          maybeSendExplorers(resources, reserved)) {
+        lastDiplomacyAction = Date.now();
+        return;
+      }
+      const route = activeAcquisitionRoute(target, resources);
+      if (maybeTradeForTargetChain(resources, ledger, goalKey, target) ||
+          maybeTradeSurplus(resources, ledger, goalKey) ||
+          maybeBuildEmbassy(resources, reserved, route)) {
         lastDiplomacyAction = Date.now();
         return;
       }
@@ -10321,7 +10336,6 @@
       optimizeProcessing(resources, goal);
       keepHealthyConvertersStable(resources);
       craftTowardTarget(resources, goal);
-      craftDiplomacyPrerequisites(resources, goal);
       // The unicorn subsystem runs BEFORE the plan executor for the same reason
       // crafting does: a sacrifice can complete a ziggurat upgrade's tears bill
       // this very tick, and the buy should follow immediately.
@@ -10352,7 +10366,6 @@
       resetTickCache();
       resources = resourceMap();
       manageDiplomacy(resources, goal);
-      manageTrade(resources, goal);
       resetTickCache();
       resources = resourceMap();
       if (maybePromoteKittens(resources, goal)) {
@@ -10785,10 +10798,28 @@
       resetTickCache();
       return acquisitionPathFor(resourceMap(), name, amount, context);
     },
+    activeAcquisitionRoute(target) {
+      resetTickCache();
+      return activeAcquisitionRoute(target, resourceMap());
+    },
+    boundedTradeBatch(route, ledger) {
+      resetTickCache();
+      return boundedTradeBatch(route, ledger, resourceMap());
+    },
+    buildReservationLedger(target) {
+      resetTickCache();
+      return buildReservationLedger(target, resourceMap());
+    },
+    manageDiplomacy(goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      manageDiplomacy(resources, goalKey);
+      return diplomacyPlanText;
+    },
     maybeTradeForTargetChain(target, goalKey = getGoal()) {
       resetTickCache();
       const resources = resourceMap();
-      return maybeTradeForTargetChain(resources, reservedNeedsFor(target, resources), goalKey, target);
+      return maybeTradeForTargetChain(resources, buildReservationLedger(target, resources), goalKey, target);
     },
     classifyTargetFeasibility(candidate) {
       return classifyTargetFeasibility(candidate, resourceMap());

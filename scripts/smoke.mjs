@@ -930,6 +930,10 @@ res("manpower").value = 3000;
 fakeNow += 25000;
 tickFn();
 check("titanium path: first ship crafted when titanium is blocking progression", res("ship").value >= 1);
+// Diplomacy is single-mutation-per-tick: crafting the reveal ship returns
+// immediately, so explorers use the next shared-cooldown slot.
+fakeNow += 25000;
+context.window.__kghDebug.manageDiplomacy("balanced");
 check("titanium path: hidden Zebras discovered via explorers after first ship", zebras.unlocked === true && /Zebras|civilization/.test(logText()));
 fakeNow += 25000;
 tickFn();
@@ -3580,6 +3584,108 @@ fakeNow += 30000;
 tickFn();
 check("Test AE re-review: actual diplomacy dispatcher executes nested Zebra before Dragon", nestedZebraDragonRouteAE.kind === "trade" && nestedZebraDragonRouteAE.nextStep?.race?.name === "dragons" && nestedZebraDragonRouteAE.inputs.some((input) => input.nextStep?.kind === "trade" && input.nextStep?.race?.name === "zebras") && (zebras.tradeTotal || 0) > zebraTradesBeforeNestedAE);
 
+/* Task 3: diplomacy has one mutation owner. The old dispatcher called both
+   manageDiplomacy() and manageTrade(), so the same nested Zebra route could hit
+   the diplomacy API twice during one tick. Count the real fixture calls rather
+   than helper returns: one tick must produce exactly one trade API mutation. */
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 10000;
+res("manpower").value = 30000;
+res("slab").value = 30000;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const diplomacyTradeApiCallsAE = [];
+const originalTradeMultipleAE = diplomacy.tradeMultiple;
+const originalTradeAllAE = diplomacy.tradeAll;
+diplomacy.tradeMultiple = (race, amount) => {
+  diplomacyTradeApiCallsAE.push({ api: "tradeMultiple", race: race?.name, amount });
+  return originalTradeMultipleAE(race, amount);
+};
+diplomacy.tradeAll = (race) => {
+  diplomacyTradeApiCallsAE.push({ api: "tradeAll", race: race?.name, amount: 1 });
+  return originalTradeAllAE(race);
+};
+fakeNow += 30000;
+tickFn();
+diplomacy.tradeMultiple = originalTradeMultipleAE;
+diplomacy.tradeAll = originalTradeAllAE;
+check("Task 3: one tick issues exactly one diplomacy trade API call", diplomacyTradeApiCallsAE.length === 1);
+
+/* Task 3: route selection and funding use the acquisition graph plus the full
+   merged reservation ledger. With Dragon titanium unfunded, the actionable
+   route is the nested Zebra step; its pressure includes the Zebra slab/ship
+   ramp and catpower, never a made-up uranium miner need. */
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 0;
+res("manpower").value = 0;
+res("slab").value = 0;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const activeNestedRouteAE = typeof dbg.activeAcquisitionRoute === "function"
+  ? dbg.activeAcquisitionRoute(acceleratorCandidateAE)
+  : null;
+const nestedDiplomacyNeedsAE = dbg.resourceNeeds("balanced").needs;
+check("Task 3: insufficient Dragon titanium selects the nested Zebra titanium route first", activeNestedRouteAE?.nextStep?.race?.name === "zebras" && activeNestedRouteAE?.resource === "titanium");
+check("Task 3: nested Zebra route pressures slab, ship, and catpower without synthetic uranium miners", (nestedDiplomacyNeedsAE.slab || 0) > 0 && (nestedDiplomacyNeedsAE.ship || 0) > 0 && (nestedDiplomacyNeedsAE.manpower || 0) > 0 && !(nestedDiplomacyNeedsAE.uranium > 0));
+
+/* Exact batch bounds: every trade price leaves the complete merged floor in
+   place, while expected output never runs beyond the target deficit or storage
+   headroom. These synthetic source labels mirror buildReservationLedger's
+   active/manual/unicorn/survival merge and make omissions visible. */
+const completeTradeLedgerAE = {
+  reserved: { titanium: 275, manpower: 150, gold: 60, unobtainium: 5000 },
+  sources: {
+    titanium: ["active plan"],
+    gold: ["manual queue"],
+    unobtainium: ["unicorn path"],
+    manpower: ["survival"],
+  },
+};
+res("titanium").value = 525;
+res("manpower").value = 250;
+res("gold").value = 75;
+res("uranium").value = 0;
+res("uranium").maxValue = 100;
+dbg.clearResourceTelemetry?.();
+const directDragonRouteAE = dbg.acquisitionPathFor("uranium", 25, { finalPurchase: true });
+const dragonBoundedBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(directDragonRouteAE, completeTradeLedgerAE)
+  : null;
+check("Task 3: Dragon batch respects active/manual/survival titanium, catpower, and gold floors", dragonBoundedBatchAE === 1);
+
+res("uranium").value = 100;
+const cappedDragonRouteAE = { ...directDragonRouteAE, amount: 125 };
+const uraniumHeadroomBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(cappedDragonRouteAE, completeTradeLedgerAE)
+  : null;
+
+res("unobtainium").value = 9999;
+res("timeCrystal").value = 0;
+res("timeCrystal").maxValue = 10;
+const fundedLeviathanRouteAE = {
+  ...leviathanTimeCrystalPathAE,
+  amount: 2,
+  nextStep: { ...leviathanTimeCrystalPathAE.nextStep, trades: 8 },
+};
+const leviathanFloorBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(fundedLeviathanRouteAE, completeTradeLedgerAE)
+  : null;
+
+res("unobtainium").value = 10000;
+res("timeCrystal").value = 1;
+res("timeCrystal").maxValue = 1;
+const cappedLeviathanRouteAE = {
+  ...leviathanTimeCrystalPathAE,
+  amount: 2,
+  nextStep: { ...leviathanTimeCrystalPathAE.nextStep, trades: 8 },
+};
+const leviathanBoundedBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(cappedLeviathanRouteAE, completeTradeLedgerAE)
+  : null;
+check("Task 3: trade batches stop at uranium/time-crystal output headroom and unobtainium floor", uraniumHeadroomBatchAE === 0 && leviathanFloorBatchAE === 0 && leviathanBoundedBatchAE === 0);
+
 res("faith").value = 0;
 res("faith").maxValue = Math.max(100, res("faith").maxValue || 0);
 perTick.faith = 0;
@@ -4103,6 +4209,9 @@ perTick.minerals = 0;         // idle bank, not "wasting income" → no storage-
 res("wood").value = 200;      // keep the cheap base buildings out of surplus reach
 res("science").value = 100;
 
+// Keep the fixture's stated plan authoritative even when earlier integration
+// ticks legitimately change the planner's pending preferred candidate.
+dbg.queueAdd("build:gildedTempleAI", 0);
 dbg.forceActiveTarget(dbg.candidateById("build:gildedTempleAI"), "Economy / normal growth", 5000);
 const aiFloors = dbg.parallelReservationFloors("balanced");
 check("Test AI: floors hold the target's missing trickle AND its banked direct slabs", (aiFloors.goldAI || 0) >= 800 && (aiFloors.slab || 0) >= 200);
