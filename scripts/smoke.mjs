@@ -829,7 +829,14 @@ vm.createContext(context);
 vm.runInContext(body, context, { filename: "kittens-game-helper.user.js" });
 
 await new Promise((resolve) => setTimeout(resolve, 100)); // bootstrap + first ticks
-const tickFn = intervalFns[0];
+const planningTickFn = intervalFns[0];
+const renderTickFn = intervalFns[2];
+// Most integration checks model one observed UI cycle: planning mutates first,
+// then the independent 500ms render lane presents the resulting state.
+const tickFn = () => {
+  planningTickFn();
+  renderTickFn();
+};
 
 const failures = [];
 const check = (label, ok) => {
@@ -1589,6 +1596,20 @@ const disarmed = hasActionBroker
   ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { forbiddenCalls += 1; } })
   : { ok: false };
 check("late game A: prestige requires explicit arm", hasActionBroker && !disarmed.ok && forbiddenCalls === 0);
+const confirmationPreservation = [false, true].map((initialNoConfirm) => {
+  gamePage.opts.noConfirm = initialNoConfirm;
+  dbg.setPrestigeAutomationArmed(false);
+  let irreversibleCalls = 0;
+  const results = ["transcend", "adore", "sacrificeAlicorns"].map((id) => dbg.executeSemanticAction({
+    id,
+    invoke: () => { irreversibleCalls += 1; },
+  }));
+  return { initialNoConfirm, afterNoConfirm: gamePage.opts.noConfirm, irreversibleCalls, results };
+});
+check("late game A review: disarmed Transcend, Adore, and alicorn sacrifice preserve false/true confirmation settings",
+  confirmationPreservation.every((sample) =>
+    sample.afterNoConfirm === sample.initialNoConfirm && sample.irreversibleCalls === 0 && sample.results.every((result) => result?.ok === false)));
+gamePage.opts.noConfirm = false;
 check("late game A: exact and structured action policies are classified", hasActionBroker &&
   dbg.actionPolicyFor("candidate:build:library") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
   dbg.actionPolicyFor("craft:beam") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
@@ -1598,6 +1619,10 @@ check("late game A: exact and structured action policies are classified", hasAct
   dbg.actionPolicyFor("sacrificeAlicorns") === dbg.ACTION_POLICY.RARE_CAPITAL &&
   dbg.actionPolicyFor("transcend") === dbg.ACTION_POLICY.AUTHORIZED_PRESTIGE &&
   dbg.actionPolicyFor("resetWorld") === dbg.ACTION_POLICY.FORBIDDEN);
+check("late game A final review: every repeatable native mutation family has a broker policy", hasActionBroker &&
+  ["observeStars", "holdFestival", "huntAll", "promoteKittens", "boosterTicks",
+    "processor:smelter", "job:assign:farmer", "job:unassign:woodcutter", "leader:select"]
+    .every((id) => dbg.actionPolicyFor(id) === dbg.ACTION_POLICY.SAFE_REPEATABLE));
 
 let safeCalls = 0;
 const safeResult = hasActionBroker
@@ -3837,6 +3862,31 @@ perTick.unobtainium = 4;
 dbg.clearResourceTelemetry?.();
 const leviathanTimeCrystalPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.acquisitionPathFor("timeCrystal", 0.25) : null;
 check("Test AE: Leviathans provide a finite time-crystal acquisition route", !!leviathanTimeCrystalPathAE?.reachable && leviathanTimeCrystalPathAE.kind === "trade" && Number.isFinite(leviathanTimeCrystalPathAE.eta) && leviathanTimeCrystalPathAE.nextStep?.race?.name === "leviathans");
+
+/* Final review: route kind is not a strategic veto. ETA is primary, while use
+   of protected rare capital is only a same-ETA tie-breaker. */
+const fastRouteResourceAE = R("fastRouteResourceAE", 0, 100, "Fast Route Resource AE");
+const capitalTieResourceAE = R("capitalTieResourceAE", 0, 100, "Capital Tie Resource AE");
+const fastRouteRaceAE = { name: "fastRouteRaceAE", title: "Fast Route Race AE", unlocked: true, buys: [], sells: [{ name: "fastRouteResourceAE", value: 1, chance: 1, width: 0 }] };
+const rareCapitalRaceAE = { name: "rareCapitalRaceAE", title: "Rare Capital Race AE", unlocked: true, buys: [{ name: "timeCrystal", val: 0.01 }], sells: [{ name: "capitalTieResourceAE", value: 1, chance: 1, width: 0 }] };
+const ordinaryCapitalRaceAE = { name: "ordinaryCapitalRaceAE", title: "Ordinary Capital Race AE", unlocked: true, buys: [{ name: "titanium", val: 1 }], sells: [{ name: "capitalTieResourceAE", value: 1, chance: 1, width: 0 }] };
+resources.push(fastRouteResourceAE, capitalTieResourceAE);
+diplomacy.races.push(fastRouteRaceAE, rareCapitalRaceAE, ordinaryCapitalRaceAE);
+perTick.fastRouteResourceAE = 0.001;
+res("manpower").value = Math.max(res("manpower").value, 100);
+res("gold").value = Math.max(res("gold").value, 100);
+res("timeCrystal").value = Math.max(res("timeCrystal").value, 0.01);
+res("titanium").value = Math.max(res("titanium").value, 1);
+dbg.clearResourceTelemetry?.();
+const fastestRouteAE = dbg.acquisitionPathFor("fastRouteResourceAE", 1);
+const tiedCapitalRouteAE = dbg.acquisitionPathFor("capitalTieResourceAE", 1);
+check("Task 3 final review: acquisition routes rank by ETA with protected capital only a minor tie-breaker",
+  fastestRouteAE.kind === "trade" && fastestRouteAE.nextStep?.race?.name === "fastRouteRaceAE" &&
+  tiedCapitalRouteAE.nextStep?.race?.name === "ordinaryCapitalRaceAE");
+delete perTick.fastRouteResourceAE;
+for (const race of [fastRouteRaceAE, rareCapitalRaceAE, ordinaryCapitalRaceAE]) diplomacy.races.splice(diplomacy.races.indexOf(race), 1);
+for (const resource of [fastRouteResourceAE, capitalTieResourceAE]) resources.splice(resources.indexOf(resource), 1);
+dbg.clearResourceTelemetry?.();
 const timeCrystalConsumerAE = { name: "timeCrystalConsumerAE", label: "Time Crystal Consumer AE", unlocked: true, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 0.25 }], effects: {} };
 buildings.push(timeCrystalConsumerAE);
 dbg.queueClear();
@@ -3986,6 +4036,42 @@ const nestedDiplomacyNeedsAE = dbg.resourceNeeds("balanced").needs;
 check("Task 3: insufficient Dragon titanium selects the nested Zebra titanium route first", activeNestedRouteAE?.nextStep?.race?.name === "zebras" && activeNestedRouteAE?.resource === "titanium");
 check("Task 3: nested Zebra route pressures slab, ship, and catpower without synthetic uranium miners", (nestedDiplomacyNeedsAE.slab || 0) > 0 && (nestedDiplomacyNeedsAE.ship || 0) > 0 && (nestedDiplomacyNeedsAE.manpower || 0) > 0 && !(nestedDiplomacyNeedsAE.uranium > 0));
 
+const nestedRouteLedgerAE = dbg.buildReservationLedger(acceleratorCandidateAE);
+const zebraOwnerIdAE = Object.keys(nestedRouteLedgerAE.routeOwners || {}).find((id) => /trade:zebras:titanium/.test(id));
+const dragonOwnerIdAE = Object.keys(nestedRouteLedgerAE.routeOwners || {}).find((id) => /trade:dragons:uranium/.test(id));
+check("Task 3 final review: nested Zebra and parent Dragon inputs are owned reservations in the active route ledger",
+  !!zebraOwnerIdAE && !!dragonOwnerIdAE &&
+  (nestedRouteLedgerAE.routeOwners[zebraOwnerIdAE]?.slab || 0) > 0 &&
+  (nestedRouteLedgerAE.routeOwners[zebraOwnerIdAE]?.manpower || 0) > 0 &&
+  (nestedRouteLedgerAE.routeOwners[dragonOwnerIdAE]?.titanium || 0) > 0 &&
+  (nestedRouteLedgerAE.routeOwners[dragonOwnerIdAE]?.gold || 0) > 0 &&
+  nestedRouteLedgerAE.reserved.slab >= nestedRouteLedgerAE.routeOwners[zebraOwnerIdAE].slab &&
+  nestedRouteLedgerAE.reserved.titanium >= nestedRouteLedgerAE.routeOwners[dragonOwnerIdAE].titanium);
+for (const [name, amount] of Object.entries(nestedRouteLedgerAE.routeReserved || {})) {
+  if (res(name)) res(name).value = Math.max(res(name).value || 0, amount);
+}
+res("titanium").value = 0;
+const ownedNestedZebraBatchAE = dbg.boundedTradeBatch(activeNestedRouteAE, nestedRouteLedgerAE);
+check("Task 3 final review: selected nested Zebra trade may consume its owned inputs while unrelated lanes see the full route floor",
+  ownedNestedZebraBatchAE > 0 && nestedRouteLedgerAE.reserved.slab > 0 && nestedRouteLedgerAE.reserved.manpower > 0);
+
+res("unobtainium").value = 0;
+res("timeCrystal").value = 0;
+const leviathanTargetCandidateAE = { kind: "build", meta: timeCrystalConsumerAE, affordable: false };
+const leviathanRouteLedgerAE = dbg.buildReservationLedger(leviathanTargetCandidateAE);
+const leviathanOwnerIdAE = Object.keys(leviathanRouteLedgerAE.routeOwners || {}).find((id) => /trade:leviathans:timeCrystal/.test(id));
+if (leviathanOwnerIdAE) res("unobtainium").value = leviathanRouteLedgerAE.routeOwners[leviathanOwnerIdAE]?.unobtainium || 0;
+const activeLeviathanRouteAE = dbg.activeAcquisitionRoute(leviathanTargetCandidateAE);
+check("Task 3 final review: Leviathan capital is reserved for and consumable by its selected route only",
+  !!leviathanOwnerIdAE && leviathanRouteLedgerAE.reserved.unobtainium > 0 && dbg.boundedTradeBatch(activeLeviathanRouteAE, leviathanRouteLedgerAE) > 0);
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 0;
+res("manpower").value = 0;
+res("slab").value = 0;
+res("unobtainium").value = 0;
+res("timeCrystal").value = 0;
+
 /* Exact batch bounds: every trade price leaves the complete merged floor in
    place, while expected output never runs beyond the target deficit or storage
    headroom. These synthetic source labels mirror buildReservationLedger's
@@ -4054,6 +4140,28 @@ const partialHeadroomDragonRouteAE = { ...directDragonRouteAE, amount: 125 };
 const partialHeadroomBatchAE = dbg.boundedTradeBatch(partialHeadroomDragonRouteAE, { reserved: {} });
 check("Task 3 review: positive uranium headroom below one expected yield permits zero trades", partialHeadroomBatchAE === 0);
 
+/* Final review: output headroom is a worst-case safety bound, not an expected-
+   value budget. A high-variance sell can land above its mean, so neither the
+   targeted nor surplus batcher may start a trade unless the maximum result fits. */
+const volatileUraniumSellAE = { name: "uranium", value: 2, chance: 0.5, width: 1 };
+const volatileDragonsAE = { ...dragonsAE, name: "volatileDragonsAE", sells: [volatileUraniumSellAE] };
+const volatileRouteAE = {
+  reachable: true,
+  resource: "uranium",
+  amount: 125,
+  expectedYield: 1,
+  nextStep: { kind: "trade", resource: "uranium", race: volatileDragonsAE, sell: volatileUraniumSellAE, trades: 25, expectedYield: 1 },
+};
+res("titanium").value = 10000;
+res("manpower").value = 10000;
+res("gold").value = 10000;
+res("uranium").value = 97;
+res("uranium").maxValue = 100;
+const volatileTargetBatchAE = dbg.boundedTradeBatch(volatileRouteAE, { reserved: {} });
+const volatileOverflowBatchAE = dbg.safeOverflowTradeBatch?.(volatileDragonsAE, { reserved: {} });
+check("Task 3 final review: maximum high-variance yield, not expected yield, protects targeted and surplus output headroom",
+  dbg.maximumTradeYield?.(volatileDragonsAE, volatileUraniumSellAE) === 4 && volatileTargetBatchAE === 0 && volatileOverflowBatchAE === 0);
+
 const isolatedFloorBatchAE = (floorName, floor, stock) => {
   res("titanium").value = 10000;
   res("manpower").value = 10000;
@@ -4083,6 +4191,11 @@ diplomacy.unlockRandomRace = () => {
 };
 res("manpower").value = 1100;
 res("manpower").maxValue = 1200;
+// Isolate explorer ownership from the earlier Dragon fixture: the newly active
+// route ledger correctly protects Dragon funding, so fully bank that unrelated
+// uranium demand before asserting the explorer controller branch.
+res("uranium").value = 250;
+res("uranium").maxValue = 2250;
 dbg.forceActiveTarget(null);
 const explorerAuditStartAE = diplomacyApiCalls.length;
 fakeNow += 30000;
@@ -4124,9 +4237,30 @@ dbg.clearResourceTelemetry?.();
 dbg.forceActiveTarget(dbg.candidateById("build:reviewTitaniumTargetAE"), "Economy / normal growth", 0);
 const tradeAuditStartAE = diplomacyApiCalls.length;
 fakeNow += 30000;
-tickFn();
+dbg.manageDiplomacy("balanced");
 const tradeAuditAE = diplomacyApiCalls.slice(tradeAuditStartAE);
 check("Task 3 review: missing tradeMultiple permits one native trade call, never a loop", fallbackTradeCallsAE === 1 && tradeAuditAE.length === 1 && tradeAuditAE[0].api === "trade");
+
+// An active selected route owns diplomacy. If its next Zebra step is blocked on
+// Slab, near-cap catpower must not fall through to an unrelated Lizard overflow
+// trade; the passive target immediately after this fixture proves overflow
+// resumes as soon as that selected route closes/invalidates.
+res("uranium").value = 0;
+res("titanium").value = 0;
+res("slab").value = 0;
+res("manpower").value = 985;
+res("manpower").maxValue = 1000;
+res("gold").value = 600;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const blockedRouteOverflowAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+const blockedRouteOverflowAuditAE = diplomacyApiCalls.slice(blockedRouteOverflowAuditStartAE);
+check("Task 3 final review: blocked active Dragon/Zebra route excludes unrelated overflow trade",
+  blockedRouteOverflowAuditAE.every((call) => call.api !== "trade" && call.api !== "tradeAll" && call.api !== "tradeMultiple") &&
+  /route|slab|fund|block|saving|embassy/i.test(panelText(".kgh-diplomacy") + " " + dbg.manageDiplomacy("balanced")));
+res("slab").value = 1000;
 
 const overflowPassiveTargetAE = { name: "overflowPassiveTargetAE", label: "Overflow Passive Target", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 100 }], effects: {} };
 buildings.push(overflowPassiveTargetAE);
@@ -4141,15 +4275,18 @@ dbg.clearResourceTelemetry?.("titanium");
 dbg.forceActiveTarget(dbg.candidateById("build:overflowPassiveTargetAE"), "Economy / normal growth", 0);
 const overflowFallbackAuditStartAE = diplomacyApiCalls.length;
 fakeNow += 30000;
-tickFn();
+dbg.maybeTradeSurplus(dbg.candidateById("build:overflowPassiveTargetAE"), "balanced");
 const overflowFallbackAuditAE = diplomacyApiCalls.slice(overflowFallbackAuditStartAE);
 check("Task 3 review: overflow fallback also uses one native trade call at batch one", overflowFallbackAuditAE.length === 1 && overflowFallbackAuditAE[0].api === "trade");
+res("manpower").value = 0;
 buildings.splice(buildings.indexOf(overflowPassiveTargetAE), 1);
 perTick.titanium = 0;
 diplomacy.tradeMultiple = savedTradeMultipleReviewAE;
 if (savedTradeReviewAE === undefined) delete diplomacy.trade; else diplomacy.trade = savedTradeReviewAE;
 [res("ship").value, res("ship").maxValue] = savedShipReviewAE;
 buildings.splice(buildings.indexOf(reviewTitaniumTargetAE), 1);
+res("uranium").value = 0;
+res("uranium").maxValue = 2250;
 
 const reviewEmbassyRaceAE = { name: "reviewEmbassyAE", title: "Review Embassy", unlocked: true, hidden: false, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 10 }], sells: [] };
 const savedEmbassyPricesAE = diplomacy.races.map((race) => [race, race.embassyPrices]);
@@ -4179,6 +4316,7 @@ diplomacy.unlockRandomRace = () => {
   return unavailableExplorerRaceAE;
 };
 res("manpower").value = 1100;
+res("uranium").value = 250;
 const manpowerBeforeUnavailableExploreAE = res("manpower").value;
 dbg.forceActiveTarget(null);
 fakeNow += 30000;
@@ -4187,6 +4325,7 @@ check("Task 3 review: unavailable explorer controller performs no raw payment or
 gamePage.tradeTab.exploreBtn.controller = savedExploreControllerAE;
 diplomacy.unlockRandomRace = savedUnlockRandomRaceAE;
 diplomacy.races.splice(diplomacy.races.indexOf(unavailableExplorerRaceAE), 1);
+res("uranium").value = 0;
 
 const unavailableEmbassyRaceAE = { name: "unavailableEmbassyAE", title: "Unavailable Embassy", unlocked: true, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 10 }], sells: [] };
 const savedEmbassyPricesUnavailableAE = diplomacy.races.map((race) => [race, race.embassyPrices]);
@@ -5572,7 +5711,7 @@ dbg.applyTickSpeed?.(50);
 fakeNow += 200;
 intervalFns[intervalFns.length - 1]();
 check("Test AM: the 50× ceiling yields in a bounded chunk and drops backlog",
-  dbg.tickSpeed?.() === 50 && extraTicksAM > 0 && extraTicksAM <= 16 && dbg.boosterTelemetry?.().lastBeat?.dropped > 0);
+  dbg.tickSpeed?.() === 50 && extraTicksAM === 49 && dbg.boosterTelemetry?.().lastBeat?.maxChunk === 16 && dbg.boosterTelemetry?.().lastBeat?.dropped === 0);
 dbg.applyTickSpeed?.(99);
 check("Test AM: an unknown multiplier falls back to native 1×",
   dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1" && !dbg.automationSchedulerSnapshot?.().lanes?.booster);
@@ -5717,6 +5856,16 @@ const failedCheckpointT5 = dbg.managePrestige?.(null);
     retainedFloorProjectionT5?.transcend?.retainedFloor === 60 && retainedFloorProjectionT5?.transcend?.ready === false && dbg.managePrestige?.(null) === false && checkpointCalls === checkpointBeforeRetainedFloorT5);
   transcendenceUpgrades[3].unlocked = false;
 
+  gamePage.religion.faith = 0;
+  gamePage.religion.faithRatio = 100;
+  const exactTranscendFundingT5 = dbg.prestigeProjection?.(null);
+  gamePage.religion.faithRatio = 99;
+  const belowTranscendFundingT5 = dbg.prestigeProjection?.(null);
+  check("Task 5 final review: exact next-tier epiphany balance funds Transcend with zero retained shortfall",
+    exactTranscendFundingT5?.transcend?.ready === true && exactTranscendFundingT5?.transcend?.remaining === 0 && !/need 0 epiphany/i.test(exactTranscendFundingT5?.transcend?.reason || ""));
+  check("Task 5 final review: below-price epiphany remains blocked by its positive shortfall",
+    belowTranscendFundingT5?.transcend?.ready === false && /need 1 epiphany/i.test(belowTranscendFundingT5?.transcend?.reason || ""));
+
 // Transcend and Adore both qualify. Transcend owns this irreversible cycle.
 // The checkpoint deliberately changes epiphany by one to prove the exact
 // before-snapshot is captured AFTER checkpoint and fresh revalidation.
@@ -5799,8 +5948,10 @@ const adoreManagedT5 = dbg.managePrestige?.(null);
   gamePage.religion.faith = 100000;
   gamePage.religion.faithRatio = 10;
   const retryAfterFaultyAdoreT5 = dbg.managePrestige?.(null);
-  check("Task 5 review: Adore requires exact native 0.01 worship reset and failed verification starts no cooldown",
-    faultyAdoreManagedT5 === false && retryAfterFaultyAdoreT5 === true && gamePage.religion.faith === 0.01);
+  fakeNow += 30000;
+  const retryAfterFaultyAdoreCooldownT5 = dbg.managePrestige?.(null);
+  check("Task 5 final review: mutated Adore postcondition starts wall cooldown before verification and retries after 30 seconds",
+    faultyAdoreManagedT5 === false && retryAfterFaultyAdoreT5 === false && retryAfterFaultyAdoreCooldownT5 === true && gamePage.religion.faith === 0.01);
 
 // Alicorn Stable is a reachable direct alicorn purchase and therefore creates
 // a protected floor. The active Time target is exactly two crystals short.
@@ -6458,6 +6609,7 @@ const megalithCraftT7 = { name: "megalithT7", label: "Megalith T7", unlocked: fa
 const blueprintCraftT7 = craft("blueprint");
 const savedBlueprintUnlockedT7 = blueprintCraftT7.unlocked;
 const savedZigguratBanksT7 = {
+  scaffold: res("scaffold").value,
   blueprint: res("blueprint").value,
   science: [res("science").value, res("science").maxValue],
   compedium: res("compedium").value,
@@ -6472,6 +6624,7 @@ Object.assign(zigguratT7, {
   prices: [{ name: "scaffold", val: 50 }, { name: "blueprint", val: 1 }, { name: "megalithT7", val: 50 }],
 });
 blueprintCraftT7.unlocked = false;
+res("scaffold").value = 0;
 res("blueprint").value = 0;
 res("science").maxValue = Math.max(res("science").maxValue, 50000);
 res("science").value = Math.max(res("science").value, 25000);
@@ -6509,8 +6662,13 @@ dbg.applyTickSpeed?.(1);
 const replaySchedulerT7 = dbg.automationSchedulerSnapshot?.();
 const replayPlanningT7 = intervalFns[replaySchedulerT7.lanes.planning.id];
 const replayActionT7 = intervalFns[replaySchedulerT7.lanes.action.id];
+const replayRenderT7 = intervalFns[replaySchedulerT7.lanes.render.id];
+const renderCountBeforePlanT7 = dbg.renderPassCount?.();
 fakeNow += replaySchedulerT7.lanes.planning.delayMs;
 replayPlanningT7();
+const renderCountAfterPlanT7 = dbg.renderPassCount?.();
+replayRenderT7();
+const renderCountAfterRenderLaneT7 = dbg.renderPassCount?.();
 const replayCountAfterPlanT7 = fastReplayT7.val;
 fakeNow += replaySchedulerT7.lanes.action.delayMs;
 replayActionT7();
@@ -6518,6 +6676,9 @@ fakeNow += replaySchedulerT7.lanes.action.delayMs;
 replayActionT7();
 check("Task 7 review: real-cadence fast lane consumes one plan decision exactly once",
   replayCountAfterPlanT7 === 1 && fastReplayT7.val === replayCountAfterPlanT7);
+check("Task 7 final review: planning never performs a full panel render and the 500ms render lane owns it",
+  Number.isFinite(renderCountBeforePlanT7) && renderCountAfterPlanT7 === renderCountBeforePlanT7 &&
+  renderCountAfterRenderLaneT7 === renderCountBeforePlanT7 + 1);
 buildings.splice(buildings.indexOf(fastReplayT7), 1);
 dbg.forceActiveTarget(null);
 
@@ -6619,7 +6780,7 @@ check("Task 7 re-review: requested 50x stays native-only before any booster tick
   Math.abs((zeroDeliveryEndT7R.logicalNow - zeroDeliveryStartT7R.logicalNow) - 100) < 1);
 
 const nativeTickLogicalMsT7R = 1000 / (gamePage.ticksPerSecond || 5);
-const selectableSpeedsT7R = [1, 2, 3, 5, 10, 20, 50];
+const selectableSpeedsT7R = [1, 2, 3, 5, 10, 20, 25, 50];
 const selectableDeliveryT7R = [];
 for (const speed of selectableSpeedsT7R) {
   dbg.applyTickSpeed?.(1);
@@ -6668,14 +6829,13 @@ for (const speed of [20, 50]) {
 }
 const capped20T7R = cappedDeliveryT7R[0];
 const capped50T7R = cappedDeliveryT7R[1];
-check("Task 7 re-review: dropped due ticks add zero logical progress",
-  capped20T7R.deliveredTicks === capped50T7R.deliveredTicks && capped50T7R.beat.dropped > capped20T7R.beat.dropped &&
+check("Task 7 final review: chunking limits each inner burst without capping total capable 20x/50x delivery",
+  capped20T7R.deliveredTicks === 19 && capped50T7R.deliveredTicks === 49 &&
+  capped20T7R.beat.dropped === 0 && capped50T7R.beat.dropped === 0 &&
   Math.abs((capped20T7R.end.logicalNow - capped20T7R.start.logicalNow) -
     ((capped20T7R.endWall - capped20T7R.startWall) + capped20T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1 &&
   Math.abs((capped50T7R.end.logicalNow - capped50T7R.start.logicalNow) -
-    ((capped50T7R.endWall - capped50T7R.startWall) + capped50T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1 &&
-  Math.abs((capped20T7R.end.logicalNow - capped20T7R.start.logicalNow) -
-    (capped50T7R.end.logicalNow - capped50T7R.start.logicalNow)) < 1);
+    ((capped50T7R.endWall - capped50T7R.startWall) + capped50T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1);
 
 dbg.applyTickSpeed?.(1);
 dbg.applyTickSpeed?.(50);
@@ -6753,6 +6913,32 @@ check("Task 7 re-review: production telemetry uses its actual multi-speed logica
 resources.splice(resources.indexOf(telemetryClockT7R), 1);
 delete perTick.telemetryClockT7R;
 delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+
+/* Final review: once a public native tick counter is available, background wall
+   time is not game progress. Completed booster calls are credited exactly once
+   even when the same calls also increment the public counter. */
+gamePage.timer = { ticksTotal: 1000 };
+dbg.resetAutomationNativeSample?.();
+const observedClockStartT7 = dbg.automationClockSnapshot?.();
+fakeNow += 1000;
+const observedClockIdleT7 = dbg.automationClockSnapshot?.();
+gamePage.timer.ticksTotal += 5;
+const observedClockNativeT7 = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(50);
+gamePage.tick = () => { gamePage.timer.ticksTotal += 1; };
+fakeNow += 200;
+const observedBoosterStartT7 = dbg.automationClockSnapshot?.();
+const observedBoosterBeatT7 = dbg.runBoosterBeat?.();
+const observedBoosterEndT7 = dbg.automationClockSnapshot?.();
+check("Task 7 final review: public native ticks gate logical time and booster counter changes are not double-counted",
+  Math.abs(observedClockIdleT7.logicalNow - observedClockStartT7.logicalNow) < 1 &&
+  Math.abs((observedClockNativeT7.logicalNow - observedClockIdleT7.logicalNow) - 1000) < 1 &&
+  observedBoosterBeatT7?.executed === 49 &&
+  Math.abs((observedBoosterEndT7.logicalNow - observedBoosterStartT7.logicalNow) - 49 * nativeTickLogicalMsT7R) < 1);
+delete gamePage.tick;
+delete gamePage.timer;
+dbg.resetAutomationNativeSample?.();
 dbg.applyTickSpeed?.(1);
 
 /* Native-style pollution status, scoring, recovery, throttle, diagnostics. */
@@ -6951,8 +7137,10 @@ gamePage.bld.getPollutionEquilibrium = () => 400;
 check("Task 7 pollution: falling to a safe equilibrium adds no recovery penalty and yields the layer",
   dbg.pollutionPenalty?.(dbg.pollutionStatus?.()) === 0 && !dbg.bestPollutionRecoveryTarget?.([cleanupCandidateT7]));
 const reportPollutionT7 = dbg.report?.() || "";
-check("Task 7 pollution: diagnostics name level, delta, equilibrium, threshold ETA, clean share, and contributors",
-  /Pollution:.*level.*delta.*equilibrium.*threshold ETA.*clean energy.*contributors/i.test(reportPollutionT7));
+check("Task 7 final review: pollution diagnostics name state, polluters/cleaners, measured penalties, and recovery/wait reason",
+  /Pollution:.*level.*delta.*equilibrium.*threshold ETA.*clean energy.*contributors/i.test(reportPollutionT7) &&
+  /cleaners:/i.test(reportPollutionT7) && /penalty:.*current.*next/i.test(reportPollutionT7) &&
+  /recovery:.*(?:active|waiting|not needed)/i.test(reportPollutionT7));
 
 const recoveryNamesT7 = ["planner", "processor", "craft", "autobuy", "diplomacy", "jobs", "render"];
 const recoveryOrderT7 = [];
@@ -6997,7 +7185,9 @@ const productionFailuresAfterFailureT7 = dbg.subsystemFailures?.();
 fakeNow += productionSchedulerT7?.lanes?.planning?.delayMs || 2000;
 productionPlanningT7?.();
 const productionRunsAfterRecoveryT7 = dbg.subsystemRunSnapshot?.();
-const productionLaterNamesT7 = ["processor", "craft", "autobuy", "diplomacy", "jobs", "render"];
+// Rendering deliberately belongs to the independent 500 ms render lane, so a
+// planning callback must isolate and continue only the later mutation phases.
+const productionLaterNamesT7 = ["processor", "craft", "autobuy", "diplomacy", "jobs"];
 const productionRunCountT7 = (snapshot, name, field) => snapshot?.[name]?.[field] || 0;
 check("Task 7 review: real production tick isolates one planner failure, runs later phases, and recovers next tick",
   typeof productionPlanningT7 === "function" &&
@@ -7024,6 +7214,7 @@ buildings.splice(buildings.indexOf(cleanPowerT7), 1);
 resources.splice(resources.indexOf(pollutionResourceT7), 1);
 Object.assign(zigguratT7, savedZigguratT7);
 blueprintCraftT7.unlocked = savedBlueprintUnlockedT7;
+res("scaffold").value = savedZigguratBanksT7.scaffold;
 res("blueprint").value = savedZigguratBanksT7.blueprint;
 res("science").value = savedZigguratBanksT7.science[0]; res("science").maxValue = savedZigguratBanksT7.science[1];
 res("compedium").value = savedZigguratBanksT7.compedium;

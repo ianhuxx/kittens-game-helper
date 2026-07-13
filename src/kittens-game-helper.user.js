@@ -251,13 +251,20 @@
   const actionPolicyFor = (actionId) => {
     if (typeof actionId !== "string" || !actionId) return ACTION_POLICY.FORBIDDEN;
     if (ACTION_IDS.has(actionId)) return ACTION_IDS.get(actionId);
-    if (actionId === "praise" || actionId === "sacrificeUnicorns") return ACTION_POLICY.SAFE_REPEATABLE;
+    if (["praise", "sacrificeUnicorns", "observeStars", "holdFestival", "huntAll", "promoteKittens", "boosterTicks"].includes(actionId)) {
+      return ACTION_POLICY.SAFE_REPEATABLE;
+    }
     const candidate = /^candidate:([^:]+):([^:]+)$/.exec(actionId);
     if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[1]) && SAFE_ACTION_NAME.test(candidate[2]) && !isDeniedKey(candidate[2])) {
       return ACTION_POLICY.SAFE_REPEATABLE;
     }
     const repeatable = /^(craft|trade|explore|embassy):([^:]+)$/.exec(actionId);
     if (repeatable && SAFE_ACTION_NAME.test(repeatable[2])) return ACTION_POLICY.SAFE_REPEATABLE;
+    const processor = /^processor:([^:]+)$/.exec(actionId);
+    if (processor && SAFE_ACTION_NAME.test(processor[1])) return ACTION_POLICY.SAFE_REPEATABLE;
+    const job = /^job:(assign|unassign):([^:]+)$/.exec(actionId);
+    if (job && SAFE_ACTION_NAME.test(job[2])) return ACTION_POLICY.SAFE_REPEATABLE;
+    if (actionId === "leader:select") return ACTION_POLICY.SAFE_REPEATABLE;
     return ACTION_POLICY.FORBIDDEN;
   };
 
@@ -297,6 +304,12 @@
     try {
       if (irreversible) result.before = checkpointedBefore;
       else if (typeof snapshot === "function") result.before = snapshot();
+      // Once an irreversible native invocation begins, its real-time suppression
+      // window is consumed even when the call throws or the postcondition cannot
+      // be verified. At that point game state may already have changed, so an
+      // immediate retry is unsafe. Every policy/arm/capability/checkpoint guard
+      // above still returns before this timestamp and therefore consumes nothing.
+      if (irreversible) lastIrreversibleActionAt = now;
       invoke();
       if (typeof snapshot === "function") result.after = snapshot();
       if (typeof verify === "function" && !verify(result.before, result.after)) {
@@ -307,7 +320,6 @@
       result.reason = `action invocation failed: ${error && error.message ? error.message : String(error)}`;
       return result;
     }
-    if (irreversible) lastIrreversibleActionAt = now;
     result.ok = true;
     result.reason = "executed";
     return result;
@@ -1483,9 +1495,23 @@
       }
       const faith = getRes(resources, "faith");
       if (faith && faith.maxValue > 0 && faith.value / faith.maxValue >= RELIGION_PRAISE_TRIGGER) {
-        religion.praise();
-        religionPlanText = "Religion: praised the sun (faith → worship)";
-        pushLog("☀ praised the sun");
+        const result = executeSemanticAction({
+          id: "praise",
+          policy: ACTION_POLICY.SAFE_REPEATABLE,
+          snapshot: () => ({
+            faith: resValueOf(resourceMap(), "faith"),
+            worship: Number(religion.faith) || 0,
+            epiphany: Number(religion.faithRatio) || 0,
+          }),
+          invoke: () => religion.praise(),
+          verify: (before, after) => after.faith < before.faith || after.worship > before.worship || after.epiphany > before.epiphany,
+        });
+        if (result.ok) {
+          religionPlanText = "Religion: praised the sun (faith → worship)";
+          pushLog("☀ praised the sun");
+        } else {
+          religionPlanText = `Religion: praise refused · ${result.reason}`;
+        }
       } else {
         religionPlanText = "Religion: praise waits near cap; no faith upgrade pending";
       }
@@ -1502,8 +1528,14 @@
       const calendar = window.gamePage && window.gamePage.calendar;
       if (!calendar || typeof calendar.observeHandler !== "function") return;
       if ((calendar.observeRemainingTime || 0) > 0) {
-        calendar.observeHandler();
-        pushLog("🔭 observed an astronomical event (science + starcharts)");
+        const result = executeSemanticAction({
+          id: "observeStars",
+          policy: ACTION_POLICY.SAFE_REPEATABLE,
+          snapshot: () => ({ remaining: Number(calendar.observeRemainingTime) || 0, resources: resourceSnapshot() }),
+          invoke: () => calendar.observeHandler(),
+          verify: (before, after) => after.remaining < before.remaining || resourceDeltasBetween(before.resources, after.resources).length > 0,
+        });
+        if (result.ok) pushLog("🔭 observed an astronomical event (science + starcharts)");
       }
     } catch (error) {
       /* ignore */
@@ -1594,24 +1626,35 @@
 
   const buyFestivalCandidate = () => {
     const game = window.gamePage;
-    const beforeDays = (game.calendar && game.calendar.festivalDays) || 0;
-    try {
-      const button = game.villageTab && game.villageTab.festivalBtn;
-      const model = button && button.model;
-      const controller = (button && button.controller) || (model && model.controller);
-      if (controller && model && typeof controller.buyItem === "function") {
-        const result = controller.buyItem(model, { boughtByQueue: true });
-        if ((result && result.itemBought) || ((game.calendar.festivalDays || 0) > beforeDays)) return true;
-      }
-    } catch (error) {
-      /* use the native manager fallback */
-    }
+    if (!game) return false;
     const prices = festivalPrices();
-    if (!canPayPrices(prices) || !game.village || typeof game.village.holdFestival !== "function") return false;
-    game.village.holdFestival(1);
-    if (game.resPool && typeof game.resPool.payPrices === "function") game.resPool.payPrices(prices);
-    else for (const cost of prices) game.resPool.addResEvent(cost.name, -cost.val);
-    return (game.calendar.festivalDays || 0) > beforeDays;
+    const button = game.villageTab && game.villageTab.festivalBtn;
+    const model = button && button.model;
+    const controller = (button && button.controller) || (model && model.controller);
+    const controllerAvailable = !!(controller && model && typeof controller.buyItem === "function");
+    const fallbackAvailable = !!(canPayPrices(prices) && game.village && typeof game.village.holdFestival === "function");
+    if (!controllerAvailable && !fallbackAvailable) return false;
+    const result = executeSemanticAction({
+      id: "holdFestival",
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot: () => ({ days: Number(game.calendar && game.calendar.festivalDays) || 0, resources: resourceSnapshot() }),
+      invoke: () => {
+        if (controllerAvailable) {
+          try {
+            controller.buyItem(model, { boughtByQueue: true });
+            if ((game.calendar.festivalDays || 0) > 0) return;
+          } catch (error) {
+            /* use the native manager fallback */
+          }
+        }
+        if (!fallbackAvailable) return;
+        game.village.holdFestival(1);
+        if (game.resPool && typeof game.resPool.payPrices === "function") game.resPool.payPrices(prices);
+        else for (const cost of prices) game.resPool.addResEvent(cost.name, -cost.val);
+      },
+      verify: (before, after) => after.days > before.days,
+    });
+    return result.ok;
   };
 
   const maybeHoldFestival = (resources) => {
@@ -1999,23 +2042,30 @@
 
   const craftUnits = (name, units) => {
     if (!isFinite(units) || units <= 0) return false;
-    const before = (getRes(resourceMap(), name) || { value: 0 }).value || 0;
     const craft = craftByName(name);
     const attempts = [
       () => (typeof window.gamePage.craft === "function" ? window.gamePage.craft(name, units) : false),
       () => (window.gamePage.workshop && typeof window.gamePage.workshop.craft === "function" ? window.gamePage.workshop.craft(craft || name, units) : false),
       () => (window.gamePage.workshop && typeof window.gamePage.workshop.craft === "function" ? window.gamePage.workshop.craft(name, units, true) : false),
     ];
-    for (const attempt of attempts) {
-      try {
-        const result = attempt();
-        const after = (getRes(resourceMap(), name) || { value: 0 }).value || 0;
-        if (result !== false && after > before) return true;
-      } catch (error) {
-        /* try the next API shape */
-      }
-    }
-    return false;
+    const result = executeSemanticAction({
+      id: `craft:${name}`,
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot: () => resValueOf(resourceMap(), name),
+      invoke: () => {
+        const before = resValueOf(resourceMap(), name);
+        for (const attempt of attempts) {
+          try {
+            attempt();
+            if (resValueOf(resourceMap(), name) > before) return;
+          } catch (error) {
+            /* try the next API shape */
+          }
+        }
+      },
+      verify: (before, after) => after > before,
+    });
+    return result.ok;
   };
 
   // Liquid floor crafting must respect: food/catpower reserves plus a luxury
@@ -2869,8 +2919,11 @@
     let cleanWatts = 0;
     let totalWatts = 0;
     const contributors = [];
-    for (const meta of buildingMetas()) {
-      if (!meta) continue;
+    const cleaners = [];
+    const seenPollutionMetas = new Set();
+    for (const meta of [...buildingMetas(), ...spaceMetas()]) {
+      if (!meta || !meta.name || seenPollutionMetas.has(meta.name)) continue;
+      seenPollutionMetas.add(meta.name);
       const count = Math.max(0, Number(meta.on != null ? meta.on : meta.val) || 0);
       const live = liveMetaView(meta) || meta;
       const watts = Math.max(0, Number(live.effects && live.effects.energyProduction) || 0) * count;
@@ -2878,8 +2931,10 @@
       totalWatts += watts;
       if (pollution <= 0) cleanWatts += watts;
       if (pollution > 0) contributors.push({ name: meta.name, label: labelOf(meta), perTick: pollution });
+      if (pollution < 0) cleaners.push({ name: meta.name, label: labelOf(meta), perTick: pollution });
     }
     contributors.sort((a, b) => b.perTick - a.perTick);
+    cleaners.sort((a, b) => a.perTick - b.perTick);
     return {
       current,
       perTick,
@@ -2891,6 +2946,7 @@
       effects,
       nextEffects,
       contributors,
+      cleaners,
     };
   };
 
@@ -4118,9 +4174,17 @@
     if (!meta || !isFinite(count)) return false;
     const next = Math.max(0, Math.min(meta.val || 0, Math.floor(count)));
     if ((meta.on || 0) === next) return false;
-    meta.on = next;
-    refreshAfterProcessorChange();
-    return true;
+    const result = executeSemanticAction({
+      id: `processor:${meta.name}`,
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot: () => Math.max(0, Number(meta.on) || 0),
+      invoke: () => {
+        meta.on = next;
+        refreshAfterProcessorChange();
+      },
+      verify: (_before, after) => after === next,
+    });
+    return result.ok;
   };
 
   const missingDirectCosts = (target, resources) => {
@@ -6798,22 +6862,34 @@
   const executeUnicornSacrifice = (chunks) => {
     const btn = sacrificeUnicornsButton();
     if (!btn || !btn.controller || !btn.model) return { gained: 0, reason: "sacrifice button unavailable (open the Religion tab once)" };
-    const before = resValueOf(resourceMap(), "tears");
     const attempts = [
       () => typeof btn.controller._transform === "function" && btn.controller._transform(btn.model, chunks),
       () => typeof btn.controller.transform === "function" && btn.controller.transform(btn.model, chunks),
       () => typeof btn.controller.sacrifice === "function" && btn.controller.sacrifice(btn.model, chunks),
     ];
-    for (const attempt of attempts) {
-      try {
-        attempt();
-      } catch (error) {
-        /* try the next API shape */
-      }
-      const gained = resValueOf(resourceMap(), "tears") - before;
-      if (gained > 0) return { gained, reason: "" };
-    }
-    return { gained: 0, reason: "sacrifice call had no effect" };
+    const result = executeSemanticAction({
+      id: "sacrificeUnicorns",
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot: () => ({
+        unicorns: resValueOf(resourceMap(), "unicorns"),
+        tears: resValueOf(resourceMap(), "tears"),
+      }),
+      invoke: () => {
+        const before = resValueOf(resourceMap(), "tears");
+        for (const attempt of attempts) {
+          try {
+            attempt();
+          } catch (error) {
+            /* try the next API shape */
+          }
+          if (resValueOf(resourceMap(), "tears") > before) return;
+        }
+      },
+      verify: (before, after) => after.tears > before.tears && after.unicorns < before.unicorns,
+    });
+    return result.ok
+      ? { gained: result.after.tears - result.before.tears, reason: "" }
+      : { gained: 0, reason: result.reason === "postcondition failed" ? "sacrifice call had no effect" : result.reason };
   };
 
   // Tick subsystem: balance the unicorn loop and perform the bounded sacrifice.
@@ -7890,6 +7966,17 @@
       /* festival pressure is advisory only */
     }
 
+    // When the selected target's missing output is owned by an actionable trade
+    // route, job scoring must fund that route's inputs rather than resurrecting
+    // the traded output as generic lookahead work (there is no uranium miner).
+    if (target && !target.affordable) {
+      for (const cost of pricesFor(target.kind, target.meta)) {
+        if (!cost || !cost.name || resValueOf(resources, cost.name) >= cost.val) continue;
+        const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
+        if (route.reachable && actionableTradeRouteFor(route) && !resourceHasDirectJobPath(cost.name)) delete needs[cost.name];
+      }
+    }
+
     if (!Object.values(needs).some((v) => v > 0)) {
       scoreNeed(needs, "wood", resRatio(resources, "wood") < 0.95 ? 2 : 0);
       scoreNeed(needs, "minerals", resRatio(resources, "minerals") < 0.95 ? 2 : 0);
@@ -7911,19 +7998,33 @@
   };
 
   const unassignJobByName = (village, name, amt) => {
-    if (amt <= 0) return;
-    if (village.sim && typeof village.sim.removeJob === "function") {
-      village.sim.removeJob(name, amt);
-      return;
-    }
-    const kittens = (village.sim && village.sim.kittens) || [];
-    for (const kitten of kittens) {
-      if (amt <= 0) break;
-      if (kitten.job === name && typeof village.unassignJob === "function") {
-        village.unassignJob(kitten);
-        amt -= 1;
-      }
-    }
+    if (amt <= 0) return false;
+    const snapshot = () => ({
+      count: Math.max(0, Number((jobByName(name) || {}).value) || 0),
+      free: typeof village.getFreeKittens === "function" ? Math.max(0, Number(village.getFreeKittens()) || 0) : 0,
+    });
+    const result = executeSemanticAction({
+      id: `job:unassign:${name}`,
+      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      snapshot,
+      invoke: () => {
+        if (village.sim && typeof village.sim.removeJob === "function") {
+          village.sim.removeJob(name, amt);
+          return;
+        }
+        const kittens = (village.sim && village.sim.kittens) || [];
+        let remaining = amt;
+        for (const kitten of kittens) {
+          if (remaining <= 0) break;
+          if (kitten.job === name && typeof village.unassignJob === "function") {
+            village.unassignJob(kitten);
+            remaining -= 1;
+          }
+        }
+      },
+      verify: (before, after) => after.count < before.count || after.free > before.free,
+    });
+    return result.ok;
   };
 
   const desiredJobCounts = (goalKey, resources) => {
@@ -8224,8 +8325,19 @@
         const fresh = jobByName(job.name);
         const need = (desired[job.name] || 0) - ((fresh && fresh.value) || 0);
         if (need > 0) {
-          village.assignJob(fresh || job, need);
-          moved += need;
+          const assignTarget = fresh || job;
+          const snapshot = () => ({
+            count: Math.max(0, Number((jobByName(job.name) || assignTarget).value) || 0),
+            free: Math.max(0, Number(village.getFreeKittens()) || 0),
+          });
+          const result = executeSemanticAction({
+            id: `job:assign:${job.name}`,
+            policy: ACTION_POLICY.SAFE_REPEATABLE,
+            snapshot,
+            invoke: () => village.assignJob(assignTarget, need),
+            verify: (before, after) => after.count > before.count || after.free < before.free,
+          });
+          if (result.ok) moved += Math.max(1, result.after.count - result.before.count);
         }
       }
       refreshJobManagementUI(village);
@@ -8283,7 +8395,16 @@
         threshold = Math.max(threshold, Math.min(cp.maxValue * 0.95, exploreCost + huntCost));
       }
       if (cp.value >= threshold) {
-        const measured = withActionResourceDeltas(() => village.huntAll(), new Set(["manpower", "furs", "ivory"]));
+        const action = executeSemanticAction({
+          id: "huntAll",
+          policy: ACTION_POLICY.SAFE_REPEATABLE,
+          snapshot: resourceSnapshot,
+          invoke: () => village.huntAll(),
+          verify: (before, after) => resourceDeltasBetween(before, after, new Set(["manpower", "furs", "ivory"])).length > 0,
+        });
+        if (!action.ok) return;
+        const measured = formatActionDeltas(action.before, action.after, new Set(["manpower", "furs", "ivory"]));
+        markTelemetryDiscontinuity(measured.deltas);
         if (Date.now() - lastHuntLog > 30000) {
           const chainLabel = sprint && sprint.candidate ? labelOf(sprint.candidate.meta) : "research";
           const reason = chainHuntNeed ? `furs for ${chainLabel} chain` : economyNeed > 0.5 ? "luxuries/mood" : "catpower near cap";
@@ -9156,6 +9277,18 @@
       out.critical.add(name);
       (out.sources[name] || (out.sources[name] = [])).push("rare capital floor");
     }
+    // Keep ordinary/manual/survival floors separate from acquisition-route
+    // ownership. A selected trade route may spend only the inputs it owns;
+    // every other lane continues to see the full merged reservation below.
+    out.baseReserved = { ...out.reserved };
+    const routeLedger = acquisitionRouteReservationLedger(target, resources);
+    out.routeReserved = { ...routeLedger.reserved };
+    out.routeOwners = routeLedger.owners;
+    for (const [name, amount] of Object.entries(routeLedger.reserved)) {
+      out.reserved[name] = Math.max(out.reserved[name] || 0, amount);
+      out.critical.add(name);
+      (out.sources[name] || (out.sources[name] = [])).push(...(routeLedger.sources[name] || ["active acquisition route"]));
+    }
     return out;
   };
 
@@ -9774,13 +9907,37 @@
     return isFinite(count) ? Math.max(0, count) : 0;
   };
 
+  const reservationFloorForSpender = (ledger, name, spenderId = null) => {
+    if (!ledger || !name || !ledger.routeReserved || !ledger.baseReserved) {
+      return reservationFloorFor((ledger && ledger.reserved) || ledger || {}, name);
+    }
+    const alias = name === "catpower" ? "manpower" : name;
+    const base = reservationFloorFor(ledger.baseReserved, alias);
+    const routeTotal = reservationFloorFor(ledger.routeReserved, alias);
+    const owned = spenderId && ledger.routeOwners && ledger.routeOwners[spenderId]
+      ? reservationFloorFor(ledger.routeOwners[spenderId], alias)
+      : 0;
+    return Math.max(base, Math.max(0, routeTotal - owned));
+  };
+
+  const affordableTradeCountForSpender = (prices, ledger, resources, spenderId) => {
+    let count = Infinity;
+    for (const price of prices) {
+      if (!price || !price.name || !isFinite(price.val) || price.val <= 0) continue;
+      const stock = resourceValue(resources, price.name);
+      const hold = reservationFloorForSpender(ledger, price.name, spenderId);
+      count = Math.min(count, Math.floor(Math.max(0, stock - hold) / price.val));
+    }
+    return isFinite(count) ? Math.max(0, count) : 0;
+  };
+
   const boundedTradeBatch = (route, ledger, resources) => {
     const step = route && route.nextStep;
     const race = step && step.kind === "trade" ? step.race : null;
     if (!route || !route.reachable || !race) return 0;
     const liveResources = resources || resourceMap();
     const prices = tradePricesForRace(race);
-    const affordable = affordableTradeCount(prices, (ledger && ledger.reserved) || {}, liveResources);
+    const affordable = affordableTradeCountForSpender(prices, ledger || { reserved: {} }, liveResources, acquisitionRouteSpenderId(route));
     if (affordable <= 0) return 0;
 
     const outputName = step.resource || route.resource;
@@ -9791,13 +9948,14 @@
     const expected = Math.max(0, Number(step.expectedYield) || Number(route.expectedYield) ||
       (step.sell ? expectedTradeYield(race, step.sell) : 0));
     if (!(expected > 0)) return 0;
+    const maximum = Math.max(expected, step.sell ? maximumTradeYield(race, step.sell) : expected);
 
     const deficitBound = Math.max(1, Math.ceil(deficit / expected));
     const headroom = output && output.maxValue > 0
       ? Math.max(0, output.maxValue - current)
       : Number.POSITIVE_INFINITY;
     if (headroom <= 0) return 0;
-    const headroomBound = isFinite(headroom) ? Math.max(0, Math.floor(headroom / expected)) : Number.POSITIVE_INFINITY;
+    const headroomBound = isFinite(headroom) ? Math.max(0, Math.floor(headroom / maximum)) : Number.POSITIVE_INFINITY;
     if (headroomBound <= 0) return 0;
     const routeBound = step.trades > 0 ? Math.ceil(step.trades) : Number.POSITIVE_INFINITY;
     return Math.max(0, Math.min(affordable, deficitBound, headroomBound, routeBound, MAX_TRADE_BATCH));
@@ -9879,6 +10037,13 @@
     const hold = reservationFloorFor(reserved, price.name);
     if (hold <= 0) return true;
     const stock = ((getRes(resources, price.name) || {}).value) || 0;
+    return stock - price.val >= hold;
+  });
+
+  const pricesRespectSpenderReservations = (prices, ledger, resources, spenderId) => prices.every((price) => {
+    if (!price || !price.name || !isFinite(price.val) || price.val <= 0) return true;
+    const hold = reservationFloorForSpender(ledger, price.name, spenderId);
+    const stock = resourceValue(resources, price.name);
     return stock - price.val >= hold;
   });
 
@@ -10077,6 +10242,28 @@
     return Math.max(0, amount * Math.max(0, Math.min(1, chance || 0)) * seasonMult * standingMult * ratioMult * energyMult);
   };
 
+  const maximumTradeYield = (race, sell) => {
+    if (!validRaceSell(race, sell)) return 0;
+    const amount = isFinite(sell.value) ? sell.value : (isFinite(sell.val) ? sell.val : 0);
+    const diplomacy = window.gamePage && window.gamePage.diplomacy;
+    let chance = isFinite(sell.chance) ? sell.chance : 1;
+    if (diplomacy && typeof diplomacy.getResourceTradeChance === "function") {
+      try {
+        const live = diplomacy.getResourceTradeChance(sell, race);
+        if (isFinite(live)) chance = live;
+      } catch (error) {
+        /* use metadata chance only to determine whether a payout is possible */
+      }
+    }
+    if (!(chance > 0)) return 0;
+    const widthMultiplier = 1 + Math.max(0, Math.abs(Number(sell.width) || 0));
+    const seasonMult = tradeSeasonMultiplier(sell);
+    const standingMult = tradeStandingMultiplier(race, diplomacy);
+    const ratioMult = tradeRatioMultiplier(race, diplomacy);
+    const energyMult = Math.max(0, 1 + (Number(race.energy) || 0) * 0.02);
+    return Math.max(0, amount * widthMultiplier * seasonMult * standingMult * ratioMult * energyMult);
+  };
+
   const tradeSellExpected = (sell, race = null) => race ? expectedTradeYield(race, sell) : 0;
 
   const acquisitionAmountBucket = (amount) => Math.max(0, Math.ceil(Math.log2(Math.max(0, amount) + 1)));
@@ -10120,6 +10307,25 @@
     producer: 8,
     storage: 9,
   })[route.kind] ?? 99;
+
+  const acquisitionRouteProtectedCapital = (route, seen = new Set()) => {
+    if (!route || seen.has(route)) return 0;
+    seen.add(route);
+    let burden = 0;
+    for (const input of route.inputs || []) {
+      if (input && RARE_CAPITAL_RESOURCES.has(input.resource)) burden += Math.max(0, Number(input.amount) || 0);
+      burden += acquisitionRouteProtectedCapital(input, seen);
+    }
+    return burden;
+  };
+
+  // Time-to-action is the route objective. Protected capital and route kind are
+  // deliberately tie-breakers only, so a familiar/passive route cannot mask a
+  // materially faster safe trade or production bridge.
+  const compareAcquisitionRoutes = (a, b) =>
+    a.eta - b.eta ||
+    acquisitionRouteProtectedCapital(a) - acquisitionRouteProtectedCapital(b) ||
+    acquisitionRoutePriority(a) - acquisitionRoutePriority(b);
 
   const acquisitionBridgeCandidates = () => [
     ...buildingMetas().map((meta) => ({ kind: "build", meta })),
@@ -10342,13 +10548,19 @@
     const rootKinds = seen.size === 0 && Array.isArray(context.rootRouteKinds)
       ? new Set(context.rootRouteKinds)
       : null;
-    const eligibleRoutes = rootKinds ? routes.filter((route) => rootKinds.has(route.kind)) : routes;
+    let eligibleRoutes = rootKinds ? routes.filter((route) => rootKinds.has(route.kind)) : routes;
+    // A native craft recipe is the owned, deterministic acquisition path for
+    // craftable intermediates. Keep diplomacy from silently replacing the
+    // protected craft closure (and its hunt/job prerequisites) with side trades.
+    if (!rootKinds && eligibleRoutes.some((route) => route.kind === "craft")) {
+      eligibleRoutes = eligibleRoutes.filter((route) => route.kind !== "trade");
+    }
     if (!eligibleRoutes.length) {
       return blockedAcquisitionPath(resources, name, requested, [
         `no ${[...rootKinds].join("/")} acquisition path for ${resTitle(resources, name)}`,
       ]);
     }
-    return eligibleRoutes.sort((a, b) => acquisitionRoutePriority(a) - acquisitionRoutePriority(b) || a.eta - b.eta)[0];
+    return eligibleRoutes.sort(compareAcquisitionRoutes)[0];
   };
 
   const alicornSacrificeAdapter = () => {
@@ -10438,10 +10650,10 @@
       transcend.nextPrice = nextPrice;
       transcend.retainedFloor = retainedFloor;
       transcend.remaining = remaining;
-      transcend.funded = transcend.available && epiphany > nextPrice && remaining >= retainedFloor;
+      transcend.funded = transcend.available && epiphany >= nextPrice && remaining >= retainedFloor;
       transcend.ready = transcend.funded;
       transcend.reason = !transcend.available ? "native next-tier price unavailable"
-        : epiphany <= nextPrice ? `need ${fmt(nextPrice - epiphany)} epiphany for next tier`
+        : epiphany < nextPrice ? `need ${fmt(nextPrice - epiphany)} epiphany for next tier`
         : remaining < retainedFloor ? `retained upgrade floor ${fmt(retainedFloor)} epiphany`
         : `ready for tier ${tier + 1}; retains ${fmt(remaining)} epiphany`;
     }
@@ -10653,6 +10865,43 @@
     return pricesFor(target.kind, target.meta)
       .filter((cost) => cost && cost.name && isFinite(cost.val) && cost.val > resValueOf(resources, cost.name))
       .map((cost) => ({ cost, route: acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true }) }));
+  };
+
+  const acquisitionRouteSpenderId = (route) => {
+    const step = route && route.nextStep;
+    if (!step || step.kind !== "trade" || !step.race) return null;
+    return `trade:${step.race.name}:${step.resource || route.resource}`;
+  };
+
+  const acquisitionRouteReservationLedger = (target, resources) => {
+    const out = { reserved: {}, owners: {}, sources: {} };
+    if (!target || target.affordable) return out;
+    const selections = acquisitionRoutesForTarget(target, resources)
+      .map(({ route }) => ({ root: route, action: actionableTradeRouteFor(route) }))
+      .filter(({ action }) => !!action)
+      .sort((a, b) => b.action.eta - a.action.eta);
+    const selected = selections[0];
+    if (!selected) return out;
+    const seen = new Set();
+    const visit = (route) => {
+      if (!route || !route.reachable || seen.has(route)) return;
+      seen.add(route);
+      const ownerId = acquisitionRouteSpenderId(route);
+      if (ownerId) {
+        const owner = out.owners[ownerId] || (out.owners[ownerId] = {});
+        for (const input of route.inputs || []) {
+          if (!input || !input.resource || !(Number(input.amount) > 0)) continue;
+          const name = input.resource === "catpower" ? "manpower" : input.resource;
+          const amount = Math.max(0, Number(input.amount) || 0);
+          owner[name] = (owner[name] || 0) + amount;
+          out.reserved[name] = (out.reserved[name] || 0) + amount;
+          (out.sources[name] || (out.sources[name] = [])).push(`active acquisition route ${ownerId}`);
+        }
+      }
+      for (const input of route.inputs || []) visit(input);
+    };
+    visit(selected.root);
+    return out;
   };
 
   // A selected acquisition root can be a craft, producer, or storage bridge
@@ -10900,7 +11149,7 @@
     const race = route.nextStep.race;
     const prices = tradePricesForRace(race);
     const batch = boundedTradeBatch(route, liveLedger, liveResources);
-    if (!prices.length || batch <= 0 || !pricesRespectReservations(prices, liveLedger.reserved || {}, liveResources)) return false;
+    if (!prices.length || batch <= 0 || !pricesRespectSpenderReservations(prices, liveLedger, liveResources, acquisitionRouteSpenderId(route))) return false;
     const diplomacy = window.gamePage && window.gamePage.diplomacy;
     const nativeBatch = diplomacy && typeof diplomacy.tradeMultiple === "function" ? batch : 1;
     const measured = withActionResourceDeltas(() => tradeWithRace(race, nativeBatch), tradeDeltaNamesForRace(race, prices));
@@ -10918,10 +11167,10 @@
     for (const sell of (race && race.sells) || []) {
       if (!validRaceSell(race, sell)) continue;
       const output = getRes(resources, sell.name);
-      const expected = expectedTradeYield(race, sell);
-      if (!output || !(output.maxValue > 0) || !(expected > 0)) continue;
+      const maximum = maximumTradeYield(race, sell);
+      if (!output || !(output.maxValue > 0) || !(maximum > 0)) continue;
       const headroom = Math.max(0, output.maxValue - output.value);
-      batch = Math.min(batch, headroom > 0 ? Math.max(0, Math.floor(headroom / expected)) : 0);
+      batch = Math.min(batch, headroom > 0 ? Math.max(0, Math.floor(headroom / maximum)) : 0);
     }
     return Math.max(0, batch);
   };
@@ -10957,6 +11206,24 @@
     diplomacyPlanText = `Diplomacy: surplus trade with ${best.title || best.name || "partner"}`;
     pushLog(`🤝 ${best.title || best.name || "partner"} trade: ${measured.suffix}; reason surplus catpower near cap`);
     return true;
+  };
+
+  const acquisitionRouteFundingBlocker = (route, ledger, resources) => {
+    if (!route || !route.nextStep || !route.nextStep.race) return "selected route unavailable";
+    const spenderId = acquisitionRouteSpenderId(route);
+    for (const price of tradePricesForRace(route.nextStep.race)) {
+      if (!price || !price.name || !(price.val > 0)) continue;
+      const floor = reservationFloorForSpender(ledger, price.name, spenderId);
+      const spendable = Math.max(0, resourceValue(resources, price.name) - floor);
+      if (spendable < price.val) {
+        return `funding ${fmt(price.val - spendable)} ${resTitle(resources, price.name)} for ${route.nextStep.race.title || route.nextStep.race.name}`;
+      }
+    }
+    const output = getRes(resources, route.resource);
+    if (output && output.maxValue > 0 && output.value >= output.maxValue) {
+      return `${resTitle(resources, route.resource)} storage is full`;
+    }
+    return `waiting for a safe ${route.nextStep.race.title || route.nextStep.race.name} batch`;
   };
 
   const maybeBuildEmbassy = (resources, reserved, route = null) => {
@@ -11043,8 +11310,22 @@
         return;
       }
       const route = activeAcquisitionRoute(target, resources);
-      if (maybeTradeForTargetChain(resources, ledger, goalKey, target) ||
-          maybeTradeSurplus(resources, ledger, goalKey)) {
+      if (maybeTradeForTargetChain(resources, ledger, goalKey, target)) {
+        lastDiplomacyAction = gameClockNow();
+        return;
+      }
+      // A live selected acquisition route owns this diplomacy cycle even while
+      // it is not yet affordable. Falling through to a generic overflow trade
+      // can spend the very funding it needs and indefinitely postpone it.
+      if (route) {
+        const embassyResult = maybeBuildEmbassy(resources, reserved, route);
+        if (embassyResult === true) lastDiplomacyAction = gameClockNow();
+        if (embassyResult !== true) {
+          diplomacyPlanText = `Targeted route blocked: ${acquisitionRouteFundingBlocker(route, ledger, resources)}; preserving route inputs`;
+        }
+        return;
+      }
+      if (maybeTradeSurplus(resources, ledger, goalKey)) {
         lastDiplomacyAction = gameClockNow();
         return;
       }
@@ -11285,7 +11566,25 @@
       const pollution = pollutionStatus();
       const contributors = (pollution.contributors || []).slice(0, 3)
         .map((item) => `${item.label} +${fmt(item.perTick)}/tick`).join(", ") || "none";
+      const cleaners = (pollution.cleaners || []).slice(0, 3)
+        .map((item) => `${item.label} ${fmt(item.perTick)}/tick`).join(", ") || "none measured";
+      const currentPollutionPenalty = pollutionUtilityLoss(pollution.effects);
+      const nextPollutionPenalty = pollutionUtilityLoss(pollution.nextEffects);
+      let pollutionRecovery = "not needed — pollution is stable, falling, or below a measured harmful transition";
+      if (pollutionPenalty(pollution) > 0) {
+        if (lastStrategicDecision && lastStrategicDecision.layer === STRATEGIC_LAYERS.pollution) {
+          pollutionRecovery = `active — ${lastStrategicDecision.reason || "environmental recovery owns the plan"}`;
+        } else {
+          const recoveryTarget = bestPollutionRecoveryTarget(gatherCandidates(resources, goal), resources, pollution);
+          pollutionRecovery = recoveryTarget
+            ? `waiting — ${labelOf(recoveryTarget.meta)} is reachable; ${(lastStrategicDecision && lastStrategicDecision.layer) || "the current safety layer"} owns this cycle`
+            : "waiting — no reachable cleaner candidate; nonessential polluters are being throttled";
+        }
+      }
       push(`Pollution: level ${pollution.level} · current ${fmt(pollution.current)} · delta ${fmt(pollution.perTick)}/tick · equilibrium ${fmt(pollution.equilibrium)} · threshold ETA ${formatEta(pollution.nextEta)} · clean energy ${Math.round(pollution.cleanEnergyRatio * 100)}% · contributors ${contributors}`);
+      push(`  cleaners: ${cleaners}`);
+      push(`  penalty: current ${fmt(currentPollutionPenalty)} utility/s · next ${fmt(nextPollutionPenalty)} utility/s`);
+      push(`  recovery: ${pollutionRecovery}`);
       push("");
       push("— PROCESSING —");
       push(processingPlanText);
@@ -11875,7 +12174,20 @@
         maybeLogLeaderDecision(`👑 leader skipped: best ${opportunity.best.kitten.name || "kitten"}/${opportunity.best.trait} gain ${fmt(opportunity.gain)} too small for ${reason}`, 90000);
         return false;
       }
-      village.makeLeader(opportunity.best.kitten);
+      const targetKitten = opportunity.best.kitten;
+      const kittens = (village.sim && village.sim.kittens) || [];
+      const targetIndex = kittens.indexOf(targetKitten);
+      const result = executeSemanticAction({
+        id: "leader:select",
+        policy: ACTION_POLICY.SAFE_REPEATABLE,
+        snapshot: () => ({ leader: village.leader || null, leaderIndex: kittens.indexOf(village.leader) }),
+        invoke: () => village.makeLeader(targetKitten),
+        verify: (_before, after) => after.leader === targetKitten || (targetIndex >= 0 && after.leaderIndex === targetIndex),
+      });
+      if (!result.ok) {
+        leaderPlanText = `Leader: swap refused for ${reason} · ${result.reason}`;
+        return false;
+      }
       if (typeof village.updateResourceProduction === "function") village.updateResourceProduction();
       leaderPlanText = `Leader: ${opportunity.best.kitten.trait.title || opportunity.best.trait} (${opportunity.best.kitten.name || "kitten"}) for ${reason}`;
       pushLog(`👑 leader set: ${opportunity.best.kitten.name || "kitten"}/${opportunity.best.trait}; ${reason}; score +${fmt(opportunity.gain)}`);
@@ -11910,19 +12222,24 @@
         return false;
       }
       if (!overflowGold && leaderGain < PROMOTION_LEADER_GAIN_THRESHOLD) return false;
-      const before = gold.value;
-      try {
-        if (typeof village.promoteKittens === "function") {
-          village.promoteKittens();
-        } else if (opportunity && opportunity.best && village.sim && typeof village.sim.promote === "function") {
-          village.sim.promote(opportunity.best.kitten, (opportunity.best.kitten.rank || 0) + 1);
-        } else if (village.leader && village.sim && typeof village.sim.promote === "function") {
-          village.sim.promote(village.leader, (village.leader.rank || 0) + 1);
-        }
-      } catch (error) {
-        /* promotion API mismatch — skip */
-      }
-      if (gold.value < before - 1) {
+      const rankTotal = () => ((village.sim && village.sim.kittens) || [])
+        .reduce((sum, kitten) => sum + Math.max(0, Number(kitten && kitten.rank) || 0), 0);
+      const result = executeSemanticAction({
+        id: "promoteKittens",
+        policy: ACTION_POLICY.SAFE_REPEATABLE,
+        snapshot: () => ({ gold: Number(gold.value) || 0, ranks: rankTotal() }),
+        invoke: () => {
+          if (typeof village.promoteKittens === "function") {
+            village.promoteKittens();
+          } else if (opportunity && opportunity.best && village.sim && typeof village.sim.promote === "function") {
+            village.sim.promote(opportunity.best.kitten, (opportunity.best.kitten.rank || 0) + 1);
+          } else if (village.leader && village.sim && typeof village.sim.promote === "function") {
+            village.sim.promote(village.leader, (village.leader.rank || 0) + 1);
+          }
+        },
+        verify: (before, after) => after.gold < before.gold - 1 || after.ranks > before.ranks,
+      });
+      if (result.ok) {
         nextPromoteAttempt = now + (overflowGold ? 30000 : 180000);
         const why = overflowGold ? "gold was capping" : `leader gain ${fmt(leaderGain)} for ${opportunity ? opportunity.targetLabel : "active plan"}`;
         pushLog(`🎖 promoted kittens (${why})`);
@@ -12152,6 +12469,7 @@
   // The helper drives the game itself — there is no external engine. "Running"
   // just means our own loop is ticking; the heartbeat is the last tick time.
   let lastTickAt = 0;
+  let renderPasses = 0;
   const helperRunning = () => lastTickAt > 0 && Date.now() - lastTickAt < 15000;
 
   const renderOffPanel = () => {
@@ -12201,7 +12519,7 @@
     // trades, hunts, job moves, leader changes, festivals, praise, policies
     // or queue execution. The planner phase owns this one global gate.
     if (!autopilotOn) {
-      renderOffPanel();
+      lastTickAt = Date.now();
       return;
     }
     let processorAllocation = null;
@@ -12265,7 +12583,11 @@
       festivalOpportunity(resources);
       trackActions();
     });
-    runNamedSubsystem("render", () => {
+    lastTickAt = Date.now();
+  };
+
+  const renderAutomationPanel = (resources, goal) => {
+      renderPasses += 1;
       if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
       if (goalEl) {
         const line = getGoalLine(resources, goal);
@@ -12295,8 +12617,6 @@
       renderQueueControl(resources, goal);
       renderRankingControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
-      lastTickAt = Date.now();
-    });
   };
 
   /* ------------------------------ game speed ------------------------------- */
@@ -12311,7 +12631,7 @@
   // speed because every rate it uses is read live (observed resource deltas
   // simply reflect the boosted wall clock, so ETAs remain wall-clock-true).
   const TICK_SPEED_KEY = "kgh.tickSpeed";
-  const TICK_SPEED_OPTIONS = [1, 2, 3, 5, 10, 20, 50];
+  const TICK_SPEED_OPTIONS = [1, 2, 3, 5, 10, 20, 25, 50];
   const TICK_SPEED_BEAT_MS = 200;
   const BOOSTER_CPU_BUDGET_MS = 8;
   const BOOSTER_MAX_CHUNK = 16;
@@ -12332,7 +12652,7 @@
   let boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
   let automationClockState = (() => {
     const wallNow = Date.now();
-    return { wallAt: wallNow, logicalNow: wallNow };
+    return { wallAt: wallNow, logicalNow: wallNow, nativeSample: null, nativeObserved: 0 };
   })();
   const nativeTicksPerSecond = () => {
     try {
@@ -12354,17 +12674,51 @@
       deliveredMultiplier: nativeTps > 0 ? Math.max(1, deliveredTicksPerSecond / nativeTps) : 1,
     };
   };
+  const readNativeTickCount = () => {
+    try {
+      const game = window.gamePage;
+      const candidates = [
+        game && game.timer && game.timer.ticksTotal,
+        game && game.timer && game.timer.totalTicks,
+        game && game.ticksTotal,
+      ];
+      for (const candidate of candidates) {
+        const value = Number(candidate);
+        if (Number.isFinite(value) && value >= 0) return value;
+      }
+    } catch (error) {
+      /* public native clock unavailable */
+    }
+    return null;
+  };
+  const resetAutomationNativeSample = () => {
+    automationClockState.nativeSample = null;
+    automationClockState.nativeObserved = 0;
+    automationClockState.wallAt = Date.now();
+  };
   const integrateAutomationClock = (wallNow = Date.now()) => {
     const elapsed = Math.max(0, wallNow - automationClockState.wallAt);
-    // Native game time advances with wall time. Booster progress is credited
-    // separately, once per game.tick call that actually completes.
-    automationClockState.logicalNow += elapsed;
+    const nativeTick = readNativeTickCount();
+    if (nativeTick !== null) {
+      if (Number.isFinite(automationClockState.nativeSample)) {
+        const completed = Math.max(0, nativeTick - automationClockState.nativeSample);
+        automationClockState.logicalNow += completed * 1000 / nativeTicksPerSecond();
+        automationClockState.nativeObserved += completed;
+      }
+      automationClockState.nativeSample = nativeTick;
+    } else if (!Number.isFinite(automationClockState.nativeSample)) {
+      // Older game builds expose no public counter. Credit only the native 1x
+      // wall cadence; booster calls remain separately measured below.
+      automationClockState.logicalNow += elapsed;
+    }
     automationClockState.wallAt = wallNow;
     const delivery = measuredAutomationDelivery(wallNow);
     return {
       ...delivery,
       wallNow,
       logicalNow: automationClockState.logicalNow,
+      nativeTick,
+      nativeObserved: automationClockState.nativeObserved,
     };
   };
   const automationClockSnapshot = () => integrateAutomationClock();
@@ -12387,21 +12741,36 @@
     const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTps * elapsed / 1000));
     const maxChunk = Math.min(BOOSTER_MAX_CHUNK, due);
     let executed = 0;
+    let boosterFailed = false;
     const game = window.gamePage;
-    if (game && typeof game.tick === "function") {
-      while (executed < maxChunk && Date.now() - started < BOOSTER_CPU_BUDGET_MS) {
-        try {
-          game.tick();
-          executed += 1;
-        } catch (error) {
-          break;
-        }
-      }
+    if (due > 0 && game && typeof game.tick === "function") {
+      executeSemanticAction({
+        id: "boosterTicks",
+        policy: ACTION_POLICY.SAFE_REPEATABLE,
+        snapshot: readNativeTickCount,
+        invoke: () => {
+          while (!boosterFailed && executed < due && Date.now() - started < BOOSTER_CPU_BUDGET_MS) {
+            const chunkEnd = Math.min(due, executed + BOOSTER_MAX_CHUNK);
+            while (executed < chunkEnd && Date.now() - started < BOOSTER_CPU_BUDGET_MS) {
+              try {
+                game.tick();
+                executed += 1;
+              } catch (error) {
+                boosterFailed = true;
+                break;
+              }
+            }
+          }
+        },
+        verify: (before, after) => executed > 0 && (before === null || after === null || after >= before + executed),
+      });
     }
     const dropped = Math.max(0, due - executed);
     boosterTelemetry.executed += executed;
     boosterTelemetry.dropped += dropped;
     boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, budgetMs: BOOSTER_CPU_BUDGET_MS };
+    const nativeAfterBooster = readNativeTickCount();
+    if (nativeAfterBooster !== null) automationClockState.nativeSample = nativeAfterBooster;
     automationClockState.logicalNow += executed * 1000 / nativeTps;
     const delivery = integrateAutomationClock(Date.now());
     refreshAdaptiveScheduler(delivery.deliveredMultiplier);
@@ -12571,6 +12940,13 @@
     timerOwner.cancelIntervals();
     refreshAdaptiveScheduler();
     armOwnedInterval("render", () => runNamedSubsystem("render", () => {
+      if (!isAutopilotOn()) {
+        renderPasses += 1;
+        renderOffPanel();
+        return;
+      }
+      resetTickCache();
+      renderAutomationPanel(resourceMap(), getGoal());
       if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
     }), RENDER_LANE_MS);
     if (tickSpeed > 1) {
@@ -12898,7 +13274,9 @@
     ordinaryCooldownSnapshot,
     automationDelayMs,
     automationClockSnapshot,
+    resetAutomationNativeSample,
     automationSchedulerSnapshot,
+    renderPassCount: () => renderPasses,
     runBoosterBeat,
     boosterTelemetry: () => ({ ...boosterTelemetry, lastBeat: boosterTelemetry.lastBeat && { ...boosterTelemetry.lastBeat } }),
     subsystemFailures: () => JSON.parse(JSON.stringify(subsystemFailures)),
@@ -12993,6 +13371,9 @@
     expectedTradeYield(race, sell) {
       return expectedTradeYield(race, sell);
     },
+    maximumTradeYield(race, sell) {
+      return maximumTradeYield(race, sell);
+    },
     acquisitionPathFor(name, amount, context = {}) {
       resetTickCache();
       return acquisitionPathFor(resourceMap(), name, amount, context);
@@ -13004,6 +13385,10 @@
     boundedTradeBatch(route, ledger) {
       resetTickCache();
       return boundedTradeBatch(route, ledger, resourceMap());
+    },
+    safeOverflowTradeBatch(race, ledger) {
+      resetTickCache();
+      return safeOverflowTradeBatch(race, ledger, resourceMap());
     },
     buildReservationLedger(target) {
       resetTickCache();
@@ -13019,6 +13404,11 @@
       resetTickCache();
       const resources = resourceMap();
       return maybeTradeForTargetChain(resources, buildReservationLedger(target, resources), goalKey, target);
+    },
+    maybeTradeSurplus(target = null, goalKey = getGoal()) {
+      resetTickCache();
+      const resources = resourceMap();
+      return maybeTradeSurplus(resources, buildReservationLedger(target, resources), goalKey);
     },
     classifyTargetFeasibility(candidate) {
       return classifyTargetFeasibility(candidate, resourceMap());

@@ -481,9 +481,15 @@ const criticalStructureIssues = (candidateSource) => {
   const capabilityBinding = constBindingView(candidateSource, "IRREVERSIBLE_EXECUTION_TOKEN");
   if (capabilityBinding.error) issues.push(capabilityBinding.error);
 
-  // All live purchase/trade/explorer/prestige mutation entry points cross the
-  // broker. A declaration or a comment elsewhere cannot satisfy this.
-  for (const owner of ["buyCandidate", "tradeWithRace", "buyEmbassyForRace", "maybeSendExplorers", "managePrestige"]) {
+  // Every live game-state mutation family crosses the broker. A declaration or
+  // a comment elsewhere cannot satisfy this: purchases, conversions, village
+  // management, processor toggles, and accelerated native ticks all fail closed.
+  for (const owner of [
+    "buyCandidate", "tradeWithRace", "buyEmbassyForRace", "maybeSendExplorers", "managePrestige",
+    "managePraise", "maybeObserveStars", "buyFestivalCandidate", "craftUnits", "setProcessorOn",
+    "executeUnicornSacrifice", "unassignJobByName", "balanceJobs", "autoHunt", "maybeSelectLeader",
+    "maybePromoteKittens", "runBoosterBeat",
+  ]) {
     requireCalls(owner, ["executeSemanticAction"]);
   }
   requireCalls("executeSemanticAction", ["actionPolicyFor", "prestigeAutomationArmed"]);
@@ -578,6 +584,18 @@ const disconnectCall = (candidateSource, owner, callee) => rewriteFunction(candi
 
 const structuralSabotageProbes = [
   ["broker call path", "buyCandidate", "executeSemanticAction"],
+  ["praise broker path", "managePraise", "executeSemanticAction"],
+  ["astronomy broker path", "maybeObserveStars", "executeSemanticAction"],
+  ["festival broker path", "buyFestivalCandidate", "executeSemanticAction"],
+  ["craft broker path", "craftUnits", "executeSemanticAction"],
+  ["processor broker path", "setProcessorOn", "executeSemanticAction"],
+  ["unicorn broker path", "executeUnicornSacrifice", "executeSemanticAction"],
+  ["job assignment broker path", "balanceJobs", "executeSemanticAction"],
+  ["job removal broker path", "unassignJobByName", "executeSemanticAction"],
+  ["hunt broker path", "autoHunt", "executeSemanticAction"],
+  ["leader broker path", "maybeSelectLeader", "executeSemanticAction"],
+  ["promotion broker path", "maybePromoteKittens", "executeSemanticAction"],
+  ["booster broker path", "runBoosterBeat", "executeSemanticAction"],
   ["semantic action policy", "actionPolicyFor", "isDeniedKey"],
   ["persistent arm read", "executeSemanticAction", "prestigeAutomationArmed"],
   ["native prestige checkpoint", "managePrestige", "createNativeCheckpoint"],
