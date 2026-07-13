@@ -1634,6 +1634,8 @@
     const controllerAvailable = !!(controller && model && typeof controller.buyItem === "function");
     const fallbackAvailable = !!(canPayPrices(prices) && game.village && typeof game.village.holdFestival === "function");
     if (!controllerAvailable && !fallbackAvailable) return false;
+    const beforeDays = Number(game.calendar && game.calendar.festivalDays) || 0;
+    let controllerAccepted = false;
     const result = executeSemanticAction({
       id: "holdFestival",
       policy: ACTION_POLICY.SAFE_REPEATABLE,
@@ -1641,8 +1643,9 @@
       invoke: () => {
         if (controllerAvailable) {
           try {
-            controller.buyItem(model, { boughtByQueue: true });
-            if ((game.calendar.festivalDays || 0) > 0) return;
+            const purchase = controller.buyItem(model, { boughtByQueue: true });
+            controllerAccepted = !!(purchase && purchase.itemBought);
+            if (controllerAccepted || (game.calendar.festivalDays || 0) > beforeDays) return;
           } catch (error) {
             /* use the native manager fallback */
           }
@@ -1652,7 +1655,7 @@
         if (game.resPool && typeof game.resPool.payPrices === "function") game.resPool.payPrices(prices);
         else for (const cost of prices) game.resPool.addResEvent(cost.name, -cost.val);
       },
-      verify: (before, after) => after.days > before.days,
+      verify: (before, after) => after.days > before.days || (controllerAccepted && resourceDeltasBetween(before.resources, after.resources).length > 0),
     });
     return result.ok;
   };
