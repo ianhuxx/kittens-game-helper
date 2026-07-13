@@ -61,7 +61,15 @@ const localStorageMock = {
   removeItem: (k) => storage.delete(k),
 };
 const NATIVE_SAVE_KEY = "com.nuclearunicorn.kittengame.savedata";
-const LCstorageMock = {};
+let nativeSaveWrites = 0;
+const LCstorageBacking = {};
+const LCstorageMock = new Proxy(LCstorageBacking, {
+  set(target, key, value) {
+    if (key === NATIVE_SAVE_KEY) nativeSaveWrites += 1;
+    target[key] = value;
+    return true;
+  },
+});
 
 /* ------------------------------ fake game ---------------------------------- */
 
@@ -624,6 +632,9 @@ const gamePage = {
   },
   save() {
     return persistCheckpoint();
+  },
+  _saveDataToString(saveData) {
+    return JSON.stringify(saveData);
   },
   craft(name, amount) {
     const c = craft(name);
@@ -5372,11 +5383,12 @@ dbg.forceActiveTarget(null);
 
 /* ---------------------------------------------------------------------
  * Test AL — the reset advisor reads metaphysics from the PRESTIGE manager
- * (v2.20.0).  Live regression: metaphysicsResearched called
- * science.get(perkName), which (a) console.error'd "Failed to get tech for
+ * (v2.20.0).  Live regression: the old advisor called science.get(perkName),
+ * which (a) console.error'd "Failed to get tech for
  * tech name 'goldenRatio'" on every advisor tick — 1000+ errors — and
- * (b) collided with the researched "engineering" TECH, marking the unowned
- * Engineering PERK as done so the advisor pointed at Golden Ratio instead.
+ * (b) collided with the researched "engineering" TECH even though the native
+ * perk ID is misspelled "engeneering". Prices and progression must come from
+ * the live prestige metadata, not a corrected-name/hardcoded roadmap.
  * ------------------------------------------------------------------- */
 const engineeringTechAL = { name: "engineering", label: "Engineering (tech)", unlocked: true, researched: true, prices: [] };
 techs.push(engineeringTechAL);
@@ -5385,16 +5397,22 @@ const perkLookupsAL = [];
 gamePage.science.get = (name) => { perkLookupsAL.push(name); return scienceGetAL(name); };
 gamePage.prestige = {
   perks: [
-    { name: "engineering", researched: false },
-    { name: "goldenRatio", researched: false },
+    { name: "engeneering", label: "Engineering", unlocked: true, researched: false, prices: [{ name: "paragon", val: 5 }] },
+    { name: "goldenRatio", label: "Golden Ratio", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }] },
+    { name: "divineProportion", label: "Divine Proportion", unlocked: false, researched: false, prices: [{ name: "paragon", val: 100 }] },
   ],
 };
 let advAL = dbg.resetAdvisorState();
 check("Test AL: the tech/perk name collision no longer hides the unowned Engineering perk", /next meta: Engineering \(5P/.test(advAL?.detail || ""));
-check("Test AL: the advisor never asks the science manager for perk names", !perkLookupsAL.includes("goldenRatio") && !perkLookupsAL.includes("engineering"));
+check("Test AL: the advisor never asks the science manager for native perk names", !perkLookupsAL.includes("engeneering") && !perkLookupsAL.includes("goldenRatio"));
 gamePage.prestige.perks[0].researched = true;
+gamePage.prestige.perks[1].unlocked = true;
 advAL = dbg.resetAdvisorState();
-check("Test AL: an owned prestige perk advances the next-meta pointer", /next meta: Golden Ratio \(15P/.test(advAL?.detail || ""));
+check("Test AL: an owned native Engineering perk advances to live Golden Ratio 50", /next meta: Golden Ratio \(50P/.test(advAL?.detail || ""));
+gamePage.prestige.perks[1].researched = true;
+gamePage.prestige.perks[2].unlocked = true;
+advAL = dbg.resetAdvisorState();
+check("Test AL: the live metadata chain advances again without hardcoded IDs or prices", /next meta: Divine Proportion \(100P/.test(advAL?.detail || ""));
 gamePage.science.get = scienceGetAL;
 techs.splice(techs.indexOf(engineeringTechAL), 1);
 delete gamePage.prestige;
@@ -5589,6 +5607,28 @@ const failedCheckpointT5 = dbg.managePrestige?.(null);
     staleSaveManagedT5 === false && transcendCalls === callsBeforeStaleSaveT5 && LCstorageMock[NATIVE_SAVE_KEY] === persistedBeforeStaleT5);
   gamePage.save = nativeSaveT5;
 
+  // A legitimate native save can serialize to the exact blob already stored.
+  // The Proxy write counter proves the setter ran; equality is not staleness.
+  fakeNow += 30000;
+  const identicalSaveDataT5 = { checkpointSerial };
+  const identicalSaveBlobT5 = gamePage._saveDataToString(identicalSaveDataT5);
+  LCstorageMock[NATIVE_SAVE_KEY] = identicalSaveBlobT5;
+  const writesBeforeIdenticalT5 = nativeSaveWrites;
+  gamePage.save = () => {
+    checkpointCalls += 1;
+    LCstorageMock[NATIVE_SAVE_KEY] = identicalSaveBlobT5;
+    return identicalSaveDataT5;
+  };
+  const tierBeforeIdenticalT5 = gamePage.religion.transcendenceTier;
+  const identicalRewriteManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 re-review: an identical verified native rewrite is a valid checkpoint",
+    identicalRewriteManagedT5 === true && nativeSaveWrites === writesBeforeIdenticalT5 + 1 && LCstorageMock[NATIVE_SAVE_KEY] === identicalSaveBlobT5 && gamePage.religion.transcendenceTier === tierBeforeIdenticalT5 + 1);
+  gamePage.save = nativeSaveT5;
+  gamePage.religion.faith = 100000;
+  gamePage.religion.faithRatio = 150;
+  gamePage.religion.transcendenceTier = 1;
+  transcendenceUpgrades[2].unlocked = false;
+
   fakeNow += 30000;
   transcendenceUpgrades[3].unlocked = true;
   gamePage.religion.faith = 0;
@@ -5611,11 +5651,12 @@ gamePage.religion.transcendenceTier = 1;
 const tierBeforeT5 = gamePage.religion.transcendenceTier;
 const epiphanyBeforeT5 = gamePage.religion.faithRatio;
 const adoreBeforePriorityT5 = adoreCalls;
+const transcendButtonsBeforePriorityT5 = transcendButtonCalls;
 const transcendManagedT5 = dbg.managePrestige?.(null);
   check("Task 5 prestige: funded Transcend checkpoints and advances exactly one tier",
     transcendManagedT5 === true && checkpointCalls >= callsBeforeDisarmedT5.checkpointCalls + 2 && gamePage.religion.transcendenceTier === tierBeforeT5 + 1 && gamePage.religion.faithRatio === epiphanyBeforeT5 + 1 - 100);
   check("Task 5 review: Transcend uses the native Religion button and unlocks the new tier metadata",
-    transcendButtonCalls === 1 && transcendenceUpgrades[2].unlocked === true);
+    transcendButtonCalls === transcendButtonsBeforePriorityT5 + 1 && transcendenceUpgrades[2].unlocked === true);
 gamePage.save = nativeSaveT5;
 check("Task 5 prestige: when Transcend and Adore both qualify one cycle runs Transcend only", adoreCalls === adoreBeforePriorityT5);
 const callsBeforeCooldownT5 = { transcendCalls, adoreCalls };
@@ -5704,10 +5745,18 @@ buildings.splice(buildings.indexOf(strandedManualRareT5), 1);
 const unreachableWholeBillT5 = { name: "unreachableWholeBillT5", label: "Unreachable Whole Bill T5", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 70 }, { name: "impossibleT5", val: 1 }], effects: {} };
 buildings.push(unreachableWholeBillT5);
 perTick.relic = 1;
-gamePage.prestige = { perks: [{ name: "engineering", researched: false }] };
-const roadmapAndWholeBillFloorT5 = dbg.rareCapitalFloor?.(null);
-check("Task 5 review: rare floor includes next metaphysics gate and rejects partially reachable candidate bills",
-  roadmapAndWholeBillFloorT5?.paragon === 5 && !(roadmapAndWholeBillFloorT5?.relic >= 70));
+gamePage.prestige = {
+  perks: [
+    { name: "engeneering", label: "Engineering", unlocked: true, researched: false, prices: [{ name: "paragon", val: 5 }] },
+    { name: "goldenRatio", label: "Golden Ratio", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }] },
+  ],
+};
+const engineeringRoadmapFloorT5 = dbg.rareCapitalFloor?.(null);
+gamePage.prestige.perks[0].researched = true;
+gamePage.prestige.perks[1].unlocked = true;
+const goldenRatioRoadmapFloorT5 = dbg.rareCapitalFloor?.(null);
+check("Task 5 re-review: rare floor follows native metaphysics IDs and live prices while rejecting partial bills",
+  engineeringRoadmapFloorT5?.paragon === 5 && !(engineeringRoadmapFloorT5?.relic >= 70) && goldenRatioRoadmapFloorT5?.paragon === 50);
 buildings.splice(buildings.indexOf(unreachableWholeBillT5), 1);
 delete perTick.relic;
 delete gamePage.prestige;

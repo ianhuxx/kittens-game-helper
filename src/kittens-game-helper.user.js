@@ -52,15 +52,6 @@
   const EARLY_GAME_RESEARCH_COUNT = 8;
   const SPRINT_PROGRESS_THRESHOLD = 0.75;
   const RESET_ADVISOR_MIN_PARAGON_PER_DAY = 8;
-  const METAPHYSICS_ORDER = [
-    { name: "engineering", cost: 5, label: "Engineering" },
-    { name: "goldenRatio", cost: 15, label: "Golden Ratio" },
-    { name: "divineProportion", cost: 50, label: "Divine Proportion" },
-    { name: "vitruvianFeline", cost: 100, label: "Vitruvian Feline" },
-    { name: "renaissance", cost: 750, label: "Renaissance" },
-    { name: "chronomancy", cost: 30, label: "Chronomancy chain" },
-    { name: "anachronomancy", cost: 375, label: "Anachronomancy chain" },
-  ];
 
   // Irreversible / permanent / resource-burning actions. Matched by name and
   // kept OUT of every generic candidate and trade list. Authorized prestige
@@ -360,25 +351,37 @@
   const isMidGame = () => totalKittenCount() < 120;
   const speedrunMode = () => getGoal() === "speedrun" || getPriority() === "speedrun";
 
-  // Metaphysics perks live in the PRESTIGE manager, never in science.
-  // science.get(perkName) both misreads them — the "engineering" TECH made the
-  // unowned Engineering perk look researched, skipping it in the advisor — and
-  // console.errors "Failed to get tech for tech name 'goldenRatio'" on every
-  // advisor tick, flooding the browser console. Scan prestige.perks directly
-  // (a pure read that can never log); getPerk is only a fallback shape.
-  const metaphysicsResearched = (name) => {
+  // Metaphysics perks live in the PRESTIGE manager, never in science. Read the
+  // live array in its native progression order — including native IDs such as
+  // "engeneering" — and use each open perk's current metadata price. This
+  // avoids corrected-name aliases and price tables drifting from the game.
+  const prestigePerkOwned = (perk) => !!(perk && (perk.researched || perk.owned || perk.on));
+  const prestigePerkPrices = (perk) => {
+    const prices = perk && (perk.prices || perk.price);
+    return Array.isArray(prices)
+      ? prices.filter((price) => price && price.name && Number.isFinite(Number(price.val)) && Number(price.val) > 0)
+      : [];
+  };
+  const nextMetaphysicsGate = () => {
     try {
-      const prestige = window.gamePage.prestige;
-      if (!prestige) return false;
-      if (Array.isArray(prestige.perks)) {
-        const perk = prestige.perks.find((item) => item && item.name === name);
-        return !!(perk && (perk.researched || perk.owned || perk.on));
+      const prestige = window.gamePage && window.gamePage.prestige;
+      if (!prestige || !Array.isArray(prestige.perks)) return null;
+      for (const perk of prestige.perks) {
+        if (!perk || prestigePerkOwned(perk) || perk.unlocked !== true) continue;
+        const paragonCost = prestigePerkPrices(perk)
+          .filter((price) => price.name === "paragon")
+          .reduce((total, price) => total + Number(price.val), 0);
+        if (!(paragonCost > 0)) continue;
+        return {
+          meta: perk,
+          label: perk.label || perk.title || perk.name,
+          cost: paragonCost,
+        };
       }
-      const perk = typeof prestige.getPerk === "function" ? prestige.getPerk(name) : null;
-      return !!(perk && (perk.researched || perk.owned || perk.on));
     } catch (error) {
-      return false;
+      /* prestige metadata unavailable */
     }
+    return null;
   };
 
   const currentParagon = () => {
@@ -476,7 +479,7 @@
       // longer keep up with arrivals rather than chasing the last few percent.
       const paragonEfficiency = kittens > 70 ? (kittens - 70) / kittens : 0;
       const effText = kittens >= 70 ? ` · ${Math.round(paragonEfficiency * 100)}% paragon-eff` : "";
-      const nextMeta = METAPHYSICS_ORDER.find((item) => !metaphysicsResearched(item.name));
+      const nextMeta = nextMetaphysicsGate();
       const metaText = nextMeta
         ? ` · next meta: ${nextMeta.label} (${nextMeta.cost}P${paragon >= nextMeta.cost ? ", affordable" : ""})`
         : " · core metaphysics plan complete";
@@ -8020,13 +8023,12 @@
       if (meta) protectDirectRareCosts({ kind, meta });
     }
 
-    // The next core metaphysics purchase is the persistent prestige roadmap
-    // gate. Only expose it when the live prestige manager and Paragon resource
-    // are present, so fresh pre-prestige runs do not gain a phantom reservation.
+    // The next currently reachable live metaphysics purchase is the persistent
+    // prestige roadmap gate. Only expose it when the Paragon resource is
+    // present, so fresh pre-prestige runs do not gain a phantom reservation.
     try {
-      const prestige = window.gamePage && window.gamePage.prestige;
-      if (prestige && Array.isArray(prestige.perks) && getRes(resources, "paragon")) {
-        const nextMeta = METAPHYSICS_ORDER.find((item) => !metaphysicsResearched(item.name));
+      if (getRes(resources, "paragon")) {
+        const nextMeta = nextMetaphysicsGate();
         if (nextMeta) floor.paragon = Math.max(floor.paragon || 0, nextMeta.cost);
       }
     } catch (error) {
@@ -9535,14 +9537,17 @@
   const createNativeCheckpoint = () => {
     const game = window.gamePage;
     if (!game || typeof game.save !== "function") throw new Error("native checkpoint API unavailable");
+    if (typeof game._saveDataToString !== "function") throw new Error("native save serializer unavailable");
     if (game.currentSaveIsBroken === true) throw new Error("native save is marked broken");
-    const beforePersisted = persistedNativeSaveBlob();
     const saveData = game.save();
     if (!saveData || typeof saveData !== "object") throw new Error("native checkpoint failed");
     if (game.currentSaveIsBroken === true) throw new Error("native save became broken");
+    const serializedSaveData = game._saveDataToString(saveData);
+    if (typeof serializedSaveData !== "string") throw new Error("native save serialization failed");
+    const expectedPersisted = serializedSaveData;
     const afterPersisted = persistedNativeSaveBlob();
-    if (afterPersisted == null || afterPersisted === beforePersisted) {
-      throw new Error("native checkpoint did not persist a fresh save");
+    if (afterPersisted == null || afterPersisted !== expectedPersisted) {
+      throw new Error("native checkpoint persisted data does not match save result");
     }
     return { saveData, persisted: afterPersisted };
   };
