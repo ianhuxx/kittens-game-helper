@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.21.1
+// @version      2.21.2
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. World reset, shatter, and time-skip remain forbidden; Transcend, Adore, and alicorn sacrifice run only through explicitly armed, freshly checkpointed, reservation-safe prestige policy.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -47,7 +47,7 @@
   const LOG_KEY = "kgh.log";
   const PRESTIGE_ARM_KEY = "kgh.prestigeArmed";
   const EXPANSION_CHECKPOINT_KEY = "kgh.expansionCheckpoint";
-  const HELPER_VERSION = "2.21.1";
+  const HELPER_VERSION = "2.21.2";
 
   // Speedrun reset helpers remain advisory. Transcend, Adore and alicorn
   // sacrifice are managed separately by the explicitly armed prestige broker.
@@ -1722,6 +1722,10 @@
     goalFrontier: null,
     goalClosure: null,
     goalSupport: null,
+    pollutionStatus: null,
+    metaEffectProfiles: new WeakMap(),
+    candidateEffectProfiles: new WeakMap(),
+    effectiveMetaProfiles: new WeakMap(),
     fxRefreshed: new WeakSet(),
   };
 
@@ -1817,6 +1821,10 @@
       goalFrontier: null,
       goalClosure: null,
       goalSupport: null,
+      pollutionStatus: null,
+      metaEffectProfiles: new WeakMap(),
+      candidateEffectProfiles: new WeakMap(),
+      effectiveMetaProfiles: new WeakMap(),
       rareCapitalFloors: new Map(),
       fxRefreshed: new WeakSet(),
     };
@@ -2730,6 +2738,8 @@
     return target;
   };
 
+  const copyEffectProfile = (source) => addEffectProfile(emptyEffectProfile(), source);
+
   const parseEffectEntry = (profile, key, value) => {
     if (!isFinite(value) || value === 0) return;
     // Pollution is a global environmental state, not a spendable resource.
@@ -2873,7 +2883,7 @@
     }
   };
 
-  const pollutionStatus = () => {
+  const computePollutionStatus = () => {
     const manager = window.gamePage && window.gamePage.bld || {};
     const readNumber = (methodNames, fieldNames, fallback = 0) => {
       for (const name of methodNames) {
@@ -2954,6 +2964,16 @@
       contributors,
       cleaners,
     };
+  };
+
+  // Candidate scoring asks for the same native pollution picture many times in
+  // one planner cycle. On a mature save, recomputing it for every candidate
+  // rescanned every Bonfire/Space structure and produced enough short-lived
+  // objects to pin the browser in garbage collection. One immutable snapshot
+  // per tick keeps every subsystem consistent and bounds the scan to O(structures).
+  const pollutionStatus = () => {
+    if (!tickCache.pollutionStatus) tickCache.pollutionStatus = computePollutionStatus();
+    return tickCache.pollutionStatus;
   };
 
   const liveVillageProduction = () => {
@@ -3074,13 +3094,16 @@
   };
 
   const metaEffectProfile = (meta) => {
+    if (!meta || typeof meta !== "object") return emptyEffectProfile();
+    const cached = tickCache.metaEffectProfiles && tickCache.metaEffectProfiles.get(meta);
+    if (cached) return cached;
     const profile = emptyEffectProfile();
-    if (!meta || typeof meta !== "object") return profile;
     const live = liveMetaView(meta) || meta;
     refreshMetaEffects(meta);
     const refreshed = liveMetaView(meta) || live;
     const effects = refreshed.effects && typeof refreshed.effects === "object" ? refreshed.effects : {};
     for (const [key, value] of Object.entries(effects)) parseEffectEntry(profile, key, value);
+    if (tickCache.metaEffectProfiles) tickCache.metaEffectProfiles.set(meta, profile);
     return profile;
   };
 
@@ -3284,7 +3307,7 @@
   };
 
   const spaceMarginalProfile = (descriptor, resources = resourceMap()) => {
-    const profile = metaEffectProfile(descriptor && descriptor.meta);
+    const profile = copyEffectProfile(metaEffectProfile(descriptor && descriptor.meta));
     const meta = descriptor && descriptor.meta;
     if (!meta) return profile;
     const effects = meta.effects || {};
@@ -3330,16 +3353,30 @@
   };
 
   const candidateEffectProfile = (kind, meta) => {
-    const profile = kind === "space" ? spaceMarginalProfile(spaceDescriptorFor(meta)) : metaEffectProfile(meta);
+    if (!meta || typeof meta !== "object") return emptyEffectProfile();
+    const cachedByKind = tickCache.candidateEffectProfiles && tickCache.candidateEffectProfiles.get(meta);
+    if (cachedByKind && cachedByKind.has(kind)) return cachedByKind.get(kind);
+    const base = kind === "space" ? spaceMarginalProfile(spaceDescriptorFor(meta)) : metaEffectProfile(meta);
+    const profile = kind === "upgrade" ? copyEffectProfile(base) : base;
     if (kind === "upgrade") addEffectProfile(profile, affectedBuildingDeltaProfile(meta));
+    if (tickCache.candidateEffectProfiles) {
+      const byKind = cachedByKind || new Map();
+      byKind.set(kind, profile);
+      tickCache.candidateEffectProfiles.set(meta, byKind);
+    }
     return profile;
   };
 
   const effectiveMetaProfile = (meta) => {
-    const profile = metaEffectProfile(meta);
+    if (!meta || typeof meta !== "object") return emptyEffectProfile();
+    const cached = tickCache.effectiveMetaProfiles && tickCache.effectiveMetaProfiles.get(meta);
+    if (cached) return cached;
+    const base = metaEffectProfile(meta);
+    const profile = meta.upgrades && Array.isArray(meta.upgrades.buildings) ? copyEffectProfile(base) : base;
     if (meta && meta.upgrades && Array.isArray(meta.upgrades.buildings)) {
       addEffectProfile(profile, affectedBuildingDeltaProfile(meta));
     }
+    if (tickCache.effectiveMetaProfiles) tickCache.effectiveMetaProfiles.set(meta, profile);
     return profile;
   };
 
@@ -13682,7 +13719,10 @@
       return bestLateGameFrontier(candidates || gatherCandidates(resources, goalKey), resources, goalKey);
     },
     powerStatus,
-    pollutionStatus,
+    pollutionStatus() {
+      resetTickCache();
+      return pollutionStatus();
+    },
     pollutionMarginalFor,
     pollutionPenalty,
     pollutionProcessorTarget,
