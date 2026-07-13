@@ -28,8 +28,15 @@ const makeEl = () => ({
   className: "",
   disabled: false,
   selectors: new Map(),
+  listeners: new Map(),
   classList: { toggle() {}, contains: () => false, add() {}, remove() {} },
-  addEventListener() {},
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  },
+  click() {
+    for (const listener of this.listeners.get("click") || []) listener({ target: this });
+  },
   appendChild(child) {
     this.children.push(child);
   },
@@ -53,6 +60,16 @@ const localStorageMock = {
   setItem: (k, v) => storage.set(k, String(v)),
   removeItem: (k) => storage.delete(k),
 };
+const NATIVE_SAVE_KEY = "com.nuclearunicorn.kittengame.savedata";
+let nativeSaveWrites = 0;
+const LCstorageBacking = {};
+const LCstorageMock = new Proxy(LCstorageBacking, {
+  set(target, key, value) {
+    if (key === NATIVE_SAVE_KEY) nativeSaveWrites += 1;
+    target[key] = value;
+    return true;
+  },
+});
 
 /* ------------------------------ fake game ---------------------------------- */
 
@@ -115,6 +132,7 @@ const craft = (name) => crafts.find((c) => c.name === name);
 const buildings = [
   { name: "library", label: "Library", unlocked: true, val: 3, on: 3, prices: [{ name: "wood", val: 500 }], effects: { scienceMax: 250 } },
   { name: "mine", label: "Mine", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 300 }], effects: { mineralsRatio: 0.2 } },
+  { name: "workshop", label: "Workshop", unlocked: true, val: 1, on: 1, prices: [{ name: "wood", val: 100 }, { name: "minerals", val: 100 }], effects: { craftRatio: 0.06 } },
   { name: "barn", label: "Barn", unlocked: true, val: 1, on: 1, prices: [{ name: "wood", val: 1000 }], effects: { catnipMax: 5000, woodMax: 200 } },
   { name: "hut", label: "Hut", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 5000 }], effects: { manpowerMax: 75 } },
   {
@@ -236,6 +254,21 @@ const religionUpgrades = [
   },
 ];
 
+// Task 5 late-game adapters start locked so the long-standing early/midgame
+// fixtures remain unchanged. The focused Task 5 block opens them explicitly.
+const transcendenceUpgrades = [
+  { name: "blackObeliskT5", label: "Black Obelisk T5", unlocked: false, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "relic", val: 10 }], effects: { solarRevolutionLimit: 0.05 } },
+  { name: "transcend", label: "Transcend raw action", unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 1 }], effects: {} },
+  { name: "tierUnlockT5", label: "Tier Unlock T5", tier: 2, unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 20 }], effects: {} },
+  { name: "retainedFloorT5", label: "Retained Floor T5", tier: 1, unlocked: false, val: 0, on: 0, prices: [{ name: "faithRatio", val: 60 }], effects: {} },
+];
+const chronoforgeUpgrades = [
+  { name: "temporalBatteryT5", label: "Temporal Battery T5", unlocked: false, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "timeCrystal", val: 5 }], effects: { temporalFluxMax: 750 } },
+];
+const voidspaceUpgrades = [
+  { name: "cryochambersT5", label: "Cryochambers T5", unlocked: false, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "karma", val: 9 }, { name: "void", val: 100 }], effects: { maxKittens: 1 } },
+];
+
 const J = (name, title, value) => ({ name, title, unlocked: true, value });
 const jobs = [
   J("woodcutter", "Woodcutter", 2),
@@ -259,11 +292,41 @@ let observeCalls = 0;
 let praiseCalls = 0;
 let festivalCalls = 0;
 let tradeCalls = 0;
+const diplomacyApiCalls = [];
 let sacrificeChunks = 0; // 2500-unicorn batches converted to tears
+
+let transcendenceControllerCalls = 0;
+let chronoforgeControllerCalls = 0;
+let voidspaceControllerCalls = 0;
+let rawTimeManagerCalls = 0;
+let checkpointCalls = 0;
+let transcendCalls = 0;
+let adoreCalls = 0;
+let alicornSacrificeCalls = 0;
+let nativeConfirmAccept = true;
+let checkpointSerial = 0;
+let transcendButtonCalls = 0;
+const persistCheckpoint = (mutate = null) => {
+  checkpointCalls += 1;
+  if (typeof mutate === "function") mutate();
+  const saveData = { checkpointSerial: ++checkpointSerial };
+  LCstorageMock[NATIVE_SAVE_KEY] = JSON.stringify(saveData);
+  return saveData;
+};
 
 const calendar = {
   festivalDays: 0,
   daysPerSeason: 100,
+  season: 1,
+  seasons: [
+    { name: "spring", title: "Spring" },
+    { name: "summer", title: "Summer" },
+    { name: "autumn", title: "Autumn" },
+    { name: "winter", title: "Winter" },
+  ],
+  getCurSeason() {
+    return this.seasons[this.season];
+  },
   observeRemainingTime: 0,
   observeHandler() {
     observeCalls += 1;
@@ -320,14 +383,25 @@ const resourcePerTickCalls = [];
 
 const diplomacy = {
   races: [
-    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], sells: [{ name: "minerals", value: 100, chance: 100 }] },
+    { name: "lizards", title: "Lizards", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], standing: 0, energy: 0, sells: [{ name: "minerals", value: 100, chance: 1 }] },
   ],
   get: (name) => diplomacy.races.find((race) => race.name === name),
   getManpowerCost: () => 50,
   getGoldCost: () => 15,
+  getTradeRatio: () => 0,
+  getFinalStanding: (race) => (Number.isFinite(race?.standing) ? race.standing : 0),
+  isValidTrade(sell, race) {
+    const resource = res(sell?.name);
+    return !!sell && !!race && (!sell.minLevel || (race.embassyLevel || 0) >= sell.minLevel) &&
+      (!!resource?.unlocked || sell.name === "uranium" || race.name === "leviathans");
+  },
+  getResourceTradeChance(sell, race) {
+    return this.isValidTrade(sell, race) ? sell.chance : 0;
+  },
   getMaxTradeAmt: () => 1,
   tradeAll(race) {
     tradeCalls += 1;
+    diplomacyApiCalls.push({ api: "tradeAll", race: race?.name, amount: 1 });
     if (race && race.name === "sharks" && canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "iron", val: 100 }])) {
       res("manpower").value -= 50;
       res("gold").value -= 15;
@@ -354,6 +428,12 @@ const pay = (prices = []) => {
 
 const gamePage = {
   opts: { noConfirm: false },
+  ui: {
+    confirm(title, message, callbackOk, callbackCancel) {
+      if (nativeConfirmAccept) callbackOk();
+      else if (callbackCancel) callbackCancel();
+    },
+  },
   resPool: {
     resources,
     get: (name) => res(name),
@@ -363,6 +443,7 @@ const gamePage = {
   },
   bld: {
     buildingsData: buildings,
+    get: (name) => buildings.find((building) => building.name === name) || null,
     // Real buildings scale price by priceRatio^val; mocks without a priceRatio
     // keep ratio 1, so every pre-existing test sees identical numbers.
     getPrices: (name) => {
@@ -398,8 +479,44 @@ const gamePage = {
   },
   religion: {
     faith: 200,
+    faithRatio: 0,
+    transcendenceTier: 0,
     religionUpgrades,
     zigguratUpgrades: zigguratUpgradesMock,
+    transcendenceUpgrades,
+    getRU(name) {
+      return religionUpgrades.find((upgrade) => upgrade.name === name) || { on: 0, val: 0 };
+    },
+    getTU(name) {
+      return transcendenceUpgrades.find((upgrade) => upgrade.name === name);
+    },
+    _getTranscendNextPrice() {
+      return 100;
+    },
+    getApocryphaResetBonus(bonusRatio) {
+      return (this.faith / 1000000) * Math.pow(this.transcendenceTier + 1, 2) * bonusRatio;
+    },
+    getSolarRevolutionRatio() {
+      return this.getRU("solarRevolution").on ? this.faith / 1000000 : 0;
+    },
+    transcend() {
+      transcendCalls += 1;
+      gamePage.ui.confirm("Transcend", "Confirm", () => {
+        const price = this._getTranscendNextPrice();
+        if (this.faithRatio <= price) return;
+        this.faithRatio -= price;
+        this.transcendenceTier += 1;
+      });
+      return true;
+    },
+    resetFaith(bonusRatio) {
+      adoreCalls += 1;
+      const gain = this.getApocryphaResetBonus(bonusRatio);
+      if (!(gain > 0)) return false;
+      this.faithRatio += gain;
+      this.faith = 0.01;
+      return true;
+    },
     build(item) {
       const meta = typeof item === "string" ? religionUpgrades.find((u) => u.name === item) : item;
       if (!meta || !pay(meta.prices || [])) return false;
@@ -429,10 +546,42 @@ const gamePage = {
   village,
   calendar,
   diplomacy,
+  tradeTab: {
+    exploreBtn: {
+      model: { prices: [{ name: "manpower", val: 1000 }] },
+      controller: {
+        buyItem(model) {
+          diplomacyApiCalls.push({ api: "explore", amount: 1 });
+          if (!pay(model?.prices || [])) return { itemBought: false };
+          const race = typeof diplomacy.unlockRandomRace === "function" ? diplomacy.unlockRandomRace() : null;
+          return { itemBought: !!race, race };
+        },
+      },
+    },
+  },
+  time: {
+    chronoforgeUpgrades,
+    voidspaceUpgrades,
+    getCFU: (name) => chronoforgeUpgrades.find((upgrade) => upgrade.name === name),
+    getVSU: (name) => voidspaceUpgrades.find((upgrade) => upgrade.name === name),
+    build() { rawTimeManagerCalls += 1; return false; },
+    buy() { rawTimeManagerCalls += 1; return false; },
+  },
   // Religion tab with the game's real button shapes: the sacrifice button's
   // controller._transform (unicorns→tears at one tear per ziggurat per 2500)
   // and the zgUpgradeButtons the helper falls back to for purchases.
   religionTab: {
+    transcendBtn: {
+      model: { enabled: true, visible: true },
+      controller: { updateEnabled() {}, updateVisible() {} },
+      handler() {
+        transcendButtonCalls += 1;
+        gamePage.religion.transcend();
+        for (const upgrade of gamePage.religion.transcendenceUpgrades) {
+          if (gamePage.religion.transcendenceTier >= (upgrade.tier || Infinity)) upgrade.unlocked = true;
+        }
+      },
+    },
     sacrificeBtn: {
       model: { prices: [{ name: "unicorns", val: 2500 }] },
       controller: {
@@ -444,6 +593,18 @@ const gamePage = {
           res("tears").value += zigs * amount;
           sacrificeChunks += amount;
           return true;
+        },
+      },
+    },
+    sacrificeAlicornsBtn: {
+      model: { prices: [{ name: "alicorn", val: 25 }], enabled: true, visible: true },
+      controller: {
+        controllerOpts: { gainMultiplier: () => 3 },
+        buyItem(model) {
+          alicornSacrificeCalls += 1;
+          if (!pay(model?.prices || [])) return { itemBought: false, reason: "cannot-afford" };
+          res("timeCrystal").value += this.controllerOpts.gainMultiplier();
+          return { itemBought: true, reason: "paid-for" };
         },
       },
     },
@@ -471,6 +632,12 @@ const gamePage = {
     resourcePerTickCalls.push({ name, includeConversion });
     return Number.isFinite(perTick[name]) ? perTick[name] : 0;
   },
+  save() {
+    return persistCheckpoint();
+  },
+  _saveDataToString(saveData) {
+    return JSON.stringify(saveData);
+  },
   craft(name, amount) {
     const c = craft(name);
     if (!c || amount <= 0) return false;
@@ -497,6 +664,164 @@ class FakeDate extends Date {
 }
 
 const intervalFns = [];
+const intervalMs = [];
+const activeIntervalIds = new Set();
+const clearedIntervalIds = [];
+const buildingToggleControllerCalls = [];
+class FakeBuildingBtnModernController {
+  constructor(game) { this.game = game; }
+  fetchModel(options) {
+    const metadata = this.game.bld?.get(options.building);
+    return metadata ? { options, metadata } : null;
+  }
+  off(model, amount = 1) {
+    model.metadata.on = Math.max(0, model.metadata.on - amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "off" });
+  }
+  offAll(model) {
+    model.metadata.on = 0;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: 0, api: "offAll" });
+  }
+  on(model, amount = 1) {
+    model.metadata.on = Math.min(model.metadata.val, model.metadata.on + amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "on" });
+  }
+  onAll(model) {
+    model.metadata.on = model.metadata.val;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "onAll" });
+  }
+}
+class FakeEmbassyButtonController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    return options;
+  }
+  getPrices(model) {
+    return model?.prices || [];
+  }
+  buyItem(model) {
+    diplomacyApiCalls.push({ api: "embassy", race: model?.race?.name, amount: 1 });
+    if (!model?.race || !pay(this.getPrices(model))) return { itemBought: false };
+    model.race.embassyLevel = (model.race.embassyLevel || 0) + 1;
+    return { itemBought: true };
+  }
+}
+class FakeSpaceProgramBtnController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    const metadata = this.game.space?.getProgram(options.id);
+    return metadata ? { options, metadata } : null;
+  }
+  getPrices(model) {
+    return (model?.metadata?.prices || []).map((price) => ({ ...price }));
+  }
+  updateEnabled() {}
+  buyItem(model) {
+    if (!model || model.metadata.val) return { itemBought: false, reason: "already-bought" };
+    if (!pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
+    model.metadata.val = 1;
+    model.metadata.on = 0; // official mission controller: in transit until its planet is reached
+    for (const planetName of model.metadata.unlocks?.planet || []) {
+      const planet = this.game.space.planets.find((item) => item.name === planetName);
+      if (planet) planet.unlocked = true;
+    }
+    for (const missionName of model.metadata.unlocks?.spaceMission || []) {
+      const mission = this.game.space.getProgram(missionName);
+      if (mission) mission.unlocked = true;
+    }
+    return { itemBought: true };
+  }
+}
+class FakePlanetBuildingBtnController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    const metadata = this.game.space?.getBuilding(options.id);
+    return metadata ? { options, metadata } : null;
+  }
+  getPrices(model) {
+    const meta = model.metadata;
+    return (meta.prices || []).map((price) => ({
+      ...price,
+      val: price.val * Math.pow(meta.priceRatio || 1.15, meta.val || 0),
+    }));
+  }
+  updateEnabled() {}
+  off(model, amount = 1) {
+    model.metadata.on = Math.max(0, model.metadata.on - amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "spaceOff" });
+  }
+  offAll(model) {
+    model.metadata.on = 0;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: 0, api: "spaceOffAll" });
+  }
+  on(model, amount = 1) {
+    model.metadata.on = Math.min(model.metadata.val, model.metadata.on + amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "spaceOn" });
+  }
+  onAll(model) {
+    model.metadata.on = model.metadata.val;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "spaceOnAll" });
+  }
+  buyItem(model) {
+    if (!model || !pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
+    model.metadata.val = (model.metadata.val || 0) + 1;
+    model.metadata.on = (model.metadata.on || 0) + 1;
+    return { itemBought: true };
+  }
+}
+class FakeLateGameStackableController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    const metadata = this.getMetadata(options.id);
+    return metadata ? { options, metadata } : null;
+  }
+  getPrices(model) {
+    const meta = model.metadata;
+    return (meta.prices || []).map((price) => ({
+      ...price,
+      val: price.val * Math.pow(meta.priceRatio || 1, meta.val || 0),
+    }));
+  }
+  updateEnabled() {}
+  buyItem(model) {
+    if (!model || !pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
+    model.metadata.val = (model.metadata.val || 0) + 1;
+    model.metadata.on = (model.metadata.on || 0) + 1;
+    return { itemBought: true };
+  }
+}
+class FakeTranscendenceBtnController extends FakeLateGameStackableController {
+  getMetadata(id) { return this.game.religion?.getTU(id); }
+  buyItem(model) {
+    transcendenceControllerCalls += 1;
+    return super.buyItem(model);
+  }
+}
+class FakeChronoforgeBtnController extends FakeLateGameStackableController {
+  getMetadata(id) { return this.game.time?.getCFU(id); }
+  buyItem(model) {
+    chronoforgeControllerCalls += 1;
+    return super.buyItem(model);
+  }
+}
+class FakeVoidSpaceBtnController extends FakeLateGameStackableController {
+  getMetadata(id) { return this.game.time?.getVSU(id); }
+  getPrices(model) {
+    return super.getPrices(model).map((price) => price.name === "karma" ? { ...price, val: price.val - 2 } : price);
+  }
+  buyItem(model) {
+    voidspaceControllerCalls += 1;
+    return super.buyItem(model);
+  }
+}
 const context = {
   console,
   Date: FakeDate,
@@ -506,27 +831,54 @@ const context = {
   isFinite,
   document: documentMock,
   localStorage: localStorageMock,
+  LCstorage: LCstorageMock,
   gamePage,
   setTimeout,
   clearTimeout,
-  setInterval: (fn) => {
+  setInterval: (fn, ms) => {
     intervalFns.push(fn);
-    return intervalFns.length - 1;
+    intervalMs.push(ms);
+    const id = intervalFns.length - 1;
+    activeIntervalIds.add(id);
+    return id;
   },
-  clearInterval: () => {},
+  clearInterval: (id) => {
+    activeIntervalIds.delete(id);
+    clearedIntervalIds.push(id);
+  },
   WeakMap,
   Map,
   Set,
   Promise,
   Array,
   Object,
+  com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController: FakeSpaceProgramBtnController } } } },
+  classes: {
+    diplomacy: { ui: { EmbassyButtonController: FakeEmbassyButtonController } },
+    ui: {
+      btn: { BuildingBtnModernController: FakeBuildingBtnModernController },
+      TranscendenceBtnController: FakeTranscendenceBtnController,
+      space: { PlanetBuildingBtnController: FakePlanetBuildingBtnController },
+      time: {
+        ChronoforgeBtnController: FakeChronoforgeBtnController,
+        VoidSpaceBtnController: FakeVoidSpaceBtnController,
+      },
+    },
+  },
 };
 context.window = context;
 vm.createContext(context);
 vm.runInContext(body, context, { filename: "kittens-game-helper.user.js" });
 
 await new Promise((resolve) => setTimeout(resolve, 100)); // bootstrap + first ticks
-const tickFn = intervalFns[0];
+const planningTickFn = intervalFns[0];
+const renderTickFn = intervalFns[2];
+// Most integration checks model one observed UI cycle: planning mutates first,
+// then the independent 500ms render lane presents the resulting state.
+const tickFn = () => {
+  planningTickFn();
+  renderTickFn();
+};
 
 const failures = [];
 const check = (label, ok) => {
@@ -539,9 +891,15 @@ const panelText = (sel) => {
   }
   return "";
 };
+const panelEl = (sel) => {
+  for (const child of documentMock.body.children) {
+    if (child.selectors && child.selectors.has(sel)) return child.selectors.get(sel);
+  }
+  return null;
+};
 const logText = () => (localStorageMock.getItem("kgh.log") || "[]").toString();
 
-check("script bootstrapped natively (noConfirm set; no external engine)", gamePage.opts.noConfirm === true && typeof tickFn === "function");
+check("script bootstrapped natively without mutating confirmation settings", gamePage.opts.noConfirm === false && typeof tickFn === "function");
 
 /* Stage 1 — native ownership + reservation holds (mine must NOT eat library wood) */
 calendar.observeRemainingTime = 100; // a star event is available this tick
@@ -626,6 +984,7 @@ techs.push({
   unlocks: {},
 });
 const astronomy = techs.find((tech) => tech.name === "astronomy");
+techs.find((tech) => tech.name === "theology").researched = true; // live prerequisite for an open Astronomy
 astronomy.unlocked = true;
 astronomy.researched = false;
 astronomy.prices = [{ name: "science", val: 30000 }, { name: "manuscript", val: 65 }];
@@ -644,6 +1003,9 @@ res("gear").value = 45;
 res("manuscript").value = 16;
 tickFn();
 check("space focus: hidden building-upgrade production is valued (Printing Press for manuscripts)", printingPress.researched === true && /Printing Press/.test(logText()));
+// This stage tests fresh Rush Space ranking, not persistence of the Theology
+// sprint that the newly modeled owned Steamworks producer now keeps reachable.
+context.window.__kghDebug.forceActiveTarget(null);
 gamePage.workshop.upgrades.push({
   name: "crossbow",
   label: "Crossbow",
@@ -662,7 +1024,7 @@ res("beam").value = 55;
 res("slab").value = 342;
 tickFn();
 check("space focus: manuscript-gated Astronomy stays ahead of side catpower Warehouse", /Astronomy/.test(panelText(".kgh-plan")) && !/warehouse/i.test(panelText(".kgh-plan")));
-check("goal line: milestone progress counted from the tech tree (0/3 toward Rocketry)", /0\/3 techs/.test(panelText(".kgh-goal-line")) && /Astronomy/.test(panelText(".kgh-goal-line")));
+check("goal line: milestone progress counted from the tech tree (1/3 toward Rocketry)", /1\/3 techs/.test(panelText(".kgh-goal-line")) && /Astronomy/.test(panelText(".kgh-goal-line")));
 
 /* Stage 6 — overflow crafting must not steal resources the focus still reserves */
 techs.forEach((tech) => { tech.researched = true; });
@@ -862,6 +1224,16 @@ diplomacy.unlockRandomRace = () => {
   return race || null;
 };
 diplomacy.tradeMultiple = (race, amt) => {
+  diplomacyApiCalls.push({ api: "tradeMultiple", race: race?.name, amount: amt });
+  if (race.name === "lizards") {
+    const prices = [{ name: "manpower", val: 50 * amt }, { name: "gold", val: 15 * amt }];
+    if (!canPay(prices)) return;
+    tradeCalls += 1;
+    pay(prices);
+    res("minerals").value += 100 * amt;
+    race.tradeTotal = (race.tradeTotal || 0) + amt;
+    return;
+  }
   if (race.name !== "zebras") return;
   if (res("gold").value < 15 * amt || res("manpower").value < 50 * amt || res("slab").value < 50 * amt) return;
   res("gold").value -= 15 * amt;
@@ -893,6 +1265,10 @@ res("manpower").value = 3000;
 fakeNow += 25000;
 tickFn();
 check("titanium path: first ship crafted when titanium is blocking progression", res("ship").value >= 1);
+// Diplomacy is single-mutation-per-tick: crafting the reveal ship returns
+// immediately, so explorers use the next shared-cooldown slot.
+fakeNow += 25000;
+context.window.__kghDebug.manageDiplomacy("balanced");
 check("titanium path: hidden Zebras discovered via explorers after first ship", zebras.unlocked === true && /Zebras|civilization/.test(logText()));
 fakeNow += 25000;
 tickFn();
@@ -922,6 +1298,7 @@ res("iron").maxValue = 300;
 fakeNow += 25000;
 tickFn();
 check("converters: an idle converter is switched ON when inputs are healthy and output wanted", blastForge.on === blastForge.val && blastForge.val >= 3);
+check("converters final review: processor enablement uses the native Building controller", buildingToggleControllerCalls.some((call) => call.name === "blastForge"));
 
 /* Stage 9 — base-economy starvation guard throttles a running converter when an
    input is critically low AND already net-draining, instead of pinning it at 0. */
@@ -931,6 +1308,7 @@ res("minerals").maxValue = 1000;
 fakeNow += 25000;
 tickFn();
 check("converters: running converter throttled to protect a starved, draining input", blastForge.on === 0);
+check("converters final review: processor throttling uses the native Building controller", buildingToggleControllerCalls.some((call) => call.name === "blastForge" && call.on === 0 && call.api === "offAll"));
 
 /* Stage 10 — input recovers well above the resume threshold → converter
    restarts (hysteresis: it does NOT flap back on at the same low level it
@@ -1245,6 +1623,107 @@ craft("compedium").prices = [{ name: "science", val: 10000 }, { name: "manuscrip
  * precisely because they only checked one snapshot.
  * =================================================================== */
 const dbg = context.window.__kghDebug;
+
+/* ---------- Late game A: fail-closed action broker + explicit prestige arm ---------- */
+const hasActionBroker = typeof dbg.actionPolicyFor === "function" && typeof dbg.executeSemanticAction === "function";
+const hasPrestigeArm = typeof dbg.prestigeAutomationArmed === "function" && typeof dbg.setPrestigeAutomationArmed === "function";
+check("late game A: semantic broker debug API exists", hasActionBroker);
+check("late game A: prestige arm defaults OFF in storage and panel", hasPrestigeArm && dbg.prestigeAutomationArmed() === false && localStorageMock.getItem("kgh.prestigeArmed") === null && /Prestige automation: OFF/.test(panelText(".kgh-prestige-arm")));
+
+let forbiddenCalls = 0;
+if (hasPrestigeArm) dbg.setPrestigeAutomationArmed(false);
+const forbiddenResults = hasActionBroker
+  ? ["resetWorld", "shatter", "timeSkip", "unknownAction"].map((id) => dbg.executeSemanticAction({ id, invoke: () => { forbiddenCalls += 1; } }))
+  : [];
+check("late game A: forbidden and unknown execution is fail-closed", forbiddenResults.length === 4 && forbiddenResults.every((result) => !result.ok) && forbiddenCalls === 0);
+const disarmed = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { forbiddenCalls += 1; } })
+  : { ok: false };
+check("late game A: prestige requires explicit arm", hasActionBroker && !disarmed.ok && forbiddenCalls === 0);
+const confirmationPreservation = [false, true].map((initialNoConfirm) => {
+  gamePage.opts.noConfirm = initialNoConfirm;
+  dbg.setPrestigeAutomationArmed(false);
+  let irreversibleCalls = 0;
+  const results = ["transcend", "adore", "sacrificeAlicorns"].map((id) => dbg.executeSemanticAction({
+    id,
+    invoke: () => { irreversibleCalls += 1; },
+  }));
+  return { initialNoConfirm, afterNoConfirm: gamePage.opts.noConfirm, irreversibleCalls, results };
+});
+check("late game A review: disarmed Transcend, Adore, and alicorn sacrifice preserve false/true confirmation settings",
+  confirmationPreservation.every((sample) =>
+    sample.afterNoConfirm === sample.initialNoConfirm && sample.irreversibleCalls === 0 && sample.results.every((result) => result?.ok === false)));
+gamePage.opts.noConfirm = false;
+check("late game A: exact and structured action policies are classified", hasActionBroker &&
+  dbg.actionPolicyFor("candidate:build:library") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("craft:beam") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("trade:zebras") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("candidateRare:time:temporalBattery") === dbg.ACTION_POLICY.RARE_CAPITAL &&
+  dbg.actionPolicyFor("candidate:transcendence:epiphanyUpgrade") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("praise") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("sacrificeUnicorns") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("sacrificeAlicorns") === dbg.ACTION_POLICY.RARE_CAPITAL &&
+  dbg.actionPolicyFor("transcend") === dbg.ACTION_POLICY.AUTHORIZED_PRESTIGE &&
+  dbg.actionPolicyFor("resetWorld") === dbg.ACTION_POLICY.FORBIDDEN);
+check("late game A final review: every repeatable native mutation family has a broker policy", hasActionBroker &&
+  ["observeStars", "holdFestival", "huntAll", "promoteKittens", "boosterTicks",
+    "processor:smelter", "job:assign:farmer", "job:unassign:woodcutter", "leader:select"]
+    .every((id) => dbg.actionPolicyFor(id) === dbg.ACTION_POLICY.SAFE_REPEATABLE));
+
+let safeCalls = 0;
+const safeResult = hasActionBroker
+  ? dbg.executeSemanticAction({
+      id: "candidate:build:library",
+      policy: dbg.ACTION_POLICY.SAFE_REPEATABLE,
+      invoke: () => { safeCalls += 1; },
+      snapshot: () => safeCalls,
+      verify: (before, after) => before === 0 && after === 1,
+    })
+  : { ok: false };
+const mismatched = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "candidate:build:library", policy: dbg.ACTION_POLICY.RARE_CAPITAL, invoke: () => { safeCalls += 1; } })
+  : { ok: false };
+const thrown = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "craft:beam", invoke: () => { throw new Error("boom"); } })
+  : { ok: false };
+check("late game A: safe execution snapshots and verifies postconditions", safeResult.ok && safeResult.before === 0 && safeResult.after === 1 && safeCalls === 1);
+check("late game A: mismatched policy and invocation errors fail closed", !mismatched.ok && !thrown.ok && safeCalls === 1);
+
+let deniedStructuredCalls = 0;
+const deniedStructuredIds = [
+  "candidate:transcendence:transcend",
+  "candidate:time:shatter",
+  "candidate:time:timeSkip",
+  "candidate:time:resetWorld",
+  "candidate:religion:sacrificeAlicorns",
+];
+const deniedStructuredResults = deniedStructuredIds.map((id) => dbg.executeSemanticAction({
+  id,
+  invoke: () => { deniedStructuredCalls += 1; },
+}));
+check("late game A review: denied names stay forbidden inside structured candidate IDs",
+  deniedStructuredResults.every((result) => result?.ok === false) && deniedStructuredCalls === 0 && deniedStructuredIds.every((id) => dbg.actionPolicyFor(id) === dbg.ACTION_POLICY.FORBIDDEN));
+
+const armButton = panelEl(".kgh-prestige-arm");
+if (armButton) armButton.click();
+check("late game A: one panel click deliberately arms and immediately renders prestige status", hasPrestigeArm && dbg.prestigeAutomationArmed() === true && localStorageMock.getItem("kgh.prestigeArmed") === "1" && /Prestige automation: ARMED/.test(panelText(".kgh-prestige-arm")) && /ARMED/.test(panelText(".kgh-prestige-status")));
+const deniedStructuredArmedResults = deniedStructuredIds.map((id) => dbg.executeSemanticAction({
+  id,
+  invoke: () => { deniedStructuredCalls += 1; },
+}));
+check("late game A review: arming cannot bypass denied names embedded in candidate IDs",
+  deniedStructuredArmedResults.every((result) => result?.ok === false) && deniedStructuredCalls === 0);
+let prestigeCalls = 0;
+const firstPrestige = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { prestigeCalls += 1; } })
+  : { ok: false };
+const cooldownPrestige = hasActionBroker
+  ? dbg.executeSemanticAction({ id: "adore", invoke: () => { prestigeCalls += 1; } })
+  : { ok: false };
+check("late game A: direct irreversible broker calls require the managed checkpoint/revalidation capability",
+  !firstPrestige.ok && !cooldownPrestige.ok && prestigeCalls === 0);
+if (hasPrestigeArm) dbg.setPrestigeAutomationArmed(false);
+check("late game A: prestige arm disarms and round-trips through storage", hasPrestigeArm && dbg.prestigeAutomationArmed() === false && localStorageMock.getItem("kgh.prestigeArmed") === "0");
 const acoustics = {
   name: "acoustics",
   label: "Acoustics",
@@ -1299,7 +1778,7 @@ const setupAcoustics = () => {
   res("iron").value = 250; res("iron").maxValue = 300;
   let sharks = diplomacy.races.find((race) => race.name === "sharks");
   if (!sharks) {
-    sharks = { name: "sharks", title: "Sharks", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], buys: [{ name: "iron", val: 100 }], sells: [{ name: "parchment", value: 7, chance: 100 }, { name: "manuscript", value: 4.8, chance: 100 }, { name: "compedium", value: 1.4, chance: 100 }] };
+    sharks = { name: "sharks", title: "Sharks", unlocked: true, embassyLevel: 0, tradeTotal: 0, embassyPrices: [], standing: 0, energy: 0, buys: [{ name: "iron", val: 100 }], sells: [{ name: "parchment", value: 7, chance: 1 }, { name: "manuscript", value: 4.8, chance: 1 }, { name: "compedium", value: 1.4, chance: 1 }] };
     diplomacy.races.push(sharks);
   }
   sharks.unlocked = true; sharks.tradeTotal = 0;
@@ -2033,9 +2512,10 @@ check("Test L: panel ships a 'Copy' button for the action log", /kgh-log-copy/.t
  * worth more than Winter Furs).  This is a unit-level check on the
  * exposed pieces; the wider scoring still runs through targetTradeScore.
  * ------------------------------------------------------------------- */
-check("Test M: tradeSellExpected hook accepts a race so embassy bonus applies", /tradeSellExpected = \(sell, race = null\)/.test(source));
+check("Test M: tradeSellExpected hook accepts a race", /tradeSellExpected = \(sell, race = null\)/.test(source));
 check("Test M: trade scoring reads current calendar season", /currentTradeSeasonName/.test(source));
-check("Test M: trade scoring folds embassy level into expected yield", /tradeEmbassyBonus/.test(source));
+check("Test M: trade scoring delegates live chance to diplomacy", /getResourceTradeChance/.test(source));
+check("Test M: trade scoring has no fabricated flat embassy payout multiplier", !/const tradeEmbassyBonus/.test(source));
 
 /* ---------------------------------------------------------------------
  * Test N — v2.4.0 trade-vs-craft pathway analysis: the planner can
@@ -2699,6 +3179,53 @@ check("Test W: first-reset expansion still outranks the same ready workshop upgr
   firstResetStillWinsW.layer === "Expansion checkpoint" && firstResetStillWinsW.target?.meta?.name === "housingW");
 workshopUpgrades.splice(workshopUpgrades.indexOf(readyWorkshopW), 1);
 
+// Task 6: after a reset, a saturated 169-kitten village may take one housing
+// checkpoint, but must then hand the plan to an actionable gateway research.
+// The checkpoint is persisted so a reload cannot restart endless housing.
+const chronophysicsT6 = {
+  name: "chronophysicsT6",
+  label: "Chronophysics T6",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 500 }],
+  unlocks: { upgrades: ["chronoforgeT6"] },
+};
+techs.push(chronophysicsT6);
+expansionTechW.researched = true;
+gamePage.totalResets = 1;
+gamePage.paragonPoints = 74;
+gamePage.karmaKittens = 185;
+village.getKittens = () => 169;
+village.maxKittens = 169;
+res("science").value = Math.max(500, res("science").value);
+localStorageMock.removeItem("kgh.expansionCheckpoint");
+dbg.clearExpansionCheckpoint?.();
+dbg.forceActiveTarget(null);
+const firstPostResetCheckpointT6 = dbg.selectStrategicTarget("balanced");
+const persistedCheckpointT6 = JSON.parse(localStorageMock.getItem("kgh.expansionCheckpoint") || "null");
+check("Task 6 expansion: a full post-reset village may take one housing checkpoint",
+  firstPostResetCheckpointT6.layer === "Expansion checkpoint" && firstPostResetCheckpointT6.target?.meta === housingW);
+check("Task 6 expansion: the bounded housing checkpoint persists its gateway contract",
+  persistedCheckpointT6?.housingId === "build:housingW" && persistedCheckpointT6?.gatewayId === "research:chronophysicsT6");
+housingW.val += 1;
+housingW.on += 1;
+dbg.forceActiveTarget(null);
+const chronophysicsAfterHousingT6 = dbg.selectStrategicTarget("balanced");
+dbg.forceActiveTarget(null);
+const chronophysicsStillOwnsT6 = dbg.selectStrategicTarget("balanced");
+check("Task 6 expansion: Chronophysics starts after one post-reset housing checkpoint",
+  chronophysicsAfterHousingT6.layer === "Research sprint" && chronophysicsAfterHousingT6.target?.meta === chronophysicsT6);
+check("Task 6 expansion: the gateway frontier keeps priority until it completes or invalidates",
+  chronophysicsStillOwnsT6.target?.meta === chronophysicsT6);
+chronophysicsT6.researched = true;
+techs.splice(techs.indexOf(chronophysicsT6), 1);
+housingW.val -= 1;
+housingW.on -= 1;
+localStorageMock.removeItem("kgh.expansionCheckpoint");
+dbg.clearExpansionCheckpoint?.();
+expansionTechW.researched = false;
+village.getKittens = () => 100;
+
 // A non-ready but fundable production upgrade owns the roadmap; an enormous
 // higher-value Steel backlog is excluded by the one-hour project horizon.
 const savedWorkshopChainW = {
@@ -3275,7 +3802,7 @@ dbg.forceActiveTarget(null);
  * without an existing uranium income/trade path it is hard-blocked and must
  * not head the planner's consideration list.
  * ------------------------------------------------------------------- */
-const uraniumAE = R("uranium", 0, 2250, "Uranium");
+const uraniumAE = R("uranium", 0, 2250, "Uranium", { unlocked: false });
 const acceleratorAE = {
   name: "acceleratorAE",
   label: "Accelerator AE",
@@ -3308,12 +3835,604 @@ workshopUpgrades.push(nuclearSmeltersAE);
 perTick.uranium = 0;
 dbg.clearResourceTelemetry?.("uranium");
 dbg.forceActiveTarget(null);
+const dragonUraniumSellAE = { name: "uranium", value: 1, chance: 0.95, width: 0, seasons: { summer: 0.35 } };
+const dragonThoriumSellAE = { name: "thorium", value: 1, chance: 0.5, width: 0.25, minLevel: 5 };
+const dragonsAE = {
+  name: "dragons",
+  title: "Dragons",
+  hidden: true,
+  unlocked: true,
+  embassyLevel: 0,
+  standing: 0,
+  energy: 0,
+  buys: [{ name: "titanium", val: 250 }],
+  sells: [dragonUraniumSellAE, dragonThoriumSellAE],
+};
+check("late game B: uranium trade is eligible before the resource unlocks", typeof dbg.validRaceSell === "function" && dbg.validRaceSell(dragonsAE, dragonUraniumSellAE));
+check("late game B: live fractional trade chance", typeof dbg.expectedTradeYield === "function" && Math.abs(dbg.expectedTradeYield(dragonsAE, dragonUraniumSellAE) - 1.2825) < 1e-6);
+check("late game B: embassy-gated thorium stays invalid below level five", typeof dbg.validRaceSell === "function" && !dbg.validRaceSell(dragonsAE, dragonThoriumSellAE));
 const acceleratorCandidateAE = dbg.candidateById("build:acceleratorAE", "balanced");
 const acceleratorChainAE = dbg.solveChain(acceleratorCandidateAE);
 const uraniumDecisionAE = dbg.selectStrategicTarget("balanced");
-check("Test AE: first uranium producer is hard-blocked when it also costs uranium", acceleratorChainAE.hardBlocked && /no path for Uranium/i.test((acceleratorChainAE.blockers || []).map((b) => b.text).join(" ")));
+check("Test AE: first uranium producer is hard-blocked when it also costs uranium", acceleratorChainAE.hardBlocked && /no (?:acquisition )?path for Uranium/i.test((acceleratorChainAE.blockers || []).map((b) => b.text).join(" ")));
 check("Test AE: hard-blocked first-uranium producer is scored below viable work", acceleratorCandidateAE.score < 0);
 check("Test AE: hard-blocked uranium bootstrap does not head the ranked candidates", uraniumDecisionAE.candidates?.[0]?.meta?.name !== "acceleratorAE");
+
+diplomacy.races.push(dragonsAE);
+const tradeFundingAE = {
+  gold: [res("gold").value, res("gold").maxValue],
+  manpower: [res("manpower").value, res("manpower").maxValue],
+  titanium: [res("titanium").value, res("titanium").maxValue],
+  slab: [res("slab").value, res("slab").maxValue],
+  rates: { gold: perTick.gold, manpower: perTick.manpower, titanium: perTick.titanium, unobtainium: perTick.unobtainium, faith: perTick.faith },
+  faith: [res("faith").value, res("faith").maxValue],
+  priest: job("priest").value,
+};
+res("gold").value = 1000; res("gold").maxValue = Math.max(1000, res("gold").maxValue || 0);
+res("manpower").value = 5000; res("manpower").maxValue = 10000;
+res("titanium").value = 6750; res("titanium").maxValue = 10000;
+const dragonUraniumPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.acquisitionPathFor("uranium", 25) : null;
+const acceleratorTradeChainAE = dbg.solveChain(acceleratorCandidateAE);
+check("Test AE: Dragons make the first uranium producer reachable", !!dragonUraniumPathAE?.reachable && dragonUraniumPathAE.kind === "trade" && Number.isFinite(dragonUraniumPathAE.eta) && dragonUraniumPathAE.nextStep?.race?.name === "dragons" && acceleratorTradeChainAE.reachable);
+
+res("gold").value = 0;
+res("manpower").value = 0;
+res("titanium").value = 0;
+perTick.gold = 1;
+perTick.manpower = 2;
+perTick.titanium = 0.5;
+dbg.clearResourceTelemetry?.();
+const unbankedDragonPathAE = dbg.acquisitionPathFor("uranium", 25);
+const unbankedDragonSlowestAE = Math.max(...(unbankedDragonPathAE.inputs || []).map((input) => input.eta));
+check("Test AE review: unbanked Dragon prices recurse and the slowest input owns ETA", unbankedDragonPathAE.reachable && unbankedDragonPathAE.kind === "trade" && ["manpower", "gold", "titanium"].every((name) => unbankedDragonPathAE.inputs.some((input) => input.resource === name && input.reachable)) && Math.abs(unbankedDragonPathAE.eta - unbankedDragonSlowestAE) < 1e-6);
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const dragonRouteNeedsAE = dbg.resourceNeeds("balanced");
+check("Test AE review: uranium target pressures Dragon route inputs, not phantom uranium work", (dragonRouteNeedsAE.needs.manpower || 0) > 0 && (dragonRouteNeedsAE.needs.gold || 0) > 0 && (dragonRouteNeedsAE.needs.titanium || 0) > 0 && !(dragonRouteNeedsAE.needs.uranium > 0));
+
+const unobtainiumAE = R("unobtainium", 0, 0, "Unobtainium");
+const timeCrystalAE = R("timeCrystal", 0, 0, "Time Crystal", { unlocked: false });
+const leviathansAE = {
+  name: "leviathans",
+  title: "Leviathans",
+  hidden: true,
+  unlocked: true,
+  embassyLevel: 0,
+  standing: 0,
+  energy: 0,
+  buys: [{ name: "unobtainium", val: 5000 }],
+  sells: [{ name: "timeCrystal", value: 0.25, chance: 0.98, width: 0.15 }],
+};
+resources.push(unobtainiumAE, timeCrystalAE);
+diplomacy.races.push(leviathansAE);
+perTick.unobtainium = 4;
+dbg.clearResourceTelemetry?.();
+const leviathanTimeCrystalPathAE = typeof dbg.acquisitionPathFor === "function" ? dbg.acquisitionPathFor("timeCrystal", 0.25) : null;
+check("Test AE: Leviathans provide a finite time-crystal acquisition route", !!leviathanTimeCrystalPathAE?.reachable && leviathanTimeCrystalPathAE.kind === "trade" && Number.isFinite(leviathanTimeCrystalPathAE.eta) && leviathanTimeCrystalPathAE.nextStep?.race?.name === "leviathans");
+
+/* Final review: route kind is not a strategic veto. ETA is primary, while use
+   of protected rare capital is only a same-ETA tie-breaker. */
+const fastRouteResourceAE = R("fastRouteResourceAE", 0, 100, "Fast Route Resource AE");
+const capitalTieResourceAE = R("capitalTieResourceAE", 0, 100, "Capital Tie Resource AE");
+const fastRouteRaceAE = { name: "fastRouteRaceAE", title: "Fast Route Race AE", unlocked: true, buys: [], sells: [{ name: "fastRouteResourceAE", value: 1, chance: 1, width: 0 }] };
+const rareCapitalRaceAE = { name: "rareCapitalRaceAE", title: "Rare Capital Race AE", unlocked: true, buys: [{ name: "timeCrystal", val: 0.01 }], sells: [{ name: "capitalTieResourceAE", value: 1, chance: 1, width: 0 }] };
+const ordinaryCapitalRaceAE = { name: "ordinaryCapitalRaceAE", title: "Ordinary Capital Race AE", unlocked: true, buys: [{ name: "titanium", val: 1 }], sells: [{ name: "capitalTieResourceAE", value: 1, chance: 1, width: 0 }] };
+resources.push(fastRouteResourceAE, capitalTieResourceAE);
+diplomacy.races.push(fastRouteRaceAE, rareCapitalRaceAE, ordinaryCapitalRaceAE);
+perTick.fastRouteResourceAE = 0.001;
+res("manpower").value = Math.max(res("manpower").value, 100);
+res("gold").value = Math.max(res("gold").value, 100);
+res("timeCrystal").value = Math.max(res("timeCrystal").value, 0.01);
+res("titanium").value = Math.max(res("titanium").value, 1);
+dbg.clearResourceTelemetry?.();
+const fastestRouteAE = dbg.acquisitionPathFor("fastRouteResourceAE", 1);
+const tiedCapitalRouteAE = dbg.acquisitionPathFor("capitalTieResourceAE", 1);
+check("Task 3 final review: acquisition routes rank by ETA with protected capital only a minor tie-breaker",
+  fastestRouteAE.kind === "trade" && fastestRouteAE.nextStep?.race?.name === "fastRouteRaceAE" &&
+  tiedCapitalRouteAE.nextStep?.race?.name === "ordinaryCapitalRaceAE");
+delete perTick.fastRouteResourceAE;
+for (const race of [fastRouteRaceAE, rareCapitalRaceAE, ordinaryCapitalRaceAE]) diplomacy.races.splice(diplomacy.races.indexOf(race), 1);
+for (const resource of [fastRouteResourceAE, capitalTieResourceAE]) resources.splice(resources.indexOf(resource), 1);
+dbg.clearResourceTelemetry?.();
+const timeCrystalConsumerAE = { name: "timeCrystalConsumerAE", label: "Time Crystal Consumer AE", unlocked: true, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 0.25 }], effects: {} };
+buildings.push(timeCrystalConsumerAE);
+dbg.queueClear();
+dbg.queueAdd("build:timeCrystalConsumerAE", 0);
+dbg.forceActiveTarget(null);
+dbg.selectStrategicTarget("balanced");
+const leviathanRouteNeedsAE = dbg.resourceNeeds("balanced");
+check("Test AE review: time-crystal target pressures Leviathan unobtainium input", (leviathanRouteNeedsAE.needs.unobtainium || 0) > 0 && (leviathanRouteNeedsAE.needs.manpower || 0) > 0 && (leviathanRouteNeedsAE.needs.gold || 0) > 0 && !(leviathanRouteNeedsAE.needs.timeCrystal > 0));
+dbg.queueClear();
+buildings.splice(buildings.indexOf(timeCrystalConsumerAE), 1);
+
+const sharksRouteAE = diplomacy.races.find((race) => race && race.name === "sharks");
+const savedCraftTradeAE = { parchment: res("parchment").value, furs: res("furs").value, iron: res("iron").value };
+res("parchment").value = 0;
+res("furs").value = 0;
+res("iron").value = 1000;
+res("manpower").value = 5000;
+res("gold").value = 1000;
+const parchmentTargetAE = { kind: "build", meta: { name: "parchmentTargetAE", label: "Parchment Target AE", prices: [{ name: "parchment", val: 1 }] }, affordable: false };
+const parchmentRouteAE = dbg.acquisitionPathFor("parchment", 1);
+const tradeCallsBeforeRouteGateAE = tradeCalls;
+const routeObeyedAE = typeof dbg.maybeTradeForTargetChain === "function" && !dbg.maybeTradeForTargetChain(parchmentTargetAE);
+check("Test AE review: targeted diplomacy obeys a selected craft route", !!sharksRouteAE && parchmentRouteAE.kind === "craft" && routeObeyedAE && tradeCalls === tradeCallsBeforeRouteGateAE);
+[res("parchment").value, res("furs").value, res("iron").value] = [savedCraftTradeAE.parchment, savedCraftTradeAE.furs, savedCraftTradeAE.iron];
+
+/* Re-review: acquisition consumers must follow the actionable trade node even
+   when the selected root is a craft, producer, or storage bridge. */
+const nestedCraftAE = R("nestedCraftAE", 0, 100, "Nested Craft AE");
+const nestedProducerAE = R("nestedProducerAE", 0, 100, "Nested Producer AE");
+const nestedStorageAE = R("nestedStorageAE", 0, 1, "Nested Storage AE");
+resources.push(nestedCraftAE, nestedProducerAE, nestedStorageAE);
+const nestedCraftRecipeAE = { name: "nestedCraftAE", label: "Nested Craft AE", unlocked: true, prices: [{ name: "uranium", val: 1 }] };
+crafts.push(nestedCraftRecipeAE);
+const nestedProducerBridgeAE = { name: "nestedProducerBridgeAE", label: "Nested Producer Bridge AE", unlocked: true, val: 0, on: 0, prices: [{ name: "uranium", val: 1 }], effects: { nestedProducerAEPerTickProd: 0.1 } };
+const nestedStorageBridgeAE = { name: "nestedStorageBridgeAE", label: "Nested Storage Bridge AE", unlocked: true, val: 0, on: 0, prices: [{ name: "uranium", val: 1 }], effects: { nestedStorageAEMax: 20 } };
+const nestedCraftTargetAE = { name: "nestedCraftTargetAE", label: "Nested Craft Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "nestedCraftAE", val: 1 }], effects: {} };
+const nestedProducerTargetAE = { name: "nestedProducerTargetAE", label: "Nested Producer Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "nestedProducerAE", val: 1 }], effects: {} };
+const nestedStorageTargetAE = { name: "nestedStorageTargetAE", label: "Nested Storage Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "nestedStorageAE", val: 10 }], effects: {} };
+buildings.push(nestedProducerBridgeAE, nestedStorageBridgeAE, nestedCraftTargetAE, nestedProducerTargetAE, nestedStorageTargetAE);
+res("gold").value = 0;
+res("manpower").value = 0;
+res("titanium").value = 0;
+perTick.gold = 1;
+perTick.manpower = 2;
+perTick.titanium = 0.5;
+dbg.clearResourceTelemetry?.();
+const nestedRouteCasesAE = [
+  ["craft", "nestedCraftAE", 1, "nestedCraftTargetAE"],
+  ["producer", "nestedProducerAE", 1, "nestedProducerTargetAE"],
+  ["storage", "nestedStorageAE", 10, "nestedStorageTargetAE"],
+];
+
+for (const [rootKind, resourceName, amount, targetName] of nestedRouteCasesAE) {
+  const nestedRootAE = dbg.acquisitionPathFor(resourceName, amount, { finalPurchase: true });
+  const nestedTargetCandidateAE = dbg.candidateById(`build:${targetName}`, "balanced");
+  dbg.forceActiveTarget(nestedTargetCandidateAE, "Economy / normal growth", 0);
+  const nestedNeedsAE = dbg.resourceNeeds("balanced").needs;
+  check(`Test AE re-review: ${rootKind} root pressures its nested Dragon trade inputs`, nestedRootAE.kind === rootKind && (nestedNeedsAE.manpower || 0) > 0 && (nestedNeedsAE.gold || 0) > 0 && (nestedNeedsAE.titanium || 0) > 0);
+}
+dbg.forceActiveTarget(null);
+for (const meta of [nestedProducerBridgeAE, nestedStorageBridgeAE, nestedCraftTargetAE, nestedProducerTargetAE, nestedStorageTargetAE]) buildings.splice(buildings.indexOf(meta), 1);
+crafts.splice(crafts.indexOf(nestedCraftRecipeAE), 1);
+for (const resource of [nestedCraftAE, nestedProducerAE, nestedStorageAE]) resources.splice(resources.indexOf(resource), 1);
+
+/* Re-review integration: exercise the real tick dispatcher. A passive titanium
+   route must suppress every Zebra fast path; a Dragon route whose titanium
+   price is itself supplied by Zebras must execute the nested Zebra step first. */
+const passiveTitaniumTargetAE = { name: "passiveTitaniumTargetAE", label: "Passive Titanium Target AE", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 500 }], effects: {} };
+buildings.push(passiveTitaniumTargetAE);
+zebras.unlocked = true;
+zebras.hidden = false;
+res("titanium").value = 0;
+res("titanium").maxValue = 1000;
+perTick.titanium = 1;
+res("gold").value = 10000;
+res("gold").maxValue = Math.max(10000, res("gold").maxValue || 0);
+res("manpower").value = 30000;
+res("manpower").maxValue = Math.max(30000, res("manpower").maxValue || 0);
+res("slab").value = 30000;
+dbg.clearResourceTelemetry?.();
+const passiveTitaniumCandidateAE = dbg.candidateById("build:passiveTitaniumTargetAE", "balanced");
+dbg.forceActiveTarget(passiveTitaniumCandidateAE, "Economy / normal growth", 0);
+const passiveTitaniumRouteAE = dbg.acquisitionPathFor("titanium", 500, { finalPurchase: true });
+const zebraTradesBeforePassiveAE = zebras.tradeTotal || 0;
+fakeNow += 30000;
+tickFn();
+check("Test AE re-review: actual diplomacy dispatcher does not Zebra-trade over a passive titanium route", passiveTitaniumRouteAE.kind === "passive" && (zebras.tradeTotal || 0) === zebraTradesBeforePassiveAE);
+buildings.splice(buildings.indexOf(passiveTitaniumTargetAE), 1);
+
+perTick.titanium = 0;
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 10000;
+res("manpower").value = 30000;
+res("slab").value = 30000;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const nestedZebraDragonRouteAE = dbg.acquisitionPathFor("uranium", 25, { finalPurchase: true });
+const zebraTradesBeforeNestedAE = zebras.tradeTotal || 0;
+fakeNow += 30000;
+tickFn();
+check("Test AE re-review: actual diplomacy dispatcher executes nested Zebra before Dragon", nestedZebraDragonRouteAE.kind === "trade" && nestedZebraDragonRouteAE.nextStep?.race?.name === "dragons" && nestedZebraDragonRouteAE.inputs.some((input) => input.nextStep?.kind === "trade" && input.nextStep?.race?.name === "zebras") && (zebras.tradeTotal || 0) > zebraTradesBeforeNestedAE);
+
+/* Task 3: diplomacy has one mutation owner. The old dispatcher called both
+   manageDiplomacy() and manageTrade(), so the same nested Zebra route could hit
+   the diplomacy API twice during one tick. Count the real fixture calls rather
+   than helper returns: one tick must produce exactly one trade API mutation. */
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 10000;
+res("manpower").value = 30000;
+res("slab").value = 30000;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const diplomacyTradeApiCallsAE = [];
+const originalTradeMultipleAE = diplomacy.tradeMultiple;
+const originalTradeAllAE = diplomacy.tradeAll;
+diplomacy.tradeMultiple = (race, amount) => {
+  diplomacyTradeApiCallsAE.push({ api: "tradeMultiple", race: race?.name, amount });
+  return originalTradeMultipleAE(race, amount);
+};
+diplomacy.tradeAll = (race) => {
+  diplomacyTradeApiCallsAE.push({ api: "tradeAll", race: race?.name, amount: 1 });
+  return originalTradeAllAE(race);
+};
+fakeNow += 30000;
+tickFn();
+diplomacy.tradeMultiple = originalTradeMultipleAE;
+diplomacy.tradeAll = originalTradeAllAE;
+check("Task 3: one tick issues exactly one diplomacy trade API call", diplomacyTradeApiCallsAE.length === 1);
+
+/* Task 3: route selection and funding use the acquisition graph plus the full
+   merged reservation ledger. With Dragon titanium unfunded, the actionable
+   route is the nested Zebra step; its pressure includes the Zebra slab/ship
+   ramp and catpower, never a made-up uranium miner need. */
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 0;
+res("manpower").value = 0;
+res("slab").value = 0;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const activeNestedRouteAE = typeof dbg.activeAcquisitionRoute === "function"
+  ? dbg.activeAcquisitionRoute(acceleratorCandidateAE)
+  : null;
+const nestedDiplomacyNeedsAE = dbg.resourceNeeds("balanced").needs;
+check("Task 3: insufficient Dragon titanium selects the nested Zebra titanium route first", activeNestedRouteAE?.nextStep?.race?.name === "zebras" && activeNestedRouteAE?.resource === "titanium");
+check("Task 3: nested Zebra route pressures slab, ship, and catpower without synthetic uranium miners", (nestedDiplomacyNeedsAE.slab || 0) > 0 && (nestedDiplomacyNeedsAE.ship || 0) > 0 && (nestedDiplomacyNeedsAE.manpower || 0) > 0 && !(nestedDiplomacyNeedsAE.uranium > 0));
+
+const nestedRouteLedgerAE = dbg.buildReservationLedger(acceleratorCandidateAE);
+const zebraOwnerIdAE = Object.keys(nestedRouteLedgerAE.routeOwners || {}).find((id) => /trade:zebras:titanium/.test(id));
+const dragonOwnerIdAE = Object.keys(nestedRouteLedgerAE.routeOwners || {}).find((id) => /trade:dragons:uranium/.test(id));
+check("Task 3 final review: nested Zebra and parent Dragon inputs are owned reservations in the active route ledger",
+  !!zebraOwnerIdAE && !!dragonOwnerIdAE &&
+  (nestedRouteLedgerAE.routeOwners[zebraOwnerIdAE]?.slab || 0) > 0 &&
+  (nestedRouteLedgerAE.routeOwners[zebraOwnerIdAE]?.manpower || 0) > 0 &&
+  (nestedRouteLedgerAE.routeOwners[dragonOwnerIdAE]?.titanium || 0) > 0 &&
+  (nestedRouteLedgerAE.routeOwners[dragonOwnerIdAE]?.gold || 0) > 0 &&
+  nestedRouteLedgerAE.reserved.slab >= nestedRouteLedgerAE.routeOwners[zebraOwnerIdAE].slab &&
+  nestedRouteLedgerAE.reserved.titanium >= nestedRouteLedgerAE.routeOwners[dragonOwnerIdAE].titanium);
+for (const [name, amount] of Object.entries(nestedRouteLedgerAE.routeReserved || {})) {
+  if (res(name)) res(name).value = Math.max(res(name).value || 0, amount);
+}
+res("titanium").value = 0;
+const ownedNestedZebraBatchAE = dbg.boundedTradeBatch(activeNestedRouteAE, nestedRouteLedgerAE);
+check("Task 3 final review: selected nested Zebra trade may consume its owned inputs while unrelated lanes see the full route floor",
+  ownedNestedZebraBatchAE > 0 && nestedRouteLedgerAE.reserved.slab > 0 && nestedRouteLedgerAE.reserved.manpower > 0);
+
+res("unobtainium").value = 0;
+res("timeCrystal").value = 0;
+const leviathanTargetCandidateAE = { kind: "build", meta: timeCrystalConsumerAE, affordable: false };
+const leviathanRouteLedgerAE = dbg.buildReservationLedger(leviathanTargetCandidateAE);
+const leviathanOwnerIdAE = Object.keys(leviathanRouteLedgerAE.routeOwners || {}).find((id) => /trade:leviathans:timeCrystal/.test(id));
+if (leviathanOwnerIdAE) res("unobtainium").value = leviathanRouteLedgerAE.routeOwners[leviathanOwnerIdAE]?.unobtainium || 0;
+const activeLeviathanRouteAE = dbg.activeAcquisitionRoute(leviathanTargetCandidateAE);
+check("Task 3 final review: Leviathan capital is reserved for and consumable by its selected route only",
+  !!leviathanOwnerIdAE && leviathanRouteLedgerAE.reserved.unobtainium > 0 && dbg.boundedTradeBatch(activeLeviathanRouteAE, leviathanRouteLedgerAE) > 0);
+res("titanium").value = 0;
+res("uranium").value = 0;
+res("gold").value = 0;
+res("manpower").value = 0;
+res("slab").value = 0;
+res("unobtainium").value = 0;
+res("timeCrystal").value = 0;
+
+/* Exact batch bounds: every trade price leaves the complete merged floor in
+   place, while expected output never runs beyond the target deficit or storage
+   headroom. These synthetic source labels mirror buildReservationLedger's
+   active/manual/unicorn/survival merge and make omissions visible. */
+const completeTradeLedgerAE = {
+  reserved: { titanium: 275, manpower: 150, gold: 60, unobtainium: 5000 },
+  sources: {
+    titanium: ["active plan"],
+    gold: ["manual queue"],
+    unobtainium: ["unicorn path"],
+    manpower: ["survival"],
+  },
+};
+res("titanium").value = 525;
+res("manpower").value = 250;
+res("gold").value = 75;
+res("uranium").value = 0;
+res("uranium").maxValue = 100;
+dbg.clearResourceTelemetry?.();
+const directDragonRouteAE = dbg.acquisitionPathFor("uranium", 25, { finalPurchase: true });
+const dragonBoundedBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(directDragonRouteAE, completeTradeLedgerAE)
+  : null;
+check("Task 3: Dragon batch respects active/manual/survival titanium, catpower, and gold floors", dragonBoundedBatchAE === 1);
+
+res("uranium").value = 100;
+const cappedDragonRouteAE = { ...directDragonRouteAE, amount: 125 };
+const uraniumHeadroomBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(cappedDragonRouteAE, completeTradeLedgerAE)
+  : null;
+
+res("unobtainium").value = 9999;
+res("timeCrystal").value = 0;
+res("timeCrystal").maxValue = 10;
+const fundedLeviathanRouteAE = {
+  ...leviathanTimeCrystalPathAE,
+  amount: 2,
+  nextStep: { ...leviathanTimeCrystalPathAE.nextStep, trades: 8 },
+};
+const leviathanFloorBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(fundedLeviathanRouteAE, completeTradeLedgerAE)
+  : null;
+
+res("unobtainium").value = 10000;
+res("timeCrystal").value = 1;
+res("timeCrystal").maxValue = 1;
+const cappedLeviathanRouteAE = {
+  ...leviathanTimeCrystalPathAE,
+  amount: 2,
+  nextStep: { ...leviathanTimeCrystalPathAE.nextStep, trades: 8 },
+};
+const leviathanBoundedBatchAE = typeof dbg.boundedTradeBatch === "function"
+  ? dbg.boundedTradeBatch(cappedLeviathanRouteAE, completeTradeLedgerAE)
+  : null;
+check("Task 3: trade batches stop at uranium/time-crystal output headroom and unobtainium floor", uraniumHeadroomBatchAE === 0 && leviathanFloorBatchAE === 0 && leviathanBoundedBatchAE === 0);
+
+/* Task 3 review: a partial output slot smaller than one expected yield is not
+   permission to overflow, and each Dragon input floor must bind on its own. */
+const savedCultureReviewAE = res("culture").value;
+res("titanium").value = 100000;
+res("manpower").value = 10000;
+res("gold").value = 10000;
+res("uranium").value = 99.5;
+res("uranium").maxValue = 100;
+const partialHeadroomDragonRouteAE = { ...directDragonRouteAE, amount: 125 };
+const partialHeadroomBatchAE = dbg.boundedTradeBatch(partialHeadroomDragonRouteAE, { reserved: {} });
+check("Task 3 review: positive uranium headroom below one expected yield permits zero trades", partialHeadroomBatchAE === 0);
+
+/* Final review: output headroom is a worst-case safety bound, not an expected-
+   value budget. A high-variance sell can land above its mean, so neither the
+   targeted nor surplus batcher may start a trade unless the maximum result fits. */
+const volatileUraniumSellAE = { name: "uranium", value: 2, chance: 0.5, width: 1 };
+const volatileDragonsAE = { ...dragonsAE, name: "volatileDragonsAE", sells: [volatileUraniumSellAE] };
+const volatileRouteAE = {
+  reachable: true,
+  resource: "uranium",
+  amount: 125,
+  expectedYield: 1,
+  nextStep: { kind: "trade", resource: "uranium", race: volatileDragonsAE, sell: volatileUraniumSellAE, trades: 25, expectedYield: 1 },
+};
+res("titanium").value = 10000;
+res("manpower").value = 10000;
+res("gold").value = 10000;
+res("uranium").value = 97;
+res("uranium").maxValue = 100;
+const volatileTargetBatchAE = dbg.boundedTradeBatch(volatileRouteAE, { reserved: {} });
+const volatileOverflowBatchAE = dbg.safeOverflowTradeBatch?.(volatileDragonsAE, { reserved: {} });
+check("Task 3 final review: maximum high-variance yield, not expected yield, protects targeted and surplus output headroom",
+  dbg.maximumTradeYield?.(volatileDragonsAE, volatileUraniumSellAE) === 4 && volatileTargetBatchAE === 0 && volatileOverflowBatchAE === 0);
+
+const savedSpiceCollateralAE = { value: res("spice").value, maxValue: res("spice").maxValue, unlocked: res("spice").unlocked };
+const collateralSpiceSellAE = { name: "spice", value: 5, chance: 1, width: 0 };
+const collateralDragonsAE = { ...dragonsAE, name: "collateralDragonsAE", sells: [volatileUraniumSellAE, collateralSpiceSellAE] };
+const collateralRouteAE = {
+  ...volatileRouteAE,
+  nextStep: { ...volatileRouteAE.nextStep, race: collateralDragonsAE },
+};
+res("spice").unlocked = true;
+res("spice").value = 99;
+res("spice").maxValue = 100;
+res("uranium").value = 0;
+const collateralTargetBatchAE = dbg.boundedTradeBatch(collateralRouteAE, { reserved: {} });
+check("Task 3 final review: targeted trade also protects every collateral output's worst-case headroom", collateralTargetBatchAE === 0);
+Object.assign(res("spice"), savedSpiceCollateralAE);
+
+res("titanium").value = 100000;
+res("manpower").value = 10000;
+res("gold").value = 10000;
+const multiBatchTradeEtaAE = dbg.tradePathSecondsFor(volatileDragonsAE, "uranium", 151);
+check("Task 3 final review: banked inputs still include cooldown ETA between four native trade batches", multiBatchTradeEtaAE >= 30 && multiBatchTradeEtaAE < 40);
+
+const isolatedFloorBatchAE = (floorName, floor, stock) => {
+  res("titanium").value = 10000;
+  res("manpower").value = 10000;
+  res("gold").value = 10000;
+  res(floorName).value = stock;
+  res("uranium").value = 0;
+  return dbg.boundedTradeBatch(directDragonRouteAE, { reserved: { [floorName]: floor } });
+};
+const isolatedTitaniumFloorAE = isolatedFloorBatchAE("titanium", 275, 524);
+const isolatedManpowerFloorAE = isolatedFloorBatchAE("manpower", 150, 199);
+const isolatedGoldFloorAE = isolatedFloorBatchAE("gold", 60, 74);
+check("Task 3 review: titanium, catpower, and gold floors independently stop Dragon trades", isolatedTitaniumFloorAE === 0 && isolatedManpowerFloorAE === 0 && isolatedGoldFloorAE === 0);
+
+check("Task 3 review: explorer and embassy semantic IDs are safe repeatable actions",
+  dbg.actionPolicyFor("explore:races") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("embassy:reviewers") === dbg.ACTION_POLICY.SAFE_REPEATABLE);
+
+/* The real dispatcher must end after one public diplomacy API mutation. Exercise
+   native explorer, single-trade fallback, and embassy controller paths while
+   observing every diplomacy API family in the fixture. */
+const reviewExplorerRaceAE = { name: "reviewExplorersAE", title: "Review Explorers", unlocked: false, hidden: false, embassyLevel: 0, embassyPrices: [] };
+diplomacy.races.push(reviewExplorerRaceAE);
+const savedUnlockRandomRaceAE = diplomacy.unlockRandomRace;
+diplomacy.unlockRandomRace = () => {
+  reviewExplorerRaceAE.unlocked = true;
+  return reviewExplorerRaceAE;
+};
+res("manpower").value = 1100;
+res("manpower").maxValue = 1200;
+// Isolate explorer ownership from the earlier Dragon fixture: the newly active
+// route ledger correctly protects Dragon funding, so fully bank that unrelated
+// uranium demand before asserting the explorer controller branch.
+res("uranium").value = 250;
+res("uranium").maxValue = 2250;
+dbg.forceActiveTarget(null);
+const explorerAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+tickFn();
+const explorerAuditAE = diplomacyApiCalls.slice(explorerAuditStartAE);
+check("Task 3 review: real dispatcher uses one native explorer API and stops", reviewExplorerRaceAE.unlocked && explorerAuditAE.length === 1 && explorerAuditAE[0].api === "explore");
+diplomacy.races.splice(diplomacy.races.indexOf(reviewExplorerRaceAE), 1);
+diplomacy.unlockRandomRace = savedUnlockRandomRaceAE;
+
+const reviewTitaniumTargetAE = { name: "reviewTitaniumTargetAE", label: "Review Titanium Target", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 100 }], effects: {} };
+buildings.push(reviewTitaniumTargetAE);
+const savedTradeMultipleReviewAE = diplomacy.tradeMultiple;
+const savedTradeReviewAE = diplomacy.trade;
+const savedShipReviewAE = [res("ship").value, res("ship").maxValue];
+delete diplomacy.tradeMultiple;
+let fallbackTradeCallsAE = 0;
+diplomacy.trade = (race) => {
+  diplomacyApiCalls.push({ api: "trade", race: race?.name, amount: 1 });
+  fallbackTradeCallsAE += 1;
+  if (race?.name === "lizards" && canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }])) {
+    pay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }]);
+    res("minerals").value += 100;
+    return true;
+  }
+  if (race?.name !== "zebras" || !canPay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "slab", val: 50 }])) return false;
+  pay([{ name: "manpower", val: 50 }, { name: "gold", val: 15 }, { name: "slab", val: 50 }]);
+  res("titanium").value += 12;
+  return true;
+};
+res("ship").value = 1;
+res("ship").maxValue = 1;
+res("titanium").value = 0;
+res("titanium").maxValue = 100;
+res("manpower").value = 5000;
+res("manpower").maxValue = 10000;
+res("gold").value = 1000;
+res("slab").value = 1000;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(dbg.candidateById("build:reviewTitaniumTargetAE"), "Economy / normal growth", 0);
+const tradeAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+const tradeAuditAE = diplomacyApiCalls.slice(tradeAuditStartAE);
+check("Task 3 review: missing tradeMultiple permits one native trade call, never a loop", fallbackTradeCallsAE === 1 && tradeAuditAE.length === 1 && tradeAuditAE[0].api === "trade");
+
+// An active selected route owns diplomacy. If its next Zebra step is blocked on
+// Slab, near-cap catpower must not fall through to an unrelated Lizard overflow
+// trade; the passive target immediately after this fixture proves overflow
+// resumes as soon as that selected route closes/invalidates.
+res("uranium").value = 0;
+res("titanium").value = 0;
+res("slab").value = 0;
+res("manpower").value = 985;
+res("manpower").maxValue = 1000;
+res("gold").value = 600;
+dbg.clearResourceTelemetry?.();
+dbg.forceActiveTarget(acceleratorCandidateAE, "Economy / normal growth", 0);
+const blockedRouteOverflowAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+const blockedRouteOverflowAuditAE = diplomacyApiCalls.slice(blockedRouteOverflowAuditStartAE);
+check("Task 3 final review: blocked active Dragon/Zebra route excludes unrelated overflow trade",
+  blockedRouteOverflowAuditAE.every((call) => call.api !== "trade" && call.api !== "tradeAll" && call.api !== "tradeMultiple") &&
+  /route|slab|fund|block|saving|embassy/i.test(panelText(".kgh-diplomacy") + " " + dbg.manageDiplomacy("balanced")));
+res("slab").value = 1000;
+
+const overflowPassiveTargetAE = { name: "overflowPassiveTargetAE", label: "Overflow Passive Target", unlocked: true, val: 0, on: 0, prices: [{ name: "titanium", val: 100 }], effects: {} };
+buildings.push(overflowPassiveTargetAE);
+perTick.titanium = 1;
+res("titanium").value = 0;
+res("titanium").maxValue = 1000;
+res("manpower").value = 985;
+res("manpower").maxValue = 1000;
+res("gold").value = 600;
+res("minerals").value = 0;
+dbg.clearResourceTelemetry?.("titanium");
+dbg.forceActiveTarget(dbg.candidateById("build:overflowPassiveTargetAE"), "Economy / normal growth", 0);
+const overflowFallbackAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+dbg.maybeTradeSurplus(dbg.candidateById("build:overflowPassiveTargetAE"), "balanced");
+const overflowFallbackAuditAE = diplomacyApiCalls.slice(overflowFallbackAuditStartAE);
+check("Task 3 review: overflow fallback also uses one native trade call at batch one", overflowFallbackAuditAE.length === 1 && overflowFallbackAuditAE[0].api === "trade");
+res("manpower").value = 0;
+buildings.splice(buildings.indexOf(overflowPassiveTargetAE), 1);
+perTick.titanium = 0;
+diplomacy.tradeMultiple = savedTradeMultipleReviewAE;
+if (savedTradeReviewAE === undefined) delete diplomacy.trade; else diplomacy.trade = savedTradeReviewAE;
+[res("ship").value, res("ship").maxValue] = savedShipReviewAE;
+buildings.splice(buildings.indexOf(reviewTitaniumTargetAE), 1);
+res("uranium").value = 0;
+res("uranium").maxValue = 2250;
+
+const reviewEmbassyRaceAE = { name: "reviewEmbassyAE", title: "Review Embassy", unlocked: true, hidden: false, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 10 }], sells: [] };
+const savedEmbassyPricesAE = diplomacy.races.map((race) => [race, race.embassyPrices]);
+for (const race of diplomacy.races) race.embassyPrices = [];
+diplomacy.races.push(reviewEmbassyRaceAE);
+res("culture").value = 100;
+res("manpower").value = 0;
+dbg.forceActiveTarget(null);
+const embassyAuditStartAE = diplomacyApiCalls.length;
+fakeNow += 30000;
+tickFn();
+const embassyAuditAE = diplomacyApiCalls.slice(embassyAuditStartAE);
+check("Task 3 review: real dispatcher uses one native embassy API and stops", reviewEmbassyRaceAE.embassyLevel === 1 && embassyAuditAE.length === 1 && embassyAuditAE[0].api === "embassy");
+diplomacy.races.splice(diplomacy.races.indexOf(reviewEmbassyRaceAE), 1);
+for (const [race, prices] of savedEmbassyPricesAE) race.embassyPrices = prices;
+
+/* With the public controller unavailable, no raw pay/unlock/level fallback is
+   allowed. The manager reports unavailable and leaves the board unchanged. */
+const unavailableExplorerRaceAE = { name: "unavailableExplorerAE", title: "Unavailable Explorer", unlocked: false, hidden: false, embassyLevel: 0, embassyPrices: [] };
+diplomacy.races.push(unavailableExplorerRaceAE);
+const savedExploreControllerAE = gamePage.tradeTab.exploreBtn.controller;
+gamePage.tradeTab.exploreBtn.controller = null;
+let rawUnlockCallsAE = 0;
+diplomacy.unlockRandomRace = () => {
+  rawUnlockCallsAE += 1;
+  unavailableExplorerRaceAE.unlocked = true;
+  return unavailableExplorerRaceAE;
+};
+res("manpower").value = 1100;
+res("uranium").value = 250;
+const manpowerBeforeUnavailableExploreAE = res("manpower").value;
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+check("Task 3 review: unavailable explorer controller performs no raw payment or race mutation", rawUnlockCallsAE === 0 && !unavailableExplorerRaceAE.unlocked && res("manpower").value === manpowerBeforeUnavailableExploreAE);
+gamePage.tradeTab.exploreBtn.controller = savedExploreControllerAE;
+diplomacy.unlockRandomRace = savedUnlockRandomRaceAE;
+diplomacy.races.splice(diplomacy.races.indexOf(unavailableExplorerRaceAE), 1);
+res("uranium").value = 0;
+
+const unavailableEmbassyRaceAE = { name: "unavailableEmbassyAE", title: "Unavailable Embassy", unlocked: true, embassyLevel: 0, embassyPrices: [{ name: "culture", val: 10 }], sells: [] };
+const savedEmbassyPricesUnavailableAE = diplomacy.races.map((race) => [race, race.embassyPrices]);
+for (const race of diplomacy.races) race.embassyPrices = [];
+diplomacy.races.push(unavailableEmbassyRaceAE);
+const savedEmbassyControllerAE = context.classes.diplomacy.ui.EmbassyButtonController;
+delete context.classes.diplomacy.ui.EmbassyButtonController;
+res("culture").value = 100;
+res("manpower").value = 0;
+const cultureBeforeUnavailableEmbassyAE = res("culture").value;
+dbg.forceActiveTarget(null);
+fakeNow += 30000;
+dbg.manageDiplomacy("balanced");
+check("Task 3 review: unavailable embassy controller performs no raw payment or level mutation", unavailableEmbassyRaceAE.embassyLevel === 0 && res("culture").value === cultureBeforeUnavailableEmbassyAE);
+context.classes.diplomacy.ui.EmbassyButtonController = savedEmbassyControllerAE;
+diplomacy.races.splice(diplomacy.races.indexOf(unavailableEmbassyRaceAE), 1);
+for (const [race, prices] of savedEmbassyPricesUnavailableAE) race.embassyPrices = prices;
+res("culture").value = savedCultureReviewAE;
+
+res("faith").value = 0;
+res("faith").maxValue = Math.max(100, res("faith").maxValue || 0);
+perTick.faith = 0;
+job("priest").value = 0;
+dbg.clearResourceTelemetry?.("faith");
+const zeroRateFaithPathAE = dbg.acquisitionPathFor("faith", 10);
+check("Test AE review: zero-rate direct job does not invent deficit-seconds ETA", !zeroRateFaithPathAE.reachable && !Number.isFinite(zeroRateFaithPathAE.eta) && (zeroRateFaithPathAE.blockers || []).length > 0);
+diplomacy.races.splice(diplomacy.races.indexOf(leviathansAE), 1);
+resources.splice(resources.indexOf(timeCrystalAE), 1);
+resources.splice(resources.indexOf(unobtainiumAE), 1);
+diplomacy.races.splice(diplomacy.races.indexOf(dragonsAE), 1);
+[res("gold").value, res("gold").maxValue] = tradeFundingAE.gold;
+[res("manpower").value, res("manpower").maxValue] = tradeFundingAE.manpower;
+[res("titanium").value, res("titanium").maxValue] = tradeFundingAE.titanium;
+[res("slab").value, res("slab").maxValue] = tradeFundingAE.slab;
+[res("faith").value, res("faith").maxValue] = tradeFundingAE.faith;
+job("priest").value = tradeFundingAE.priest;
+for (const [name, value] of Object.entries(tradeFundingAE.rates)) {
+  if (value === undefined) delete perTick[name];
+  else perTick[name] = value;
+}
 workshopUpgrades.splice(workshopUpgrades.indexOf(nuclearSmeltersAE), 1);
 buildings.splice(buildings.indexOf(acceleratorAE), 1);
 buildings.splice(buildings.indexOf(reactorAE), 1);
@@ -3336,28 +4455,20 @@ dbg.queueClear();
 dbg.forceActiveTarget(null);
 const orbitalEngineeringAC = { name: "orbitalEngineeringAC", label: "Orbital Engineering", unlocked: true, researched: false, prices: [{ name: "science", val: 1000 }], unlocks: {} };
 techs.push(orbitalEngineeringAC);
-const satelliteAC = { name: "satelliteAC", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, requiredTech: [], prices: [{ name: "titanium", val: 50 }, { name: "science", val: 500 }], effects: { observatoryRatio: 0.05 } };
-const spaceElevatorAC = { name: "spaceElevatorAC", label: "Space Elevator", unlocked: false, val: 0, on: 0, priceRatio: 1.15, requiredTech: ["orbitalEngineeringAC"], prices: [{ name: "titanium", val: 6000 }, { name: "science", val: 75000 }], effects: {} };
-const cathAC = { name: "cathAC", label: "Cath", buildings: [satelliteAC, spaceElevatorAC] };
-const orbitalLaunchAC = { name: "orbitalLaunchAC", label: "Orbital Launch", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 400 }], effects: {} };
+const satelliteAC = { name: "sattelite", label: "Satellite", unlocked: true, val: 0, on: 0, priceRatio: 1.08, requiredTech: [], prices: [{ name: "titanium", val: 50 }, { name: "science", val: 500 }], effects: { observatoryRatio: 0.05 } };
+const spaceElevatorAC = { name: "spaceElevator", label: "Space Elevator", unlocked: false, val: 0, on: 0, priceRatio: 1.15, requiredTech: ["orbitalEngineeringAC"], prices: [{ name: "titanium", val: 6000 }, { name: "science", val: 75000 }], effects: {} };
+const cathAC = { name: "cath", label: "Cath", unlocked: true, reached: true, routeDays: 0, buildings: [satelliteAC, spaceElevatorAC] };
+const orbitalLaunchAC = { name: "orbitalLaunch", label: "Orbital Launch", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 400 }], effects: {} };
 gamePage.space = {
   programs: [orbitalLaunchAC],
   planets: [cathAC],
   getProgram: (id) => [orbitalLaunchAC].find((p) => p.name === id),
   getBuilding: (id) => [satelliteAC, spaceElevatorAC].find((b) => b.name === id),
-  build(item) {
-    const name = typeof item === "string" ? item : item && item.name;
-    const meta = [orbitalLaunchAC, satelliteAC, spaceElevatorAC].find((m) => m.name === name);
-    if (!meta || !pay(meta.prices || [])) return false;
-    meta.val = (meta.val || 0) + 1;
-    meta.on = (meta.on || 0) + 1;
-    return true;
-  },
 };
 
-check("Test AC: an unlocked Cath planet building (Satellite) is scanned as a candidate", dbg.candidateById("space:satelliteAC")?.kind === "space");
-check("Test AC: the space mission (Orbital Launch) is ALSO still scanned", !!dbg.candidateById("space:orbitalLaunchAC"));
-check("Test AC: a locked planet building (needs Orbital Engineering) is NOT yet a candidate", !dbg.candidateById("space:spaceElevatorAC"));
+check("Test AC: an unlocked Cath planet building (Satellite) is scanned as a candidate", dbg.candidateById("space:sattelite")?.kind === "space");
+check("Test AC: the space mission (Orbital Launch) is ALSO still scanned", !!dbg.candidateById("space:orbitalLaunch"));
+check("Test AC: a locked planet building (needs Orbital Engineering) is NOT yet a candidate", !dbg.candidateById("space:spaceElevator"));
 
 const solarSatellitesAC = { name: "solarSatellitesAC", label: "Solar Satellites", unlocked: false, researched: false, prices: [{ name: "science", val: 225000 }, { name: "alloy", val: 750 }], effects: {} };
 workshopUpgrades.push(solarSatellitesAC);
@@ -3365,9 +4476,9 @@ workshopUpgrades.push(solarSatellitesAC);
 const reportAC = dbg.report();
 check(
   "Test AC: report SPACE section lists the buildable Satellite distinctly from the LOCKED workshop 'Solar Satellites' upgrade",
-  /— SPACE /.test(reportAC) && /\n {2}Satellite ×0 · next .*(buildable now|need )/.test(reportAC) && /Solar Satellites · LOCKED/.test(reportAC),
+  /— SPACE /.test(reportAC) && /Cath.*Satellite ×0 · next .*(buildable now|need )/.test(reportAC) && /Solar Satellites · LOCKED/.test(reportAC),
 );
-check("Test AC: report SPACE section shows the locked Space Elevator gated on Orbital Engineering", /Space Elevator · LOCKED — needs Orbital Engineering/.test(reportAC));
+check("Test AC: report SPACE section shows Cath ownership and the Space Elevator technology gate", /Cath.*Space Elevator.*technology.*Orbital Engineering/i.test(reportAC));
 
 // Fund and buy the Satellite through the native planner path (kind "space",
 // planet-building sub-type) — proves purchase EXECUTION, not just scanning,
@@ -3411,6 +4522,247 @@ gamePage.resPool.energyCons = savedPowerY.energyCons;
 gamePage.resPool.energyWinterProd = savedPowerY.energyWinterProd;
 res("science").value = savedScienceY.value;
 res("science").maxValue = savedScienceY.maxValue;
+
+/* ---------------------------------------------------------------------
+ * Task 4 RED regressions - normalized ownership/gates, controller-only
+ * mission execution, dependency-frontier ranking, and marginal Space effects.
+ * ------------------------------------------------------------------- */
+const resourceSnapshotsT4 = new Map();
+const ensureResourceT4 = (name, value, maxValue) => {
+  let resource = res(name);
+  if (resource) {
+    resourceSnapshotsT4.set(name, { resource, value: resource.value, maxValue: resource.maxValue, unlocked: resource.unlocked, added: false });
+    resource.value = value;
+    resource.maxValue = maxValue;
+    resource.unlocked = true;
+  } else {
+    resource = R(name, value, maxValue);
+    resources.push(resource);
+    resourceSnapshotsT4.set(name, { resource, added: true });
+  }
+  return resource;
+};
+for (const [name, value, maxValue] of [
+  ["oil", 20000, 25000], ["starchart", 10000, 10000], ["kerosene", 10000, 10000],
+  ["alloy", 10000, 10000], ["thorium", 100000, 100000], ["relic", 100, 100],
+  ["eludium", 10000, 10000], ["concrate", 10000, 10000], ["uranium", 5000, 5000],
+  ["unobtainium", 150, 150], ["antimatter", 0, 100], ["gflops", 100, 1000],
+  ["hashrates", 0, 100000],
+]) ensureResourceT4(name, value, maxValue);
+const savedUnlimitedDRT4 = gamePage.getUnlimitedDR;
+gamePage.getUnlimitedDR = (value, stripe) => value / (1 + value / stripe);
+
+const nanoTechT4 = { name: "nanotechnologyT4", label: "Nanotechnology", unlocked: true, researched: false, prices: [], unlocks: {} };
+techs.push(nanoTechT4);
+const missionT4 = { name: "controllerMissionT4", label: "Controller Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], unlocks: { planet: ["controllerPlanetT4"], spaceMission: ["downstreamMissionT4"] }, effects: {} };
+const downstreamMissionT4 = { name: "downstreamMissionT4", label: "Downstream Mission", unlocked: false, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], effects: {} };
+const predecessorMissionT4 = { name: "predecessorMissionT4", label: "Predecessor Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], unlocks: { spaceMission: ["lockedMissionT4"] }, effects: {} };
+const lockedMissionT4 = { name: "lockedMissionT4", label: "Locked Mission", unlocked: false, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 10 }], effects: {} };
+const piscineMissionT4 = { name: "piscineMission", label: "Piscine Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 100 }], unlocks: { planet: ["piscine"] }, effects: {} };
+const heliosMissionT4 = { name: "heliosMission", label: "Helios Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 100 }], unlocks: { planet: ["helios"] }, effects: {} };
+
+const bT4 = (name, label, effects = {}, extra = {}) => ({ name, label, unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "science", val: 100 }], effects, ...extra });
+const satteliteT4 = bT4("sattelite", "Satellite", { starchartPerTickBaseSpace: 0.001 });
+const elevatorT4 = bT4("spaceElevator", "Space Elevator", { oilReductionRatio: 0.05, spaceRatio: 0.01, prodTransferBonus: 0.001 }, { unlocked: false, requiredTech: ["nanotechnologyT4"] });
+const moonOutpostT4 = bT4("moonOutpost", "Lunar Outpost", { uraniumPerTickCon: -0.35, unobtainiumPerTickSpace: 0.007, energyConsumption: 5 }, { unlocked: false });
+const moonBaseT4 = bT4("moonBase", "Moon Base", { unobtainiumMax: 150, energyConsumption: 10 });
+const planetCrackerT4 = bT4("planetCracker", "Planet Cracker", { uraniumPerTickSpace: 0.3, uraniumMax: 1750 });
+const sunlifterT4 = bT4("sunlifter", "Sunlifter", { antimatterProduction: 1, energyProduction: 30 });
+const containmentT4 = bT4("containmentChamber", "Containment Chamber", { antimatterMax: 108, energyConsumption: 52 }, { unlocked: false, val: 2, on: 2 });
+const heatsinkT4 = bT4("heatsink", "Heatsink", {}, { upgrades: { spaceBuilding: ["containmentChamber"] } });
+const sunforgeT4 = bT4("sunforge", "Sunforge", { baseMetalMaxRatio: 0.01 });
+const navigationRelayT4 = bT4("navigationRelay", "Navigation Relay", { routeSpeed: 0.25 });
+const terraformingT4 = bT4("terraformingStation", "Terraforming Station", { maxKittens: 1 }, { val: 2, on: 2 });
+const hydroponicsT4 = bT4("hydroponics", "Hydroponics", { catnipRatio: 0.025, catnipMaxRatio: 0.1, terraformingMaxKittensRatio: 0 }, {
+  val: 2,
+  on: 2,
+  upgrades: { spaceBuilding: ["terraformingStation"] },
+  updateEffects(self, game) {
+    self.effects.terraformingMaxKittensRatio = game.getUnlimitedDR(self.on, 100) / self.on;
+  },
+});
+const harvesterT4 = bT4("hrHarvester", "HR Harvester", { energyProduction: 4 });
+const entanglerT4 = bT4("entangler", "Entangler", { gflopsConsumption: 0.1, energyConsumption: 25 });
+const tectonicT4 = bT4("tectonic", "Tectonic", { energyProduction: 25 }, { val: 3, on: 3 });
+const moltenCoreT4 = bT4("moltenCore", "Molten Core", { tectonicBonus: 0.05 }, { upgrades: { spaceBuilding: ["tectonic"] } });
+const ordinaryT4 = bT4("ordinarySpaceT4", "Ordinary Space", { woodPerTickSpace: 2, woodMax: 100 });
+
+const controllerPlanetT4 = { name: "controllerPlanetT4", label: "Controller Planet", unlocked: false, reached: false, routeDays: 10, buildings: [satteliteT4] };
+const techPlanetT4 = { name: "techPlanetT4", label: "Tech Planet", unlocked: true, reached: true, routeDays: 0, buildings: [elevatorT4, ordinaryT4] };
+const moonPlanetT4 = { name: "moon", label: "Moon", unlocked: true, reached: false, routeDays: 12, buildings: [moonOutpostT4, moonBaseT4] };
+const dunePlanetT4 = { name: "dune", label: "Dune", unlocked: true, reached: true, routeDays: 0, buildings: [planetCrackerT4] };
+const heliosPlanetT4 = { name: "helios", label: "Helios", unlocked: true, reached: true, routeDays: 0, buildings: [sunlifterT4, containmentT4, heatsinkT4, sunforgeT4] };
+const yarnPlanetT4 = { name: "yarn", label: "Yarn", unlocked: true, reached: true, routeDays: 0, buildings: [terraformingT4, hydroponicsT4] };
+const umbraPlanetT4 = { name: "umbra", label: "Umbra", unlocked: true, reached: true, routeDays: 0, buildings: [harvesterT4, navigationRelayT4] };
+const charonPlanetT4 = { name: "charon", label: "Charon", unlocked: true, reached: true, routeDays: 0, buildings: [entanglerT4] };
+const centaurusPlanetT4 = { name: "centaurusSystem", label: "Centaurus", unlocked: true, reached: true, routeDays: 0, buildings: [tectonicT4, moltenCoreT4] };
+const planetsT4 = [controllerPlanetT4, techPlanetT4, moonPlanetT4, dunePlanetT4, heliosPlanetT4, yarnPlanetT4, umbraPlanetT4, charonPlanetT4, centaurusPlanetT4];
+const programsT4 = [missionT4, downstreamMissionT4, predecessorMissionT4, lockedMissionT4, piscineMissionT4, heliosMissionT4];
+gamePage.space = {
+  programs: programsT4,
+  planets: planetsT4,
+  getProgram: (id) => programsT4.find((program) => program.name === id),
+  getBuilding: (id) => planetsT4.flatMap((planet) => planet.buildings).find((building) => building.name === id),
+};
+
+const descriptorsT4 = typeof dbg.spaceDescriptors === "function" ? dbg.spaceDescriptors() : [];
+const descriptorT4 = (meta) => typeof dbg.spaceDescriptorFor === "function" ? dbg.spaceDescriptorFor(meta) : descriptorsT4.find((descriptor) => descriptor.meta === meta);
+check("Task 4: descriptors preserve mission/building subtype and owning planet", descriptorT4(missionT4)?.subtype === "mission" && descriptorT4(satteliteT4)?.subtype === "planetBuilding" && descriptorT4(satteliteT4)?.planet === controllerPlanetT4);
+check("Task 4: predecessor mission gate is explicit", /predecessor mission.*Predecessor Mission/i.test(descriptorT4(lockedMissionT4)?.gateState?.reason || ""));
+check("Task 4: planet transit gate reports ETA", /Moon.*transit/i.test(descriptorT4(moonOutpostT4)?.gateState?.reason || "") && (descriptorT4(moonOutpostT4)?.gateState?.transitEta || 0) > 0);
+check("Task 4: required technology gate is explicit", /technology.*Nanotechnology/i.test(descriptorT4(elevatorT4)?.gateState?.reason || ""));
+check("Task 4: upgrades.spaceBuilding dependency gate is explicit", /Space building.*Heatsink/i.test(descriptorT4(containmentT4)?.gateState?.reason || ""));
+check("Task 4 review: upgrades.spaceBuilding gateway edge is counted once", typeof dbg.candidateGatewayValue === "function" && dbg.candidateGatewayValue("space", heatsinkT4) === 1);
+
+const nativePlanetControllerT4 = context.classes.ui.space.PlanetBuildingBtnController;
+const unavailableSpaceAdaptersT4 = [
+  ["controller", null],
+  ["model", class extends nativePlanetControllerT4 { fetchModel() { return null; } }],
+  ["getPrices", class {
+    constructor(game) { this.game = game; }
+    fetchModel(options) {
+      const metadata = this.game.space.getBuilding(options.id);
+      return metadata ? { options, metadata } : null;
+    }
+    buyItem() { return { itemBought: false }; }
+  }],
+];
+for (const [missing, Controller] of unavailableSpaceAdaptersT4) {
+  if (Controller) context.classes.ui.space.PlanetBuildingBtnController = Controller;
+  else delete context.classes.ui.space.PlanetBuildingBtnController;
+  const gate = descriptorT4(ordinaryT4)?.gateState;
+  const candidate = dbg.candidateById("space:ordinarySpaceT4");
+  const diagnostic = dbg.report();
+  check(`Task 4 review: missing native Space ${missing} fails closed`, gate?.open === false && !candidate && /native PlanetBuildingBtnController.*unavailable/i.test(gate?.reason || "") && /native PlanetBuildingBtnController.*unavailable/i.test(diagnostic));
+}
+context.classes.ui.space.PlanetBuildingBtnController = nativePlanetControllerT4;
+
+res("science").value = 5000; res("science").maxValue = 5000;
+const controllerMissionCandidateT4 = dbg.candidateById("space:controllerMissionT4");
+dbg.forceActiveTarget(controllerMissionCandidateT4, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 4: controller-only mission unlocks its planet/downstream mission", missionT4.val === 1 && missionT4.on === 0 && controllerPlanetT4.unlocked && downstreamMissionT4.unlocked);
+check("Task 4: in-transit one-time mission is not repeatable", !dbg.candidateById("space:controllerMissionT4"));
+controllerPlanetT4.reached = true;
+const satteliteCandidateT4 = dbg.candidateById("space:sattelite");
+dbg.forceActiveTarget(satteliteCandidateT4, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 4: controller-only sattelite increments", satteliteT4.val === 1 && satteliteT4.on === 1);
+
+const savedBuildingUnlockedT4 = buildings.map((building) => building.unlocked);
+const savedTechStateT4 = techs.map((tech) => [tech.unlocked, tech.researched]);
+const savedUpgradeStateT4 = workshopUpgrades.map((upgrade) => upgrade.researched);
+const savedReligionStateT4 = religionUpgrades.map((upgrade) => upgrade.unlocked);
+const savedFestivalT4 = calendar.festivalDays;
+for (const building of buildings) building.unlocked = false;
+for (const tech of techs) tech.researched = true;
+for (const upgrade of workshopUpgrades) upgrade.researched = true;
+for (const upgrade of religionUpgrades) upgrade.unlocked = false;
+calendar.festivalDays = calendar.daysPerSeason + 1;
+downstreamMissionT4.unlocked = false;
+predecessorMissionT4.unlocked = false;
+res("antimatter").value = res("antimatter").maxValue;
+const acceleratorT4 = { name: "acceleratorT4", label: "Accelerator", unlocked: true, val: 8, on: 8, priceRatio: 1.15, prices: [{ name: "uranium", val: 50 }], effects: { uraniumMax: 250 } };
+buildings.push(acceleratorT4);
+perTick.uranium = 0;
+perTick.unobtainium = 0;
+dbg.forceActiveTarget(null);
+const frontierT4 = dbg.selectStrategicTarget("balanced");
+const allowedFrontierT4 = new Set(["piscineMission", "heliosMission", "planetCracker", "moonOutpost", "moonBase"]);
+check("Task 4: supplied state selects Late-game progression frontier", frontierT4?.layer === "Late-game progression frontier");
+check("Task 4: mission/producer/storage bridge beats repeat Accelerator", allowedFrontierT4.has(frontierT4?.target?.meta?.name) && frontierT4?.target?.meta !== acceleratorT4);
+
+ensureResourceT4("producerNeedT4", 0, 100);
+ensureResourceT4("capNeedT4", 100, 100);
+ensureResourceT4("routeFuelT4", 1, 1000);
+ensureResourceT4("remoteFuelT4", 0, 1000);
+ensureResourceT4("remoteCapNeedT4", 100, 100);
+perTick.capNeedT4 = 1;
+perTick.remoteCapNeedT4 = 1;
+perTick.remoteFuelT4 = 0.000001;
+const orderedMissionT4 = { name: "orderedMissionT4", label: "Ordered Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "science", val: 1 }], unlocks: { planet: ["orderedPlanetT4"] }, effects: {} };
+const remoteMissionT4 = { name: "remoteMissionT4", label: "Remote Mission", unlocked: true, noStackable: true, val: 0, on: 0, prices: [{ name: "remoteFuelT4", val: 10 }], unlocks: { planet: ["remotePlanetT4"] }, effects: {} };
+programsT4.push(orderedMissionT4, remoteMissionT4);
+const missingProducerT4 = bT4("missingProducerT4", "Missing Producer", { producerNeedT4PerTickSpace: 1 });
+const capStorageT4 = bT4("capStorageT4", "Cap Storage", { capNeedT4Max: 100 });
+const capBlockedTargetT4 = bT4("capBlockedTargetT4", "Cap-blocked Target", {}, { prices: [{ name: "capNeedT4", val: 200 }] });
+const selectedRouteTargetT4 = bT4("selectedRouteTargetT4", "Selected Route Target", {}, { prices: [{ name: "routeFuelT4", val: 100 }] });
+const requiredRouteInfraT4 = bT4("requiredRouteInfraT4", "Required Route Infrastructure", { routeFuelT4PerTickSpace: 1 });
+const unrelatedInfraT4 = bT4("unrelatedInfraT4", "Unrelated Infrastructure", { spaceRatio: 0.5 });
+const remoteCapStorageT4 = bT4("remoteCapStorageT4", "Remote Cap Storage", { remoteCapNeedT4Max: 100 });
+const remoteCapTargetT4 = bT4("remoteCapTargetT4", "Remote Cap Target", {}, { prices: [{ name: "remoteCapNeedT4", val: 200 }, { name: "remoteFuelT4", val: 10 }] });
+techPlanetT4.buildings.push(missingProducerT4, capStorageT4, capBlockedTargetT4, selectedRouteTargetT4, requiredRouteInfraT4, unrelatedInfraT4, remoteCapStorageT4, remoteCapTargetT4);
+const candidateT4 = (meta) => dbg.candidateById(`space:${meta.name}`);
+const orderedMissionCandidateT4 = candidateT4(orderedMissionT4);
+const producerCandidateT4 = candidateT4(missingProducerT4);
+const storageCandidateT4 = candidateT4(capStorageT4);
+const capTargetCandidateT4 = { ...candidateT4(capBlockedTargetT4), score: 1000 };
+const selectedRouteCandidateT4 = { ...candidateT4(selectedRouteTargetT4), score: 10000 };
+const requiredInfraCandidateT4 = candidateT4(requiredRouteInfraT4);
+const unrelatedInfraCandidateT4 = { ...candidateT4(unrelatedInfraT4), score: 9000 };
+const remoteMissionCandidateT4 = { ...candidateT4(remoteMissionT4), score: 11000 };
+const remoteCapStorageCandidateT4 = candidateT4(remoteCapStorageT4);
+const remoteCapTargetCandidateT4 = { ...candidateT4(remoteCapTargetT4), score: 12000 };
+check("Task 4 review: frontier order starts with first mission gateway", dbg.bestLateGameFrontier([storageCandidateT4, producerCandidateT4, orderedMissionCandidateT4, capTargetCandidateT4])?.candidate?.meta === orderedMissionT4);
+check("Task 4 review: missing-resource producer follows mission tier", dbg.bestLateGameFrontier([storageCandidateT4, producerCandidateT4, capTargetCandidateT4])?.candidate?.meta === missingProducerT4);
+check("Task 4 review: live cap bridge follows producer tier", dbg.bestLateGameFrontier([storageCandidateT4, capTargetCandidateT4])?.candidate?.meta === capStorageT4);
+check("Task 4 review: infrastructure must belong to selected acquisition route", dbg.bestLateGameFrontier([selectedRouteCandidateT4, requiredInfraCandidateT4, unrelatedInfraCandidateT4])?.candidate?.meta === requiredRouteInfraT4);
+check("Task 4 review: remote/unrelated first copies beyond horizon yield to repeat economy", dbg.bestLateGameFrontier([remoteMissionCandidateT4, unrelatedInfraCandidateT4, dbg.candidateById("build:acceleratorT4")]) === null);
+check("Task 4 re-review: remote cap-blocked target does not make storage monopolize frontier", dbg.bestLateGameFrontier([remoteCapStorageCandidateT4, remoteCapTargetCandidateT4, dbg.candidateById("build:acceleratorT4")]) === null);
+
+const marginalCasesT4 = [
+  ["Space Elevator", elevatorT4, (p) => p.globalProductionRatio > 0 && p.productionTransfer > 0 && p.costReduction?.oil > 0],
+  ["Sunlifter", sunlifterT4, (p) => p.perTick?.antimatter === 1 && p.energyProduction === 30],
+  ["Containment Chamber", containmentT4, (p) => p.max?.antimatter >= 100 && p.energyConsumption > 0],
+  ["Heatsink synergy", heatsinkT4, (p) => p.max?.antimatter > 0],
+  ["Sunforge", sunforgeT4, (p) => p.baseStorageRatio > 0],
+  ["Navigation Relay", navigationRelayT4, (p) => p.travelSpeed > 0],
+  ["Terraforming Station", terraformingT4, (p) => p.housing >= 1],
+  ["Hydroponics synergy", hydroponicsT4, (p) => p.ratio?.catnip > 0 && p.max?.catnip > 0 && p.housing > 0],
+  ["HR Harvester", harvesterT4, (p) => p.energyProduction > 0],
+  ["Entangler", entanglerT4, (p) => p.perTick?.gflops < 0 && p.perTick?.hashrates > 0 && p.energyConsumption > 0],
+  ["Tectonic", tectonicT4, (p) => p.energyProduction > 0],
+  ["Molten Core synergy", moltenCoreT4, (p) => p.energyProduction > 0],
+  ["ordinary resource/storage", ordinaryT4, (p) => p.perTick?.wood === 2 && p.max?.wood === 100],
+];
+hydroponicsT4.updateEffects(hydroponicsT4, gamePage);
+for (const [label, meta, assertion] of marginalCasesT4) {
+  const descriptor = descriptorT4(meta);
+  const profile = descriptor && typeof dbg.spaceMarginalProfile === "function" ? dbg.spaceMarginalProfile(descriptor) : {};
+  check(`Task 4 marginal: ${label}`, !!descriptor && assertion(profile));
+}
+const hydroBeforeT4 = { val: hydroponicsT4.val, on: hydroponicsT4.on, effects: { ...hydroponicsT4.effects } };
+const hydroProfileT4 = dbg.spaceMarginalProfile(descriptorT4(hydroponicsT4));
+const hydroExpectedT4 = terraformingT4.on * (gamePage.getUnlimitedDR(hydroponicsT4.on + 1, 100) - gamePage.getUnlimitedDR(hydroponicsT4.on, 100));
+check("Task 4 review: Hydroponics projects exact nonlinear next-copy terraforming gain without mutation", Math.abs(hydroProfileT4.housing - hydroExpectedT4) < 1e-9 && hydroponicsT4.val === hydroBeforeT4.val && hydroponicsT4.on === hydroBeforeT4.on && JSON.stringify(hydroponicsT4.effects) === JSON.stringify(hydroBeforeT4.effects));
+nanoTechT4.researched = false;
+const reportT4 = dbg.report();
+check("Task 4: diagnostics include planet ownership and exact gate", /Moon.*Lunar Outpost.*transit/i.test(reportT4) && /Tech Planet.*Space Elevator.*technology.*Nanotechnology/i.test(reportT4) && /Helios.*Containment Chamber.*Space building.*Heatsink/i.test(reportT4));
+if (savedUnlimitedDRT4 === undefined) delete gamePage.getUnlimitedDR;
+else gamePage.getUnlimitedDR = savedUnlimitedDRT4;
+
+buildings.splice(buildings.indexOf(acceleratorT4), 1);
+buildings.forEach((building, index) => { building.unlocked = savedBuildingUnlockedT4[index]; });
+techs.forEach((tech, index) => { [tech.unlocked, tech.researched] = savedTechStateT4[index]; });
+workshopUpgrades.forEach((upgrade, index) => { upgrade.researched = savedUpgradeStateT4[index]; });
+religionUpgrades.forEach((upgrade, index) => { upgrade.unlocked = savedReligionStateT4[index]; });
+calendar.festivalDays = savedFestivalT4;
+techs.splice(techs.indexOf(nanoTechT4), 1);
+delete perTick.uranium;
+delete perTick.unobtainium;
+delete perTick.capNeedT4;
+delete perTick.remoteCapNeedT4;
+delete perTick.remoteFuelT4;
+for (const snapshot of resourceSnapshotsT4.values()) {
+  if (snapshot.added) resources.splice(resources.indexOf(snapshot.resource), 1);
+  else {
+    snapshot.resource.value = snapshot.value;
+    snapshot.resource.maxValue = snapshot.maxValue;
+    snapshot.resource.unlocked = snapshot.unlocked;
+  }
+}
+dbg.forceActiveTarget(null);
+delete gamePage.space;
 
 /* ---------------------------------------------------------------------
  * Test AD — ziggurat / unicorn path (v2.11.0).  The player used to run the
@@ -3816,6 +5168,9 @@ perTick.minerals = 0;         // idle bank, not "wasting income" → no storage-
 res("wood").value = 200;      // keep the cheap base buildings out of surplus reach
 res("science").value = 100;
 
+// Keep the fixture's stated plan authoritative even when earlier integration
+// ticks legitimately change the planner's pending preferred candidate.
+dbg.queueAdd("build:gildedTempleAI", 0);
 dbg.forceActiveTarget(dbg.candidateById("build:gildedTempleAI"), "Economy / normal growth", 5000);
 const aiFloors = dbg.parallelReservationFloors("balanced");
 check("Test AI: floors hold the target's missing trickle AND its banked direct slabs", (aiFloors.goldAI || 0) >= 800 && (aiFloors.slab || 0) >= 200);
@@ -4291,29 +5646,54 @@ dbg.forceActiveTarget(null);
 
 /* ---------------------------------------------------------------------
  * Test AL — the reset advisor reads metaphysics from the PRESTIGE manager
- * (v2.20.0).  Live regression: metaphysicsResearched called
- * science.get(perkName), which (a) console.error'd "Failed to get tech for
+ * (v2.20.0).  Live regression: the old advisor called science.get(perkName),
+ * which (a) console.error'd "Failed to get tech for
  * tech name 'goldenRatio'" on every advisor tick — 1000+ errors — and
- * (b) collided with the researched "engineering" TECH, marking the unowned
- * Engineering PERK as done so the advisor pointed at Golden Ratio instead.
+ * (b) collided with the researched "engineering" TECH even though the native
+ * perk ID is misspelled "engeneering". Prices and progression must come from
+ * the live prestige metadata, not a corrected-name/hardcoded roadmap.
  * ------------------------------------------------------------------- */
 const engineeringTechAL = { name: "engineering", label: "Engineering (tech)", unlocked: true, researched: true, prices: [] };
 techs.push(engineeringTechAL);
 const scienceGetAL = gamePage.science.get;
 const perkLookupsAL = [];
 gamePage.science.get = (name) => { perkLookupsAL.push(name); return scienceGetAL(name); };
+const nativeMetaphysicsFixture = () => [
+  { name: "engeneering", label: "Engineering", unlocked: true, researched: false, prices: [{ name: "paragon", val: 5 }], unlocks: { perks: ["megalomania", "goldenRatio", "codexVox"] } },
+  { name: "codexVox", label: "Codex Vox", unlocked: false, researched: false, prices: [{ name: "paragon", val: 25 }], unlocks: { perks: ["codexLogos"] } },
+  { name: "codexLogos", label: "Codex Logos", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }], unlocks: { perks: ["codexAgrum", "codexLeviathanianus"] } },
+  { name: "codexAgrum", label: "Codex Agrum", unlocked: false, researched: false, prices: [{ name: "paragon", val: 75 }], unlocks: {} },
+  { name: "megalomania", label: "Megalomania", unlocked: false, researched: false, prices: [{ name: "paragon", val: 10 }], unlocks: { perks: ["blackCodex"] } },
+  { name: "blackCodex", label: "Black Codex", unlocked: false, researched: false, prices: [{ name: "paragon", val: 25 }], unlocks: {} },
+  { name: "codexLeviathanianus", label: "Codex Leviathanianus", unlocked: false, researched: false, prices: [{ name: "paragon", val: 75 }], unlocks: {} },
+  { name: "goldenRatio", label: "Golden Ratio", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }], unlocks: { perks: ["divineProportion"] } },
+  { name: "divineProportion", label: "Divine Proportion", unlocked: false, researched: false, prices: [{ name: "paragon", val: 100 }], unlocks: { perks: ["vitruvianFeline"] } },
+  { name: "vitruvianFeline", label: "Vitruvian Feline", unlocked: false, researched: false, prices: [{ name: "paragon", val: 250 }], unlocks: { perks: ["renaissance"] } },
+  { name: "renaissance", label: "Renaissance", unlocked: false, researched: false, prices: [{ name: "paragon", val: 750 }], unlocks: {} },
+];
 gamePage.prestige = {
-  perks: [
-    { name: "engineering", researched: false },
-    { name: "goldenRatio", researched: false },
-  ],
+  perks: nativeMetaphysicsFixture(),
 };
 let advAL = dbg.resetAdvisorState();
 check("Test AL: the tech/perk name collision no longer hides the unowned Engineering perk", /next meta: Engineering \(5P/.test(advAL?.detail || ""));
-check("Test AL: the advisor never asks the science manager for perk names", !perkLookupsAL.includes("goldenRatio") && !perkLookupsAL.includes("engineering"));
+check("Test AL: the advisor never asks the science manager for native perk names", !perkLookupsAL.includes("engeneering") && !perkLookupsAL.includes("goldenRatio"));
 gamePage.prestige.perks[0].researched = true;
+for (const siblingName of gamePage.prestige.perks[0].unlocks.perks) {
+  gamePage.prestige.perks.find((perk) => perk.name === siblingName).unlocked = true;
+}
 advAL = dbg.resetAdvisorState();
-check("Test AL: an owned prestige perk advances the next-meta pointer", /next meta: Golden Ratio \(15P/.test(advAL?.detail || ""));
+check("Test AL: live sibling branches still prioritize Golden Ratio 50 after Engineering", /next meta: Golden Ratio \(50P/.test(advAL?.detail || "") && gamePage.prestige.perks.find((perk) => perk.name === "codexVox").unlocked && gamePage.prestige.perks.find((perk) => perk.name === "megalomania").unlocked);
+const goldenRatioAL = gamePage.prestige.perks.find((perk) => perk.name === "goldenRatio");
+goldenRatioAL.researched = true;
+gamePage.prestige.perks.find((perk) => perk.name === "divineProportion").unlocked = true;
+advAL = dbg.resetAdvisorState();
+check("Test AL: the recursive live gateway continues to Divine Proportion 100 ahead of siblings", /next meta: Divine Proportion \(100P/.test(advAL?.detail || ""));
+const cycleAlphaAL = { name: "cycleAlphaAL", label: "Cycle Alpha", unlocked: true, researched: false, prices: [{ name: "paragon", val: 1 }], unlocks: { perks: ["cycleBetaAL"] } };
+const cycleBetaAL = { name: "cycleBetaAL", label: "Cycle Beta", unlocked: false, researched: false, prices: [{ name: "paragon", val: 1 }], unlocks: { perks: ["cycleAlphaAL"] } };
+gamePage.prestige.perks[0].unlocks.perks.push("cycleAlphaAL");
+gamePage.prestige.perks.push(cycleAlphaAL, cycleBetaAL);
+advAL = dbg.resetAdvisorState();
+check("Test AL: cyclic live unlock metadata terminates safely without displacing the main gateway", /next meta: Divine Proportion \(100P/.test(advAL?.detail || ""));
 gamePage.science.get = scienceGetAL;
 techs.splice(techs.indexOf(engineeringTechAL), 1);
 delete gamePage.prestige;
@@ -4383,26 +5763,1633 @@ resources.splice(resources.indexOf(alloyAN), 1);
  * nothing, the choice persists under kgh.tickSpeed, and an unknown
  * multiplier falls back to native.
  * ------------------------------------------------------------------- */
-const intervalCountAM = intervalFns.length;
 let extraTicksAM = 0;
 gamePage.tick = () => { extraTicksAM += 1; };
 check("Test AM: default speed is native 1×", dbg.tickSpeed?.() === 1);
 dbg.applyTickSpeed?.(5);
-check("Test AM: choosing 5× persists and arms one booster interval",
-  dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && intervalFns.length === intervalCountAM + 1);
-intervalFns[intervalFns.length - 1]();
-check("Test AM: each booster beat adds (multiplier − 1) extra game ticks", extraTicksAM === 4);
+let speedSchedulerAM = dbg.automationSchedulerSnapshot?.();
+check("Test AM: choosing 5× persists and arms one owned booster lane",
+  dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && !!speedSchedulerAM?.lanes?.booster);
+fakeNow += 200;
+await intervalFns[intervalFns.length - 1]();
+check("Test AM: one 5× booster beat adds the due bounded extra ticks", extraTicksAM === 4);
 extraTicksAM = 0;
 dbg.applyTickSpeed?.(50);
-intervalFns[intervalFns.length - 1]();
-check("Test AM: the 50× ceiling arms 49 extra ticks per beat", dbg.tickSpeed?.() === 50 && extraTicksAM === 49);
+fakeNow += 200;
+await intervalFns[intervalFns.length - 1]();
+check("Test AM: the 50× ceiling yields in a bounded chunk and drops backlog",
+  dbg.tickSpeed?.() === 50 && extraTicksAM === 49 && dbg.boosterTelemetry?.().lastBeat?.maxChunk === 16 && dbg.boosterTelemetry?.().lastBeat?.dropped === 0);
 dbg.applyTickSpeed?.(99);
 check("Test AM: an unknown multiplier falls back to native 1×",
-  dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1");
+  dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1" && !dbg.automationSchedulerSnapshot?.().lanes?.booster);
 extraTicksAM = 0;
 delete gamePage.tick;
-intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
+await intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
 check("Test AM: at 1× the game is left untouched", extraTicksAM === 0);
+
+/* ---------------------------------------------------------------------
+ * Task 5 — native Time/transcendence adapters and armed prestige policy.
+ * All mutations are observable through controller/manager counters. The
+ * helper must checkpoint, revalidate, execute once, and verify exact deltas.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+dbg.setPrestigeAutomationArmed(false);
+const addedRareResourcesT5 = [];
+for (const [name, maxValue, title] of [
+  ["timeCrystal", 100, "Time Crystal"],
+  ["relic", 1000, "Relic"],
+  ["void", 1000, "Void"],
+  ["karma", 1000, "Karma"],
+  ["paragon", 1000, "Paragon"],
+]) {
+  if (!res(name)) {
+    const resource = R(name, 0, maxValue, title, { unlocked: true });
+    resources.push(resource);
+    addedRareResourcesT5.push(resource);
+  }
+}
+for (const resourceName of ["timeCrystal", "relic", "void", "karma", "paragon", "alicorn"]) {
+  res(resourceName).unlocked = true;
+}
+res("relic").value = 10;
+res("timeCrystal").value = 20;
+res("karma").value = 7; // live Void controller discount; raw metadata still says 9
+res("void").value = 100;
+transcendenceUpgrades[0].unlocked = true;
+transcendenceUpgrades[1].unlocked = true;
+chronoforgeUpgrades[0].unlocked = true;
+voidspaceUpgrades[0].unlocked = true;
+
+const hasTask5Adapters = typeof dbg.transcendenceUpgrades === "function" && typeof dbg.timeDescriptorFor === "function";
+const transcendenceCandidateT5 = dbg.candidateById("transcendence:blackObeliskT5");
+check("Task 5 adapter: ordinary transcendence upgrade is discovered as its own candidate kind",
+  hasTask5Adapters && dbg.transcendenceUpgrades().includes(transcendenceUpgrades[0]) && transcendenceCandidateT5?.kind === "transcendence");
+check("Task 5 adapter: raw Transcend action never becomes a candidate", !dbg.candidateById("transcendence:transcend"));
+check("Task 5 adapter: Time descriptors preserve Chronoforge/Void Space manager membership",
+  hasTask5Adapters && dbg.timeDescriptorFor(chronoforgeUpgrades[0])?.subtype === "chronoforge" && dbg.timeDescriptorFor(voidspaceUpgrades[0])?.subtype === "voidspace");
+
+fakeNow += 5000;
+dbg.forceActiveTarget(transcendenceCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 final review: disarmed rare-capital candidate performs no purchase and no checkpoint",
+  transcendenceUpgrades[0].val === 0 && transcendenceControllerCalls === 0 && checkpointCalls === 0);
+dbg.setPrestigeAutomationArmed(true);
+fakeNow += 30000;
+dbg.forceActiveTarget(transcendenceCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 adapter: transcendence upgrade buys only through TranscendenceBtnController",
+  transcendenceUpgrades[0].val === 1 && transcendenceControllerCalls === 1 && checkpointCalls === 1);
+const chronoforgeCandidateT5 = dbg.candidateById("time:temporalBatteryT5");
+fakeNow += 30000;
+dbg.forceActiveTarget(chronoforgeCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 adapter: Chronoforge item buys only through ChronoforgeBtnController",
+  chronoforgeUpgrades[0].val === 1 && chronoforgeControllerCalls === 1 && rawTimeManagerCalls === 0 && checkpointCalls === 2);
+const voidspaceCandidateT5 = dbg.candidateById("time:cryochambersT5");
+check("Task 5 adapter: Void Space affordability uses its live controller price",
+  voidspaceCandidateT5?.affordable === true && dbg.timePricesFor?.(voidspaceUpgrades[0])?.find((price) => price.name === "karma")?.val === 7);
+fakeNow += 30000;
+dbg.forceActiveTarget(voidspaceCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 adapter: Void Space item buys only through VoidSpaceBtnController",
+  voidspaceUpgrades[0].val === 1 && voidspaceControllerCalls === 1 && rawTimeManagerCalls === 0 && res("karma").value === 0 && checkpointCalls === 3);
+dbg.setPrestigeAutomationArmed(false);
+
+// Keep ordinary candidates from becoming policy blockers while the prestige
+// projection fixtures exercise only native manager state.
+religionUpgrades.forEach((upgrade) => { upgrade.researched = true; upgrade.on = Math.max(1, upgrade.on || 0); });
+transcendenceUpgrades.forEach((upgrade) => { upgrade.unlocked = false; });
+chronoforgeUpgrades.forEach((upgrade) => { upgrade.unlocked = false; });
+voidspaceUpgrades.forEach((upgrade) => { upgrade.unlocked = false; });
+perTick.faith = 100;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 150;
+gamePage.religion.transcendenceTier = 1;
+const callsBeforeDisarmedT5 = { checkpointCalls, transcendCalls, adoreCalls, alicornSacrificeCalls };
+const disarmedProjectionT5 = typeof dbg.prestigeProjection === "function" ? dbg.prestigeProjection() : null;
+const disarmedManagedT5 = typeof dbg.managePrestige === "function" ? dbg.managePrestige(null) : false;
+check("Task 5 prestige: disarmed mode still projects but executes zero irreversible APIs",
+  !!disarmedProjectionT5 && disarmedManagedT5 === false && checkpointCalls === callsBeforeDisarmedT5.checkpointCalls && transcendCalls === callsBeforeDisarmedT5.transcendCalls && adoreCalls === callsBeforeDisarmedT5.adoreCalls && alicornSacrificeCalls === callsBeforeDisarmedT5.alicornSacrificeCalls);
+
+dbg.setPrestigeAutomationArmed(true);
+const nativeSaveT5 = gamePage.save;
+gamePage.save = () => { checkpointCalls += 1; return false; };
+fakeNow += 30000;
+const callsBeforeFailedCheckpointT5 = transcendCalls;
+const failedCheckpointT5 = dbg.managePrestige?.(null);
+  check("Task 5 prestige: failed native checkpoint prevents Transcend", failedCheckpointT5 === false && transcendCalls === callsBeforeFailedCheckpointT5);
+  gamePage.save = nativeSaveT5;
+
+  fakeNow += 30000;
+  gamePage.currentSaveIsBroken = true;
+  const callsBeforeBrokenSaveT5 = transcendCalls;
+  const brokenSaveManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 review: broken native save state prevents every prestige mutation",
+    brokenSaveManagedT5 === false && transcendCalls === callsBeforeBrokenSaveT5);
+  gamePage.currentSaveIsBroken = false;
+
+  fakeNow += 30000;
+  const persistedBeforeStaleT5 = LCstorageMock[NATIVE_SAVE_KEY];
+  gamePage.save = () => { checkpointCalls += 1; return { checkpointSerial: checkpointSerial + 1 }; };
+  const callsBeforeStaleSaveT5 = transcendCalls;
+  const staleSaveManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 review: a save return without a fresh persisted blob is not a checkpoint",
+    staleSaveManagedT5 === false && transcendCalls === callsBeforeStaleSaveT5 && LCstorageMock[NATIVE_SAVE_KEY] === persistedBeforeStaleT5);
+  gamePage.save = nativeSaveT5;
+
+  // A legitimate native save can serialize to the exact blob already stored.
+  // The Proxy write counter proves the setter ran; equality is not staleness.
+  fakeNow += 30000;
+  const identicalSaveDataT5 = { checkpointSerial };
+  const identicalSaveBlobT5 = gamePage._saveDataToString(identicalSaveDataT5);
+  LCstorageMock[NATIVE_SAVE_KEY] = identicalSaveBlobT5;
+  const writesBeforeIdenticalT5 = nativeSaveWrites;
+  gamePage.save = () => {
+    checkpointCalls += 1;
+    LCstorageMock[NATIVE_SAVE_KEY] = identicalSaveBlobT5;
+    return identicalSaveDataT5;
+  };
+  const tierBeforeIdenticalT5 = gamePage.religion.transcendenceTier;
+  const identicalRewriteManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 re-review: an identical verified native rewrite is a valid checkpoint",
+    identicalRewriteManagedT5 === true && nativeSaveWrites === writesBeforeIdenticalT5 + 1 && LCstorageMock[NATIVE_SAVE_KEY] === identicalSaveBlobT5 && gamePage.religion.transcendenceTier === tierBeforeIdenticalT5 + 1);
+  gamePage.save = nativeSaveT5;
+  gamePage.religion.faith = 100000;
+  gamePage.religion.faithRatio = 150;
+  gamePage.religion.transcendenceTier = 1;
+  transcendenceUpgrades[2].unlocked = false;
+
+  fakeNow += 30000;
+  transcendenceUpgrades[3].unlocked = true;
+  gamePage.religion.faith = 0;
+  gamePage.religion.faithRatio = 150;
+  const retainedFloorProjectionT5 = dbg.prestigeProjection?.(null);
+  const checkpointBeforeRetainedFloorT5 = checkpointCalls;
+  check("Task 5 review: Transcend preserves the full retained epiphany upgrade floor",
+    retainedFloorProjectionT5?.transcend?.retainedFloor === 60 && retainedFloorProjectionT5?.transcend?.ready === false && dbg.managePrestige?.(null) === false && checkpointCalls === checkpointBeforeRetainedFloorT5);
+  transcendenceUpgrades[3].unlocked = false;
+
+  gamePage.religion.faith = 0;
+  gamePage.religion.faithRatio = 100;
+  const exactTranscendFundingT5 = dbg.prestigeProjection?.(null);
+  gamePage.religion.faithRatio = 99;
+  const belowTranscendFundingT5 = dbg.prestigeProjection?.(null);
+  check("Task 5 final review: exact next-tier epiphany balance funds Transcend with zero retained shortfall",
+    exactTranscendFundingT5?.transcend?.ready === true && exactTranscendFundingT5?.transcend?.remaining === 0 && !/need 0 epiphany/i.test(exactTranscendFundingT5?.transcend?.reason || ""));
+  check("Task 5 final review: below-price epiphany remains blocked by its positive shortfall",
+    belowTranscendFundingT5?.transcend?.ready === false && /need 1 epiphany/i.test(belowTranscendFundingT5?.transcend?.reason || ""));
+
+// Transcend and Adore both qualify. Transcend owns this irreversible cycle.
+// The checkpoint deliberately changes epiphany by one to prove the exact
+// before-snapshot is captured AFTER checkpoint and fresh revalidation.
+fakeNow += 30000;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 150;
+gamePage.religion.transcendenceTier = 1;
+  transcendenceUpgrades[2].unlocked = false;
+  gamePage.save = () => persistCheckpoint(() => { gamePage.religion.faithRatio += 1; });
+const tierBeforeT5 = gamePage.religion.transcendenceTier;
+const epiphanyBeforeT5 = gamePage.religion.faithRatio;
+const adoreBeforePriorityT5 = adoreCalls;
+const transcendButtonsBeforePriorityT5 = transcendButtonCalls;
+const transcendManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 prestige: funded Transcend checkpoints and advances exactly one tier",
+    transcendManagedT5 === true && checkpointCalls >= callsBeforeDisarmedT5.checkpointCalls + 2 && gamePage.religion.transcendenceTier === tierBeforeT5 + 1 && gamePage.religion.faithRatio === epiphanyBeforeT5 + 1 - 100);
+  check("Task 5 review: Transcend uses the native Religion button and unlocks the new tier metadata",
+    transcendButtonCalls === transcendButtonsBeforePriorityT5 + 1 && transcendenceUpgrades[2].unlocked === true);
+gamePage.save = nativeSaveT5;
+check("Task 5 prestige: when Transcend and Adore both qualify one cycle runs Transcend only", adoreCalls === adoreBeforePriorityT5);
+const callsBeforeCooldownT5 = { transcendCalls, adoreCalls };
+check("Task 5 prestige: shared irreversible cooldown blocks a second same-cycle action",
+  dbg.managePrestige?.(null) === false && transcendCalls === callsBeforeCooldownT5.transcendCalls && adoreCalls === callsBeforeCooldownT5.adoreCalls);
+
+// Delivered game time may advance ordinary automation, but the irreversible
+// broker's 30-second safety window is deliberately real wall time.
+const prestigeWallStartT7Review = fakeNow;
+const prestigeLogicalStartT7Review = dbg.automationClockSnapshot?.().logicalNow;
+const savedPrestigeTickT7Review = gamePage.tick;
+let prestigeDeliveredTicksT7Review = 0;
+gamePage.tick = () => { prestigeDeliveredTicksT7Review += 1; };
+dbg.applyTickSpeed?.(50);
+for (let beat = 0; beat < 10; beat += 1) {
+  fakeNow += 200;
+  await dbg.runBoosterBeat?.();
+}
+const prestigeLogicalEndT7Review = dbg.automationClockSnapshot?.().logicalNow;
+const callsBeforeWallCooldownT7Review = { transcendCalls, adoreCalls };
+const wallCooldownManagedT7Review = dbg.managePrestige?.(null);
+check("Task 7 re-review: delivered speed cannot expire the 30-second wall prestige cooldown",
+  prestigeDeliveredTicksT7Review > 0 && fakeNow - prestigeWallStartT7Review < 30000 &&
+  prestigeLogicalEndT7Review - prestigeLogicalStartT7Review > 30000 &&
+  wallCooldownManagedT7Review === false &&
+  transcendCalls === callsBeforeWallCooldownT7Review.transcendCalls &&
+  adoreCalls === callsBeforeWallCooldownT7Review.adoreCalls);
+if (savedPrestigeTickT7Review === undefined) delete gamePage.tick;
+else gamePage.tick = savedPrestigeTickT7Review;
+dbg.applyTickSpeed?.(1);
+
+// A separate later cycle may Adore when native projected gain is positive and
+// the measured Solar Revolution recovery lies within the policy horizon.
+fakeNow += 30000;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 10;
+const nativeSolarRatioT5 = gamePage.religion.getSolarRevolutionRatio;
+gamePage.religion.getSolarRevolutionRatio = () => 100;
+perTick.faith = 10;
+const boostedRecoveryT5 = dbg.prestigeProjection?.(null);
+check("Task 5 prestige: Adore recovery removes the temporary Solar Revolution production boost",
+  boostedRecoveryT5?.adore?.ready === false && boostedRecoveryT5?.adore?.recoverySeconds > 6 * 60 * 60);
+gamePage.religion.getSolarRevolutionRatio = nativeSolarRatioT5;
+perTick.faith = 100;
+const adoreEpiphanyBeforeT5 = gamePage.religion.faithRatio;
+const adoreManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 prestige: Adore requires positive native gain and bounded Solar Revolution recovery",
+    adoreManagedT5 === true && adoreCalls === adoreBeforePriorityT5 + 1 && gamePage.religion.faithRatio > adoreEpiphanyBeforeT5 && gamePage.religion.faith === 0.01);
+
+  fakeNow += 30000;
+  const nativeResetFaithT5 = gamePage.religion.resetFaith;
+  gamePage.religion.faith = 100000;
+  gamePage.religion.faithRatio = 10;
+  gamePage.religion.resetFaith = function faultyAdore(bonusRatio) {
+    adoreCalls += 1;
+    this.faithRatio += this.getApocryphaResetBonus(bonusRatio);
+    this.faith = 1;
+    return true;
+  };
+  const faultyAdoreManagedT5 = dbg.managePrestige?.(null);
+  gamePage.religion.resetFaith = nativeResetFaithT5;
+  gamePage.religion.faith = 100000;
+  gamePage.religion.faithRatio = 10;
+  const retryAfterFaultyAdoreT5 = dbg.managePrestige?.(null);
+  fakeNow += 30000;
+  const retryAfterFaultyAdoreCooldownT5 = dbg.managePrestige?.(null);
+  check("Task 5 final review: mutated Adore postcondition starts wall cooldown before verification and retries after 30 seconds",
+    faultyAdoreManagedT5 === false && retryAfterFaultyAdoreT5 === false && retryAfterFaultyAdoreCooldownT5 === true && gamePage.religion.faith === 0.01);
+
+// Alicorn Stable is a reachable direct alicorn purchase and therefore creates
+// a protected floor. The active Time target is exactly two crystals short.
+const alicornStableT5 = { name: "alicornStableT5", label: "Alicorn Stable T5", unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "alicorn", val: 20 }], effects: { alicornChance: 0.1 } };
+const crystalTargetT5 = { name: "crystalTargetT5", label: "Crystal Target T5", unlocked: true, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "timeCrystal", val: 3 }], effects: {} };
+zigguratUpgradesMock.push(alicornStableT5);
+chronoforgeUpgrades.push(crystalTargetT5);
+const zigguratMetaT5 = buildings.find((building) => building.name === "ziggurat");
+zigguratMetaT5.val = 1;
+zigguratMetaT5.on = 1;
+const crystalTargetCandidateT5 = { kind: "time", meta: crystalTargetT5, affordable: false };
+const savedRacesT5 = diplomacy.races.slice();
+diplomacy.races.splice(0, diplomacy.races.length); // no faster Leviathan route
+perTick.timeCrystal = 0;
+res("alicorn").value = 39.85;
+res("timeCrystal").value = 1;
+gamePage.religion.faith = 0;
+const alicornBaitT5 = { name: "alicornBaitT5", label: "Alicorn Bait T5", unlocked: true, val: 0, on: 0, prices: [{ name: "alicorn", val: 25 }], effects: { productionRatio: 1 } };
+const savedBuildingUnlocksT5 = buildings.map((building) => building.unlocked);
+for (const building of buildings) building.unlocked = false;
+buildings.push(alicornBaitT5);
+const alicornBaitCandidateT5 = dbg.candidateById("build:alicornBaitT5");
+dbg.forceActiveTarget(crystalTargetCandidateT5, "Late-game progression frontier", 0);
+fakeNow += 5000;
+dbg.executePlan();
+check("Task 5 capital: cap-relief/surplus purchases consume the complete rare-capital ledger",
+  alicornBaitCandidateT5?.affordable === true && alicornBaitT5.val === 0 && alicornStableT5.val === 0 && res("alicorn").value === 39.85);
+buildings.splice(buildings.indexOf(alicornBaitT5), 1);
+buildings.forEach((building, index) => { building.unlocked = savedBuildingUnlocksT5[index]; });
+dbg.forceActiveTarget(null);
+
+const strandedActiveRareT5 = { name: "strandedActiveRareT5", label: "Stranded Active Rare T5", unlocked: true, val: 0, on: 0, prices: [{ name: "void", val: 500 }, { name: "impossibleT5", val: 1 }], effects: {} };
+const strandedManualRareT5 = { name: "strandedManualRareT5", label: "Stranded Manual Rare T5", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 80 }, { name: "impossibleT5", val: 1 }], effects: {} };
+buildings.push(strandedActiveRareT5, strandedManualRareT5);
+perTick.relic = 0;
+const activeRareFloorT5 = dbg.rareCapitalFloor?.({ kind: "build", meta: strandedActiveRareT5, affordable: false });
+dbg.queueAdd?.("build:strandedManualRareT5", 0);
+const manualRareFloorT5 = dbg.rareCapitalFloor?.(null);
+check("Task 5 review: active and manual targets unconditionally protect full direct rare-capital costs",
+  activeRareFloorT5?.void === 500 && manualRareFloorT5?.relic === 80);
+dbg.queueClear();
+buildings.splice(buildings.indexOf(strandedActiveRareT5), 1);
+buildings.splice(buildings.indexOf(strandedManualRareT5), 1);
+
+const unreachableWholeBillT5 = { name: "unreachableWholeBillT5", label: "Unreachable Whole Bill T5", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 70 }, { name: "impossibleT5", val: 1 }], effects: {} };
+buildings.push(unreachableWholeBillT5);
+perTick.relic = 1;
+gamePage.prestige = {
+  perks: nativeMetaphysicsFixture(),
+};
+const engineeringRoadmapFloorT5 = dbg.rareCapitalFloor?.(null);
+gamePage.prestige.perks[0].researched = true;
+for (const siblingName of gamePage.prestige.perks[0].unlocks.perks) {
+  gamePage.prestige.perks.find((perk) => perk.name === siblingName).unlocked = true;
+}
+const goldenRatioRoadmapFloorT5 = dbg.rareCapitalFloor?.(null);
+check("Task 5 final review: rare floor selects the strongest live gateway over unlocked sibling branches",
+  engineeringRoadmapFloorT5?.paragon === 5 && !(engineeringRoadmapFloorT5?.relic >= 70) && goldenRatioRoadmapFloorT5?.paragon === 50 && gamePage.prestige.perks.find((perk) => perk.name === "codexVox").unlocked);
+buildings.splice(buildings.indexOf(unreachableWholeBillT5), 1);
+delete perTick.relic;
+delete gamePage.prestige;
+
+const rareFloorT5 = typeof dbg.rareCapitalFloor === "function" ? dbg.rareCapitalFloor(crystalTargetCandidateT5) : {};
+const blockedAlicornProjectionT5 = typeof dbg.prestigeProjection === "function" ? dbg.prestigeProjection(crystalTargetCandidateT5) : null;
+const alicornCallsBeforeFloorT5 = alicornSacrificeCalls;
+fakeNow += 30000;
+const blockedAlicornManagedT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: 39.85 state preserves Alicorn Stable 20 floor and calls zero APIs",
+  rareFloorT5.alicorn >= 20 && /protected.*floor/i.test(blockedAlicornProjectionT5?.alicorn?.reason || "") && blockedAlicornManagedT5 === false && alicornSacrificeCalls === alicornCallsBeforeFloorT5);
+
+fakeNow += 30000;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 10;
+const alicornCallsBeforeAdorePriorityT5 = alicornSacrificeCalls;
+const adoreOverBlockedAlicornT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 review: a non-ready alicorn plan never blocks a ready Adore",
+  adoreOverBlockedAlicornT5 === true && alicornSacrificeCalls === alicornCallsBeforeAdorePriorityT5 && gamePage.religion.faith === 0.01);
+
+res("alicorn").value = 50;
+res("timeCrystal").value = 1;
+fakeNow += 30000;
+gamePage.religion.faith = 0.01;
+gamePage.religion.faithRatio = 10;
+const nativeSaveBeforeReselectT5 = gamePage.save;
+gamePage.save = () => persistCheckpoint(() => { gamePage.religion.faith = 100000; });
+const alicornCallsBeforeFreshReselectT5 = alicornSacrificeCalls;
+const adoreCallsBeforeFreshReselectT5 = adoreCalls;
+const freshReselectedT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 review: checkpoint revalidation recomputes all projections and reselects Adore over alicorn",
+  freshReselectedT5 === true && adoreCalls === adoreCallsBeforeFreshReselectT5 + 1 && alicornSacrificeCalls === alicornCallsBeforeFreshReselectT5);
+gamePage.save = nativeSaveBeforeReselectT5;
+gamePage.religion.faith = 0;
+fakeNow += 30000;
+perTick.timeCrystal = 0.000001; // slow passive route must not hide a funded Leviathan trade
+const immediateLeviathanT5 = { name: "leviathans", title: "Leviathans", unlocked: true, embassyLevel: 0, sells: [{ name: "timeCrystal", value: 2, chance: 1, width: 0 }] };
+diplomacy.races.push(immediateLeviathanT5);
+res("manpower").value = 1000;
+res("gold").value = 100;
+const leviathanPreferredT5 = dbg.prestigeProjection?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: funded Leviathan trade is compared explicitly even beside a slow passive route",
+  leviathanPreferredT5?.alicorn?.ready === false && /Leviathan|trade/i.test(leviathanPreferredT5?.alicorn?.reason || ""));
+diplomacy.races.splice(diplomacy.races.indexOf(immediateLeviathanT5), 1);
+perTick.timeCrystal = 0;
+
+crystalTargetT5.prices[0].val = 11; // deficit 10; four 3-crystal batches required
+const multiBatchProjectionT5 = dbg.prestigeProjection?.(crystalTargetCandidateT5);
+const callsBeforeMultiBatchT5 = alicornSacrificeCalls;
+check("Task 5 alicorn: insufficient capital for the complete whole-batch plan calls zero APIs",
+  multiBatchProjectionT5?.alicorn?.batchesNeeded === 4 && multiBatchProjectionT5?.alicorn?.ready === false && dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeMultiBatchT5);
+crystalTargetT5.prices[0].val = 3;
+
+res("alicorn").value = 100;
+res("timeCrystal").value = 1;
+res("timeCrystal").maxValue = 5;
+crystalTargetT5.prices[0].val = 5; // two batches yield six into only four headroom
+fakeNow += 30000;
+const callsBeforeSequenceHeadroomT5 = alicornSacrificeCalls;
+const sequenceHeadroomT5 = dbg.prestigeProjection?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: whole multi-batch sequence must fit output headroom before batch one",
+  sequenceHeadroomT5?.alicorn?.batchesNeeded === 2 && sequenceHeadroomT5?.alicorn?.ready === false && dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeSequenceHeadroomT5);
+crystalTargetT5.prices[0].val = 3;
+res("alicorn").value = 50;
+res("timeCrystal").value = 1;
+res("timeCrystal").maxValue = 100;
+fakeNow += 30000;
+
+res("timeCrystal").maxValue = 3; // only two headroom; native batch would gain three
+const callsBeforeHeadroomT5 = alicornSacrificeCalls;
+check("Task 5 alicorn: output headroom blocks a batch before any irreversible API call",
+  dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeHeadroomT5 && res("alicorn").value === 50 && res("timeCrystal").value === 1);
+res("timeCrystal").maxValue = 100;
+const checkpointBeforeAlicornT5 = checkpointCalls;
+const positiveAlicornT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: exact two-crystal deficit executes one checkpointed 25-alicorn batch and verifies live gain",
+  positiveAlicornT5 === true && checkpointCalls === checkpointBeforeAlicornT5 + 1 && alicornSacrificeCalls === alicornCallsBeforeFloorT5 + 1 && res("alicorn").value === 25 && res("timeCrystal").value === 4);
+res("timeCrystal").value = 1;
+const callsBeforeAlicornCooldownT5 = alicornSacrificeCalls;
+check("Task 5 alicorn: one-batch action enters irreversible cooldown",
+  dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeAlicornCooldownT5);
+check("Task 5 observability: panel and diagnostics show armed prestige projections/blockers",
+  /Prestige/i.test(panelText(".kgh-prestige-status")) && /PRESTIGE|Prestige/.test(dbg.report()) && /Chronoforge|Void Space|Transcendence/.test(dbg.report()));
+
+zigguratUpgradesMock.splice(zigguratUpgradesMock.indexOf(alicornStableT5), 1);
+chronoforgeUpgrades.splice(chronoforgeUpgrades.indexOf(crystalTargetT5), 1);
+diplomacy.races.push(...savedRacesT5);
+delete perTick.faith;
+delete perTick.timeCrystal;
+dbg.setPrestigeAutomationArmed(false);
+for (const resource of addedRareResourcesT5) resources.splice(resources.indexOf(resource), 1);
+
+/* ---------------------------------------------------------------------
+ * Task 6 — sustainable processor fuel, bounded post-reset expansion,
+ * complete late-game diagnostics, and unlock-watch invalidation.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+const addedResourcesT6 = [];
+const ensureResourceT6 = (name, value, maxValue, title = null) => {
+  let resource = res(name);
+  if (!resource) {
+    resource = R(name, value, maxValue, title || undefined);
+    resources.push(resource);
+    addedResourcesT6.push(resource);
+  }
+  resource.value = value;
+  resource.maxValue = maxValue;
+  resource.unlocked = true;
+  return resource;
+};
+ensureResourceT6("uranium", 100, 1000, "Uranium");
+ensureResourceT6("unobtainium", 0, 1000, "Unobtainium");
+ensureResourceT6("timeCrystal", 5, 100, "Time Crystal");
+ensureResourceT6("relic", 50, 1000, "Relic");
+ensureResourceT6("void", 100, 1000, "Void");
+ensureResourceT6("karma", 20, 1000, "Karma");
+const savedFuelT6 = {
+  scienceValue: res("science").value,
+  scienceMax: res("science").maxValue,
+  uraniumRate: perTick.uranium,
+  scienceRate: perTick.science,
+  powerProd: gamePage.resPool.energyProd,
+  powerCons: gamePage.resPool.energyCons,
+  powerWinter: gamePage.resPool.energyWinterProd,
+  races: diplomacy.races.slice(),
+};
+res("science").value = 0;
+res("science").maxValue = 10000;
+perTick.science = 1;
+// The game reports NET production. Four active Reactors burn 4 uranium/s,
+// so -4/s represents a colony with no outside uranium income.
+perTick.uranium = -0.8;
+gamePage.resPool.energyProd = 100;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 100;
+const fuelProducerT6 = {
+  name: "fuelProducerT6",
+  label: "First Uranium Producer T6",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "uranium", val: 100 }, { name: "science", val: 500 }],
+  effects: { uraniumPerTickProd: 1 },
+};
+const reactorT6 = {
+  name: "reactorT6",
+  label: "Reactor T6",
+  unlocked: true,
+  val: 4,
+  on: 4,
+  prices: [{ name: "titanium", val: 1 }],
+  effects: { uraniumPerTickCon: -0.2, energyProduction: 5 },
+};
+buildings.push(fuelProducerT6, reactorT6);
+const fuelTargetT6 = dbg.candidateById("build:fuelProducerT6") || { kind: "build", meta: fuelProducerT6, affordable: false };
+const reactorNoIncomeT6 = dbg.sustainableProcessorCount?.(reactorT6, { reserved: { uranium: 100 } }, 60);
+check("Task 6 fuel: a Reactor cannot consume uranium reserved for the first producer",
+  reactorNoIncomeT6 === 0);
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: live Reactor control honors the banked active-target uranium floor",
+  reactorT6.on === 0);
+perTick.uranium = 0.4; // +2 uranium/s; each Reactor consumes 1/s.
+dbg.clearResourceTelemetry?.("uranium");
+const reactorIncomeT6 = dbg.sustainableProcessorCount?.(reactorT6, { reserved: { uranium: 100 } }, 60);
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: only the Reactor count sustainable for the 60-second income horizon resumes",
+  reactorIncomeT6 === 2 && reactorT6.on === 2);
+// Once those two Reactors are running, live telemetry reports zero NET uranium.
+// Their own burn must be added back or the controller will flap them off again.
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+const reactorSteadyT6 = dbg.sustainableProcessorCount?.(reactorT6, { reserved: { uranium: 100 } }, 60);
+check("Task 6 fuel: a sustainable Reactor count stays stable when telemetry includes its own burn",
+  reactorSteadyT6 === 2);
+
+const lunarOutpostT6 = {
+  name: "lunarOutpostT6",
+  label: "Lunar Outpost T6",
+  unlocked: true,
+  val: 3,
+  on: 3,
+  prices: [{ name: "uranium", val: 10 }],
+  effects: { uraniumPerTickCon: -0.5, unobtainiumPerTickSpace: 0.01, energyConsumption: 1 },
+};
+const spaceGateTechT6 = {
+  name: "spaceGateTechT6",
+  label: "Chronophysics Gate T6",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 1000 }],
+  unlocks: {},
+};
+techs.push(spaceGateTechT6);
+const lockedSpaceGateT6 = {
+  name: "lockedSpaceGateT6",
+  label: "Space Gate T6",
+  unlocked: false,
+  val: 0,
+  on: 0,
+  prices: [{ name: "science", val: 1000 }],
+  requiredTech: ["spaceGateTechT6"],
+  effects: {},
+};
+const unlockMissionT6 = {
+  name: "unlockMissionT6",
+  label: "Unlock Mission T6",
+  unlocked: false,
+  noStackable: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "science", val: 1 }],
+  effects: {},
+};
+const moonT6 = { name: "moonT6", label: "Moon T6", unlocked: true, reached: true, routeDays: 0, buildings: [lunarOutpostT6, lockedSpaceGateT6] };
+const programsT6 = [unlockMissionT6];
+gamePage.space = {
+  programs: programsT6,
+  planets: [moonT6],
+  getProgram: (id) => programsT6.find((program) => program.name === id),
+  getBuilding: (id) => moonT6.buildings.find((building) => building.name === id),
+};
+reactorT6.val = 0;
+reactorT6.on = 0;
+// Three active Lunar Outposts burn 7.5 uranium/s; keep outside income at zero.
+perTick.uranium = -1.5;
+dbg.clearResourceTelemetry?.("uranium");
+const lunarNoIncomeT6 = dbg.sustainableProcessorCount?.(lunarOutpostT6, { reserved: { uranium: 100 } }, 60);
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: Lunar Outposts also preserve the selected frontier's uranium",
+  lunarNoIncomeT6 === 0 && lunarOutpostT6.on === 0);
+perTick.uranium = 0.5; // +2.5/s, exactly one Lunar Outpost at -2.5/s.
+dbg.clearResourceTelemetry?.("uranium");
+const lunarIncomeT6 = dbg.sustainableProcessorCount?.(lunarOutpostT6, { reserved: { uranium: 100 } }, 60);
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: Lunar Outposts resume only the uranium-sustainable count",
+  lunarIncomeT6 === 1 && lunarOutpostT6.on === 1);
+
+// When several processor families share one fuel bank, the chosen frontier's
+// producer gets first call and the total projected burn must still fit once.
+const unobtainiumFrontierT6 = {
+  name: "unobtainiumFrontierT6",
+  label: "Unobtainium Frontier T6",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "uranium", val: 100 }, { name: "unobtainium", val: 100 }],
+  effects: {},
+};
+buildings.push(unobtainiumFrontierT6);
+reactorT6.val = 4;
+reactorT6.on = 0;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 0;
+perTick.uranium = 0.5;
+perTick.unobtainium = 0.01;
+res("uranium").value = 100;
+res("unobtainium").value = 0;
+fakeNow += 21000;
+dbg.queueAdd("build:unobtainiumFrontierT6", 0);
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 fuel: shared uranium budget prioritizes the selected unobtainium frontier without double allocation",
+  lunarOutpostT6.on === 1 && reactorT6.on === 0);
+
+// Review regressions: power and every fuel consumer must share one allocation.
+// These deliberately combine high stock, cooldown hysteresis, incumbent burn,
+// and a selected Space output so independent per-family budgets cannot pass.
+gamePage.resPool.energyProd = 2;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 2;
+res("uranium").value = 1000;
+res("uranium").maxValue = 1000;
+perTick.uranium = 0;
+reactorT6.val = 0;
+reactorT6.on = 0;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 0;
+dbg.clearResourceTelemetry?.("uranium");
+const lunarPowerPartialT6 = dbg.sustainableProcessorCount?.(lunarOutpostT6, { reserved: {} }, 60);
+check("Task 6 review: processor allocation caps a Lunar Outpost fleet to effective winter power headroom",
+  lunarPowerPartialT6 === 1);
+
+const backgroundProcessorT6 = {
+  name: "backgroundProcessorT6",
+  label: "Background Processor T6",
+  unlocked: true,
+  val: 2,
+  on: 0,
+  prices: [{ name: "uranium", val: 1000 }],
+  effects: { uraniumPerTickCon: -0.2, sciencePerTickProd: 0.01 },
+};
+buildings.push(backgroundProcessorT6);
+gamePage.resPool.energyProd = 100;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 100;
+unobtainiumFrontierT6.prices = [{ name: "uranium", val: 750 }, { name: "unobtainium", val: 100 }];
+res("uranium").value = 900;
+res("science").value = 0;
+perTick.uranium = 0;
+lunarOutpostT6.val = 1;
+lunarOutpostT6.on = 0;
+dbg.clearResourceTelemetry?.("uranium");
+dbg.queueClear();
+dbg.queueAdd("build:unobtainiumFrontierT6", 0);
+dbg.forceActiveTarget(null);
+fakeNow += 21000;
+tickFn();
+check("Task 6 review: the stability pass cannot double-allocate a high-stock uranium budget",
+  lunarOutpostT6.on === 1 && backgroundProcessorT6.on === 0);
+
+// Establish a fresh Reactor run transition, then switch to the Lunar frontier
+// before its minimum-run cooldown expires. The held Reactor's real burn gets
+// first claim; a desired-zero virtual count must not free that fuel for Lunar.
+backgroundProcessorT6.val = 0;
+backgroundProcessorT6.on = 0;
+reactorT6.val = 1;
+reactorT6.on = 0;
+lunarOutpostT6.val = 1;
+lunarOutpostT6.on = 0;
+unobtainiumFrontierT6.prices = [{ name: "uranium", val: 100 }, { name: "unobtainium", val: 100 }];
+res("uranium").value = 160;
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+dbg.queueClear();
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 review fixture: one Reactor enters the live run cooldown", reactorT6.on === 1);
+res("uranium").value = 250;
+perTick.uranium = -0.2; // -1/s net: no external income while one Reactor burns.
+dbg.clearResourceTelemetry?.("uranium");
+dbg.queueAdd("build:unobtainiumFrontierT6", 0);
+dbg.forceActiveTarget(null);
+fakeNow += 1000;
+dbg.optimizeProcessing();
+check("Task 6 review: cooldown-held Reactor burn is charged before later processor families",
+  reactorT6.on === 1 && lunarOutpostT6.on === 0);
+
+// After cooldown, reconstruct the one global 2.5/s outside supply from live net
+// telemetry. The selected Lunar producer gets first call and the incumbent
+// Reactor yields instead of defending the net-zero state it helped create.
+reactorT6.on = 1;
+lunarOutpostT6.on = 0;
+res("uranium").value = 100;
+perTick.uranium = 0.3; // +1.5/s net + 1/s live Reactor burn = 2.5/s gross.
+dbg.clearResourceTelemetry?.("uranium");
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 review: target-useful Lunar allocation takes over from an incumbent Reactor",
+  lunarOutpostT6.on === 1 && reactorT6.on === 0);
+
+const sharedAllocationReportT6 = dbg.reportForTarget?.({ kind: "build", meta: unobtainiumFrontierT6, affordable: false }) || "";
+check("Task 6 review: diagnostics print the same shared allocation used by execution",
+  /Reactor T6:.*sustainable 0\/1/i.test(sharedAllocationReportT6) &&
+  /Lunar Outpost T6:.*sustainable 1\/1/i.test(sharedAllocationReportT6));
+
+// P1 review: a target-useful power consumer may need the fleet allocator to
+// retain the minimum shared-fuel generator count first. With 0 Wt base power,
+// one Reactor supplies the 3 Lunar Outposts plus the 1 Wt safety headroom; the
+// exact uranium budget must not start an optional second Reactor afterward.
+reactorT6.val = 2;
+reactorT6.on = 1;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 0;
+res("uranium").value = 100;
+perTick.uranium = 1.5; // +7.5/s net + 1/s live Reactor burn = 8.5/s gross.
+dbg.clearResourceTelemetry?.("uranium");
+gamePage.resPool.energyProd = 5;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 5;
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 P1: minimum Reactor generation is pre-allocated before the prioritized Lunar fleet",
+  reactorT6.on === 1 && lunarOutpostT6.on === 3);
+
+// P1 review: build a real paused-for-power memo, age out its pause cooldown,
+// then provide raw power equal to 3 Lunar demand + the 1 Wt safety headroom.
+// Latent demand is a planning signal and must not be subtracted a second time
+// inside the fleet allocation that is itself deciding how much can resume.
+reactorT6.val = 0;
+reactorT6.on = 0;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 3;
+res("uranium").value = 100;
+perTick.uranium = 0; // net zero while all three consume the 7.5/s outside supply.
+dbg.clearResourceTelemetry?.("uranium");
+gamePage.resPool.energyProd = 0;
+gamePage.resPool.energyCons = 1;
+gamePage.resPool.energyWinterProd = 0;
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 P1 fixture: Lunar fleet is paused with latent power demand", lunarOutpostT6.on === 0 && dbg.latentPowerDemand?.() >= 3);
+perTick.uranium = 1.5; // +7.5/s outside supply with Lunar now off.
+dbg.clearResourceTelemetry?.("uranium");
+gamePage.resPool.energyProd = 4;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 4;
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 P1: raw power at fleet demand plus headroom resumes a latent-paused Lunar fleet",
+  lunarOutpostT6.on === 3);
+
+dbg.queueClear();
+delete perTick.unobtainium;
+buildings.splice(buildings.indexOf(backgroundProcessorT6), 1);
+buildings.splice(buildings.indexOf(unobtainiumFrontierT6), 1);
+
+const diagnosticTransT6 = { name: "diagnosticTransT6", label: "Transcendence Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 10 }], effects: {} };
+const diagnosticChronoT6 = { name: "diagnosticChronoT6", label: "Chronoforge Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 5 }], effects: {} };
+const diagnosticVoidT6 = { name: "diagnosticVoidT6", label: "Void Space Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "void", val: 50 }, { name: "karma", val: 10 }], effects: {} };
+const unlockTransT6 = { name: "unlockTransT6", label: "Unlock Transcendence T6", unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 1 }], effects: {} };
+const unlockChronoT6 = { name: "unlockChronoT6", label: "Unlock Chronoforge T6", unlocked: false, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 1 }], effects: {} };
+transcendenceUpgrades.push(diagnosticTransT6, unlockTransT6);
+chronoforgeUpgrades.push(diagnosticChronoT6, unlockChronoT6);
+voidspaceUpgrades.push(diagnosticVoidT6);
+
+// Seed the watcher with the new families still locked, then open all three
+// metadata sources while a stale lock is active.
+dbg.watchNewUnlocks?.();
+dbg.forceActiveTarget(fuelTargetT6, "Economy / normal growth", 0);
+unlockMissionT6.unlocked = true;
+unlockTransT6.unlocked = true;
+unlockChronoT6.unlocked = true;
+const unlockWatchT6 = dbg.watchNewUnlocks?.();
+check("Task 6 unlocks: Space, Time, and transcendence metadata all enter the watcher",
+  ["space:unlockMissionT6", "time:unlockChronoT6", "transcendence:unlockTransT6"].every((id) => unlockWatchT6?.freshIds?.includes(id)));
+check("Task 6 unlocks: a late-game unlock invalidates the stale plan lock",
+  unlockWatchT6?.invalidated === true && dbg.activeTargetId?.() === null);
+
+// Diagnostics must explain the whole selected late-game route from one dump.
+// Make uranium short so Dragons are the active acquisition step; keep the
+// direct time-crystal bill banked to exercise the rare-capital floor line.
+fuelProducerT6.prices = [{ name: "uranium", val: 200 }, { name: "timeCrystal", val: 5 }];
+unlockMissionT6.prices = [{ name: "uranium", val: 200 }, { name: "timeCrystal", val: 5 }];
+unlockMissionT6.unlocks = { planet: ["diagnosticPlanetT6"] };
+res("uranium").value = 100;
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+res("manpower").value = 1000;
+res("gold").value = 1000;
+res("titanium").value = 2000;
+diplomacy.races.splice(0, diplomacy.races.length, {
+  name: "dragons",
+  title: "Dragons",
+  unlocked: true,
+  embassyLevel: 10,
+  standing: 0,
+  energy: 0,
+  buys: [{ name: "titanium", val: 250 }],
+  sells: [{ name: "uranium", value: 20, chance: 1, width: 0 }],
+});
+reactorT6.val = 4;
+reactorT6.on = 0;
+lunarOutpostT6.val = 0;
+lunarOutpostT6.on = 0;
+dbg.forceActiveTarget(null);
+const reportT6 = dbg.reportForTarget?.({ kind: "space", meta: unlockMissionT6, affordable: false }) || dbg.report();
+check("Task 6 diagnostics: report prints route nodes with ETA and blockers",
+  /ACQUISITION ROUTE/i.test(reportT6) && /Uranium.*ETA.*blocker/i.test(reportT6));
+check("Task 6 diagnostics: report prints diplomacy expected yield and bounded batch cap",
+  /Dragons.*expected yield.*batch cap/i.test(reportT6));
+check("Task 6 diagnostics: report retains exact Space gate reasons",
+  /Moon T6.*Space Gate T6.*technology.*Chronophysics Gate T6/i.test(reportT6));
+check("Task 6 diagnostics: report includes Transcendence, Chronoforge, and Void Space census entries",
+  /Transcendence Diagnostic T6/i.test(reportT6) && /Chronoforge Diagnostic T6/i.test(reportT6) && /Void Space Diagnostic T6/i.test(reportT6));
+check("Task 6 diagnostics: report includes prestige projections and rare-capital floors",
+  /Prestige:.*Transcend.*Adore.*Alicorn/i.test(reportT6) && /Rare floors:.*Time Crystal.*5/i.test(reportT6));
+check("Task 6 diagnostics: report includes each processor's sustainable fuel budget",
+  /Reactor T6:.*sustainable 0\/4.*Uranium.*60s/i.test(reportT6));
+
+buildings.splice(buildings.indexOf(fuelProducerT6), 1);
+buildings.splice(buildings.indexOf(reactorT6), 1);
+techs.splice(techs.indexOf(spaceGateTechT6), 1);
+transcendenceUpgrades.splice(transcendenceUpgrades.indexOf(diagnosticTransT6), 1);
+transcendenceUpgrades.splice(transcendenceUpgrades.indexOf(unlockTransT6), 1);
+chronoforgeUpgrades.splice(chronoforgeUpgrades.indexOf(diagnosticChronoT6), 1);
+chronoforgeUpgrades.splice(chronoforgeUpgrades.indexOf(unlockChronoT6), 1);
+voidspaceUpgrades.splice(voidspaceUpgrades.indexOf(diagnosticVoidT6), 1);
+delete gamePage.space;
+diplomacy.races.splice(0, diplomacy.races.length, ...savedFuelT6.races);
+res("science").value = savedFuelT6.scienceValue;
+res("science").maxValue = savedFuelT6.scienceMax;
+perTick.science = savedFuelT6.scienceRate;
+if (savedFuelT6.uraniumRate === undefined) delete perTick.uranium; else perTick.uranium = savedFuelT6.uraniumRate;
+gamePage.resPool.energyProd = savedFuelT6.powerProd;
+gamePage.resPool.energyCons = savedFuelT6.powerCons;
+gamePage.resPool.energyWinterProd = savedFuelT6.powerWinter;
+for (const resource of addedResourcesT6) resources.splice(resources.indexOf(resource), 1);
+dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
+ * Task 7 — lifecycle source gates, logical automation time, and pollution.
+ * These fixtures deliberately expose metadata before the game surface that
+ * owns it. Persisted post-reset metadata must never bypass Library/Workshop.
+ * ------------------------------------------------------------------- */
+const libraryT7 = buildings.find((building) => building.name === "library");
+const savedLibraryT7 = { val: libraryT7.val, on: libraryT7.on };
+const workshopT7 = buildings.find((building) => building.name === "workshop");
+const savedWorkshopT7 = { val: workshopT7.val, on: workshopT7.on };
+const researchT7 = {
+  name: "freshResearchT7", label: "Fresh Research T7", unlocked: true, researched: false,
+  prices: [{ name: "science", val: 10 }], effects: { scienceRatio: 0.01 },
+};
+const upgradeT7 = {
+  name: "freshUpgradeT7", label: "Fresh Upgrade T7", unlocked: true, researched: false,
+  prices: [{ name: "freshPartT7", val: 1 }], effects: { mineralsRatio: 0.01 },
+};
+const freshPartT7 = R("freshPartT7", 0, 0, "Fresh Part T7");
+const freshCraftT7 = { name: "freshPartT7", label: "Fresh Part T7", unlocked: true, prices: [{ name: "wood", val: 1 }] };
+techs.push(researchT7);
+workshopUpgrades.push(upgradeT7);
+resources.push(freshPartT7);
+crafts.push(freshCraftT7);
+const savedScienceTabT7 = gamePage.scienceTab;
+const savedWorkshopTabT7 = gamePage.workshopTab;
+gamePage.scienceTab = {
+  buttons: [{ model: { options: { id: researchT7.name }, metadata: researchT7, visible: true } }],
+};
+gamePage.workshopTab = {
+  buttons: [
+    { model: { options: { id: upgradeT7.name }, metadata: upgradeT7, visible: true } },
+    { model: { options: { id: freshCraftT7.name }, metadata: freshCraftT7, visible: true } },
+  ],
+};
+libraryT7.val = 0; libraryT7.on = 0;
+workshopT7.val = 0; workshopT7.on = 0;
+dbg.forceActiveTarget(null);
+
+check("Task 7 review: stale visible native models cannot bypass Library/Workshop x0",
+  dbg.candidateGate?.("research", researchT7)?.state === "closed" &&
+  dbg.candidateGate?.("upgrade", upgradeT7)?.state === "closed" &&
+  dbg.candidateGate?.("craft", freshCraftT7)?.state === "closed");
+check("Task 7 lifecycle: persisted research metadata stays closed at Library ×0",
+  dbg.candidateGate?.("research", researchT7)?.state === "closed" && !dbg.candidateById("research:freshResearchT7"));
+check("Task 7 lifecycle: persisted upgrade and non-core craft metadata stay closed at Workshop ×0",
+  dbg.candidateGate?.("upgrade", upgradeT7)?.state === "closed" &&
+  dbg.candidateGate?.("craft", freshCraftT7)?.state === "closed" &&
+  !dbg.candidateById("upgrade:freshUpgradeT7") && dbg.acquisitionPathFor("freshPartT7", 1)?.reachable === false);
+check("Task 7 lifecycle: closed families are absent from pressure, demand, novelty, queue, and reservation surfaces",
+  !(dbg.storageBlockPressure?.().freshPartT7 > 0) && !(dbg.productionDemand?.().freshPartT7 > 0) &&
+  !dbg.queuePickerEntries().some((entry) => /fresh(?:Research|Upgrade)T7/.test(entry.id)) &&
+  !dbg.watchNewUnlocks?.().freshIds?.some((id) => /fresh(?:Research|Upgrade)T7/.test(id)) &&
+  !(dbg.buildReservationLedger(null)?.reserved?.freshPartT7 > 0));
+
+libraryT7.val = 1; libraryT7.on = 1;
+check("Task 7 lifecycle: Library ×1 opens research", dbg.candidateGate?.("research", researchT7)?.state === "actionable" && !!dbg.candidateById("research:freshResearchT7"));
+workshopT7.val = 1; workshopT7.on = 1;
+check("Task 7 lifecycle: Workshop ×1 opens upgrades and non-core crafts",
+  dbg.candidateGate?.("upgrade", upgradeT7)?.state === "actionable" &&
+  dbg.candidateGate?.("craft", freshCraftT7)?.state === "actionable" &&
+  !!dbg.candidateById("upgrade:freshUpgradeT7") && dbg.acquisitionPathFor("freshPartT7", 1)?.reachable === true);
+
+// Simulated reset: metadata remains open, source buildings return to zero.
+libraryT7.val = 0; libraryT7.on = 0; workshopT7.val = 0; workshopT7.on = 0;
+dbg.forceActiveTarget(null);
+check("Task 7 lifecycle: simulated reset re-closes persisted research/upgrade/craft metadata",
+  !dbg.candidateById("research:freshResearchT7") && !dbg.candidateById("upgrade:freshUpgradeT7") &&
+  dbg.acquisitionPathFor("freshPartT7", 1)?.reachable === false);
+
+// A stale upgrade lock must release on the same execution tick without being
+// recorded as a failed purchase/bench event.
+workshopT7.val = 1; workshopT7.on = 1;
+res("wood").value = Math.max(res("wood").value, 10);
+freshPartT7.value = 1;
+const liveUpgradeT7 = dbg.candidateById("upgrade:freshUpgradeT7");
+dbg.forceActiveTarget(liveUpgradeT7, "Workshop roadmap", 0);
+const failuresBeforeGateT7 = dbg.buyFailureState?.("upgrade:freshUpgradeT7")?.count || 0;
+workshopT7.val = 0; workshopT7.on = 0;
+dbg.executePlan();
+check("Task 7 lifecycle: execution-time closed gate releases stale lock without purchase benching",
+  dbg.activeTargetId?.() === null && upgradeT7.researched === false &&
+  (dbg.buyFailureState?.("upgrade:freshUpgradeT7")?.count || 0) === failuresBeforeGateT7);
+
+/* Aggregate hidden-building precursor: every reveal leg must be reachable. */
+const zigguratT7 = buildings.find((building) => building.name === "ziggurat");
+const savedZigguratT7 = {
+  unlocked: zigguratT7.unlocked, unlockable: zigguratT7.unlockable,
+  defaultUnlockable: zigguratT7.defaultUnlockable, unlockRatio: zigguratT7.unlockRatio,
+  prices: zigguratT7.prices, requiredTech: zigguratT7.requiredTech, val: zigguratT7.val, on: zigguratT7.on,
+};
+const constructionT7 = { name: "constructionT7", label: "Construction T7", unlocked: true, researched: true, prices: [], effects: {} };
+const physicsT7 = { name: "physicsT7", label: "Physics T7", unlocked: true, researched: false, prices: [], effects: {} };
+const megalithT7 = R("megalithT7", 0, 0, "Megalith T7");
+const megalithCraftT7 = { name: "megalithT7", label: "Megalith T7", unlocked: false, prices: [{ name: "slab", val: 1 }, { name: "beam", val: 1 }] };
+const blueprintCraftT7 = craft("blueprint");
+const savedBlueprintUnlockedT7 = blueprintCraftT7.unlocked;
+const savedZigguratBanksT7 = {
+  scaffold: res("scaffold").value,
+  blueprint: res("blueprint").value,
+  science: [res("science").value, res("science").maxValue],
+  compedium: res("compedium").value,
+};
+techs.push(constructionT7, physicsT7);
+resources.push(megalithT7);
+crafts.push(megalithCraftT7);
+workshopT7.val = 1; workshopT7.on = 1;
+Object.assign(zigguratT7, {
+  unlocked: false, unlockable: true, defaultUnlockable: false, unlockRatio: 0.01,
+  requiredTech: "constructionT7", val: 0, on: 0,
+  prices: [{ name: "scaffold", val: 50 }, { name: "blueprint", val: 1 }, { name: "megalithT7", val: 50 }],
+});
+blueprintCraftT7.unlocked = false;
+res("scaffold").value = 0;
+res("blueprint").value = 0;
+res("science").maxValue = Math.max(res("science").maxValue, 50000);
+res("science").value = Math.max(res("science").value, 25000);
+res("compedium").value = Math.max(res("compedium").value, 25);
+dbg.forceActiveTarget(null);
+check("Task 7 Ziggurat: Construction plus Scaffold route but locked Blueprint produces no precursor focus",
+  dbg.candidateGate?.("build", zigguratT7)?.state === "precursor" && dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat");
+physicsT7.researched = true;
+blueprintCraftT7.unlocked = true;
+check("Task 7 Ziggurat: opening Physics while another threshold leg is unreachable still produces no focus",
+  dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat");
+megalithCraftT7.unlocked = true;
+const revealZigguratT7 = dbg.bootstrapResourceCandidate?.();
+const revealLedgerT7 = revealZigguratT7 ? dbg.buildTargetLedger(revealZigguratT7) : { reserved: {} };
+check("Task 7 Ziggurat: all reachable legs produce one aggregate Reveal Ziggurat precursor",
+  revealZigguratT7?.meta?.downstreamName === "ziggurat" && /Reveal Ziggurat/.test(revealZigguratT7.meta.label) &&
+  revealZigguratT7.meta.prices?.length === 3);
+check("Task 7 Ziggurat: precursor reserves the aggregate reachable closure instead of one fastest leg",
+  ["scaffold", "blueprint", "megalithT7"].every((name) => (revealLedgerT7.reserved[name] || 0) > 0));
+res("scaffold").value = 0.5; res("blueprint").value = 0.01; megalithT7.value = 0.5;
+zigguratT7.unlocked = true;
+dbg.forceActiveTarget(null);
+check("Task 7 Ziggurat: native unlock replaces aggregate precursor with ordinary actionable building",
+  dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat" && dbg.candidateById("build:ziggurat")?.kind === "build");
+
+/* A fast action lane may consume a plan decision once, never replay it. */
+const fastReplayT7 = {
+  name: "fastReplayT7", label: "Fast Replay T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "wood", val: 1 }], effects: { mineralsRatio: 1000 },
+};
+buildings.push(fastReplayT7);
+res("wood").value = Math.max(res("wood").value, 20);
+dbg.forceActiveTarget(dbg.candidateById("build:fastReplayT7"), "Economy growth", 0);
+dbg.applyTickSpeed?.(1);
+const replaySchedulerT7 = dbg.automationSchedulerSnapshot?.();
+const replayPlanningT7 = intervalFns[replaySchedulerT7.lanes.planning.id];
+const replayActionT7 = intervalFns[replaySchedulerT7.lanes.action.id];
+const replayRenderT7 = intervalFns[replaySchedulerT7.lanes.render.id];
+const renderCountBeforePlanT7 = dbg.renderPassCount?.();
+fakeNow += replaySchedulerT7.lanes.planning.delayMs;
+replayPlanningT7();
+const renderCountAfterPlanT7 = dbg.renderPassCount?.();
+replayRenderT7();
+const renderCountAfterRenderLaneT7 = dbg.renderPassCount?.();
+const replayCountAfterPlanT7 = fastReplayT7.val;
+fakeNow += replaySchedulerT7.lanes.action.delayMs;
+replayActionT7();
+fakeNow += replaySchedulerT7.lanes.action.delayMs;
+replayActionT7();
+check("Task 7 review: real-cadence fast lane consumes one plan decision exactly once",
+  replayCountAfterPlanT7 === 1 && fastReplayT7.val === replayCountAfterPlanT7);
+check("Task 7 final review: planning never performs a full panel render and the 500ms render lane owns it",
+  Number.isFinite(renderCountBeforePlanT7) && renderCountAfterPlanT7 === renderCountBeforePlanT7 &&
+  renderCountAfterRenderLaneT7 === renderCountBeforePlanT7 + 1);
+buildings.splice(buildings.indexOf(fastReplayT7), 1);
+dbg.forceActiveTarget(null);
+
+/* Logical automation clock and cooperative booster contracts. */
+const clock1xT7 = dbg.automationClockSnapshot?.();
+const stampT7 = clock1xT7?.logicalNow ?? fakeNow;
+fakeNow += 1000;
+check("Task 7 clock: 1× logical elapsed time preserves wall-clock behavior",
+  clock1xT7?.requestedMultiplier === 1 && Math.abs((dbg.gameElapsedMs?.(stampT7) || 0) - 1000) < 1);
+
+dbg.applyTickSpeed?.(1);
+const transitionStartT7 = dbg.automationClockSnapshot?.();
+const namedCooldownStartT7 = dbg.ordinaryCooldownSnapshot?.();
+fakeNow += 1000;
+const beforeFastT7 = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(50);
+const fastStartT7 = dbg.automationClockSnapshot?.();
+fakeNow += 100;
+const afterFastT7 = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(1);
+fakeNow += 1000;
+const transitionEndT7 = dbg.automationClockSnapshot?.();
+const namedCooldownEndT7 = dbg.ordinaryCooldownSnapshot?.();
+const expectedTransitionLogicalT7 = 1000 + 100 + 1000;
+const namedCooldownsT7 = ["trade", "autobuy", "jobs", "rejection", "processor", "unicorn"];
+check("Task 7 review: 1x->50x->1x integrates named ordinary cooldown ages without retroactive rescaling",
+  Number.isFinite(transitionStartT7?.logicalNow) &&
+  Math.abs((beforeFastT7.logicalNow - transitionStartT7.logicalNow) - 1000) < 1 &&
+  Math.abs((afterFastT7.logicalNow - fastStartT7.logicalNow) - 100) < 1 &&
+  Math.abs((transitionEndT7.logicalNow - transitionStartT7.logicalNow) - expectedTransitionLogicalT7) < 1 &&
+  namedCooldownsT7.every((name) => Math.abs(
+    (namedCooldownEndT7?.ages?.[name] || 0) - (namedCooldownStartT7?.ages?.[name] || 0) - expectedTransitionLogicalT7,
+  ) < 1));
+dbg.applyTickSpeed?.(50);
+const scheduler50T7 = dbg.automationSchedulerSnapshot?.();
+const expectedAdaptiveDelayT7 = (baseMs, floorMs, multiplier) =>
+  Math.round(Math.max(floorMs, baseMs / Math.max(1, multiplier || 1)));
+check("Task 7 re-review: zero delivered ticks keep exact native owned-lane cadence",
+  scheduler50T7?.lanes?.action?.delayMs === 250 && scheduler50T7?.lanes?.planning?.delayMs === 2000 &&
+  scheduler50T7?.lanes?.render?.delayMs === 500 && scheduler50T7?.lanes?.booster?.delayMs === 200);
+check("Task 7 clock: a speed change leaves exactly one owned timer per lane",
+  scheduler50T7?.ownerCount === Object.keys(scheduler50T7?.lanes || {}).length && scheduler50T7?.overlappingMutations === 0);
+let boosterTicksT7 = 0;
+gamePage.tick = () => { boosterTicksT7 += 1; fakeNow += 2; };
+fakeNow += 200;
+const boosterBeatT7 = await dbg.runBoosterBeat?.();
+const clock50T7 = dbg.automationClockSnapshot?.();
+const partialScheduler50T7 = dbg.automationSchedulerSnapshot?.();
+check("Task 7 clock: slow game.tick yields within CPU budget and drops backlog",
+  boosterBeatT7?.executed > 0 && boosterBeatT7.executed <= boosterBeatT7.maxChunk && boosterBeatT7.dropped >= 0 &&
+  clock50T7?.requestedMultiplier === 50 && clock50T7.deliveredMultiplier < 50);
+check("Task 7 final review: partial delivery promptly re-arms only adaptive lanes to exact measured cadence",
+  partialScheduler50T7?.lanes?.action?.delayMs === expectedAdaptiveDelayT7(250, 100, clock50T7.deliveredMultiplier) &&
+  partialScheduler50T7?.lanes?.planning?.delayMs === expectedAdaptiveDelayT7(2000, 250, clock50T7.deliveredMultiplier) &&
+  partialScheduler50T7?.lanes?.action?.id !== scheduler50T7?.lanes?.action?.id &&
+  partialScheduler50T7?.lanes?.planning?.id !== scheduler50T7?.lanes?.planning?.id &&
+  partialScheduler50T7?.lanes?.render?.id === scheduler50T7?.lanes?.render?.id &&
+  partialScheduler50T7?.lanes?.booster?.id === scheduler50T7?.lanes?.booster?.id &&
+  partialScheduler50T7?.ownerCount === 4 && activeIntervalIds.size === 4 && partialScheduler50T7?.overlappingMutations === 0);
+
+gamePage.tick = () => { boosterTicksT7 += 1; };
+fakeNow += 200;
+await dbg.runBoosterBeat?.();
+const steadyClock50T7 = dbg.automationClockSnapshot?.();
+const steadyScheduler50T7 = dbg.automationSchedulerSnapshot?.();
+check("Task 7 final review: steady delivery updates materially changed rounded adaptive delays only",
+  steadyScheduler50T7?.lanes?.action?.delayMs === expectedAdaptiveDelayT7(250, 100, steadyClock50T7.deliveredMultiplier) &&
+  steadyScheduler50T7?.lanes?.planning?.delayMs === expectedAdaptiveDelayT7(2000, 250, steadyClock50T7.deliveredMultiplier) &&
+  steadyScheduler50T7?.lanes?.action?.id === partialScheduler50T7?.lanes?.action?.id &&
+  steadyScheduler50T7?.lanes?.planning?.id !== partialScheduler50T7?.lanes?.planning?.id &&
+  steadyScheduler50T7?.lanes?.render?.id === scheduler50T7?.lanes?.render?.id &&
+  steadyScheduler50T7?.lanes?.booster?.id === scheduler50T7?.lanes?.booster?.id &&
+  steadyScheduler50T7?.ownerCount === 4 && activeIntervalIds.size === 4 && steadyScheduler50T7?.overlappingMutations === 0);
+
+fakeNow += 200;
+await dbg.runBoosterBeat?.();
+const unchangedScheduler50T7 = dbg.automationSchedulerSnapshot?.();
+check("Task 7 final review: unchanged rounded delays preserve adaptive timer identity and ownership",
+  unchangedScheduler50T7?.lanes?.action?.id === steadyScheduler50T7?.lanes?.action?.id &&
+  unchangedScheduler50T7?.lanes?.planning?.id === steadyScheduler50T7?.lanes?.planning?.id &&
+  unchangedScheduler50T7?.lanes?.render?.id === steadyScheduler50T7?.lanes?.render?.id &&
+  unchangedScheduler50T7?.lanes?.booster?.id === steadyScheduler50T7?.lanes?.booster?.id &&
+  unchangedScheduler50T7?.ownerCount === 4 && activeIntervalIds.size === 4 && unchangedScheduler50T7?.overlappingMutations === 0);
+delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+const restoredNativeSchedulerT7 = dbg.automationSchedulerSnapshot?.();
+check("Task 7 final review: returning to 1x restores native cadence and removes the booster owner",
+  restoredNativeSchedulerT7?.lanes?.action?.delayMs === 250 && restoredNativeSchedulerT7?.lanes?.planning?.delayMs === 2000 &&
+  restoredNativeSchedulerT7?.lanes?.render?.delayMs === 500 && !restoredNativeSchedulerT7?.lanes?.booster &&
+  restoredNativeSchedulerT7?.ownerCount === 3 && activeIntervalIds.size === 3 && restoredNativeSchedulerT7?.overlappingMutations === 0);
+
+/* Re-review: logical time is native wall progress plus completed booster ticks. */
+dbg.applyTickSpeed?.(50);
+const zeroDeliveryStartT7R = dbg.automationClockSnapshot?.();
+fakeNow += 100;
+const zeroDeliveryEndT7R = dbg.automationClockSnapshot?.();
+check("Task 7 re-review: requested 50x stays native-only before any booster tick executes",
+  zeroDeliveryEndT7R?.requestedMultiplier === 50 && zeroDeliveryEndT7R?.deliveredMultiplier === 1 &&
+  Math.abs((zeroDeliveryEndT7R.logicalNow - zeroDeliveryStartT7R.logicalNow) - 100) < 1);
+
+const nativeTickLogicalMsT7R = 1000 / (gamePage.ticksPerSecond || 5);
+const selectableSpeedsT7R = [1, 2, 3, 5, 10, 20, 25, 50];
+const selectableDeliveryT7R = [];
+for (const speed of selectableSpeedsT7R) {
+  dbg.applyTickSpeed?.(1);
+  dbg.applyTickSpeed?.(speed);
+  const startWall = fakeNow;
+  const start = dbg.automationClockSnapshot?.();
+  let deliveredTicks = 0;
+  gamePage.tick = () => { deliveredTicks += 1; };
+  fakeNow += 200;
+  const beat = await dbg.runBoosterBeat?.();
+  const end = dbg.automationClockSnapshot?.();
+  const scheduler = dbg.automationSchedulerSnapshot?.();
+  selectableDeliveryT7R.push({ speed, startWall, start, end, beat, deliveredTicks, endWall: fakeNow, scheduler });
+}
+check("Task 7 re-review: every selectable speed credits only successfully delivered booster ticks",
+  selectableDeliveryT7R.length === selectableSpeedsT7R.length && selectableDeliveryT7R.every((sample) =>
+    sample.start?.requestedMultiplier === sample.speed && sample.end?.requestedMultiplier === sample.speed &&
+    sample.beat?.executed === sample.deliveredTicks &&
+    Math.abs(
+      (sample.end.logicalNow - sample.start.logicalNow) -
+      ((sample.endWall - sample.startWall) + sample.deliveredTicks * nativeTickLogicalMsT7R),
+    ) < 1));
+check("Task 7 re-review: fully delivered selectable boosts add exact per-tick logical progress",
+  selectableDeliveryT7R.filter((sample) => sample.speed <= 10).every((sample) =>
+    sample.deliveredTicks === Math.max(0, sample.speed - 1)));
+check("Task 7 final review: every selectable speed owns exact measured adaptive cadence",
+  selectableDeliveryT7R.every((sample) =>
+    sample.scheduler?.lanes?.action?.delayMs === expectedAdaptiveDelayT7(250, 100, sample.end.deliveredMultiplier) &&
+    sample.scheduler?.lanes?.planning?.delayMs === expectedAdaptiveDelayT7(2000, 250, sample.end.deliveredMultiplier) &&
+    sample.scheduler?.lanes?.render?.delayMs === 500 &&
+    (sample.speed === 1 ? !sample.scheduler?.lanes?.booster : sample.scheduler?.lanes?.booster?.delayMs === 200) &&
+    sample.scheduler?.ownerCount === (sample.speed === 1 ? 3 : 4) && sample.scheduler?.overlappingMutations === 0));
+
+const cappedDeliveryT7R = [];
+for (const speed of [20, 50]) {
+  dbg.applyTickSpeed?.(1);
+  dbg.applyTickSpeed?.(speed);
+  const startWall = fakeNow;
+  const start = dbg.automationClockSnapshot?.();
+  let deliveredTicks = 0;
+  gamePage.tick = () => { deliveredTicks += 1; };
+  fakeNow += 200;
+  const beat = await dbg.runBoosterBeat?.();
+  const end = dbg.automationClockSnapshot?.();
+  cappedDeliveryT7R.push({ speed, startWall, start, end, beat, deliveredTicks, endWall: fakeNow });
+}
+const capped20T7R = cappedDeliveryT7R[0];
+const capped50T7R = cappedDeliveryT7R[1];
+check("Task 7 final review: chunking limits each inner burst without capping total capable 20x/50x delivery",
+  capped20T7R.deliveredTicks === 19 && capped50T7R.deliveredTicks === 49 &&
+  capped20T7R.beat.dropped === 0 && capped50T7R.beat.dropped === 0 &&
+  capped20T7R.beat.yieldedChunks >= 1 && capped50T7R.beat.yieldedChunks >= 3 &&
+  Math.abs((capped20T7R.end.logicalNow - capped20T7R.start.logicalNow) -
+    ((capped20T7R.endWall - capped20T7R.startWall) + capped20T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1 &&
+  Math.abs((capped50T7R.end.logicalNow - capped50T7R.start.logicalNow) -
+    ((capped50T7R.endWall - capped50T7R.startWall) + capped50T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1);
+
+dbg.applyTickSpeed?.(1);
+dbg.applyTickSpeed?.(50);
+const partialStartWallT7R = fakeNow;
+const partialStartT7R = dbg.automationClockSnapshot?.();
+let partialDeliveredTicksT7R = 0;
+gamePage.tick = () => { partialDeliveredTicksT7R += 1; fakeNow += 2; };
+fakeNow += 200;
+const partialBeatT7R = await dbg.runBoosterBeat?.();
+const partialEndT7R = dbg.automationClockSnapshot?.();
+check("Task 7 re-review: CPU-limited partial delivery adds exact completed-tick progress",
+  partialDeliveredTicksT7R > 0 && partialDeliveredTicksT7R < partialBeatT7R?.maxChunk &&
+  partialBeatT7R?.executed === partialDeliveredTicksT7R && partialBeatT7R?.dropped > 0 &&
+  Math.abs((partialEndT7R.logicalNow - partialStartT7R.logicalNow) -
+    ((fakeNow - partialStartWallT7R) + partialDeliveredTicksT7R * nativeTickLogicalMsT7R)) < 1);
+
+delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+const transitionStartT7R = dbg.automationClockSnapshot?.();
+const namedCooldownStartT7R = dbg.ordinaryCooldownSnapshot?.();
+fakeNow += 1000;
+const beforeFastT7R = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(50);
+const fastStartT7R = dbg.automationClockSnapshot?.();
+fakeNow += 100;
+const afterUndeliveredFastT7R = dbg.automationClockSnapshot?.();
+let transitionDeliveredTicksT7R = 0;
+gamePage.tick = () => { transitionDeliveredTicksT7R += 1; };
+fakeNow += 100;
+const transitionBeatT7R = await dbg.runBoosterBeat?.();
+const afterDeliveredFastT7R = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(1);
+fakeNow += 1000;
+const transitionEndT7R = dbg.automationClockSnapshot?.();
+const namedCooldownEndT7R = dbg.ordinaryCooldownSnapshot?.();
+const expectedTransitionLogicalT7R = 1000 + 100 + 100 +
+  transitionDeliveredTicksT7R * nativeTickLogicalMsT7R + 1000;
+const namedCooldownsT7R = ["trade", "autobuy", "jobs", "rejection", "processor", "unicorn"];
+check("Task 7 re-review: speed transitions integrate native wall plus delivered ticks without retroactive scaling",
+  Number.isFinite(transitionStartT7R?.logicalNow) &&
+  Math.abs((beforeFastT7R.logicalNow - transitionStartT7R.logicalNow) - 1000) < 1 &&
+  Math.abs((afterUndeliveredFastT7R.logicalNow - fastStartT7R.logicalNow) - 100) < 1 &&
+  transitionBeatT7R?.executed === transitionDeliveredTicksT7R &&
+  Math.abs((afterDeliveredFastT7R.logicalNow - afterUndeliveredFastT7R.logicalNow) -
+    (100 + transitionDeliveredTicksT7R * nativeTickLogicalMsT7R)) < 1 &&
+  Math.abs((transitionEndT7R.logicalNow - transitionStartT7R.logicalNow) - expectedTransitionLogicalT7R) < 1);
+check("Task 7 re-review: named ordinary cooldowns age on delivered logical time",
+  namedCooldownsT7R.every((name) => Math.abs(
+    (namedCooldownEndT7R?.ages?.[name] || 0) - (namedCooldownStartT7R?.ages?.[name] || 0) - expectedTransitionLogicalT7R,
+  ) < 1));
+
+const telemetryClockT7R = R("telemetryClockT7R", 100, 100000, "Telemetry Clock T7R");
+resources.push(telemetryClockT7R);
+perTick.telemetryClockT7R = 2;
+dbg.applyTickSpeed?.(1);
+dbg.clearResourceTelemetry?.("telemetryClockT7R");
+dbg.sampleResourceTelemetry?.();
+fakeNow += 3500;
+telemetryClockT7R.value += 35;
+dbg.applyTickSpeed?.(2);
+fakeNow += 200;
+telemetryClockT7R.value += 2;
+let telemetryDeliveredTicksT7R = 0;
+gamePage.tick = () => {
+  telemetryDeliveredTicksT7R += 1;
+  telemetryClockT7R.value += 2;
+};
+const telemetryBeatT7R = await dbg.runBoosterBeat?.();
+dbg.applyTickSpeed?.(1);
+dbg.sampleResourceTelemetry?.();
+const transitionObservedProductionT7R = dbg.productionFor?.("telemetryClockT7R");
+check("Task 7 re-review: production telemetry uses its actual multi-speed logical sample span",
+  telemetryBeatT7R?.executed === 1 && telemetryDeliveredTicksT7R === 1 &&
+  Math.abs(transitionObservedProductionT7R - 10) < 1e-9);
+resources.splice(resources.indexOf(telemetryClockT7R), 1);
+delete perTick.telemetryClockT7R;
+delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+
+/* Final review: once a public native tick counter is available, background wall
+   time is not game progress. Completed booster calls are credited exactly once
+   even when the same calls also increment the public counter. */
+gamePage.timer = { ticksTotal: 1000 };
+dbg.resetAutomationNativeSample?.();
+const observedClockStartT7 = dbg.automationClockSnapshot?.();
+fakeNow += 1000;
+const observedClockIdleT7 = dbg.automationClockSnapshot?.();
+gamePage.timer.ticksTotal += 5;
+const observedClockNativeT7 = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(50);
+gamePage.tick = () => { gamePage.timer.ticksTotal += 1; };
+fakeNow += 200;
+const observedBoosterStartT7 = dbg.automationClockSnapshot?.();
+const observedBoosterBeatT7 = await dbg.runBoosterBeat?.();
+const observedBoosterEndT7 = dbg.automationClockSnapshot?.();
+check("Task 7 final review: public native ticks gate logical time and booster counter changes are not double-counted",
+  Math.abs(observedClockIdleT7.logicalNow - observedClockStartT7.logicalNow) < 1 &&
+  Math.abs((observedClockNativeT7.logicalNow - observedClockIdleT7.logicalNow) - 1000) < 1 &&
+  observedBoosterBeatT7?.executed === 49 &&
+  Math.abs((observedBoosterEndT7.logicalNow - observedBoosterStartT7.logicalNow) - 49 * nativeTickLogicalMsT7R) < 1);
+dbg.applyTickSpeed?.(1);
+gamePage.timer.ticksTotal = 2000;
+dbg.resetAutomationNativeSample?.();
+dbg.automationClockSnapshot?.();
+fakeNow += 1000;
+gamePage.timer.ticksTotal += 2;
+const throttledNativeClockT7 = dbg.automationClockSnapshot?.();
+check("Task 7 final review: scheduler telemetry measures throttled native TPS from the public tick counter",
+  Math.abs((throttledNativeClockT7?.observedNativeTicksPerSecond || 0) - 2) < 0.001 &&
+  Math.abs((throttledNativeClockT7?.logicalNow - observedBoosterEndT7.logicalNow) - 400) < 1);
+delete gamePage.tick;
+delete gamePage.timer;
+dbg.resetAutomationNativeSample?.();
+
+/* Native-style pollution status, scoring, recovery, throttle, diagnostics. */
+const pollutionResourceT7 = R("cathPollution", 900, 0, "Cath Pollution");
+resources.push(pollutionResourceT7);
+const savedPollutionManagerT7 = {
+  cathPollution: gamePage.bld.cathPollution,
+  cathPollutionPerTick: gamePage.bld.cathPollutionPerTick,
+  pollutionLevels: gamePage.bld.pollutionLevels,
+  getPollutionPerTick: gamePage.bld.getPollutionPerTick,
+  getPollutionLevel: gamePage.bld.getPollutionLevel,
+  getPollutionEquilibrium: gamePage.bld.getPollutionEquilibrium,
+};
+gamePage.bld.cathPollution = 900;
+gamePage.bld.cathPollutionPerTick = 2;
+gamePage.bld.pollutionLevels = [
+  { threshold: 0, effects: {} },
+  { threshold: 500, effects: { catnipPollutionRatio: -0.05 } },
+  { threshold: 1000, effects: { catnipPollutionRatio: -0.15, happiness: -0.05 } },
+];
+gamePage.bld.getPollutionPerTick = () => 2;
+gamePage.bld.getPollutionLevel = () => ({ level: 1, effects: { catnipPollutionRatio: -0.05 } });
+gamePage.bld.getPollutionEquilibrium = () => 1500;
+const cleanupT7 = {
+  name: "carbonSequestrationT7", label: "Carbon Sequestration T7", unlocked: true, researched: false,
+  prices: [{ name: "science", val: 1 }], effects: { cathPollutionPerTickProd: -4 },
+};
+const dirtyPowerT7 = {
+  name: "dirtyPowerT7", label: "Dirty Power T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "wood", val: 1 }], effects: { energyProduction: 5, cathPollutionPerTickProd: 1 },
+};
+const cleanPowerT7 = {
+  name: "cleanPowerT7", label: "Clean Power T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "wood", val: 1 }], effects: { energyProduction: 5 },
+};
+workshopUpgrades.push(cleanupT7);
+buildings.push(dirtyPowerT7, cleanPowerT7);
+workshopT7.val = 1; workshopT7.on = 1;
+const pollutionStatusT7 = dbg.pollutionStatus?.();
+const cleanupProfileT7 = dbg.metaEffectProfile?.(cleanupT7);
+const cleanupCandidateT7 = dbg.candidateById("upgrade:carbonSequestrationT7");
+const dirtyCandidateT7 = dbg.candidateById("build:dirtyPowerT7");
+const cleanCandidateT7 = dbg.candidateById("build:cleanPowerT7");
+check("Task 7 pollution: native status exposes level, delta, equilibrium, threshold ETA, clean share, and effects",
+  pollutionStatusT7?.current === 900 && pollutionStatusT7?.perTick === 2 && pollutionStatusT7?.level === 1 &&
+  pollutionStatusT7?.equilibrium === 1500 && pollutionStatusT7?.nextThreshold === 1000 &&
+  Math.abs(pollutionStatusT7?.nextEta - 10) < 0.001 && pollutionStatusT7?.effects?.catnipPollutionRatio === -0.05);
+check("Task 7 pollution: pollution pseudo-resource is excluded from generic production value while cleanup remains measurable",
+  !Object.prototype.hasOwnProperty.call(cleanupProfileT7?.perTick || {}, "cathPollution") && dbg.pollutionMarginalFor?.(cleanupT7) === -4);
+check("Task 7 pollution: measured sequestration earns benefit and comparable clean generation beats dirty generation",
+  dbg.candidateScore(cleanupCandidateT7) > 0 && dbg.candidateScore(cleanCandidateT7) > dbg.candidateScore(dirtyCandidateT7));
+const recoveryT7 = dbg.bestPollutionRecoveryTarget?.([dirtyCandidateT7, cleanCandidateT7, cleanupCandidateT7]);
+check("Task 7 pollution: rising harmful pollution selects a reachable cleaner/sequestering action",
+  recoveryT7?.meta?.name === "carbonSequestrationT7");
+const pollutionDecisionT7 = dbg.selectStrategicTarget?.("balanced");
+check("Task 7 pollution: recovery layer is visible above repeated economy growth",
+  /Pollution recovery/.test(pollutionDecisionT7?.layer || "") && pollutionDecisionT7?.target?.meta?.name === "carbonSequestrationT7");
+
+const utilityPollutionLevelsT7 = gamePage.bld.pollutionLevels;
+const utilityGetPollutionLevelT7 = gamePage.bld.getPollutionLevel;
+const utilityCatnipPerTickT7 = perTick.catnip;
+const utilityHappinessT7 = gamePage.village.happiness;
+const utilityArrivalT7 = gamePage.village.calculateKittensPerTick;
+const utilitySolarRatioT7 = gamePage.religion.getSolarRevolutionRatio;
+const pollutionUtilityPenaltyT7 = (currentEffects, nextEffects = currentEffects) => {
+  gamePage.bld.pollutionLevels = [
+    { threshold: 0, effects: {} },
+    { threshold: 500, effects: currentEffects },
+    { threshold: 1000, effects: nextEffects },
+  ];
+  gamePage.bld.getPollutionLevel = () => ({ level: 1, effects: currentEffects });
+  return dbg.pollutionPenalty(dbg.pollutionStatus());
+};
+
+perTick.catnip = 1;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const lowCatnipPollutionUtilityT7 = pollutionUtilityPenaltyT7({ catnipPollutionRatio: -0.05 });
+perTick.catnip = 12;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const highCatnipPollutionUtilityT7 = pollutionUtilityPenaltyT7({ catnipPollutionRatio: -0.05 });
+check("Task 7 review: pollution utility scales with live catnip production",
+  highCatnipPollutionUtilityT7 > lowCatnipPollutionUtilityT7);
+
+perTick.catnip = 0;
+gamePage.village.happiness = 0.26;
+const floorHappinessPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionHappines: -0.1 });
+gamePage.village.happiness = 1.1;
+const highHappinessPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionHappines: -0.1 });
+check("Task 7 review: pollution utility respects live happiness headroom",
+  highHappinessPollutionUtilityT7 > floorHappinessPollutionUtilityT7);
+
+gamePage.village.calculateKittensPerTick = () => 0.001;
+const lowArrivalPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionArrivalSlowdown: 2 });
+gamePage.village.calculateKittensPerTick = () => 0.1;
+const highArrivalPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionArrivalSlowdown: 2 });
+check("Task 7 review: pollution utility scales with live kitten-arrival rate",
+  highArrivalPollutionUtilityT7 > lowArrivalPollutionUtilityT7);
+
+gamePage.village.calculateKittensPerTick = () => 0;
+gamePage.religion.getSolarRevolutionRatio = () => 0.1;
+const lowSolarPollutionUtilityT7 = pollutionUtilityPenaltyT7({ solarRevolutionPollution: -0.25 });
+gamePage.religion.getSolarRevolutionRatio = () => 2;
+const highSolarPollutionUtilityT7 = pollutionUtilityPenaltyT7({ solarRevolutionPollution: -0.25 });
+check("Task 7 review: pollution utility scales with live Solar Revolution strength",
+  highSolarPollutionUtilityT7 > lowSolarPollutionUtilityT7);
+
+perTick.catnip = 5;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const mildThresholdPollutionUtilityT7 = pollutionUtilityPenaltyT7(
+  { catnipPollutionRatio: -0.01 },
+  { catnipPollutionRatio: -0.02 },
+);
+const severeThresholdPollutionUtilityT7 = pollutionUtilityPenaltyT7(
+  { catnipPollutionRatio: -0.01 },
+  { catnipPollutionRatio: -0.5 },
+);
+check("Task 7 review: pollution utility prices the native next-level effect transition",
+  severeThresholdPollutionUtilityT7 > mildThresholdPollutionUtilityT7);
+
+gamePage.bld.pollutionLevels = utilityPollutionLevelsT7;
+gamePage.bld.getPollutionLevel = utilityGetPollutionLevelT7;
+perTick.catnip = utilityCatnipPerTickT7;
+gamePage.village.happiness = utilityHappinessT7;
+gamePage.village.calculateKittensPerTick = utilityArrivalT7;
+gamePage.religion.getSolarRevolutionRatio = utilitySolarRatioT7;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const criticalSmelterT7 = { name: "criticalSmelterT7", label: "Critical Smelter T7", unlocked: true, val: 3, on: 3, effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.2, cathPollutionPerTickProd: 0.1 } };
+const expendablePolluterT7 = { name: "expendablePolluterT7", label: "Expendable Polluter T7", unlocked: true, val: 3, on: 3, effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.01, cathPollutionPerTickProd: 0.3 } };
+check("Task 7 pollution: nonessential polluters throttle but a critical smelter keeps one viable unit",
+  dbg.pollutionProcessorTarget?.(expendablePolluterT7, null, pollutionStatusT7) === 0 &&
+  dbg.pollutionProcessorTarget?.(criticalSmelterT7, { kind: "build", meta: criticalSmelterT7 }, pollutionStatusT7) >= 1);
+
+// Allocation-level review: neither safety role is discoverable by a token.
+// The generator's live watts are required to preserve the 1 Wt grid headroom;
+// the converter makes a nested craft input for the selected target. Pollution
+// may remove only the third, genuinely nonessential family.
+const savedPollutionAllocationT7 = {
+  powerProd: gamePage.resPool.energyProd,
+  powerCons: gamePage.resPool.energyCons,
+  powerWinter: gamePage.resPool.energyWinterProd,
+  minerals: [res("minerals").value, res("minerals").maxValue],
+};
+const criticalCatalystT7 = R("criticalCatalystT7", 0, 100, "Critical Catalyst T7");
+const criticalPartT7 = R("criticalPartT7", 0, 100, "Critical Part T7");
+const criticalPartCraftT7 = { name: "criticalPartT7", label: "Critical Part T7", unlocked: true, prices: [{ name: "criticalCatalystT7", val: 1 }] };
+const pollutingGridSupportT7 = {
+  name: "pollutingGridSupportT7", label: "Polluting Grid Support T7", unlocked: true, val: 2, on: 1,
+  prices: [], effects: { energyProduction: 4, cathPollutionPerTickProd: 0.4 },
+};
+const routedCriticalConverterT7 = {
+  name: "routedCriticalConverterT7", label: "Routed Critical Converter T7", unlocked: true, val: 2, on: 0,
+  prices: [], effects: { mineralsPerTickCon: -0.01, criticalCatalystT7PerTickProd: 0.1, cathPollutionPerTickProd: 0.2 },
+};
+const unrelatedPolluterT7 = {
+  name: "unrelatedPolluterT7", label: "Unrelated Polluter T7", unlocked: true, val: 2, on: 0,
+  prices: [], effects: { mineralsPerTickCon: -0.01, ironPerTickProd: 0.1, cathPollutionPerTickProd: 0.3 },
+};
+const routedCriticalTargetT7 = {
+  name: "routedCriticalTargetT7", label: "Routed Critical Target T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "criticalPartT7", val: 10 }], effects: {},
+};
+resources.push(criticalCatalystT7, criticalPartT7);
+crafts.push(criticalPartCraftT7);
+buildings.push(pollutingGridSupportT7, routedCriticalConverterT7, unrelatedPolluterT7, routedCriticalTargetT7);
+res("minerals").value = 1000; res("minerals").maxValue = 1000;
+gamePage.resPool.energyProd = 4; gamePage.resPool.energyCons = 3; gamePage.resPool.energyWinterProd = 4;
+const routedCriticalCandidateT7 = dbg.candidateById("build:routedCriticalTargetT7");
+dbg.forceActiveTarget(routedCriticalCandidateT7, "Late-game progression frontier", 0);
+const gridSupportAllocationT7 = dbg.sustainableProcessorCount?.(pollutingGridSupportT7, { reserved: {} }, 60);
+const routedCriticalAllocationT7 = dbg.sustainableProcessorCount?.(routedCriticalConverterT7, { reserved: {} }, 60);
+const unrelatedPolluterAllocationT7 = dbg.sustainableProcessorCount?.(unrelatedPolluterT7, { reserved: {} }, 60);
+check("Task 7 review: pollution preserves the shared grid-support minimum",
+  gridSupportAllocationT7 >= 1);
+check("Task 7 review: pollution preserves the recursively target-useful converter minimum",
+  routedCriticalAllocationT7 >= 1);
+check("Task 7 review: pollution still throttles nonessential processor capacity",
+  unrelatedPolluterAllocationT7 === 0);
+dbg.forceActiveTarget(null);
+buildings.splice(buildings.indexOf(pollutingGridSupportT7), 1);
+buildings.splice(buildings.indexOf(routedCriticalConverterT7), 1);
+buildings.splice(buildings.indexOf(unrelatedPolluterT7), 1);
+buildings.splice(buildings.indexOf(routedCriticalTargetT7), 1);
+crafts.splice(crafts.indexOf(criticalPartCraftT7), 1);
+resources.splice(resources.indexOf(criticalCatalystT7), 1);
+resources.splice(resources.indexOf(criticalPartT7), 1);
+res("minerals").value = savedPollutionAllocationT7.minerals[0]; res("minerals").maxValue = savedPollutionAllocationT7.minerals[1];
+gamePage.resPool.energyProd = savedPollutionAllocationT7.powerProd;
+gamePage.resPool.energyCons = savedPollutionAllocationT7.powerCons;
+gamePage.resPool.energyWinterProd = savedPollutionAllocationT7.powerWinter;
+gamePage.bld.getPollutionPerTick = () => -2;
+gamePage.bld.getPollutionEquilibrium = () => 400;
+check("Task 7 pollution: falling to a safe equilibrium adds no recovery penalty and yields the layer",
+  dbg.pollutionPenalty?.(dbg.pollutionStatus?.()) === 0 && !dbg.bestPollutionRecoveryTarget?.([cleanupCandidateT7]));
+const reportPollutionT7 = dbg.report?.() || "";
+check("Task 7 final review: pollution diagnostics name state, polluters/cleaners, measured penalties, and recovery/wait reason",
+  /Pollution:.*level.*delta.*equilibrium.*threshold ETA.*clean energy.*contributors/i.test(reportPollutionT7) &&
+  /cleaners:/i.test(reportPollutionT7) && /penalty:.*current.*next/i.test(reportPollutionT7) &&
+  /recovery:.*(?:active|waiting|not needed)/i.test(reportPollutionT7));
+
+const recoveryNamesT7 = ["planner", "processor", "craft", "autobuy", "diplomacy", "jobs", "render"];
+const recoveryOrderT7 = [];
+const recoveryEntriesT7 = recoveryNamesT7.map((name) => {
+  let throws = true;
+  return {
+    name,
+    run() {
+      if (throws) { throws = false; throw new Error(`${name} sentinel`); }
+      recoveryOrderT7.push(name);
+    },
+  };
+});
+const firstRecoveryT7 = dbg.runSubsystemSequence?.(recoveryEntriesT7);
+const secondRecoveryT7 = dbg.runSubsystemSequence?.(recoveryEntriesT7);
+check("Task 7 resilience: every major subsystem failure is named while later subsystems continue",
+  firstRecoveryT7?.failures?.every((failure, index) => failure.name === recoveryNamesT7[index] && failure.message === `${failure.name} sentinel`) &&
+  firstRecoveryT7?.attempted === recoveryNamesT7.length);
+check("Task 7 resilience: subsequent ticks recover every previously failing subsystem",
+  secondRecoveryT7?.failures?.length === 0 && recoveryOrderT7.join(",") === recoveryNamesT7.join(","));
+
+/* The real planning callback must isolate a production-phase failure.  The
+   existing synthetic sequence is useful diagnostics coverage, but it cannot
+   prove that tick() actually routes its live work through that boundary. */
+const productionSchedulerT7 = dbg.automationSchedulerSnapshot?.();
+const productionPlanningT7 = intervalFns[productionSchedulerT7?.lanes?.planning?.id];
+const productionRunsBeforeT7 = dbg.subsystemRunSnapshot?.();
+const savedStorageGetT7 = localStorageMock.getItem;
+let throwGoalReadT7 = true;
+localStorageMock.getItem = (key) => {
+  if (key === "kgh.goal" && throwGoalReadT7) {
+    throwGoalReadT7 = false;
+    throw new Error("real planner sentinel");
+  }
+  return savedStorageGetT7(key);
+};
+fakeNow += productionSchedulerT7?.lanes?.planning?.delayMs || 2000;
+productionPlanningT7?.();
+localStorageMock.getItem = savedStorageGetT7;
+const productionRunsAfterFailureT7 = dbg.subsystemRunSnapshot?.();
+const productionFailuresAfterFailureT7 = dbg.subsystemFailures?.();
+fakeNow += productionSchedulerT7?.lanes?.planning?.delayMs || 2000;
+productionPlanningT7?.();
+const productionRunsAfterRecoveryT7 = dbg.subsystemRunSnapshot?.();
+// Rendering deliberately belongs to the independent 500 ms render lane, so a
+// planning callback must isolate and continue only the later mutation phases.
+const productionLaterNamesT7 = ["processor", "craft", "autobuy", "diplomacy", "jobs"];
+const productionRunCountT7 = (snapshot, name, field) => snapshot?.[name]?.[field] || 0;
+check("Task 7 review: real production tick isolates one planner failure, runs later phases, and recovers next tick",
+  typeof productionPlanningT7 === "function" &&
+  productionFailuresAfterFailureT7?.planner?.last === "real planner sentinel" &&
+  productionRunCountT7(productionRunsAfterFailureT7, "planner", "attempts") -
+    productionRunCountT7(productionRunsBeforeT7, "planner", "attempts") === 1 &&
+  productionRunCountT7(productionRunsAfterFailureT7, "planner", "successes") -
+    productionRunCountT7(productionRunsBeforeT7, "planner", "successes") === 0 &&
+  productionLaterNamesT7.every((name) =>
+    productionRunCountT7(productionRunsAfterFailureT7, name, "attempts") -
+      productionRunCountT7(productionRunsBeforeT7, name, "attempts") === 1) &&
+  ["planner", ...productionLaterNamesT7].every((name) =>
+    productionRunCountT7(productionRunsAfterRecoveryT7, name, "successes") -
+      productionRunCountT7(productionRunsAfterFailureT7, name, "successes") === 1) &&
+  dbg.automationSchedulerSnapshot?.().overlappingMutations === productionSchedulerT7?.overlappingMutations);
+
+// Restore Task 7 fixtures.
+for (const [key, value] of Object.entries(savedPollutionManagerT7)) {
+  if (value === undefined) delete gamePage.bld[key]; else gamePage.bld[key] = value;
+}
+workshopUpgrades.splice(workshopUpgrades.indexOf(cleanupT7), 1);
+buildings.splice(buildings.indexOf(dirtyPowerT7), 1);
+buildings.splice(buildings.indexOf(cleanPowerT7), 1);
+resources.splice(resources.indexOf(pollutionResourceT7), 1);
+Object.assign(zigguratT7, savedZigguratT7);
+blueprintCraftT7.unlocked = savedBlueprintUnlockedT7;
+res("scaffold").value = savedZigguratBanksT7.scaffold;
+res("blueprint").value = savedZigguratBanksT7.blueprint;
+res("science").value = savedZigguratBanksT7.science[0]; res("science").maxValue = savedZigguratBanksT7.science[1];
+res("compedium").value = savedZigguratBanksT7.compedium;
+techs.splice(techs.indexOf(constructionT7), 1);
+techs.splice(techs.indexOf(physicsT7), 1);
+crafts.splice(crafts.indexOf(megalithCraftT7), 1);
+resources.splice(resources.indexOf(megalithT7), 1);
+libraryT7.val = savedLibraryT7.val; libraryT7.on = savedLibraryT7.on;
+workshopT7.val = savedWorkshopT7.val; workshopT7.on = savedWorkshopT7.on;
+techs.splice(techs.indexOf(researchT7), 1);
+workshopUpgrades.splice(workshopUpgrades.indexOf(upgradeT7), 1);
+crafts.splice(crafts.indexOf(freshCraftT7), 1);
+resources.splice(resources.indexOf(freshPartT7), 1);
+if (savedScienceTabT7 === undefined) delete gamePage.scienceTab; else gamePage.scienceTab = savedScienceTabT7;
+if (savedWorkshopTabT7 === undefined) delete gamePage.workshopTab; else gamePage.workshopTab = savedWorkshopTabT7;
+dbg.forceActiveTarget(null);
+
+const predecessorTimersT7 = [...activeIntervalIds];
+vm.runInContext(body, context, { filename: "kittens-game-helper-reinjected.user.js" });
+await new Promise((resolve) => setTimeout(resolve, 100));
+const replacementDbgT7 = context.window.__kghDebug;
+const replacementSchedulerT7 = replacementDbgT7?.automationSchedulerSnapshot?.();
+check("Task 7 reinjection: every predecessor timer is cancelled and exactly one replacement owner remains",
+  predecessorTimersT7.every((id) => clearedIntervalIds.includes(id) && !activeIntervalIds.has(id)) &&
+  activeIntervalIds.size === replacementSchedulerT7?.ownerCount && replacementSchedulerT7?.ownerCount === 3);
+
+// Exercise the real async bootstrap, not the debug scheduler: two injections
+// begin while both gameReady() and document.body are false. The second must own
+// and cancel the first one's pending readiness timeout before either can resume.
+const savedBootstrapGamePageT7 = context.gamePage;
+const savedBootstrapBodyT7 = documentMock.body;
+const savedBootstrapSetTimeoutT7 = context.setTimeout;
+const savedBootstrapClearTimeoutT7 = context.clearTimeout;
+const activeBootstrapTimeoutsT7 = new Set();
+const clearedBootstrapTimeoutsT7 = new Set();
+context.setTimeout = (fn, ms, ...args) => {
+  let id = null;
+  id = setTimeout(() => {
+    activeBootstrapTimeoutsT7.delete(id);
+    fn(...args);
+  }, ms);
+  activeBootstrapTimeoutsT7.add(id);
+  return id;
+};
+context.clearTimeout = (id) => {
+  clearedBootstrapTimeoutsT7.add(id);
+  activeBootstrapTimeoutsT7.delete(id);
+  clearTimeout(id);
+};
+context.gamePage = null;
+documentMock.body = null;
+vm.runInContext(body, context, { filename: "kittens-game-helper-bootstrap-predecessor.user.js" });
+const bootstrapPredecessorOwnerT7 = context.window.__kghTimerOwner;
+const bootstrapPredecessorTimeoutsT7 = [...activeBootstrapTimeoutsT7];
+vm.runInContext(body, context, { filename: "kittens-game-helper-bootstrap-replacement.user.js" });
+const bootstrapReplacementOwnerT7 = context.window.__kghTimerOwner;
+check("Task 7 review: bootstrap timeout handles are owned by the live window owner",
+  bootstrapReplacementOwnerT7 !== bootstrapPredecessorOwnerT7 &&
+  Object.keys(bootstrapReplacementOwnerT7?.timeouts || {}).length === 1 &&
+  activeBootstrapTimeoutsT7.size === 1);
+check("Task 7 review: reinjection cancels every predecessor bootstrap timeout",
+  bootstrapPredecessorOwnerT7?.cancelled === true &&
+  Object.keys(bootstrapPredecessorOwnerT7?.timeouts || {}).length === 0 &&
+  bootstrapPredecessorTimeoutsT7.every((id) => clearedBootstrapTimeoutsT7.has(id)));
+
+context.gamePage = savedBootstrapGamePageT7;
+documentMock.body = savedBootstrapBodyT7;
+await new Promise((resolve) => setTimeout(resolve, 350));
+const bootstrapReplacementSchedulerT7 = context.window.__kghDebug?.automationSchedulerSnapshot?.();
+const bootstrapReplacementIntervalIdsT7 = new Set(
+  Object.values(bootstrapReplacementSchedulerT7?.lanes || {}).map((lane) => lane.id),
+);
+const resumedPredecessorIntervalsT7 = [...activeIntervalIds]
+  .filter((id) => !bootstrapReplacementIntervalIdsT7.has(id));
+const savedBootstrapGetItemT7 = localStorageMock.getItem;
+const savedBootstrapAutopilotT7 = storage.get("kgh.autopilot");
+let predecessorBootstrapMutationReadsT7 = 0;
+localStorageMock.getItem = (key) => {
+  if (key === "kgh.autopilot") predecessorBootstrapMutationReadsT7 += 1;
+  return savedBootstrapGetItemT7(key);
+};
+storage.set("kgh.autopilot", "0");
+for (const id of resumedPredecessorIntervalsT7) intervalFns[id]?.();
+localStorageMock.getItem = savedBootstrapGetItemT7;
+if (savedBootstrapAutopilotT7 === undefined) storage.delete("kgh.autopilot");
+else storage.set("kgh.autopilot", savedBootstrapAutopilotT7);
+check("Task 7 review: stale bootstrap generation cannot arm lanes or mutate after readiness",
+  bootstrapReplacementSchedulerT7?.ownerCount === 3 && activeIntervalIds.size === 3 &&
+  resumedPredecessorIntervalsT7.length === 0 && predecessorBootstrapMutationReadsT7 === 0);
+context.setTimeout = savedBootstrapSetTimeoutT7;
+context.clearTimeout = savedBootstrapClearTimeoutT7;
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);

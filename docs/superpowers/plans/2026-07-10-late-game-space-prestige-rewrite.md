@@ -20,6 +20,9 @@
 - Every trade and rare-capital action must respect the complete reservation ledger and output storage headroom.
 - In the supplied 39.85-alicorn/1-time-crystal state, no alicorn sacrifice may execute or be recommended while Alicorn Stable still requires 20 alicorns.
 - Preserve early-game safety, genuine power recovery, first-reset population milestones, active research contracts, and bounded unicorn-to-tears behavior.
+- Workshop upgrades/crafts require Workshop ×1; Ziggurat/unicorn planning requires the live native source gate; raw future metadata cannot create a focus.
+- At 5×/10×/25×/50×, ordinary automation delays follow measured logical game time; use a 100–250 ms action lane, a 250 ms full-plan floor, and a 2 Hz render ceiling; irreversible cooldowns remain real wall time.
+- Pollution decisions use live cathPollution, delta, equilibrium, levels, clean-energy ratio, and measured downstream effects; critical target/safety converters cannot be pollution-throttled.
 - Update `@version`, `HELPER_VERSION`, and `package.json` together from `2.20.6` to `2.21.0` only in the release task.
 
 ---
@@ -243,7 +246,48 @@ The shown object is the required blocked return shape; replace its fields with t
 
 - [ ] **Step 8: Rerun smoke, run `git diff --check`, and commit with `fix: coordinate late-game fuel and diagnostics`.**
 
-### Task 7: Add end-to-end simulations, release documentation, and final verification
+### Task 7: Gate lifecycle content, accelerate automation safely, and manage pollution
+
+**Files:**
+- Modify: `scripts/smoke.mjs` fresh-start, speed-clock, pollution, and processor fixtures
+- Modify: `scripts/simulate.mjs` long-run speed/pollution phases
+- Modify: `src/kittens-game-helper.user.js` candidate gathering, source gates, scheduling/cooldowns, scoring, processor control, strategic layers, and diagnostics
+
+**Interfaces:**
+- Produces: `candidateGate(kind, meta) -> { state: "closed" | "precursor" | "actionable", reason, source, model }`
+- Produces: `gameElapsedMs(since) -> number`
+- Produces: `automationDelayMs(baseMs, floorMs) -> number`
+- Produces: `automationClockSnapshot() -> { requestedMultiplier, deliveredTicksPerSecond, deliveredMultiplier, wallNow }`
+- Produces: `pollutionStatus() -> { current, perTick, level, equilibrium, nextThreshold, nextEta, cleanEnergyRatio, effects }`
+- Produces: `bestPollutionRecoveryTarget(candidates, resources, status) -> candidate | null`
+
+- [ ] **Step 1: Add failing fresh-start gates.** Start with Library ×0 and Workshop ×0 while research/upgrade metadata is already open. Assert neither family enters candidates, storage pressure, producer demand, novelty, queue resolution, reservation, job pressure, or execution; after Library ×1 research appears and after Workshop ×1 upgrades/crafts appear. Repeat after a simulated reset with persisted metadata and both source counts back at zero. Force a stale upgrade lock, remove Workshop, and assert the same tick releases it without purchase benching.
+
+- [ ] **Step 2: Run `npm.cmd run smoke` and confirm the premature Workshop and Ziggurat assertions fail for the current raw-metadata scans.**
+
+- [ ] **Step 3: Implement `candidateGate`.** Query native controller model visibility/actionability when available; otherwise use structural fallbacks: Library/Science surface for research, Workshop surface/Workshop ×1 for upgrades and non-core crafts, and the appropriate religion/policy/space/time source. For ordinary buildings call native `bld.isUnlockable`/`bld.isUnlocked` when available and honor live `unlocked`, `unlockRatio`, required technology, and active stage. Apply the gate in candidate discovery, storage pressure, producer demand, acquisition routes, novelty, queue lookup, lock feasibility, bootstrap/roadmaps, jobs, reservations, unlock watching, diagnostics, and a fresh execution-time recheck. A closed execution gate releases/replans without counting as a failed buy.
+
+- [ ] **Step 3a: Add and fix the aggregate Ziggurat precursor regression.** Use native-style prices 50 Scaffold + 1 Blueprint + 50 Megalith with `unlockRatio: 0.01`. Construction plus a Scaffold route but locked Blueprint must produce no focus; unlocking Physics while another leg is unreachable still produces none; once all legs are reachable produce one aggregate `Reveal Ziggurat` precursor; after all threshold stocks and native unlock update, replace it with the ordinary actionable building. The precursor reserves its aggregate reachable closure, never one fastest threshold leg.
+
+- [ ] **Step 4: Add failing controllable-clock tests.** Stub `Date.now`, executed tick counts, and timers; select each supported speed; and assert trade/autobuy/jobs/plan rejection/processor hysteresis/unicorn batching produce the same logical-game schedule. Assert the action lane stays within 100–250 ms, full planning never drops below 250 ms, rendering never exceeds 2 Hz, lanes never overlap a mutation, speed changes re-arm exactly one owned timer per lane, reinjection cancels every predecessor timer, and irreversible cooldown still requires 30 real seconds.
+
+- [ ] **Step 5: Run the timing tests and confirm 50× remains tied to the old wall-clock delays.**
+
+- [ ] **Step 6: Implement the speed-aware automation clock and cooperative booster.** Measure delivered TPS from native plus executed booster ticks; replace ordinary `Date.now() - stamp < constant` comparisons with logical progress; split cheap active-route/safety/affordability checks from full planning/render; centralize `window`-owned timer cancellation/re-arming; enforce per-frame booster CPU budget with bounded chunks and dropped backlog; keep UI/irreversible timers real-time. Preserve 1× behavior exactly and make `productionFor`/ETAs accept measured boosted telemetry rather than rejecting it at the old 35% delta.
+
+- [ ] **Step 7: Add failing pollution-model and scoring tests.** Build live-style manager fixtures for pollution current/delta/equilibrium/level/effects and clean/polluting energy. Assert `cathPollutionPerTickProd` never receives positive generic resource value, cleanup is not discarded as an unknown resource, next-threshold ETA is correct, the penalty grows near a harmful level, Carbon Sequestration earns measured benefit, clean generators win when utility is comparable, and falling-to-safe-equilibrium pollution adds no penalty.
+
+- [ ] **Step 8: Add failing pollution-control tests.** Rising harmful pollution selects a reachable cleaner/sequestering action; nonessential polluters throttle only after protected target/safety demand is satisfied; a critical Calciner/Smelter stays at its minimum viable target count; falling/bounded pollution yields the layer. Diagnostics name level, delta, equilibrium, threshold ETA, clean-energy share, and top contributors.
+
+- [ ] **Step 9: Implement the pollution model, marginal scoring, and recovery layer.** Exclude pollution keys from generic resource parsing; read native Buildings manager methods first; calculate only documented fallbacks; project pollution production/consumption against catnip, happiness, arrival, and Solar Revolution effects; compare clean/dirty watts on total utility; and insert recovery below food/power/fuel safety but above repeated economy growth.
+
+- [ ] **Step 10: Add 1× and 50× unattended simulations covering fresh start through Workshop/Ziggurat and industry through pollution mitigation.** Assert equivalent progression ordering, no premature focus, no overlapping helper ticks, and either bounded pollution or a visible active mitigation plan.
+
+Add a machine-bound fixture that requests 50× but delivers less, a deliberately slow `game.tick()` fixture proving the booster yields without backlog, and a reinjection fixture proving exactly one timer owner remains. Throw once from each major tick subsystem and assert the failure is named while later subsystems and subsequent ticks recover.
+
+- [ ] **Step 11: Run smoke and simulate, run `git diff --check`, and commit with `feat: harden lifecycle speed and pollution`.**
+
+### Task 8: Add end-to-end simulations, release documentation, and final verification
 
 **Files:**
 - Modify: `scripts/simulate.mjs`
@@ -266,6 +310,8 @@ The shown object is the required blocked return shape; replace its fields with t
 - [ ] **Step 4: Update validation invariants.** Require the action broker, persistent arm key, acquisition graph, one diplomacy owner, normalized descriptor adapters, correct Time controllers, and version parity. Remove assertions that require global `noConfirm` or encode alicorn sacrifice as universally denied.
 
 - [ ] **Step 5: Update README.** Document Space dependency planning, Dragon/Leviathan routes, one-time prestige arming, exact irreversible safeguards, rare-capital floors, diagnostics, and the still-forbidden reset/shatter/time-skip actions.
+
+Document native lifecycle gates, speed-aware automation timing, and pollution recovery/diagnostics in the same release section.
 
 - [ ] **Step 6: Bump `@version`, `HELPER_VERSION`, and `package.json` to `2.21.0`.**
 

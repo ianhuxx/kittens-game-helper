@@ -45,14 +45,72 @@ away — every spender (planner, crafting, trade, diplomacy) checks the same res
 first. It also **refines surplus catnip into wood** to break the classic early
 wood/mineral starvation. You never touch a number.
 
-The first thing it does on load is set the game's **no-confirm** option, so automation is
-never blocked by a pop-up dialog. It keeps prestige **resets OFF**, plus every other
-irreversible action (transcend, sacrifice alicorns, time-skip, shatter time crystals):
-those are filtered out of every candidate and trade list, so the helper *continues* your
-game and can never reset it behind your back. The one deliberate exception is the
-repeatable **unicorn→tears sacrifice**, which the unicorn planner performs in bounded
-batches to fund the ziggurat upgrade it has chosen (see below) — it can never fire as a
-generic candidate and never touches alicorns.
+The helper does not change the game's global confirmation setting. Every mutation goes
+through a semantic action broker: ordinary purchases/trades/crafts are safe repeatable
+actions, rare-capital spends receive extra floors, and unknown actions fail closed.
+**World reset, challenge reset, time skip and time-crystal shattering are always
+forbidden.** Transcend, Adore and alicorn sacrifice are separate, explicitly armed
+prestige actions with the safeguards described below. The repeatable **unicorn→tears
+sacrifice** remains a bounded ziggurat-planner conversion and never touches alicorns.
+
+## Late-game autonomy and safety (v2.21.0)
+
+Late-game progression uses the same locked target and reservation ledger as the early
+game, but plans a dependency **frontier** instead of scoring Space objects in isolation.
+A mission or first building that opens a planet/resource/controller wins before another
+repeat Accelerator. The plan remains the real destination while **Now** reports its
+current prerequisite: Planet Cracker uranium production, Dragon uranium, Lunar Outpost
+unobtainium, Moon Base storage, Sunlifter antimatter, Heatsink, or Containment Chamber.
+Missions and planet buildings retain their owning planet and native controller; Time
+descriptors keep Chronoforge and Void Space on their distinct native controllers.
+
+- **Dragon route:** uranium is reachable through live Dragon trades even before its bar
+  is unlocked. If titanium is short, the recursive route first funds Zebra titanium,
+  then trades Dragons, then buys the original Space target. The displayed plan never
+  changes into a phantom uranium/miner job.
+- **Leviathan route:** active Leviathans supply time crystals, relics, sorrow and other
+  trade-only capital from live eligibility, chance, seasonal yield and embassy rules.
+  A departure invalidates the route immediately. One diplomacy executor owns reveal,
+  targeted trade, optional surplus trade and embassy work, with at most one mutation per
+  planner tick.
+- **Rare-capital floors:** alicorns, time crystals, relics, void, karma and paragon needed
+  by the active plan, manual queue, reachable prestige/upgrade roadmap and policy
+  reservations are protected. Trades, processors, parallel buys and alicorn batches may
+  spend only true surplus above the merged floor.
+
+Prestige automation defaults **OFF**. One deliberate click on **Prestige automation**
+stores `kgh.prestigeArmed`; the authorization persists until you disarm it, and disarming
+takes effect before the next planner tick. Before every Transcend, Adore or alicorn batch,
+the broker must create and verify a fresh native checkpoint, reread live state, recompute
+the exact before/after projection, preserve every reservation/protected floor, execute at
+most one native public action, verify the measured postcondition, and enter a real-wall-
+time cooldown. Transcend must advance exactly one tier while retaining upgrade epiphany;
+Adore requires positive projected gain and bounded Solar Revolution recovery; alicorn
+sacrifice requires a concrete active time-crystal deficit, no faster passive or Leviathan
+route, full-sequence capital/headroom, and executes only one 25-alicorn batch before
+replanning. No internal reset helper or raw counter mutation is permitted.
+
+The copied diagnostics report makes these decisions inspectable: nested acquisition
+steps and ETAs, selected race/yield/batch/floors, Space predecessor/transit/technology/
+upgrade gates, ordinary/ziggurat/transcendence religion, Chronoforge versus Void Space,
+prestige projections/blockers/cooldown, processor fuel budgets, and recent measured
+actions all appear with the owning subsystem.
+
+Lifecycle, clock and pollution controls are part of the same release:
+
+- Persisted metadata cannot bypass native lifecycle gates. Research waits for the
+  Science surface (or Library ×1), workshop upgrades/crafts wait for Workshop ×1, and
+  Ziggurat content waits for its technology, resources, source building and native
+  reveal. A closing gate releases the plan without benching a purchase.
+- Automation timing follows **delivered game ticks**, not a fictional selected speed.
+  The report shows requested versus measured speed; cheap action and full planning/
+  render lanes never overlap. Ordinary cooldowns scale with delivered progress, while
+  irreversible cooldowns and UI feedback remain real wall time.
+- Pollution recovery reads the native level, slope, equilibrium, clean-energy share and
+  threshold ETA. When pollution is materially worsening it can buy sequestration/clean
+  power and throttle nonessential polluters while preserving converters required by
+  food, power or the active acquisition route. The Pollution diagnostic names top
+  contributors, active penalties and the recovery action or blocker.
 
 ## What the panel shows
 
@@ -116,9 +174,10 @@ eventually unlock alicorns — is fully automated:
   Ziggurat *before* sacrificing and says so in the 🦄 panel line.
 - An upgrade whose first copy **unlocks alicorns** (Ivory Tower) may claim the plan even
   when its payback is slow — it's new content, not just production.
-- Queue a specific ziggurat upgrade in the manual build queue and the sacrifice will fund
-  *that* item instead of the planner's pick. **Alicorn sacrifice stays off** (it feeds
-  time crystals, prestige territory).
+- Queue a specific ziggurat upgrade in the manual build queue and the unicorn sacrifice
+  will fund *that* item instead of the planner's pick. Alicorn sacrifice is unrelated:
+  it remains off unless prestige automation is deliberately armed and every target,
+  checkpoint, route, floor, headroom and cooldown safeguard above passes.
 
 So the autopilot handles the steady grind, and the queue is your steering wheel for
 anything you want prioritised.
@@ -261,9 +320,10 @@ resolves the prerequisite the right way and the display names that exact sub-act
   low or some far-off candidate uses it. With an unrelated plan, no Zebra trading happens
   and no "titanium path" is shown.
 
-The late game is covered by the same engine: **space programs** and **Chronoforge / Void
-structures** are scored, reserved for, and bought through the game's own controllers, just
-like bonfire buildings — so the planner doesn't go blank after Rocketry.
+The late game is covered by the same engine: dependency-aware **Space missions and planet
+buildings**, **transcendence upgrades**, and **Chronoforge / Void Space** structures are
+gated, scored, reserved for, and bought through their exact native controllers, so the
+planner does not go blank after Rocketry.
 
 ## Policies: fully automatic — exclusive picks included
 
@@ -307,10 +367,10 @@ conversion can never steal the run-up to the focused build/research.
 
 Everything Kitten Scientists used to cover is now done directly through the game's API:
 
-- **Trade.** When catpower is near its cap (and would otherwise be wasted), nothing is
-  reserved, and the explorer path isn't saving catpower, the helper trades with the
-  partner whose goods you most need room for — `diplomacy.tradeAll(race)`. The Zebra →
-  titanium route keeps its dedicated ship/explorer/trade logic.
+- **Trade.** One diplomacy executor first reveals/prepares the race required by the active
+  acquisition route, then funds and executes its bounded targeted trade. Only when no
+  active route needs diplomacy inputs may it make a true-surplus trade or buy an embassy.
+  Dragon, Zebra and Leviathan steps therefore share one owner and one reservation ledger.
 - **Religion.** Faith-priced religion upgrades are planned and bought like anything else;
   **Praise the Sun** fires (converting the faith bank to worship) only when faith is near
   its cap *and* no faith upgrade is still being saved for, so it never burns the bank an
@@ -331,8 +391,8 @@ the copy count required to restore current economic utility, temporary downtime 
 energy/consumption penalties, cap safety, and opportunity-cost-adjusted payback. A change
 must be materially better and repay within the planning horizon. After the switch, the
 rebuild is an atomic reservation-backed continuation until effect parity is restored;
-then a cooldown prevents upgrade/downgrade oscillation. All irreversible actions remain
-disabled.
+then a cooldown prevents upgrade/downgrade oscillation. Stage changes remain reversible
+transactions; forbidden reset/shatter/time-skip actions never enter this path.
 
 ## Leader selection & promotions
 
@@ -395,11 +455,11 @@ verdict instead of a stat line you had to decode:
 - **Reset is beneficial NOW** (red) — paragon/day has flattened (arrivals no longer keep
   up), so banking and restarting compounds faster than continuing this run.
 
-The reset itself is intentionally **never automated** — reset/transcend/
-alicorn-sacrifice/time-skip actions are filtered out of every decision the helper makes
-(the bounded unicorn→tears sacrifice above is the only exception, and it can't touch your
-prestige state). When the card says GO and you've **exported a backup**, do it yourself
-in the game's **Time Control** tab.
+The world reset itself is intentionally **never automated**, regardless of the advisor or
+prestige arm. Challenge reset, time skip and time-crystal shattering are equally
+forbidden. The prestige arm authorizes only the guarded Transcend, Adore and target-bound
+alicorn policies described above. When the card says GO and you have **exported a
+backup**, perform the world reset yourself in the game's **Time Control** tab.
 
 ## Files
 
@@ -413,9 +473,10 @@ scripts/smoke.mjs                 Behavioral test: runs the script against a moc
                                   the native praise/festival/trade/observe subsystems work
 scripts/simulate.mjs              Multi-scenario harness (npm run simulate): drives the bot
                                   through early / mid / titanium-trap / titanium-needed /
-                                  craft-chain / oil-well-producer / late-game-space states and
-                                  asserts progress, plan↔action coherence, no off-plan titanium,
-                                  and that prerequisite chains (craft, produce, trade) are driven
+                                  craft-chain / lifecycle / pollution plus Dragon uranium,
+                                  uranium→unobtainium, antimatter/containment, Leviathan
+                                  departure, Transcendence, armed prestige and Void Space;
+                                  asserts progressed state and visible plan/action explanations
 package.json                      npm test (validate + smoke + simulate)
 LICENSE                           MIT
 ```
