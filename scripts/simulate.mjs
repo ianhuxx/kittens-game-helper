@@ -46,7 +46,10 @@ const makeState = () => {
     parchmentMade: 0, festivals: 0, boosterTicks: 0, dragonTrades: 0,
     leviathanTrades: 0, transcendencePurchases: 0, chronoforgePurchases: 0,
     voidPurchases: 0, transcendCalls: 0, checkpoints: 0,
+    planetBuildingPurchases: 0, planetBuildingPurchaseIds: [],
+    rawSpaceManagerCalls: 0,
   };
+  const mutationEvents = [];
 
   const resources = [
     R("catnip", 2000, 8000), R("wood", 400, 2500), R("minerals", 700, 1500),
@@ -174,6 +177,7 @@ const makeState = () => {
           output.unlocked = true;
         }
       }
+      if (race && race.name) mutationEvents.push({ action: `trade:${race.name}`, controller: "diplomacy" });
       return true;
     },
     trade(race) { diplomacy.tradeMultiple(race, 1); },
@@ -292,7 +296,7 @@ const makeState = () => {
     tradeTab: { exploreBtn: { model: { prices: [{ name: "manpower", val: 1000 }] } } },
   };
 
-  return { resources, res, crafts, buildings, techs, policies, workshopUpgrades, religionUpgrades, jobs, kittens, diplomacy, village, calendar, perTick, gamePage, spies };
+  return { resources, res, crafts, buildings, techs, policies, workshopUpgrades, religionUpgrades, jobs, kittens, diplomacy, village, calendar, perTick, gamePage, spies, mutationEvents };
 };
 
 /* ------------------------------ scenario tweaks ---------------------------- */
@@ -569,6 +573,7 @@ const applyPhase = (st, phase) => {
           if (gamePage.religion.faithRatio <= price) return false;
           gamePage.religion.faithRatio -= price;
           gamePage.religion.transcendenceTier += 1;
+          st.mutationEvents.push({ action: "prestige:transcend", controller: "Religion transcend button" });
           return true;
         },
       },
@@ -698,7 +703,11 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
   const failures = [];
   const st = makeState();
   applyPhase(st, phase);
-  const { res, gamePage, spies, buildings, techs } = st;
+  const { res, gamePage, spies, buildings, techs, mutationEvents } = st;
+  if (gamePage.space) {
+    gamePage.space.build = () => { spies.rawSpaceManagerCalls += 1; return false; };
+    gamePage.space.buy = () => { spies.rawSpaceManagerCalls += 1; return false; };
+  }
 
   const storage = new Map();
   const holdAutopilotForInitialEvidence = phase === "freshLifecycle" || phase === "pollutionIndustry";
@@ -763,6 +772,9 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         const unlocked = this.game.space?.getBuilding(buildingName);
         if (unlocked) unlocked.unlocked = true;
       }
+      spies.planetBuildingPurchases += 1;
+      spies.planetBuildingPurchaseIds.push(model.metadata.name);
+      mutationEvents.push({ action: `space:${model.metadata.name}`, controller: "PlanetBuildingBtnController" });
       return { itemBought: true };
     }
   }
@@ -788,15 +800,36 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
   }
   class TranscendenceBtnController extends LateGameStackableController {
     getMetadata(id) { return this.game.religion?.getTU(id); }
-    buyItem(model) { spies.transcendencePurchases += 1; return super.buyItem(model); }
+    buyItem(model) {
+      const result = super.buyItem(model);
+      if (result.itemBought) {
+        spies.transcendencePurchases += 1;
+        mutationEvents.push({ action: `transcendence:${model.metadata.name}`, controller: "TranscendenceBtnController" });
+      }
+      return result;
+    }
   }
   class ChronoforgeBtnController extends LateGameStackableController {
     getMetadata(id) { return this.game.time?.getCFU(id); }
-    buyItem(model) { spies.chronoforgePurchases += 1; return super.buyItem(model); }
+    buyItem(model) {
+      const result = super.buyItem(model);
+      if (result.itemBought) {
+        spies.chronoforgePurchases += 1;
+        mutationEvents.push({ action: `chronoforge:${model.metadata.name}`, controller: "ChronoforgeBtnController" });
+      }
+      return result;
+    }
   }
   class VoidSpaceBtnController extends LateGameStackableController {
     getMetadata(id) { return this.game.time?.getVSU(id); }
-    buyItem(model) { spies.voidPurchases += 1; return super.buyItem(model); }
+    buyItem(model) {
+      const result = super.buyItem(model);
+      if (result.itemBought) {
+        spies.voidPurchases += 1;
+        mutationEvents.push({ action: `voidspace:${model.metadata.name}`, controller: "VoidSpaceBtnController" });
+      }
+      return result;
+    }
   }
 
   let nextTimerId = 1;
@@ -857,7 +890,9 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       let recoveryLayerSeen = false;
       let initialPollutionEvidence = null;
       let maxMutationOverlaps = 0;
-      let visibleEvidence = [dbg.report?.(), dbg.planText?.(), dbg.nowText?.()].filter(Boolean).join("\n");
+      let mutationEventCursor = 0;
+      const scopedMutationEvidence = [];
+      st.scopedMutationEvidence = scopedMutationEvidence;
       const recordLifecycle = (event) => {
         if (!lifecycleSeen.has(event)) { lifecycleSeen.add(event); lifecycleEvents.push(event); }
       };
@@ -907,6 +942,25 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         if (st.onTick) st.onTick(tick);
         try { advanceTimers(4000); } catch (e) { failures.push(`${name}: timer lane threw ${e.message}`); }
 
+        while (mutationEventCursor < mutationEvents.length) {
+          const event = mutationEvents[mutationEventCursor++];
+          let recentActions = "";
+          try {
+            const parsed = JSON.parse(localStorageMock.getItem("kgh.log") || "[]");
+            recentActions = Array.isArray(parsed) ? parsed.slice(0, 4).join("\n") : "";
+          } catch (error) {
+            recentActions = "";
+          }
+          scopedMutationEvidence.push({
+            ...event,
+            tick,
+            visible: [
+              panel(".kgh-plan"), panel(".kgh-now"), panel(".kgh-buy"),
+              panel(".kgh-diplomacy"), panel(".kgh-prestige-status"), recentActions,
+            ].filter(Boolean).join("\n"),
+          });
+        }
+
         const scheduler = dbg.automationSchedulerSnapshot?.();
         maxMutationOverlaps = Math.max(maxMutationOverlaps, scheduler?.overlappingMutations || 0);
         if (st.lifecycle) {
@@ -932,7 +986,6 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         // focus is non-titanium.
         const now = panel(".kgh-now");
         const plan = panel(".kgh-plan");
-        visibleEvidence += `\n${plan}\n${now}\n${panel(".kgh-diplomacy")}\n${panel(".kgh-buy")}\n${panel(".kgh-prestige-status")}`;
         if (/titanium path/i.test(now) && !/titanium/i.test(plan)) coherenceViolations += 1;
         const m = plan.match(/—\s*([^·]+?)\s*·/);
         if (m) focusNames.add(m[1].trim());
@@ -944,7 +997,26 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
 
       const gained = purchasesOf() - startPurchases;
       const check = (label, ok) => { if (!ok) failures.push(`${name}: ${label}`); };
-      visibleEvidence += `\n${dbg.report?.() || ""}\n${localStorageMock.getItem("kgh.log") || ""}`;
+      const scopedExplanationIn = (entries, action, patterns, controller = null) => entries.some((entry) =>
+        entry.action === action && (!controller || entry.controller === controller) &&
+        patterns.every((pattern) => pattern.test(entry.visible)));
+      const scopedExplanationFor = (action, patterns, controller = null) =>
+        scopedExplanationIn(scopedMutationEvidence, action, patterns, controller);
+      const lateGamePhases = new Set([
+        "dragonUranium", "uraniumUnobtainium", "antimatterContainment", "leviathanDeparture",
+        "transcendenceUpgrade", "armedPrestige", "voidSpace",
+      ]);
+      const censusOnlySabotage = [{
+        action: "space:lunarOutpostE2E",
+        controller: "diagnostics",
+        visible: "SPACE Dragons Uranium Lunar Outpost E2E built",
+      }];
+      if (lateGamePhases.has(phase)) {
+        check(`diagnostic-census-only sabotage cannot satisfy a controller-scoped mutation explanation`,
+          !scopedExplanationIn(censusOnlySabotage, "space:lunarOutpostE2E", [/Lunar Outpost E2E/i, /uranium/i], "PlanetBuildingBtnController"));
+        check(`scoped mutation evidence excludes unconditional diagnostics census sections`,
+          scopedMutationEvidence.length > 0 && scopedMutationEvidence.every((entry) => !/— (?:SPACE|TIME|RELIGION|TRANSCENDENCE)/i.test(entry.visible)));
+      }
 
       // Universal invariants
       check(`display/action coherence (no titanium-path shown for a non-titanium focus) — ${coherenceViolations} violations`, coherenceViolations === 0);
@@ -991,42 +1063,60 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       if (phase === "dragonUranium") {
         check(`Dragon uranium route executed (${spies.dragonTrades} trades)`, spies.dragonTrades > 0);
         check(`Dragon bootstrap purchased the uranium-gated Space frontier (Lunar Outpost ${st.lateGame.lunarOutpost.val})`, st.lateGame.lunarOutpost.val > 0);
-        check(`visible plan/action explains Dragons → uranium → Lunar Outpost`, /Dragons/i.test(visibleEvidence) && /uranium/i.test(visibleEvidence) && /Lunar Outpost E2E/i.test(visibleEvidence));
+        check(`scoped Dragon mutation tick coherently explains target, route, and action`,
+          scopedExplanationFor("trade:dragons", [/Lunar Outpost E2E/i, /Dragons/i, /uranium/i], "diplomacy"));
+        check(`Dragon Space purchase used the native PlanetBuilding controller`,
+          spies.planetBuildingPurchases > 0 && spies.planetBuildingPurchaseIds.includes("lunarOutpostE2E") &&
+          scopedExplanationFor("space:lunarOutpostE2E", [/Lunar Outpost E2E/i], "PlanetBuildingBtnController"));
+        check(`Dragon Space purchase never used a generic space.build fallback`, spies.rawSpaceManagerCalls === 0);
       }
       if (phase === "uraniumUnobtainium") {
         const { planetCracker, lunarOutpost, moonBase } = st.lateGame;
         check(`Planet Cracker created the uranium path (${planetCracker.val})`, planetCracker.val > 0);
         check(`Lunar Outpost progressed uranium → unobtainium (${lunarOutpost.val})`, lunarOutpost.val > 0 && res("unobtainium").value > 0);
         check(`Moon Base consumed the new unobtainium path (${moonBase.val})`, moonBase.val > 0);
-        check(`visible plan/action explains the uranium/unobtainium Space dependency`, /Planet Cracker E2E/i.test(visibleEvidence) && /Lunar Outpost Loop E2E/i.test(visibleEvidence) && /unobtainium/i.test(visibleEvidence));
+        check(`scoped Space mutation ticks explain the uranium/unobtainium dependency`,
+          scopedExplanationFor("space:planetCrackerE2E", [/Lunar Outpost Loop E2E/i, /uranium/i, /Planet Cracker E2E/i], "PlanetBuildingBtnController") &&
+          scopedExplanationFor("space:lunarOutpostLoopE2E", [/Lunar Outpost Loop E2E/i, /(?:buying|completed)/i], "PlanetBuildingBtnController") &&
+          scopedExplanationFor("space:moonBaseE2E", [/Moon Base E2E/i, /unobtainium/i, /(?:buying|completed)/i], "PlanetBuildingBtnController"));
+        check(`uranium/unobtainium Space purchases used only native PlanetBuilding controllers`,
+          ["planetCrackerE2E", "lunarOutpostLoopE2E", "moonBaseE2E"].every((id) => spies.planetBuildingPurchaseIds.includes(id)) && spies.rawSpaceManagerCalls === 0);
       }
       if (phase === "antimatterContainment") {
         const { sunlifter, heatsink, containment } = st.lateGame;
         check(`Sunlifter established antimatter production (${sunlifter.val})`, sunlifter.val > 0);
         check(`Heatsink opened the containment dependency (${heatsink.val}; unlocked ${containment.unlocked})`, heatsink.val > 0 && containment.unlocked);
         check(`Containment Chamber purchased from produced antimatter (${containment.val})`, containment.val > 0);
-        check(`visible plan/action explains antimatter production and Heatsink containment gate`, /antimatter/i.test(visibleEvidence) && /Heatsink E2E/i.test(visibleEvidence) && /Containment Chamber E2E/i.test(visibleEvidence));
+        check(`scoped Space mutation ticks explain antimatter production and containment gate`,
+          scopedExplanationFor("space:sunlifterE2E", [/Sunlifter E2E/i, /Containment Chamber E2E/i, /antimatter/i], "PlanetBuildingBtnController") &&
+          scopedExplanationFor("space:containmentChamberE2E", [/Containment Chamber E2E/i, /antimatter/i, /(?:buying|completed)/i], "PlanetBuildingBtnController"));
+        check(`antimatter/containment Space purchases used only native PlanetBuilding controllers`,
+          ["sunlifterE2E", "heatsinkE2E", "containmentChamberE2E"].every((id) => spies.planetBuildingPurchaseIds.includes(id)) && spies.rawSpaceManagerCalls === 0);
       }
       if (phase === "leviathanDeparture") {
         const { leviathans, temporalBattery, departed } = st.lateGame;
         const departedRoute = dbg.acquisitionPathFor?.("timeCrystal", 6, { finalPurchase: true, rootRouteKinds: ["trade"] });
-        check(`active Leviathans funded the Time purchase (${spies.leviathanTrades} trades; Temporal Battery ${temporalBattery.val})`, spies.leviathanTrades > 0 && temporalBattery.val > 0);
+        check(`active Leviathans funded the native Time purchase (${spies.leviathanTrades} trades; Temporal Battery ${temporalBattery.val}; controller calls ${spies.chronoforgePurchases})`, spies.leviathanTrades > 0 && temporalBattery.val > 0 && spies.chronoforgePurchases > 0);
         check(`Leviathan departure invalidated the trade route`, departed && leviathans.unlocked === false && departedRoute?.reachable === false);
-        check(`visible plan/action explains Leviathans → time crystals → Temporal Battery`, /Leviathans/i.test(visibleEvidence) && /time.?crystal/i.test(visibleEvidence) && /Temporal Battery E2E/i.test(visibleEvidence));
+        check(`scoped Leviathan mutation tick explains time crystals → Temporal Battery`,
+          scopedExplanationFor("trade:leviathans", [/Leviathans/i, /time.?crystal/i, /Temporal Battery E2E/i], "diplomacy"));
       }
       if (phase === "transcendenceUpgrade") {
         check(`native Transcendence controller purchased Black Obelisk (${st.lateGame.blackObelisk.val}; calls ${spies.transcendencePurchases})`, st.lateGame.blackObelisk.val > 0 && spies.transcendencePurchases > 0);
-        check(`visible plan/action distinguishes the Transcendence upgrade`, /Transcendence/i.test(visibleEvidence) && /Black Obelisk E2E/i.test(visibleEvidence));
+        check(`scoped mutation tick explains the Black Obelisk upgrade action`,
+          scopedExplanationFor("transcendence:blackObeliskE2E", [/Black Obelisk E2E/i, /(?:Plan locked|plan)/i], "TranscendenceBtnController"));
       }
       if (phase === "armedPrestige") {
         check(`persistently armed prestige executed one checkpointed Transcend`, localStorageMock.getItem("kgh.prestigeArmed") === "1" && spies.checkpoints === 1 && spies.transcendCalls === 1 && gamePage.religion.transcendenceTier === 1);
         check(`armed prestige preserved exact tier/capital postcondition`, gamePage.religion.faithRatio === 50);
-        check(`visible plan/action explains authorization, checkpoint, measured Transcend, and cooldown`, /ARMED/i.test(visibleEvidence) && /Prestige transcend:/i.test(visibleEvidence) && /checkpointed/i.test(visibleEvidence) && /cooldown/i.test(visibleEvidence));
+        check(`scoped prestige mutation tick explains authorization, checkpoint, measured Transcend, and cooldown`,
+          scopedExplanationFor("prestige:transcend", [/ARMED/i, /Prestige transcend:/i, /checkpointed/i, /cooldown/i], "Religion transcend button"));
       }
       if (phase === "voidSpace") {
         check(`native Void Space controller purchased Cryochambers (${st.lateGame.cryochambers.val}; calls ${spies.voidPurchases})`, st.lateGame.cryochambers.val > 0 && spies.voidPurchases > 0);
         check(`Void Space purchase spent the live rare-capital bill`, res("void").value < 100 && res("karma").value < 20);
-        check(`visible plan/action identifies Void Space and Cryochambers`, /Void Space/i.test(visibleEvidence) && /Cryochambers E2E/i.test(visibleEvidence));
+        check(`scoped mutation tick explains the Cryochambers Void Space action`,
+          scopedExplanationFor("voidspace:cryochambersE2E", [/Cryochambers E2E/i, /karma/i, /void/i], "VoidSpaceBtnController"));
       }
 
       if (phase === "freshLifecycle") {
@@ -1057,7 +1147,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       resolve({ name, failures, metrics: {
         gained, coherenceViolations, maxNoPurchaseGap, focusCount: focusNames.size, spies,
         lifecycleEvents, lifecycleViolations, recoveryLayerSeen, maxMutationOverlaps,
-        lifecycleViolationReasons, initialPollutionEvidence,
+        lifecycleViolationReasons, initialPollutionEvidence, scopedMutationEvidence,
       } });
     }, 0);
   });
@@ -1103,6 +1193,11 @@ for (const sc of scenarios) {
     console.log(`    pollution initial ${JSON.stringify(metrics.initialPollutionEvidence)}`);
   }
   for (const f of failures) console.log(`      → ${f}`);
+  if (failures.length && metrics.scopedMutationEvidence?.length) {
+    for (const entry of metrics.scopedMutationEvidence) {
+      console.log(`      scoped ${entry.action} via ${entry.controller} @ tick ${entry.tick}: ${JSON.stringify(entry.visible)}`);
+    }
+  }
   allFailures.push(...failures);
 }
 
