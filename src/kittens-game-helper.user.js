@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.21.0
+// @version      2.21.1
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. World reset, shatter, and time-skip remain forbidden; Transcend, Adore, and alicorn sacrifice run only through explicitly armed, freshly checkpointed, reservation-safe prestige policy.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -47,7 +47,7 @@
   const LOG_KEY = "kgh.log";
   const PRESTIGE_ARM_KEY = "kgh.prestigeArmed";
   const EXPANSION_CHECKPOINT_KEY = "kgh.expansionCheckpoint";
-  const HELPER_VERSION = "2.21.0";
+  const HELPER_VERSION = "2.21.1";
 
   // Speedrun reset helpers remain advisory. Transcend, Adore and alicorn
   // sacrifice are managed separately by the explicitly armed prestige broker.
@@ -13051,8 +13051,11 @@
   const runPlanningLane = () => withMutationLane("planning", tick);
   const refreshAdaptiveScheduler = (deliveredMultiplier = automationClockSnapshot().deliveredMultiplier) => {
     if (!isCurrentTimerOwner()) return false;
-    const planningChanged = replaceOwnedInterval("planning", runPlanningLane,
-      Math.max(PLANNING_LANE_FLOOR_MS, HELPER_TICK_MS / Math.max(1, deliveredMultiplier)));
+    // Planning is CPU work, not game progress. Accelerating it with the game
+    // ticker made a persisted high speed monopolize the browser before the
+    // helper panel could paint. Keep the planner at its native wall cadence;
+    // only the lightweight action lane adapts to delivered game speed.
+    const planningChanged = replaceOwnedInterval("planning", runPlanningLane, HELPER_TICK_MS);
     const actionChanged = replaceOwnedInterval("action", runActionLane,
       Math.max(ACTION_LANE_FLOOR_MS, ACTION_LANE_BASE_MS / Math.max(1, deliveredMultiplier)));
     return planningChanged || actionChanged;

@@ -6801,14 +6801,16 @@ fakeNow += 200;
 const boosterBeatT7 = await dbg.runBoosterBeat?.();
 const clock50T7 = dbg.automationClockSnapshot?.();
 const partialScheduler50T7 = dbg.automationSchedulerSnapshot?.();
+check("Regression: boosted game speed never accelerates the expensive planning lane",
+  partialScheduler50T7?.lanes?.planning?.delayMs === 2000);
 check("Task 7 clock: slow game.tick yields within CPU budget and drops backlog",
   boosterBeatT7?.executed > 0 && boosterBeatT7.executed <= boosterBeatT7.maxChunk && boosterBeatT7.dropped >= 0 &&
   clock50T7?.requestedMultiplier === 50 && clock50T7.deliveredMultiplier < 50);
 check("Task 7 final review: partial delivery promptly re-arms only adaptive lanes to exact measured cadence",
   partialScheduler50T7?.lanes?.action?.delayMs === expectedAdaptiveDelayT7(250, 100, clock50T7.deliveredMultiplier) &&
-  partialScheduler50T7?.lanes?.planning?.delayMs === expectedAdaptiveDelayT7(2000, 250, clock50T7.deliveredMultiplier) &&
+  partialScheduler50T7?.lanes?.planning?.delayMs === 2000 &&
   partialScheduler50T7?.lanes?.action?.id !== scheduler50T7?.lanes?.action?.id &&
-  partialScheduler50T7?.lanes?.planning?.id !== scheduler50T7?.lanes?.planning?.id &&
+  partialScheduler50T7?.lanes?.planning?.id === scheduler50T7?.lanes?.planning?.id &&
   partialScheduler50T7?.lanes?.render?.id === scheduler50T7?.lanes?.render?.id &&
   partialScheduler50T7?.lanes?.booster?.id === scheduler50T7?.lanes?.booster?.id &&
   partialScheduler50T7?.ownerCount === 4 && activeIntervalIds.size === 4 && partialScheduler50T7?.overlappingMutations === 0);
@@ -6820,9 +6822,9 @@ const steadyClock50T7 = dbg.automationClockSnapshot?.();
 const steadyScheduler50T7 = dbg.automationSchedulerSnapshot?.();
 check("Task 7 final review: steady delivery updates materially changed rounded adaptive delays only",
   steadyScheduler50T7?.lanes?.action?.delayMs === expectedAdaptiveDelayT7(250, 100, steadyClock50T7.deliveredMultiplier) &&
-  steadyScheduler50T7?.lanes?.planning?.delayMs === expectedAdaptiveDelayT7(2000, 250, steadyClock50T7.deliveredMultiplier) &&
+  steadyScheduler50T7?.lanes?.planning?.delayMs === 2000 &&
   steadyScheduler50T7?.lanes?.action?.id === partialScheduler50T7?.lanes?.action?.id &&
-  steadyScheduler50T7?.lanes?.planning?.id !== partialScheduler50T7?.lanes?.planning?.id &&
+  steadyScheduler50T7?.lanes?.planning?.id === partialScheduler50T7?.lanes?.planning?.id &&
   steadyScheduler50T7?.lanes?.render?.id === scheduler50T7?.lanes?.render?.id &&
   steadyScheduler50T7?.lanes?.booster?.id === scheduler50T7?.lanes?.booster?.id &&
   steadyScheduler50T7?.ownerCount === 4 && activeIntervalIds.size === 4 && steadyScheduler50T7?.overlappingMutations === 0);
@@ -6883,7 +6885,7 @@ check("Task 7 re-review: fully delivered selectable boosts add exact per-tick lo
 check("Task 7 final review: every selectable speed owns exact measured adaptive cadence",
   selectableDeliveryT7R.every((sample) =>
     sample.scheduler?.lanes?.action?.delayMs === expectedAdaptiveDelayT7(250, 100, sample.end.deliveredMultiplier) &&
-    sample.scheduler?.lanes?.planning?.delayMs === expectedAdaptiveDelayT7(2000, 250, sample.end.deliveredMultiplier) &&
+    sample.scheduler?.lanes?.planning?.delayMs === 2000 &&
     sample.scheduler?.lanes?.render?.delayMs === 500 &&
     (sample.speed === 1 ? !sample.scheduler?.lanes?.booster : sample.scheduler?.lanes?.booster?.delayMs === 200) &&
     sample.scheduler?.ownerCount === (sample.speed === 1 ? 3 : 4) && sample.scheduler?.overlappingMutations === 0));
