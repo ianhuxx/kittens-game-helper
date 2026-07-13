@@ -3098,6 +3098,53 @@ check("Test W: first-reset expansion still outranks the same ready workshop upgr
   firstResetStillWinsW.layer === "Expansion checkpoint" && firstResetStillWinsW.target?.meta?.name === "housingW");
 workshopUpgrades.splice(workshopUpgrades.indexOf(readyWorkshopW), 1);
 
+// Task 6: after a reset, a saturated 169-kitten village may take one housing
+// checkpoint, but must then hand the plan to an actionable gateway research.
+// The checkpoint is persisted so a reload cannot restart endless housing.
+const chronophysicsT6 = {
+  name: "chronophysicsT6",
+  label: "Chronophysics T6",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 500 }],
+  unlocks: { upgrades: ["chronoforgeT6"] },
+};
+techs.push(chronophysicsT6);
+expansionTechW.researched = true;
+gamePage.totalResets = 1;
+gamePage.paragonPoints = 74;
+gamePage.karmaKittens = 185;
+village.getKittens = () => 169;
+village.maxKittens = 169;
+res("science").value = Math.max(500, res("science").value);
+localStorageMock.removeItem("kgh.expansionCheckpoint");
+dbg.clearExpansionCheckpoint?.();
+dbg.forceActiveTarget(null);
+const firstPostResetCheckpointT6 = dbg.selectStrategicTarget("balanced");
+const persistedCheckpointT6 = JSON.parse(localStorageMock.getItem("kgh.expansionCheckpoint") || "null");
+check("Task 6 expansion: a full post-reset village may take one housing checkpoint",
+  firstPostResetCheckpointT6.layer === "Expansion checkpoint" && firstPostResetCheckpointT6.target?.meta === housingW);
+check("Task 6 expansion: the bounded housing checkpoint persists its gateway contract",
+  persistedCheckpointT6?.housingId === "build:housingW" && persistedCheckpointT6?.gatewayId === "research:chronophysicsT6");
+housingW.val += 1;
+housingW.on += 1;
+dbg.forceActiveTarget(null);
+const chronophysicsAfterHousingT6 = dbg.selectStrategicTarget("balanced");
+dbg.forceActiveTarget(null);
+const chronophysicsStillOwnsT6 = dbg.selectStrategicTarget("balanced");
+check("Task 6 expansion: Chronophysics starts after one post-reset housing checkpoint",
+  chronophysicsAfterHousingT6.layer === "Research sprint" && chronophysicsAfterHousingT6.target?.meta === chronophysicsT6);
+check("Task 6 expansion: the gateway frontier keeps priority until it completes or invalidates",
+  chronophysicsStillOwnsT6.target?.meta === chronophysicsT6);
+chronophysicsT6.researched = true;
+techs.splice(techs.indexOf(chronophysicsT6), 1);
+housingW.val -= 1;
+housingW.on -= 1;
+localStorageMock.removeItem("kgh.expansionCheckpoint");
+dbg.clearExpansionCheckpoint?.();
+expansionTechW.researched = false;
+village.getKittens = () => 100;
+
 // A non-ready but fundable production upgrade owns the roadmap; an enormous
 // higher-value Steel backlog is excluded by the one-hour project horizon.
 const savedWorkshopChainW = {
@@ -5865,6 +5912,272 @@ delete perTick.faith;
 delete perTick.timeCrystal;
 dbg.setPrestigeAutomationArmed(false);
 for (const resource of addedRareResourcesT5) resources.splice(resources.indexOf(resource), 1);
+
+/* ---------------------------------------------------------------------
+ * Task 6 — sustainable processor fuel, bounded post-reset expansion,
+ * complete late-game diagnostics, and unlock-watch invalidation.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+const addedResourcesT6 = [];
+const ensureResourceT6 = (name, value, maxValue, title = null) => {
+  let resource = res(name);
+  if (!resource) {
+    resource = R(name, value, maxValue, title || undefined);
+    resources.push(resource);
+    addedResourcesT6.push(resource);
+  }
+  resource.value = value;
+  resource.maxValue = maxValue;
+  resource.unlocked = true;
+  return resource;
+};
+ensureResourceT6("uranium", 100, 1000, "Uranium");
+ensureResourceT6("unobtainium", 0, 1000, "Unobtainium");
+ensureResourceT6("timeCrystal", 5, 100, "Time Crystal");
+ensureResourceT6("relic", 50, 1000, "Relic");
+ensureResourceT6("void", 100, 1000, "Void");
+ensureResourceT6("karma", 20, 1000, "Karma");
+const savedFuelT6 = {
+  scienceValue: res("science").value,
+  scienceMax: res("science").maxValue,
+  uraniumRate: perTick.uranium,
+  scienceRate: perTick.science,
+  powerProd: gamePage.resPool.energyProd,
+  powerCons: gamePage.resPool.energyCons,
+  powerWinter: gamePage.resPool.energyWinterProd,
+  races: diplomacy.races.slice(),
+};
+res("science").value = 0;
+res("science").maxValue = 10000;
+perTick.science = 1;
+// The game reports NET production. Four active Reactors burn 4 uranium/s,
+// so -4/s represents a colony with no outside uranium income.
+perTick.uranium = -0.8;
+gamePage.resPool.energyProd = 100;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 100;
+const fuelProducerT6 = {
+  name: "fuelProducerT6",
+  label: "First Uranium Producer T6",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "uranium", val: 100 }, { name: "science", val: 500 }],
+  effects: { uraniumPerTickProd: 1 },
+};
+const reactorT6 = {
+  name: "reactorT6",
+  label: "Reactor T6",
+  unlocked: true,
+  val: 4,
+  on: 4,
+  prices: [{ name: "titanium", val: 1 }],
+  effects: { uraniumPerTickCon: -0.2, energyProduction: 5 },
+};
+buildings.push(fuelProducerT6, reactorT6);
+const fuelTargetT6 = dbg.candidateById("build:fuelProducerT6") || { kind: "build", meta: fuelProducerT6, affordable: false };
+const reactorNoIncomeT6 = dbg.sustainableProcessorCount?.(reactorT6, { reserved: { uranium: 100 } }, 60);
+check("Task 6 fuel: a Reactor cannot consume uranium reserved for the first producer",
+  reactorNoIncomeT6 === 0);
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: live Reactor control honors the banked active-target uranium floor",
+  reactorT6.on === 0);
+perTick.uranium = 0.4; // +2 uranium/s; each Reactor consumes 1/s.
+dbg.clearResourceTelemetry?.("uranium");
+const reactorIncomeT6 = dbg.sustainableProcessorCount?.(reactorT6, { reserved: { uranium: 100 } }, 60);
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: only the Reactor count sustainable for the 60-second income horizon resumes",
+  reactorIncomeT6 === 2 && reactorT6.on === 2);
+// Once those two Reactors are running, live telemetry reports zero NET uranium.
+// Their own burn must be added back or the controller will flap them off again.
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+const reactorSteadyT6 = dbg.sustainableProcessorCount?.(reactorT6, { reserved: { uranium: 100 } }, 60);
+check("Task 6 fuel: a sustainable Reactor count stays stable when telemetry includes its own burn",
+  reactorSteadyT6 === 2);
+
+const lunarOutpostT6 = {
+  name: "lunarOutpostT6",
+  label: "Lunar Outpost T6",
+  unlocked: true,
+  val: 3,
+  on: 3,
+  prices: [{ name: "uranium", val: 10 }],
+  effects: { uraniumPerTickCon: -0.5, unobtainiumPerTickSpace: 0.01, energyConsumption: 1 },
+};
+const spaceGateTechT6 = {
+  name: "spaceGateTechT6",
+  label: "Chronophysics Gate T6",
+  unlocked: true,
+  researched: false,
+  prices: [{ name: "science", val: 1000 }],
+  unlocks: {},
+};
+techs.push(spaceGateTechT6);
+const lockedSpaceGateT6 = {
+  name: "lockedSpaceGateT6",
+  label: "Space Gate T6",
+  unlocked: false,
+  val: 0,
+  on: 0,
+  prices: [{ name: "science", val: 1000 }],
+  requiredTech: ["spaceGateTechT6"],
+  effects: {},
+};
+const unlockMissionT6 = {
+  name: "unlockMissionT6",
+  label: "Unlock Mission T6",
+  unlocked: false,
+  noStackable: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "science", val: 1 }],
+  effects: {},
+};
+const moonT6 = { name: "moonT6", label: "Moon T6", unlocked: true, reached: true, routeDays: 0, buildings: [lunarOutpostT6, lockedSpaceGateT6] };
+const programsT6 = [unlockMissionT6];
+gamePage.space = {
+  programs: programsT6,
+  planets: [moonT6],
+  getProgram: (id) => programsT6.find((program) => program.name === id),
+  getBuilding: (id) => moonT6.buildings.find((building) => building.name === id),
+};
+reactorT6.val = 0;
+reactorT6.on = 0;
+// Three active Lunar Outposts burn 7.5 uranium/s; keep outside income at zero.
+perTick.uranium = -1.5;
+dbg.clearResourceTelemetry?.("uranium");
+const lunarNoIncomeT6 = dbg.sustainableProcessorCount?.(lunarOutpostT6, { reserved: { uranium: 100 } }, 60);
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: Lunar Outposts also preserve the selected frontier's uranium",
+  lunarNoIncomeT6 === 0 && lunarOutpostT6.on === 0);
+perTick.uranium = 0.5; // +2.5/s, exactly one Lunar Outpost at -2.5/s.
+dbg.clearResourceTelemetry?.("uranium");
+const lunarIncomeT6 = dbg.sustainableProcessorCount?.(lunarOutpostT6, { reserved: { uranium: 100 } }, 60);
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 fuel: Lunar Outposts resume only the uranium-sustainable count",
+  lunarIncomeT6 === 1 && lunarOutpostT6.on === 1);
+
+// When several processor families share one fuel bank, the chosen frontier's
+// producer gets first call and the total projected burn must still fit once.
+const unobtainiumFrontierT6 = {
+  name: "unobtainiumFrontierT6",
+  label: "Unobtainium Frontier T6",
+  unlocked: true,
+  val: 0,
+  on: 0,
+  prices: [{ name: "uranium", val: 100 }, { name: "unobtainium", val: 100 }],
+  effects: {},
+};
+buildings.push(unobtainiumFrontierT6);
+reactorT6.val = 4;
+reactorT6.on = 0;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 0;
+perTick.uranium = 0.5;
+perTick.unobtainium = 0.01;
+res("uranium").value = 100;
+res("unobtainium").value = 0;
+fakeNow += 21000;
+dbg.queueAdd("build:unobtainiumFrontierT6", 0);
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 fuel: shared uranium budget prioritizes the selected unobtainium frontier without double allocation",
+  lunarOutpostT6.on === 1 && reactorT6.on === 0);
+dbg.queueClear();
+delete perTick.unobtainium;
+buildings.splice(buildings.indexOf(unobtainiumFrontierT6), 1);
+
+const diagnosticTransT6 = { name: "diagnosticTransT6", label: "Transcendence Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 10 }], effects: {} };
+const diagnosticChronoT6 = { name: "diagnosticChronoT6", label: "Chronoforge Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 5 }], effects: {} };
+const diagnosticVoidT6 = { name: "diagnosticVoidT6", label: "Void Space Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "void", val: 50 }, { name: "karma", val: 10 }], effects: {} };
+const unlockTransT6 = { name: "unlockTransT6", label: "Unlock Transcendence T6", unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 1 }], effects: {} };
+const unlockChronoT6 = { name: "unlockChronoT6", label: "Unlock Chronoforge T6", unlocked: false, val: 0, on: 0, prices: [{ name: "timeCrystal", val: 1 }], effects: {} };
+transcendenceUpgrades.push(diagnosticTransT6, unlockTransT6);
+chronoforgeUpgrades.push(diagnosticChronoT6, unlockChronoT6);
+voidspaceUpgrades.push(diagnosticVoidT6);
+
+// Seed the watcher with the new families still locked, then open all three
+// metadata sources while a stale lock is active.
+dbg.watchNewUnlocks?.();
+dbg.forceActiveTarget(fuelTargetT6, "Economy / normal growth", 0);
+unlockMissionT6.unlocked = true;
+unlockTransT6.unlocked = true;
+unlockChronoT6.unlocked = true;
+const unlockWatchT6 = dbg.watchNewUnlocks?.();
+check("Task 6 unlocks: Space, Time, and transcendence metadata all enter the watcher",
+  ["space:unlockMissionT6", "time:unlockChronoT6", "transcendence:unlockTransT6"].every((id) => unlockWatchT6?.freshIds?.includes(id)));
+check("Task 6 unlocks: a late-game unlock invalidates the stale plan lock",
+  unlockWatchT6?.invalidated === true && dbg.activeTargetId?.() === null);
+
+// Diagnostics must explain the whole selected late-game route from one dump.
+// Make uranium short so Dragons are the active acquisition step; keep the
+// direct time-crystal bill banked to exercise the rare-capital floor line.
+fuelProducerT6.prices = [{ name: "uranium", val: 200 }, { name: "timeCrystal", val: 5 }];
+unlockMissionT6.prices = [{ name: "uranium", val: 200 }, { name: "timeCrystal", val: 5 }];
+unlockMissionT6.unlocks = { planet: ["diagnosticPlanetT6"] };
+res("uranium").value = 100;
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+res("manpower").value = 1000;
+res("gold").value = 1000;
+res("titanium").value = 2000;
+diplomacy.races.splice(0, diplomacy.races.length, {
+  name: "dragons",
+  title: "Dragons",
+  unlocked: true,
+  embassyLevel: 10,
+  standing: 0,
+  energy: 0,
+  buys: [{ name: "titanium", val: 250 }],
+  sells: [{ name: "uranium", value: 20, chance: 1, width: 0 }],
+});
+reactorT6.val = 4;
+reactorT6.on = 0;
+lunarOutpostT6.val = 0;
+lunarOutpostT6.on = 0;
+dbg.forceActiveTarget(null);
+const reportT6 = dbg.reportForTarget?.({ kind: "space", meta: unlockMissionT6, affordable: false }) || dbg.report();
+check("Task 6 diagnostics: report prints route nodes with ETA and blockers",
+  /ACQUISITION ROUTE/i.test(reportT6) && /Uranium.*ETA.*blocker/i.test(reportT6));
+check("Task 6 diagnostics: report prints diplomacy expected yield and bounded batch cap",
+  /Dragons.*expected yield.*batch cap/i.test(reportT6));
+check("Task 6 diagnostics: report retains exact Space gate reasons",
+  /Moon T6.*Space Gate T6.*technology.*Chronophysics Gate T6/i.test(reportT6));
+check("Task 6 diagnostics: report includes Transcendence, Chronoforge, and Void Space census entries",
+  /Transcendence Diagnostic T6/i.test(reportT6) && /Chronoforge Diagnostic T6/i.test(reportT6) && /Void Space Diagnostic T6/i.test(reportT6));
+check("Task 6 diagnostics: report includes prestige projections and rare-capital floors",
+  /Prestige:.*Transcend.*Adore.*Alicorn/i.test(reportT6) && /Rare floors:.*Time Crystal.*5/i.test(reportT6));
+check("Task 6 diagnostics: report includes each processor's sustainable fuel budget",
+  /Reactor T6:.*sustainable 0\/4.*Uranium.*60s/i.test(reportT6));
+
+buildings.splice(buildings.indexOf(fuelProducerT6), 1);
+buildings.splice(buildings.indexOf(reactorT6), 1);
+techs.splice(techs.indexOf(spaceGateTechT6), 1);
+transcendenceUpgrades.splice(transcendenceUpgrades.indexOf(diagnosticTransT6), 1);
+transcendenceUpgrades.splice(transcendenceUpgrades.indexOf(unlockTransT6), 1);
+chronoforgeUpgrades.splice(chronoforgeUpgrades.indexOf(diagnosticChronoT6), 1);
+chronoforgeUpgrades.splice(chronoforgeUpgrades.indexOf(unlockChronoT6), 1);
+voidspaceUpgrades.splice(voidspaceUpgrades.indexOf(diagnosticVoidT6), 1);
+delete gamePage.space;
+diplomacy.races.splice(0, diplomacy.races.length, ...savedFuelT6.races);
+res("science").value = savedFuelT6.scienceValue;
+res("science").maxValue = savedFuelT6.scienceMax;
+perTick.science = savedFuelT6.scienceRate;
+if (savedFuelT6.uraniumRate === undefined) delete perTick.uranium; else perTick.uranium = savedFuelT6.uraniumRate;
+gamePage.resPool.energyProd = savedFuelT6.powerProd;
+gamePage.resPool.energyCons = savedFuelT6.powerCons;
+gamePage.resPool.energyWinterProd = savedFuelT6.powerWinter;
+for (const resource of addedResourcesT6) resources.splice(resources.indexOf(resource), 1);
+dbg.forceActiveTarget(null);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
