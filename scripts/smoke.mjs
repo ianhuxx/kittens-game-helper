@@ -7045,7 +7045,11 @@ gamePage.bld.pollutionLevels = [
   { threshold: 500, effects: { catnipPollutionRatio: -0.05 } },
   { threshold: 1000, effects: { catnipPollutionRatio: -0.15, happiness: -0.05 } },
 ];
-gamePage.bld.getPollutionPerTick = () => 2;
+let pollutionNativeReadsT7 = 0;
+gamePage.bld.getPollutionPerTick = () => {
+  pollutionNativeReadsT7 += 1;
+  return 2;
+};
 gamePage.bld.getPollutionLevel = () => ({ level: 1, effects: { catnipPollutionRatio: -0.05 } });
 gamePage.bld.getPollutionEquilibrium = () => 1500;
 const cleanupT7 = {
@@ -7063,6 +7067,21 @@ const cleanPowerT7 = {
 workshopUpgrades.push(cleanupT7);
 buildings.push(dirtyPowerT7, cleanPowerT7);
 workshopT7.val = 1; workshopT7.on = 1;
+dbg.selectStrategicTarget?.("balanced");
+check("Regression: one planning cycle computes one pollution snapshot instead of rescanning per candidate",
+  pollutionNativeReadsT7 === 1);
+let effectReadsT7 = 0;
+const effectProfileProbeT7 = { name: "effectProfileProbeT7", effects: {} };
+Object.defineProperty(effectProfileProbeT7.effects, "scienceRatio", {
+  enumerable: true,
+  get() {
+    effectReadsT7 += 1;
+    return 0.25;
+  },
+});
+for (let i = 0; i < 12; i += 1) dbg.candidateEffectProfile?.("build", effectProfileProbeT7);
+check("Regression: one tick parses each metadata effect profile only once",
+  effectReadsT7 === 1);
 const pollutionStatusT7 = dbg.pollutionStatus?.();
 const cleanupProfileT7 = dbg.metaEffectProfile?.(cleanupT7);
 const cleanupCandidateT7 = dbg.candidateById("upgrade:carbonSequestrationT7");
