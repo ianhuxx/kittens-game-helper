@@ -5741,6 +5741,31 @@ const callsBeforeCooldownT5 = { transcendCalls, adoreCalls };
 check("Task 5 prestige: shared irreversible cooldown blocks a second same-cycle action",
   dbg.managePrestige?.(null) === false && transcendCalls === callsBeforeCooldownT5.transcendCalls && adoreCalls === callsBeforeCooldownT5.adoreCalls);
 
+// Delivered game time may advance ordinary automation, but the irreversible
+// broker's 30-second safety window is deliberately real wall time.
+const prestigeWallStartT7Review = fakeNow;
+const prestigeLogicalStartT7Review = dbg.automationClockSnapshot?.().logicalNow;
+const savedPrestigeTickT7Review = gamePage.tick;
+let prestigeDeliveredTicksT7Review = 0;
+gamePage.tick = () => { prestigeDeliveredTicksT7Review += 1; };
+dbg.applyTickSpeed?.(50);
+for (let beat = 0; beat < 10; beat += 1) {
+  fakeNow += 200;
+  dbg.runBoosterBeat?.();
+}
+const prestigeLogicalEndT7Review = dbg.automationClockSnapshot?.().logicalNow;
+const callsBeforeWallCooldownT7Review = { transcendCalls, adoreCalls };
+const wallCooldownManagedT7Review = dbg.managePrestige?.(null);
+check("Task 7 re-review: delivered speed cannot expire the 30-second wall prestige cooldown",
+  prestigeDeliveredTicksT7Review > 0 && fakeNow - prestigeWallStartT7Review < 30000 &&
+  prestigeLogicalEndT7Review - prestigeLogicalStartT7Review > 30000 &&
+  wallCooldownManagedT7Review === false &&
+  transcendCalls === callsBeforeWallCooldownT7Review.transcendCalls &&
+  adoreCalls === callsBeforeWallCooldownT7Review.adoreCalls);
+if (savedPrestigeTickT7Review === undefined) delete gamePage.tick;
+else gamePage.tick = savedPrestigeTickT7Review;
+dbg.applyTickSpeed?.(1);
+
 // A separate later cycle may Adore when native projected gain is positive and
 // the measured Solar Revolution recovery lies within the policy horizon.
 fakeNow += 30000;
@@ -6516,12 +6541,12 @@ dbg.applyTickSpeed?.(1);
 fakeNow += 1000;
 const transitionEndT7 = dbg.automationClockSnapshot?.();
 const namedCooldownEndT7 = dbg.ordinaryCooldownSnapshot?.();
-const expectedTransitionLogicalT7 = 1000 + 100 * (fastStartT7?.deliveredMultiplier || 0) + 1000;
+const expectedTransitionLogicalT7 = 1000 + 100 + 1000;
 const namedCooldownsT7 = ["trade", "autobuy", "jobs", "rejection", "processor", "unicorn"];
 check("Task 7 review: 1x->50x->1x integrates named ordinary cooldown ages without retroactive rescaling",
   Number.isFinite(transitionStartT7?.logicalNow) &&
   Math.abs((beforeFastT7.logicalNow - transitionStartT7.logicalNow) - 1000) < 1 &&
-  Math.abs((afterFastT7.logicalNow - fastStartT7.logicalNow) - 100 * fastStartT7.deliveredMultiplier) < 1 &&
+  Math.abs((afterFastT7.logicalNow - fastStartT7.logicalNow) - 100) < 1 &&
   Math.abs((transitionEndT7.logicalNow - transitionStartT7.logicalNow) - expectedTransitionLogicalT7) < 1 &&
   namedCooldownsT7.every((name) => Math.abs(
     (namedCooldownEndT7?.ages?.[name] || 0) - (namedCooldownStartT7?.ages?.[name] || 0) - expectedTransitionLogicalT7,
@@ -6541,6 +6566,144 @@ const clock50T7 = dbg.automationClockSnapshot?.();
 check("Task 7 clock: slow game.tick yields within CPU budget and drops backlog",
   boosterBeatT7?.executed > 0 && boosterBeatT7.executed <= boosterBeatT7.maxChunk && boosterBeatT7.dropped >= 0 &&
   clock50T7?.requestedMultiplier === 50 && clock50T7.deliveredMultiplier < 50);
+delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+
+/* Re-review: logical time is native wall progress plus completed booster ticks. */
+dbg.applyTickSpeed?.(50);
+const zeroDeliveryStartT7R = dbg.automationClockSnapshot?.();
+fakeNow += 100;
+const zeroDeliveryEndT7R = dbg.automationClockSnapshot?.();
+check("Task 7 re-review: requested 50x stays native-only before any booster tick executes",
+  zeroDeliveryEndT7R?.requestedMultiplier === 50 && zeroDeliveryEndT7R?.deliveredMultiplier === 1 &&
+  Math.abs((zeroDeliveryEndT7R.logicalNow - zeroDeliveryStartT7R.logicalNow) - 100) < 1);
+
+const nativeTickLogicalMsT7R = 1000 / (gamePage.ticksPerSecond || 5);
+const selectableSpeedsT7R = [1, 2, 3, 5, 10, 20, 50];
+const selectableDeliveryT7R = [];
+for (const speed of selectableSpeedsT7R) {
+  dbg.applyTickSpeed?.(1);
+  dbg.applyTickSpeed?.(speed);
+  const startWall = fakeNow;
+  const start = dbg.automationClockSnapshot?.();
+  let deliveredTicks = 0;
+  gamePage.tick = () => { deliveredTicks += 1; };
+  fakeNow += 200;
+  const beat = dbg.runBoosterBeat?.();
+  const end = dbg.automationClockSnapshot?.();
+  selectableDeliveryT7R.push({ speed, startWall, start, end, beat, deliveredTicks, endWall: fakeNow });
+}
+check("Task 7 re-review: every selectable speed credits only successfully delivered booster ticks",
+  selectableDeliveryT7R.length === selectableSpeedsT7R.length && selectableDeliveryT7R.every((sample) =>
+    sample.start?.requestedMultiplier === sample.speed && sample.end?.requestedMultiplier === sample.speed &&
+    sample.beat?.executed === sample.deliveredTicks &&
+    Math.abs(
+      (sample.end.logicalNow - sample.start.logicalNow) -
+      ((sample.endWall - sample.startWall) + sample.deliveredTicks * nativeTickLogicalMsT7R),
+    ) < 1));
+check("Task 7 re-review: fully delivered selectable boosts add exact per-tick logical progress",
+  selectableDeliveryT7R.filter((sample) => sample.speed <= 10).every((sample) =>
+    sample.deliveredTicks === Math.max(0, sample.speed - 1)));
+
+const cappedDeliveryT7R = [];
+for (const speed of [20, 50]) {
+  dbg.applyTickSpeed?.(1);
+  dbg.applyTickSpeed?.(speed);
+  const startWall = fakeNow;
+  const start = dbg.automationClockSnapshot?.();
+  let deliveredTicks = 0;
+  gamePage.tick = () => { deliveredTicks += 1; };
+  fakeNow += 200;
+  const beat = dbg.runBoosterBeat?.();
+  const end = dbg.automationClockSnapshot?.();
+  cappedDeliveryT7R.push({ speed, startWall, start, end, beat, deliveredTicks, endWall: fakeNow });
+}
+const capped20T7R = cappedDeliveryT7R[0];
+const capped50T7R = cappedDeliveryT7R[1];
+check("Task 7 re-review: dropped due ticks add zero logical progress",
+  capped20T7R.deliveredTicks === capped50T7R.deliveredTicks && capped50T7R.beat.dropped > capped20T7R.beat.dropped &&
+  Math.abs((capped20T7R.end.logicalNow - capped20T7R.start.logicalNow) -
+    ((capped20T7R.endWall - capped20T7R.startWall) + capped20T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1 &&
+  Math.abs((capped50T7R.end.logicalNow - capped50T7R.start.logicalNow) -
+    ((capped50T7R.endWall - capped50T7R.startWall) + capped50T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1 &&
+  Math.abs((capped20T7R.end.logicalNow - capped20T7R.start.logicalNow) -
+    (capped50T7R.end.logicalNow - capped50T7R.start.logicalNow)) < 1);
+
+dbg.applyTickSpeed?.(1);
+dbg.applyTickSpeed?.(50);
+const partialStartWallT7R = fakeNow;
+const partialStartT7R = dbg.automationClockSnapshot?.();
+let partialDeliveredTicksT7R = 0;
+gamePage.tick = () => { partialDeliveredTicksT7R += 1; fakeNow += 2; };
+fakeNow += 200;
+const partialBeatT7R = dbg.runBoosterBeat?.();
+const partialEndT7R = dbg.automationClockSnapshot?.();
+check("Task 7 re-review: CPU-limited partial delivery adds exact completed-tick progress",
+  partialDeliveredTicksT7R > 0 && partialDeliveredTicksT7R < partialBeatT7R?.maxChunk &&
+  partialBeatT7R?.executed === partialDeliveredTicksT7R && partialBeatT7R?.dropped > 0 &&
+  Math.abs((partialEndT7R.logicalNow - partialStartT7R.logicalNow) -
+    ((fakeNow - partialStartWallT7R) + partialDeliveredTicksT7R * nativeTickLogicalMsT7R)) < 1);
+
+delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+const transitionStartT7R = dbg.automationClockSnapshot?.();
+const namedCooldownStartT7R = dbg.ordinaryCooldownSnapshot?.();
+fakeNow += 1000;
+const beforeFastT7R = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(50);
+const fastStartT7R = dbg.automationClockSnapshot?.();
+fakeNow += 100;
+const afterUndeliveredFastT7R = dbg.automationClockSnapshot?.();
+let transitionDeliveredTicksT7R = 0;
+gamePage.tick = () => { transitionDeliveredTicksT7R += 1; };
+fakeNow += 100;
+const transitionBeatT7R = dbg.runBoosterBeat?.();
+const afterDeliveredFastT7R = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(1);
+fakeNow += 1000;
+const transitionEndT7R = dbg.automationClockSnapshot?.();
+const namedCooldownEndT7R = dbg.ordinaryCooldownSnapshot?.();
+const expectedTransitionLogicalT7R = 1000 + 100 + 100 +
+  transitionDeliveredTicksT7R * nativeTickLogicalMsT7R + 1000;
+const namedCooldownsT7R = ["trade", "autobuy", "jobs", "rejection", "processor", "unicorn"];
+check("Task 7 re-review: speed transitions integrate native wall plus delivered ticks without retroactive scaling",
+  Number.isFinite(transitionStartT7R?.logicalNow) &&
+  Math.abs((beforeFastT7R.logicalNow - transitionStartT7R.logicalNow) - 1000) < 1 &&
+  Math.abs((afterUndeliveredFastT7R.logicalNow - fastStartT7R.logicalNow) - 100) < 1 &&
+  transitionBeatT7R?.executed === transitionDeliveredTicksT7R &&
+  Math.abs((afterDeliveredFastT7R.logicalNow - afterUndeliveredFastT7R.logicalNow) -
+    (100 + transitionDeliveredTicksT7R * nativeTickLogicalMsT7R)) < 1 &&
+  Math.abs((transitionEndT7R.logicalNow - transitionStartT7R.logicalNow) - expectedTransitionLogicalT7R) < 1);
+check("Task 7 re-review: named ordinary cooldowns age on delivered logical time",
+  namedCooldownsT7R.every((name) => Math.abs(
+    (namedCooldownEndT7R?.ages?.[name] || 0) - (namedCooldownStartT7R?.ages?.[name] || 0) - expectedTransitionLogicalT7R,
+  ) < 1));
+
+const telemetryClockT7R = R("telemetryClockT7R", 100, 100000, "Telemetry Clock T7R");
+resources.push(telemetryClockT7R);
+perTick.telemetryClockT7R = 2;
+dbg.applyTickSpeed?.(1);
+dbg.clearResourceTelemetry?.("telemetryClockT7R");
+dbg.sampleResourceTelemetry?.();
+fakeNow += 3500;
+telemetryClockT7R.value += 35;
+dbg.applyTickSpeed?.(2);
+fakeNow += 200;
+telemetryClockT7R.value += 2;
+let telemetryDeliveredTicksT7R = 0;
+gamePage.tick = () => {
+  telemetryDeliveredTicksT7R += 1;
+  telemetryClockT7R.value += 2;
+};
+const telemetryBeatT7R = dbg.runBoosterBeat?.();
+dbg.applyTickSpeed?.(1);
+dbg.sampleResourceTelemetry?.();
+const transitionObservedProductionT7R = dbg.productionFor?.("telemetryClockT7R");
+check("Task 7 re-review: production telemetry uses its actual multi-speed logical sample span",
+  telemetryBeatT7R?.executed === 1 && telemetryDeliveredTicksT7R === 1 &&
+  Math.abs(transitionObservedProductionT7R - 10) < 1e-9);
+resources.splice(resources.indexOf(telemetryClockT7R), 1);
+delete perTick.telemetryClockT7R;
 delete gamePage.tick;
 dbg.applyTickSpeed?.(1);
 

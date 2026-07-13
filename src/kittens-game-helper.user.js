@@ -1665,6 +1665,7 @@
 
   const sampleResourceTelemetry = () => {
     const now = Date.now();
+    const logicalNow = gameClockNow();
     try {
       for (const res of window.gamePage.resPool.resources || []) {
         if (!res || !res.name || !isFinite(res.value)) continue;
@@ -1672,7 +1673,7 @@
         const entry = resourceTelemetry[key] || (resourceTelemetry[key] = { samples: [] });
         entry.cap = liveResourceCap(res);
         entry.title = res.title || res.name;
-        entry.samples.push({ t: now, value: res.value, cap: entry.cap });
+        entry.samples.push({ t: now, logicalT: logicalNow, value: res.value, cap: entry.cap });
         while (entry.samples.length > RESOURCE_TELEMETRY_MAX_SAMPLES) entry.samples.shift();
         while (entry.samples.length > 1 && now - entry.samples[0].t > RESOURCE_TELEMETRY_MAX_AGE_MS) entry.samples.shift();
       }
@@ -1686,6 +1687,7 @@
   // negative (or positive) ticker rate on the next planner pass.
   const markTelemetryDiscontinuity = (deltas) => {
     const now = Date.now();
+    const logicalNow = gameClockNow();
     for (const item of deltas || []) {
       const name = item && (item.name === "catpower" ? "manpower" : item.name);
       if (!name) continue;
@@ -1694,7 +1696,9 @@
       entry.discontinuityAt = now;
       entry.cap = liveResourceCap(res);
       entry.title = (res && (res.title || res.name)) || name;
-      entry.samples = res && isFinite(res.value) ? [{ t: now, value: res.value, cap: entry.cap }] : [];
+      entry.samples = res && isFinite(res.value)
+        ? [{ t: now, logicalT: logicalNow, value: res.value, cap: entry.cap }]
+        : [];
     }
   };
 
@@ -1703,16 +1707,15 @@
     if (!entry || entry.samples.length < 2) return null;
     const first = entry.samples[0];
     const last = entry.samples[entry.samples.length - 1];
-    const span = last.t - first.t;
-    const deliveredMultiplier = Math.max(1, automationClockSnapshot().deliveredMultiplier);
-    if (span * deliveredMultiplier < RESOURCE_TELEMETRY_MIN_SPAN_MS) return null;
+    const logicalSpan = Number(last.logicalT) - Number(first.logicalT);
+    if (!isFinite(logicalSpan) || logicalSpan < RESOURCE_TELEMETRY_MIN_SPAN_MS) return null;
     // A capped resource bar is flat because production is clipped, not because
     // its ticker is zero.  Likewise, do not bridge a known discrete action.
     if (entry.samples.some((sample) => sample.cap > 0 && sample.value >= sample.cap * 0.985)) return null;
     if (entry.discontinuityAt && entry.discontinuityAt >= first.t && entry.discontinuityAt <= last.t) return null;
     const delta = last.value - first.value;
     if (!isFinite(delta)) return null;
-    return delta / (span / 1000) / deliveredMultiplier;
+    return delta / (logicalSpan / 1000);
   };
 
   const liveCapFor = (resources, name) => {
@@ -12297,7 +12300,7 @@
   let boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
   let automationClockState = (() => {
     const wallNow = Date.now();
-    return { wallAt: wallNow, logicalNow: wallNow, deliveredMultiplier: 1 };
+    return { wallAt: wallNow, logicalNow: wallNow };
   })();
   const nativeTicksPerSecond = () => {
     try {
@@ -12310,10 +12313,8 @@
   const measuredAutomationDelivery = (wallNow) => {
     const nativeTps = nativeTicksPerSecond();
     const elapsed = Math.max(0, wallNow - boosterTelemetry.startedAt);
-    const warm = elapsed < TICK_SPEED_BEAT_MS;
     const measuredExtraTps = elapsed > 0 ? boosterTelemetry.executed * 1000 / elapsed : 0;
     const deliveredTicksPerSecond = tickSpeed <= 1 ? nativeTps
-      : warm ? nativeTps * tickSpeed
       : Math.min(nativeTps * tickSpeed, nativeTps + measuredExtraTps);
     return {
       requestedMultiplier: tickSpeed,
@@ -12323,10 +12324,11 @@
   };
   const integrateAutomationClock = (wallNow = Date.now()) => {
     const elapsed = Math.max(0, wallNow - automationClockState.wallAt);
-    automationClockState.logicalNow += elapsed * automationClockState.deliveredMultiplier;
+    // Native game time advances with wall time. Booster progress is credited
+    // separately, once per game.tick call that actually completes.
+    automationClockState.logicalNow += elapsed;
     automationClockState.wallAt = wallNow;
     const delivery = measuredAutomationDelivery(wallNow);
-    automationClockState.deliveredMultiplier = delivery.deliveredMultiplier;
     return {
       ...delivery,
       wallNow,
@@ -12349,7 +12351,8 @@
     integrateAutomationClock(started);
     const elapsed = Math.max(TICK_SPEED_BEAT_MS, started - boosterTelemetry.lastBeatAt);
     boosterTelemetry.lastBeatAt = started;
-    const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTicksPerSecond() * elapsed / 1000));
+    const nativeTps = nativeTicksPerSecond();
+    const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTps * elapsed / 1000));
     const maxChunk = Math.min(BOOSTER_MAX_CHUNK, due);
     let executed = 0;
     const game = window.gamePage;
@@ -12367,6 +12370,7 @@
     boosterTelemetry.executed += executed;
     boosterTelemetry.dropped += dropped;
     boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, budgetMs: BOOSTER_CPU_BUDGET_MS };
+    automationClockState.logicalNow += executed * 1000 / nativeTps;
     integrateAutomationClock(Date.now());
     return boosterTelemetry.lastBeat;
   };
