@@ -12285,7 +12285,7 @@
   const BOOSTER_MAX_CHUNK = 16;
   const ACTION_LANE_BASE_MS = 250;
   const ACTION_LANE_FLOOR_MS = 100;
-  const PLANNING_LANE_FLOOR_MS = 500;
+  const PLANNING_LANE_FLOOR_MS = 250;
   const RENDER_LANE_MS = 500;
   let tickSpeedTimer = null;
   let tickSpeed = (() => {
@@ -12371,7 +12371,8 @@
     boosterTelemetry.dropped += dropped;
     boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, budgetMs: BOOSTER_CPU_BUDGET_MS };
     automationClockState.logicalNow += executed * 1000 / nativeTps;
-    integrateAutomationClock(Date.now());
+    const delivery = integrateAutomationClock(Date.now());
+    refreshAdaptiveScheduler(delivery.deliveredMultiplier);
     return boosterTelemetry.lastBeat;
   };
 
@@ -12511,11 +12512,32 @@
       if (isCurrentTimerOwner()) fn();
     }, delayMsRounded);
   };
+  const replaceOwnedInterval = (lane, fn, delayMs) => {
+    if (!isCurrentTimerOwner()) return false;
+    const rounded = Math.max(1, Math.round(delayMs));
+    const armed = Object.prototype.hasOwnProperty.call(timerOwner.timers, lane);
+    if (armed && timerOwner.delays[lane] === rounded) return false;
+    if (armed) {
+      try { clearInterval(timerOwner.timers[lane]); } catch (error) { /* already cleared */ }
+      delete timerOwner.timers[lane];
+      delete timerOwner.delays[lane];
+    }
+    armOwnedInterval(lane, fn, rounded);
+    return true;
+  };
+  const runPlanningLane = () => withMutationLane("planning", tick);
+  const refreshAdaptiveScheduler = (deliveredMultiplier = automationClockSnapshot().deliveredMultiplier) => {
+    if (!isCurrentTimerOwner()) return false;
+    const planningChanged = replaceOwnedInterval("planning", runPlanningLane,
+      Math.max(PLANNING_LANE_FLOOR_MS, HELPER_TICK_MS / Math.max(1, deliveredMultiplier)));
+    const actionChanged = replaceOwnedInterval("action", runActionLane,
+      Math.max(ACTION_LANE_FLOOR_MS, ACTION_LANE_BASE_MS / Math.max(1, deliveredMultiplier)));
+    return planningChanged || actionChanged;
+  };
   const armAutomationScheduler = () => {
     if (!isCurrentTimerOwner()) return;
     timerOwner.cancelIntervals();
-    armOwnedInterval("planning", () => withMutationLane("planning", tick), automationDelayMs(HELPER_TICK_MS, PLANNING_LANE_FLOOR_MS));
-    armOwnedInterval("action", runActionLane, automationDelayMs(ACTION_LANE_BASE_MS, ACTION_LANE_FLOOR_MS));
+    refreshAdaptiveScheduler();
     armOwnedInterval("render", () => runNamedSubsystem("render", () => {
       if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
     }), RENDER_LANE_MS);
