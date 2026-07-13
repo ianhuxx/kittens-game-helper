@@ -43,7 +43,9 @@ const R = (name, value, maxValue, title, extra = {}) => ({
 const makeState = () => {
   const spies = {
     zebraTrades: 0, shipBuilt: 0, manuscriptMade: 0, compendiumMade: 0,
-    parchmentMade: 0, festivals: 0, boosterTicks: 0,
+    parchmentMade: 0, festivals: 0, boosterTicks: 0, dragonTrades: 0,
+    leviathanTrades: 0, transcendencePurchases: 0, chronoforgePurchases: 0,
+    voidPurchases: 0, transcendCalls: 0, checkpoints: 0,
   };
 
   const resources = [
@@ -139,14 +141,40 @@ const makeState = () => {
     races: [],
     get: (name) => diplomacy.races.find((r) => r.name === name),
     getManpowerCost: () => 50, getGoldCost: () => 15, getMaxTradeAmt: () => 10,
+    getTradeRatio: () => 0,
+    getFinalStanding: (race) => Number(race?.standing) || 0,
+    isValidTrade(sell, race) {
+      const output = sell && res(sell.name);
+      return !!sell && !!race && race.unlocked !== false && !race.collapsed &&
+        (!sell.minLevel || (race.embassyLevel || 0) >= sell.minLevel) &&
+        (!!output?.unlocked || sell.name === "uranium" || race.name === "leviathans");
+    },
+    getResourceTradeChance(sell, race) {
+      return diplomacy.isValidTrade(sell, race) ? Number(sell.chance) || 0 : 0;
+    },
     tradeMultiple(race, amt) {
       if (race && race.name === "zebras") spies.zebraTrades += amt || 1;
+      if (race && race.name === "dragons") spies.dragonTrades += amt || 1;
+      if (race && race.name === "leviathans") spies.leviathanTrades += amt || 1;
       const n = amt || 1;
       // model the cost so trades can't run for free
       res("manpower").value = Math.max(0, res("manpower").value - 50 * n);
       res("gold").value = Math.max(0, res("gold").value - 15 * n);
       if (race && race.buys) for (const b of race.buys) if (res(b.name)) res(b.name).value = Math.max(0, res(b.name).value - b.val * n);
       if (race && race.name === "zebras") res("titanium").value = Math.min(res("titanium").maxValue || Infinity, res("titanium").value + n * 1.5 * 0.15);
+      if (race && race.name !== "zebras") {
+        for (const sell of race.sells || []) {
+          if (!diplomacy.isValidTrade(sell, race)) continue;
+          const output = res(sell.name);
+          if (!output) continue;
+          const rawChance = diplomacy.getResourceTradeChance(sell, race);
+          const chance = rawChance > 1 ? rawChance / 100 : rawChance;
+          const gain = n * (Number(sell.value) || 0) * Math.max(0, chance);
+          output.value = Math.min(output.maxValue || Infinity, output.value + gain);
+          output.unlocked = true;
+        }
+      }
+      return true;
     },
     trade(race) { diplomacy.tradeMultiple(race, 1); },
     tradeAll(race) { diplomacy.tradeMultiple(race, diplomacy.getMaxTradeAmt(race)); },
@@ -272,6 +300,25 @@ const applyPhase = (st, phase) => {
   const { res, buildings, techs, diplomacy, gamePage } = st;
   const unlockTitanium = () => { const t = res("titanium"); t.unlocked = true; };
   const addZebras = () => diplomacy.races.push({ name: "zebras", title: "Zebras", hidden: false, unlocked: true, embassyLevel: 1, embassyPrices: [], buys: [{ name: "slab", val: 30 }], sells: [{ name: "titanium", value: 1.5, chance: 15 }] });
+  const addResource = (name, value, maxValue, title = null, extra = {}) => {
+    const resource = R(name, value, maxValue, title || undefined, extra);
+    st.resources.push(resource);
+    return resource;
+  };
+  const isolateLateGame = () => {
+    for (const building of buildings) building.unlocked = false;
+    for (const technology of techs) { technology.unlocked = true; technology.researched = true; }
+    for (const upgrade of st.workshopUpgrades) upgrade.researched = true;
+    for (const upgrade of st.religionUpgrades) upgrade.unlocked = false;
+    for (const policy of st.policies) {
+      policy.researched = policy.name !== "tradition";
+      policy.blocked = policy.name === "tradition";
+    }
+    st.calendar.festivalDays = st.calendar.daysPerSeason + 1;
+    gamePage.resPool.energyProd = 1000;
+    gamePage.resPool.energyCons = 0;
+    gamePage.resPool.energyWinterProd = 1000;
+  };
 
   if (phase === "early") {
     // Few kittens, tiny science cap, only the basics open, no titanium at all.
@@ -359,6 +406,190 @@ const applyPhase = (st, phase) => {
       getBuilding: (id) => cathBuildings.find((p) => p.name === id),
     };
     st.onTick = () => { const sc = res("starchart"); sc.value = Math.min(sc.maxValue, sc.value + 8); };
+  } else if (phase === "dragonUranium") {
+    // A first Lunar Outpost is the active Space frontier, but its uranium
+    // bill has no passive source. The unified route must fund one bounded
+    // Dragon batch, keep the Space item as the plan, then purchase it.
+    isolateLateGame();
+    addResource("uranium", 0, 100, "Uranium", { unlocked: false });
+    addResource("unobtainium", 0, 100, "Unobtainium");
+    res("science").value = 1000; res("science").maxValue = 1000;
+    res("manpower").value = 800; res("manpower").maxValue = 1000;
+    res("gold").value = 500; res("gold").maxValue = 500;
+    res("titanium").value = 1000; res("titanium").maxValue = 2000; res("titanium").unlocked = true;
+    const dragons = {
+      name: "dragons", title: "Dragons", hidden: false, unlocked: true,
+      embassyLevel: 5, embassyPrices: [], standing: 0, energy: 0,
+      buys: [{ name: "titanium", val: 5 }],
+      sells: [{ name: "uranium", value: 2, chance: 0.95, width: 0 }],
+    };
+    diplomacy.races.push(dragons);
+    const lunarOutpost = {
+      name: "lunarOutpostE2E", label: "Lunar Outpost E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 10,
+      prices: [{ name: "uranium", val: 8 }],
+      effects: { uraniumPerTickCon: -0.01, unobtainiumPerTickSpace: 0.01 },
+    };
+    const moon = { name: "moonE2E", label: "Moon E2E", unlocked: true, reached: true, routeDays: 0, buildings: [lunarOutpost] };
+    gamePage.space = {
+      programs: [], planets: [moon],
+      getProgram: () => null,
+      getBuilding: (id) => moon.buildings.find((building) => building.name === id),
+    };
+    st.lateGame = { dragons, lunarOutpost };
+  } else if (phase === "uraniumUnobtainium") {
+    isolateLateGame();
+    addResource("uranium", 0, 100, "Uranium");
+    addResource("unobtainium", 0, 100, "Unobtainium");
+    res("science").value = 500; res("science").maxValue = 500;
+    const planetCracker = {
+      name: "planetCrackerE2E", label: "Planet Cracker E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 100,
+      prices: [{ name: "science", val: 10 }],
+      effects: { uraniumPerTickSpace: 1, uraniumMax: 100 },
+    };
+    const lunarOutpost = {
+      name: "lunarOutpostLoopE2E", label: "Lunar Outpost Loop E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 100,
+      prices: [{ name: "uranium", val: 20 }],
+      effects: { uraniumPerTickCon: -0.1, unobtainiumPerTickSpace: 1 },
+    };
+    const moonBase = {
+      name: "moonBaseE2E", label: "Moon Base E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 100,
+      prices: [{ name: "unobtainium", val: 12 }],
+      effects: { unobtainiumMax: 100 },
+    };
+    const dune = { name: "duneE2E", label: "Dune E2E", unlocked: true, reached: true, routeDays: 0, buildings: [planetCracker] };
+    const moon = { name: "moonLoopE2E", label: "Moon Loop E2E", unlocked: true, reached: true, routeDays: 0, buildings: [lunarOutpost, moonBase] };
+    gamePage.space = {
+      programs: [], planets: [dune, moon],
+      getProgram: () => null,
+      getBuilding: (id) => [planetCracker, lunarOutpost, moonBase].find((building) => building.name === id),
+    };
+    st.onTick = () => {
+      res("uranium").value = Math.min(res("uranium").maxValue, res("uranium").value + planetCracker.on * 4);
+      res("unobtainium").value = Math.min(res("unobtainium").maxValue, res("unobtainium").value + lunarOutpost.on * 3);
+    };
+    st.lateGame = { planetCracker, lunarOutpost, moonBase };
+  } else if (phase === "antimatterContainment") {
+    isolateLateGame();
+    addResource("antimatter", 0, 20, "Antimatter");
+    res("science").value = 500; res("science").maxValue = 500;
+    const sunlifter = {
+      name: "sunlifterE2E", label: "Sunlifter E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 100,
+      prices: [{ name: "science", val: 10 }],
+      effects: { antimatterProduction: 1, energyProduction: 30 },
+    };
+    const heatsink = {
+      name: "heatsinkE2E", label: "Heatsink E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 100,
+      prices: [{ name: "science", val: 10 }],
+      effects: {}, upgrades: { spaceBuilding: ["containmentChamberE2E"] },
+    };
+    const containment = {
+      name: "containmentChamberE2E", label: "Containment Chamber E2E", unlocked: false,
+      val: 0, on: 0, priceRatio: 100,
+      prices: [{ name: "antimatter", val: 10 }],
+      effects: { antimatterMax: 50, energyConsumption: 10 },
+    };
+    const helios = { name: "heliosE2E", label: "Helios E2E", unlocked: true, reached: true, routeDays: 0, buildings: [sunlifter, heatsink, containment] };
+    gamePage.space = {
+      programs: [], planets: [helios],
+      getProgram: () => null,
+      getBuilding: (id) => helios.buildings.find((building) => building.name === id),
+    };
+    st.onTick = () => {
+      res("antimatter").value = Math.min(res("antimatter").maxValue, res("antimatter").value + sunlifter.on * 2);
+    };
+    st.lateGame = { sunlifter, heatsink, containment };
+  } else if (phase === "leviathanDeparture") {
+    isolateLateGame();
+    addResource("timeCrystal", 0, 100, "Time Crystal");
+    addResource("unobtainium", 500, 1000, "Unobtainium");
+    res("manpower").value = 1000; res("manpower").maxValue = 1000;
+    res("gold").value = 500; res("gold").maxValue = 500;
+    const leviathans = {
+      name: "leviathans", title: "Leviathans", hidden: false, unlocked: true,
+      embassyLevel: 0, embassyPrices: [], standing: 0, energy: 0,
+      buys: [{ name: "unobtainium", val: 10 }],
+      sells: [{ name: "timeCrystal", value: 2, chance: 1, width: 0 }],
+    };
+    diplomacy.races.push(leviathans);
+    const temporalBattery = {
+      name: "temporalBatteryE2E", label: "Temporal Battery E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 10,
+      prices: [{ name: "timeCrystal", val: 6 }],
+      effects: { temporalFluxMax: 750 },
+    };
+    gamePage.time = {
+      chronoforgeUpgrades: [temporalBattery], voidspaceUpgrades: [],
+      getCFU: (id) => id === temporalBattery.name ? temporalBattery : null,
+      getVSU: () => null,
+    };
+    st.lateGame = { leviathans, temporalBattery, departed: false };
+    st.onTick = () => {
+      if (!st.lateGame.departed && temporalBattery.val > 0) {
+        leviathans.unlocked = false;
+        leviathans.collapsed = true;
+        st.lateGame.departed = true;
+      }
+    };
+  } else if (phase === "transcendenceUpgrade") {
+    isolateLateGame();
+    addResource("relic", 50, 100, "Relic");
+    const blackObelisk = {
+      name: "blackObeliskE2E", label: "Black Obelisk E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 10,
+      prices: [{ name: "relic", val: 10 }],
+      effects: { solarRevolutionLimit: 0.05 },
+    };
+    gamePage.religion.transcendenceUpgrades = [blackObelisk];
+    gamePage.religion.getTU = (id) => id === blackObelisk.name ? blackObelisk : null;
+    st.lateGame = { blackObelisk };
+  } else if (phase === "armedPrestige") {
+    isolateLateGame();
+    gamePage.religion.faith = 0;
+    gamePage.religion.faithRatio = 150;
+    gamePage.religion.transcendenceTier = 0;
+    gamePage.religion.transcendenceUpgrades = [];
+    gamePage.religion.getTU = () => null;
+    gamePage.religion._getTranscendNextPrice = () => 100;
+    gamePage.religion.getApocryphaResetBonus = () => 0;
+    gamePage.religion.getSolarRevolutionRatio = () => 0;
+    gamePage.religion.resetFaith = () => false;
+    gamePage.religionTab = {
+      transcendBtn: {
+        model: { enabled: true, visible: true },
+        controller: { updateEnabled() {}, updateVisible() {} },
+        handler() {
+          st.spies.transcendCalls += 1;
+          const price = gamePage.religion._getTranscendNextPrice();
+          if (gamePage.religion.faithRatio <= price) return false;
+          gamePage.religion.faithRatio -= price;
+          gamePage.religion.transcendenceTier += 1;
+          return true;
+        },
+      },
+    };
+    st.lateGame = { prestige: true };
+  } else if (phase === "voidSpace") {
+    isolateLateGame();
+    addResource("void", 100, 1000, "Void");
+    addResource("karma", 20, 100, "Karma");
+    const cryochambers = {
+      name: "cryochambersE2E", label: "Cryochambers E2E", unlocked: true,
+      val: 0, on: 0, priceRatio: 10,
+      prices: [{ name: "karma", val: 5 }, { name: "void", val: 20 }],
+      effects: { maxKittens: 1 },
+    };
+    gamePage.time = {
+      chronoforgeUpgrades: [], voidspaceUpgrades: [cryochambers],
+      getCFU: () => null,
+      getVSU: (id) => id === cryochambers.name ? cryochambers : null,
+    };
+    st.lateGame = { cryochambers };
   } else if (phase === "freshLifecycle") {
     // A reset-shaped save deliberately retains post-reset metadata while both
     // source buildings are at zero. The helper must rebuild those sources,
@@ -474,7 +705,16 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
   storage.set("kgh.goal", goal || "balanced");
   storage.set("kgh.autopilot", holdAutopilotForInitialEvidence ? "0" : "1");
   storage.set("kgh.tickSpeed", String(speed));
+  if (phase === "armedPrestige") storage.set("kgh.prestigeArmed", "1");
   const localStorageMock = { getItem: (k) => (storage.has(k) ? storage.get(k) : null), setItem: (k, v) => storage.set(k, String(v)) };
+  if (phase === "armedPrestige") {
+    gamePage.save = () => {
+      const saveData = { checkpoint: ++spies.checkpoints };
+      storage.set("com.nuclearunicorn.kittengame.savedata", JSON.stringify(saveData));
+      return saveData;
+    };
+    gamePage._saveDataToString = (saveData) => JSON.stringify(saveData);
+  }
   const documentMock = { head: makeEl(), body: makeEl(), createElement: () => makeEl(), getElementById: () => null };
 
   let fakeNow = Date.now();
@@ -519,8 +759,44 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       for (const price of prices) res(price.name).value -= price.val;
       model.metadata.val = (model.metadata.val || 0) + 1;
       model.metadata.on = (model.metadata.on || 0) + 1;
+      for (const buildingName of model.metadata.upgrades?.spaceBuilding || []) {
+        const unlocked = this.game.space?.getBuilding(buildingName);
+        if (unlocked) unlocked.unlocked = true;
+      }
       return { itemBought: true };
     }
+  }
+  class LateGameStackableController {
+    constructor(game) { this.game = game; }
+    fetchModel(options) {
+      const metadata = this.getMetadata(options.id);
+      return metadata ? { options, metadata } : null;
+    }
+    getPrices(model) {
+      const meta = model.metadata;
+      return (meta.prices || []).map((price) => ({ ...price, val: price.val * Math.pow(meta.priceRatio || 1, meta.val || 0) }));
+    }
+    updateEnabled() {}
+    buyItem(model) {
+      const prices = this.getPrices(model);
+      if (prices.some((price) => (res(price.name)?.value || 0) < price.val)) return { itemBought: false };
+      for (const price of prices) res(price.name).value -= price.val;
+      model.metadata.val = (model.metadata.val || 0) + 1;
+      model.metadata.on = (model.metadata.on || 0) + 1;
+      return { itemBought: true };
+    }
+  }
+  class TranscendenceBtnController extends LateGameStackableController {
+    getMetadata(id) { return this.game.religion?.getTU(id); }
+    buyItem(model) { spies.transcendencePurchases += 1; return super.buyItem(model); }
+  }
+  class ChronoforgeBtnController extends LateGameStackableController {
+    getMetadata(id) { return this.game.time?.getCFU(id); }
+    buyItem(model) { spies.chronoforgePurchases += 1; return super.buyItem(model); }
+  }
+  class VoidSpaceBtnController extends LateGameStackableController {
+    getMetadata(id) { return this.game.time?.getVSU(id); }
+    buyItem(model) { spies.voidPurchases += 1; return super.buyItem(model); }
   }
 
   let nextTimerId = 1;
@@ -549,7 +825,11 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
     clearInterval: (id) => timers.delete(id),
     WeakMap, Map, Set, Promise, Array, Object,
     com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController } } } },
-    classes: { ui: { space: { PlanetBuildingBtnController } } },
+    classes: { ui: {
+      TranscendenceBtnController,
+      space: { PlanetBuildingBtnController },
+      time: { ChronoforgeBtnController, VoidSpaceBtnController },
+    } },
   };
   context.window = context;
   const sandbox = vm.createContext(context);
@@ -577,6 +857,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       let recoveryLayerSeen = false;
       let initialPollutionEvidence = null;
       let maxMutationOverlaps = 0;
+      let visibleEvidence = [dbg.report?.(), dbg.planText?.(), dbg.nowText?.()].filter(Boolean).join("\n");
       const recordLifecycle = (event) => {
         if (!lifecycleSeen.has(event)) { lifecycleSeen.add(event); lifecycleEvents.push(event); }
       };
@@ -651,6 +932,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         // focus is non-titanium.
         const now = panel(".kgh-now");
         const plan = panel(".kgh-plan");
+        visibleEvidence += `\n${plan}\n${now}\n${panel(".kgh-diplomacy")}\n${panel(".kgh-buy")}\n${panel(".kgh-prestige-status")}`;
         if (/titanium path/i.test(now) && !/titanium/i.test(plan)) coherenceViolations += 1;
         const m = plan.match(/—\s*([^·]+?)\s*·/);
         if (m) focusNames.add(m[1].trim());
@@ -662,6 +944,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
 
       const gained = purchasesOf() - startPurchases;
       const check = (label, ok) => { if (!ok) failures.push(`${name}: ${label}`); };
+      visibleEvidence += `\n${dbg.report?.() || ""}\n${localStorageMock.getItem("kgh.log") || ""}`;
 
       // Universal invariants
       check(`display/action coherence (no titanium-path shown for a non-titanium focus) — ${coherenceViolations} violations`, coherenceViolations === 0);
@@ -704,6 +987,46 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         const boughtAny = boughtMission || boughtBuilding;
         check(`space mission/building bought by the native planner (sattelite val ${sat.val}, any ${boughtAny})`, boughtAny);
         check(`official Space shapes preserved (missions in programs; sattelite under Cath)`, !gamePage.space.programs.some((item) => item.name === "sattelite" || item.name === "spaceElevator") && !!sat);
+      }
+      if (phase === "dragonUranium") {
+        check(`Dragon uranium route executed (${spies.dragonTrades} trades)`, spies.dragonTrades > 0);
+        check(`Dragon bootstrap purchased the uranium-gated Space frontier (Lunar Outpost ${st.lateGame.lunarOutpost.val})`, st.lateGame.lunarOutpost.val > 0);
+        check(`visible plan/action explains Dragons → uranium → Lunar Outpost`, /Dragons/i.test(visibleEvidence) && /uranium/i.test(visibleEvidence) && /Lunar Outpost E2E/i.test(visibleEvidence));
+      }
+      if (phase === "uraniumUnobtainium") {
+        const { planetCracker, lunarOutpost, moonBase } = st.lateGame;
+        check(`Planet Cracker created the uranium path (${planetCracker.val})`, planetCracker.val > 0);
+        check(`Lunar Outpost progressed uranium → unobtainium (${lunarOutpost.val})`, lunarOutpost.val > 0 && res("unobtainium").value > 0);
+        check(`Moon Base consumed the new unobtainium path (${moonBase.val})`, moonBase.val > 0);
+        check(`visible plan/action explains the uranium/unobtainium Space dependency`, /Planet Cracker E2E/i.test(visibleEvidence) && /Lunar Outpost Loop E2E/i.test(visibleEvidence) && /unobtainium/i.test(visibleEvidence));
+      }
+      if (phase === "antimatterContainment") {
+        const { sunlifter, heatsink, containment } = st.lateGame;
+        check(`Sunlifter established antimatter production (${sunlifter.val})`, sunlifter.val > 0);
+        check(`Heatsink opened the containment dependency (${heatsink.val}; unlocked ${containment.unlocked})`, heatsink.val > 0 && containment.unlocked);
+        check(`Containment Chamber purchased from produced antimatter (${containment.val})`, containment.val > 0);
+        check(`visible plan/action explains antimatter production and Heatsink containment gate`, /antimatter/i.test(visibleEvidence) && /Heatsink E2E/i.test(visibleEvidence) && /Containment Chamber E2E/i.test(visibleEvidence));
+      }
+      if (phase === "leviathanDeparture") {
+        const { leviathans, temporalBattery, departed } = st.lateGame;
+        const departedRoute = dbg.acquisitionPathFor?.("timeCrystal", 6, { finalPurchase: true, rootRouteKinds: ["trade"] });
+        check(`active Leviathans funded the Time purchase (${spies.leviathanTrades} trades; Temporal Battery ${temporalBattery.val})`, spies.leviathanTrades > 0 && temporalBattery.val > 0);
+        check(`Leviathan departure invalidated the trade route`, departed && leviathans.unlocked === false && departedRoute?.reachable === false);
+        check(`visible plan/action explains Leviathans → time crystals → Temporal Battery`, /Leviathans/i.test(visibleEvidence) && /time.?crystal/i.test(visibleEvidence) && /Temporal Battery E2E/i.test(visibleEvidence));
+      }
+      if (phase === "transcendenceUpgrade") {
+        check(`native Transcendence controller purchased Black Obelisk (${st.lateGame.blackObelisk.val}; calls ${spies.transcendencePurchases})`, st.lateGame.blackObelisk.val > 0 && spies.transcendencePurchases > 0);
+        check(`visible plan/action distinguishes the Transcendence upgrade`, /Transcendence/i.test(visibleEvidence) && /Black Obelisk E2E/i.test(visibleEvidence));
+      }
+      if (phase === "armedPrestige") {
+        check(`persistently armed prestige executed one checkpointed Transcend`, localStorageMock.getItem("kgh.prestigeArmed") === "1" && spies.checkpoints === 1 && spies.transcendCalls === 1 && gamePage.religion.transcendenceTier === 1);
+        check(`armed prestige preserved exact tier/capital postcondition`, gamePage.religion.faithRatio === 50);
+        check(`visible plan/action explains authorization, checkpoint, measured Transcend, and cooldown`, /ARMED/i.test(visibleEvidence) && /Prestige transcend:/i.test(visibleEvidence) && /checkpointed/i.test(visibleEvidence) && /cooldown/i.test(visibleEvidence));
+      }
+      if (phase === "voidSpace") {
+        check(`native Void Space controller purchased Cryochambers (${st.lateGame.cryochambers.val}; calls ${spies.voidPurchases})`, st.lateGame.cryochambers.val > 0 && spies.voidPurchases > 0);
+        check(`Void Space purchase spent the live rare-capital bill`, res("void").value < 100 && res("karma").value < 20);
+        check(`visible plan/action identifies Void Space and Cryochambers`, /Void Space/i.test(visibleEvidence) && /Cryochambers E2E/i.test(visibleEvidence));
       }
 
       if (phase === "freshLifecycle") {
@@ -749,6 +1072,13 @@ const allScenarios = [
   { name: "compendium craft-chain (chemistry)", phase: "compendium", goal: "space" },
   { name: "producer prerequisite (oil well → calciner)", phase: "oilWell", goal: "production" },
   { name: "late-game space programs", phase: "space", goal: "space" },
+  { name: "late-game Dragon uranium bootstrap", phase: "dragonUranium", goal: "balanced" },
+  { name: "late-game uranium → unobtainium Space loop", phase: "uraniumUnobtainium", goal: "balanced" },
+  { name: "late-game antimatter + containment", phase: "antimatterContainment", goal: "balanced" },
+  { name: "late-game active Leviathans + departure", phase: "leviathanDeparture", goal: "balanced" },
+  { name: "late-game Transcendence upgrade", phase: "transcendenceUpgrade", goal: "balanced" },
+  { name: "late-game explicitly armed prestige", phase: "armedPrestige", goal: "balanced" },
+  { name: "late-game Void Space", phase: "voidSpace", goal: "balanced" },
   { name: "fresh lifecycle + Workshop/Ziggurat (1x)", phase: "freshLifecycle", goal: "balanced", speed: 1 },
   { name: "fresh lifecycle + Workshop/Ziggurat (50x)", phase: "freshLifecycle", goal: "balanced", speed: 50 },
   { name: "industry + pollution mitigation (1x)", phase: "pollutionIndustry", goal: "balanced", speed: 1 },

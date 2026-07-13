@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
-// @version      2.20.6
+// @version      2.21.0
 // @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. World reset, shatter, and time-skip remain forbidden; Transcend, Adore, and alicorn sacrifice run only through explicitly armed, freshly checkpointed, reservation-safe prestige policy.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
@@ -47,7 +47,7 @@
   const LOG_KEY = "kgh.log";
   const PRESTIGE_ARM_KEY = "kgh.prestigeArmed";
   const EXPANSION_CHECKPOINT_KEY = "kgh.expansionCheckpoint";
-  const HELPER_VERSION = "2.20.6";
+  const HELPER_VERSION = "2.21.0";
 
   // Speedrun reset helpers remain advisory. Transcend, Adore and alicorn
   // sacrifice are managed separately by the explicitly armed prestige broker.

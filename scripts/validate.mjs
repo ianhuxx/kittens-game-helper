@@ -3,8 +3,9 @@
 // It does not (and cannot) drive a browser. It verifies that:
 //   1. the userscript body parses (no syntax errors),
 //   2. the bot is fully NATIVE — no Kitten Scientists / external engine,
-//   3. the reset-safety guard is intact (irreversible actions can't be planned),
-//   4. native execution + every smart-play layer is still wired in.
+//   3. every mutation crosses the fail-closed semantic action broker,
+//   4. native execution + every smart-play layer is still wired in,
+//   5. the three release versions match exactly.
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,7 @@ const source = await readFile(scriptPath, "utf8");
 const readmePath = fileURLToPath(new URL("../README.md", import.meta.url));
 const readme = await readFile(readmePath, "utf8");
 const rawScriptUrl = "https://raw.githubusercontent.com/ianhuxx/kittens-game-helper/main/src/kittens-game-helper.user.js";
+const releaseVersion = "2.21.0";
 
 // The helper now drives the game's own API directly. None of these may appear:
 // any reintroduction of Kitten Scientists or a settings-tree bridge is a
@@ -34,17 +36,23 @@ if (leaked.length > 0) {
 }
 
 const required = [
-  // Boots on the game alone, and suppresses confirm dialogs natively.
+  // Boots on the game alone without mutating global confirmation settings.
   "waitForGame",
   "gameReady",
-  "opts.noConfirm",
-  // Reset-safety: irreversible actions are filtered OUT of every candidate list.
+  // Candidate filtering remains defense in depth. The semantic broker is the
+  // final fail-closed boundary for safe, rare-capital, prestige, and forbidden
+  // actions; alicorn sacrifice is not treated as universally denied.
   "DENY_SUBSTRINGS",
-  '"reset"',
-  '"transcend"',
-  '"sacrifice"',
   "isDeniedKey",
   "!isDeniedKey(c.meta.name)",
+  "ACTION_POLICY",
+  "ACTION_IDS",
+  "actionPolicyFor",
+  "executeSemanticAction",
+  'const PRESTIGE_ARM_KEY = "kgh.prestigeArmed"',
+  "IRREVERSIBLE_EXECUTION_TOKEN",
+  "createNativeCheckpoint",
+  "lastIrreversibleActionAt",
   // Autopilot toggle must exist.
   "autopilot",
   // Native execution: purchases go through the game's own button controllers.
@@ -61,13 +69,21 @@ const required = [
   "observeHandler",
   "maybeHoldFestival",
   "holdFestival",
-  "manageTrade",
+  "manageDiplomacy",
   "tradeAll",
   "updateReserveStatus",
   "RELIGION_PRAISE_TRIGGER",
   // Plan execution + the reservation contract every native spender consults.
   "executePlan",
   "gatherCandidates",
+  // One recursive acquisition graph owns reachability, nested inputs, ETA,
+  // active trade steps, reservations, and bounded execution.
+  "acquisitionPathFor",
+  "activeAcquisitionRoute",
+  "actionableTradeRouteFor",
+  "scoreAcquisitionRouteInputs",
+  "boundedTradeBatch",
+  "buildReservationLedger",
   "reservedNeedsFor",
   "respectsReservations",
   "kgh-reserve",
@@ -175,7 +191,6 @@ const required = [
   "policyBlockedByRival",
   "queuedPolicyNames",
   // Diplomacy: explorers/embassies sent from the game's own prices.
-  "manageDiplomacy",
   "maybeSendExplorers",
   "maybeBuildEmbassy",
   "EmbassyButtonController",
@@ -209,11 +224,21 @@ const required = [
   // The reservation-backed planner now also covers the late game (space
   // programs + Chronoforge/Void structures), via the game's own controllers.
   "spaceMetas",
+  "spaceDescriptors",
+  "spaceDescriptorFor",
+  "spaceNativeAdapter",
   "timeMetas",
+  "timeDescriptorFor",
+  "nativeStackableAdapter",
+  "transcendenceNativeAdapter",
+  "timeNativeAdapter",
   "scaledStackablePrices",
   "VAL_BASED_KINDS",
   "SpaceProgramBtnController",
+  "PlanetBuildingBtnController",
+  "TranscendenceBtnController",
   "ChronoforgeBtnController",
+  "VoidSpaceBtnController",
   // Purchase safety: the raw-metadata buy fallback stays OFF by default; official
   // controller/API purchase only. If it fails, the item is benched, never poked.
   "ALLOW_RAW_METADATA_BUY_FALLBACK = false",
@@ -241,14 +266,35 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
+// One executor owns all diplomacy mutations. The removed legacy trade loop
+// and global no-confirm mutation are architectural regressions, not optional
+// implementation details.
+const diplomacyOwnerDefinitions = source.match(/const\s+manageDiplomacy\s*=/g) || [];
+if (diplomacyOwnerDefinitions.length !== 1 || /\bmanageTrade\b/.test(source)) {
+  console.error(`Diplomacy ownership invariant failed: owners=${diplomacyOwnerDefinitions.length}, legacy=${/\bmanageTrade\b/.test(source)}.`);
+  process.exit(1);
+}
+if (/opts\.noConfirm\s*=/.test(source)) {
+  console.error("Global confirmation settings must not be mutated; irreversible actions belong to the semantic broker.");
+  process.exit(1);
+}
+
+// Pricing/discovery and execution must both select the controller by the
+// normalized Time descriptor: Void Space never goes through Chronoforge.
+const correctTimeControllerSelections = source.match(/descriptor\.subtype\s*===\s*"voidspace"\s*\?\s*"VoidSpaceBtnController"\s*:\s*"ChronoforgeBtnController"/g) || [];
+if (correctTimeControllerSelections.length < 2) {
+  console.error(`Time controller invariant failed: expected normalized selections in pricing and execution, found ${correctTimeControllerSelections.length}.`);
+  process.exit(1);
+}
+
 // Version consistency: @version, HELPER_VERSION and package.json must always
 // agree.  Every change is expected to bump the version (see CLAUDE.md), so a
 // mismatch here usually means a bump was forgotten in one of the three places.
 const metaVersion = (source.match(/@version\s+([0-9]+\.[0-9]+\.[0-9]+)/) || [])[1];
 const constVersion = (source.match(/HELPER_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/) || [])[1];
 const pkg = JSON.parse(await readFile(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
-if (!metaVersion || !constVersion || metaVersion !== constVersion || metaVersion !== pkg.version) {
-  console.error(`✗ Version mismatch — @version=${metaVersion}, HELPER_VERSION=${constVersion}, package.json=${pkg.version} (all three must match; bump every update).`);
+if (!metaVersion || !constVersion || metaVersion !== constVersion || metaVersion !== pkg.version || metaVersion !== releaseVersion) {
+  console.error(`✗ Version mismatch — @version=${metaVersion}, HELPER_VERSION=${constVersion}, package.json=${pkg.version}; release requires exact parity at ${releaseVersion}.`);
   process.exit(1);
 }
 
@@ -274,4 +320,4 @@ try {
   process.exit(1);
 }
 
-console.log(`✓ Userscript parses, is fully native (no Kitten Scientists), reset-safety guard intact, version ${pkg.version} consistent.`);
+console.log(`✓ Userscript parses, is fully native, broker-guarded, single-owner diplomacy and normalized late-game adapters are intact, and release version ${pkg.version} matches exactly.`);
