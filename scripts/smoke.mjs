@@ -6092,8 +6092,103 @@ dbg.forceActiveTarget(null);
 dbg.optimizeProcessing();
 check("Task 6 fuel: shared uranium budget prioritizes the selected unobtainium frontier without double allocation",
   lunarOutpostT6.on === 1 && reactorT6.on === 0);
+
+// Review regressions: power and every fuel consumer must share one allocation.
+// These deliberately combine high stock, cooldown hysteresis, incumbent burn,
+// and a selected Space output so independent per-family budgets cannot pass.
+gamePage.resPool.energyProd = 2;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 2;
+res("uranium").value = 1000;
+res("uranium").maxValue = 1000;
+perTick.uranium = 0;
+reactorT6.val = 0;
+reactorT6.on = 0;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 0;
+dbg.clearResourceTelemetry?.("uranium");
+const lunarPowerPartialT6 = dbg.sustainableProcessorCount?.(lunarOutpostT6, { reserved: {} }, 60);
+check("Task 6 review: processor allocation caps a Lunar Outpost fleet to effective winter power headroom",
+  lunarPowerPartialT6 === 1);
+
+const backgroundProcessorT6 = {
+  name: "backgroundProcessorT6",
+  label: "Background Processor T6",
+  unlocked: true,
+  val: 2,
+  on: 0,
+  prices: [{ name: "uranium", val: 1000 }],
+  effects: { uraniumPerTickCon: -0.2, sciencePerTickProd: 0.01 },
+};
+buildings.push(backgroundProcessorT6);
+gamePage.resPool.energyProd = 100;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 100;
+unobtainiumFrontierT6.prices = [{ name: "uranium", val: 750 }, { name: "unobtainium", val: 100 }];
+res("uranium").value = 900;
+res("science").value = 0;
+perTick.uranium = 0;
+lunarOutpostT6.val = 1;
+lunarOutpostT6.on = 0;
+dbg.clearResourceTelemetry?.("uranium");
+dbg.queueClear();
+dbg.queueAdd("build:unobtainiumFrontierT6", 0);
+dbg.forceActiveTarget(null);
+fakeNow += 21000;
+tickFn();
+check("Task 6 review: the stability pass cannot double-allocate a high-stock uranium budget",
+  lunarOutpostT6.on === 1 && backgroundProcessorT6.on === 0);
+
+// Establish a fresh Reactor run transition, then switch to the Lunar frontier
+// before its minimum-run cooldown expires. The held Reactor's real burn gets
+// first claim; a desired-zero virtual count must not free that fuel for Lunar.
+backgroundProcessorT6.val = 0;
+backgroundProcessorT6.on = 0;
+reactorT6.val = 1;
+reactorT6.on = 0;
+lunarOutpostT6.val = 1;
+lunarOutpostT6.on = 0;
+unobtainiumFrontierT6.prices = [{ name: "uranium", val: 100 }, { name: "unobtainium", val: 100 }];
+res("uranium").value = 160;
+perTick.uranium = 0;
+dbg.clearResourceTelemetry?.("uranium");
+dbg.queueClear();
+fakeNow += 21000;
+dbg.forceActiveTarget(fuelTargetT6, "Late-game progression frontier", 0);
+dbg.optimizeProcessing();
+check("Task 6 review fixture: one Reactor enters the live run cooldown", reactorT6.on === 1);
+res("uranium").value = 250;
+perTick.uranium = -0.2; // -1/s net: no external income while one Reactor burns.
+dbg.clearResourceTelemetry?.("uranium");
+dbg.queueAdd("build:unobtainiumFrontierT6", 0);
+dbg.forceActiveTarget(null);
+fakeNow += 1000;
+dbg.optimizeProcessing();
+check("Task 6 review: cooldown-held Reactor burn is charged before later processor families",
+  reactorT6.on === 1 && lunarOutpostT6.on === 0);
+
+// After cooldown, reconstruct the one global 2.5/s outside supply from live net
+// telemetry. The selected Lunar producer gets first call and the incumbent
+// Reactor yields instead of defending the net-zero state it helped create.
+reactorT6.on = 1;
+lunarOutpostT6.on = 0;
+res("uranium").value = 100;
+perTick.uranium = 0.3; // +1.5/s net + 1/s live Reactor burn = 2.5/s gross.
+dbg.clearResourceTelemetry?.("uranium");
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 review: target-useful Lunar allocation takes over from an incumbent Reactor",
+  lunarOutpostT6.on === 1 && reactorT6.on === 0);
+
+const sharedAllocationReportT6 = dbg.reportForTarget?.({ kind: "build", meta: unobtainiumFrontierT6, affordable: false }) || "";
+check("Task 6 review: diagnostics print the same shared allocation used by execution",
+  /Reactor T6:.*sustainable 0\/1/i.test(sharedAllocationReportT6) &&
+  /Lunar Outpost T6:.*sustainable 1\/1/i.test(sharedAllocationReportT6));
+
 dbg.queueClear();
 delete perTick.unobtainium;
+buildings.splice(buildings.indexOf(backgroundProcessorT6), 1);
 buildings.splice(buildings.indexOf(unobtainiumFrontierT6), 1);
 
 const diagnosticTransT6 = { name: "diagnosticTransT6", label: "Transcendence Diagnostic T6", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 10 }], effects: {} };

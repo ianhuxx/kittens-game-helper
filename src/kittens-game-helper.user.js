@@ -3769,8 +3769,11 @@
     return { count: inputs.length ? sustainable : full, full, horizon, inputs };
   };
 
-  const sustainableProcessorCount = (meta, resources, ledger = {}, horizonSeconds = PROCESSOR_FUEL_HORIZON_SECONDS) =>
-    processorFuelBudget(meta, resources, ledger, horizonSeconds).count;
+  const sustainableProcessorCount = (meta, resources, ledger = null, horizonSeconds = PROCESSOR_FUEL_HORIZON_SECONDS) => {
+    const target = getTargetCached(resources, getGoal());
+    const allocation = sharedProcessorAllocation(target, resources, ledger, horizonSeconds, false);
+    return allocation.allocations.get(meta)?.count || 0;
+  };
 
   // Processor protection is deliberately stronger than the general spender
   // ledger: banked direct prices are normally omitted so the focused purchase
@@ -3789,7 +3792,7 @@
     return ledger;
   };
 
-  const desiredProcessorState = (meta, resources, missing, needed, reserved, powerOverride) => {
+  const desiredProcessorState = (meta, resources, missing, needed, reserved, powerOverride, allocationOverride = null) => {
     const name = meta.name;
     const profile = processingProfileFor(meta);
     // Keep only real resources: a live effect can list a pseudo-output such as
@@ -3801,8 +3804,11 @@
     const inputs = (profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[name] || []).filter(isRealRes);
     const outputs = (profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[name] || []).filter(isRealRes);
     const full = Math.max(0, meta.val || 0);
-    const fuelBudget = processorFuelBudget(meta, resources, reserved, PROCESSOR_FUEL_HORIZON_SECONDS);
-    const sustainable = fuelBudget.count;
+    const fuelBudget = allocationOverride && allocationOverride.fuelBudget ||
+      processorFuelBudget(meta, resources, reserved, PROCESSOR_FUEL_HORIZON_SECONDS);
+    const sustainable = allocationOverride
+      ? Math.max(0, Math.min(full, Math.floor(allocationOverride.count || 0)))
+      : fuelBudget.count;
     const fuelInputNames = new Set(fuelBudget.inputs.map((input) => input.name));
     const wasStarvePaused = pausedProcessors[name] && pausedProcessors[name].reason === "starve";
     const lowRatio = wasStarvePaused ? PROCESSOR_RESUME_RATIO : PROCESSOR_STARVE_RATIO;
@@ -3819,10 +3825,10 @@
       const held = fuelBudget.inputs.filter((input) => input.count <= 0).map((input) => resTitle(resources, input.name));
       return { on: 0, reason: "fuel", detail: `protecting ${held.join("+")} over ${fmt(fuelBudget.horizon)}s` };
     }
-    if (full > 0 && netEnergy > 0 && powerEmergency && hardStarvedInputs.length === 0) {
+    if (!allocationOverride && full > 0 && netEnergy > 0 && powerEmergency && hardStarvedInputs.length === 0) {
       return { on: sustainable, reason: "power", detail: `power deficit ${fmt(power.delta)} Wt` };
     }
-    if (full > 0 && netEnergy < 0 && (power.delta + netEnergy < TUNING.powerHeadroom || power.winterDelta + netEnergy < 0)) {
+    if (!allocationOverride && full > 0 && netEnergy < 0 && (power.delta + netEnergy < TUNING.powerHeadroom || power.winterDelta + netEnergy < 0)) {
       return { on: 0, reason: "power", detail: "protecting Wt" };
     }
     const wantedOutputs = outputs.some((output) => !resCapped(resources, output) || needed.has(output));
@@ -3882,54 +3888,198 @@
       : { on: full, reason: "run", detail: "" };
   };
 
+  // Build one immutable decision for the whole processor fleet. Resource
+  // telemetry is net of every live family, so gross outside supply adds every
+  // family's current burn back exactly once. Fuel, power and cooldown minima
+  // are then allocated from shared pools in target-useful order.
+  let lastProcessorAllocation = null;
+  const sharedProcessorAllocation = (target, resources, ledgerOverride = null, horizonSeconds = PROCESSOR_FUEL_HORIZON_SECONDS, respectCooldown = true) => {
+    const converters = converterBuildings();
+    const horizon = Math.max(1, Number(horizonSeconds) || PROCESSOR_FUEL_HORIZON_SECONDS);
+    const ledger = ledgerOverride != null
+      ? (ledgerOverride.reserved && typeof ledgerOverride.reserved === "object" ? ledgerOverride : { reserved: ledgerOverride })
+      : processorReservationLedger(target, resources);
+    const reserved = ledger.reserved || {};
+    const missing = target ? missingDirectCosts(target, resources) : new Set();
+    const needed = target ? resourcesNeededForTarget(target, resources) : new Set();
+    const ordered = [...converters].sort((a, b) => {
+      const wanted = (meta) => processingProfileFor(meta).outputs.some((output) => needed.has(output));
+      return Number(wanted(b)) - Number(wanted(a));
+    });
+
+    const ratesByMeta = new Map();
+    const liveBurn = {};
+    for (const meta of converters) {
+      const rates = processorInputRates(meta, resources);
+      ratesByMeta.set(meta, rates);
+      const currentOn = Math.max(0, Math.min(meta.val || 0, Math.floor(meta.on || 0)));
+      for (const [name, rate] of Object.entries(rates)) {
+        liveBurn[name] = (liveBurn[name] || 0) + currentOn * rate;
+      }
+    }
+
+    const fuelPools = {};
+    for (const name of Object.keys(liveBurn)) {
+      const resource = getRes(resources, name);
+      const stock = Math.max(0, Number(resource && resource.value) || 0);
+      const floor = Math.max(0, reservedHoldFor(reserved, name));
+      const netIncome = productionFor(name);
+      const grossIncome = Math.max(0, netIncome + liveBurn[name]);
+      const available = Math.max(0, stock + grossIncome * horizon - floor);
+      fuelPools[name] = { name, stock, floor, netIncome, grossIncome, liveBurn: liveBurn[name], available, initialAvailable: available };
+    }
+
+    const effective = effectivePowerStatus();
+    let liveNetEnergy = 0;
+    for (const meta of converters) {
+      const profile = processingProfileFor(meta);
+      liveNetEnergy += Math.max(0, Math.floor(meta.on || 0)) * ((profile.energyProduction || 0) - (profile.energyConsumption || 0));
+    }
+    const projectedPower = {
+      delta: effective.delta - liveNetEnergy,
+      winterDelta: effective.winterDelta - liveNetEnergy,
+    };
+
+    const minimumCounts = new Map();
+    const forcedPauses = new Set();
+    const now = Date.now();
+    if (respectCooldown) {
+      for (const meta of converters) {
+        const currentOn = Math.max(0, Math.min(meta.val || 0, Math.floor(meta.on || 0)));
+        const transition = processorTransitions[meta.name];
+        if (!transition || !(transition.at > 0)) continue;
+        if (currentOn > 0 && transition.state === "run" && now - transition.at < PROCESSOR_MIN_RUN_MS) {
+          minimumCounts.set(meta, currentOn);
+        } else if (currentOn <= 0 && transition.state === "pause" && now - transition.at < PROCESSOR_MIN_PAUSE_MS) {
+          forcedPauses.add(meta);
+        }
+      }
+    }
+
+    const chargeFuel = (meta, count) => {
+      if (!(count > 0)) return;
+      for (const [name, burnPerSecond] of Object.entries(ratesByMeta.get(meta) || {})) {
+        const pool = fuelPools[name];
+        if (pool) pool.available = Math.max(0, pool.available - count * burnPerSecond * horizon);
+      }
+    };
+    const advancePower = (meta, count) => {
+      if (!(count > 0)) return;
+      const profile = processingProfileFor(meta);
+      const perUnitNet = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+      projectedPower.delta += count * perUnitNet;
+      projectedPower.winterDelta += count * perUnitNet;
+    };
+
+    // Cooldown-held units are real consumers, not desired virtual counts. Debit
+    // them before target-priority allocation so later families cannot spend the
+    // same stock or income while those units remain physically on.
+    for (const [meta, count] of minimumCounts) {
+      chargeFuel(meta, count);
+      advancePower(meta, count);
+    }
+
+    const allocations = new Map();
+    for (const meta of ordered) {
+      const full = Math.max(0, Math.floor(meta.val || 0));
+      const rates = ratesByMeta.get(meta) || {};
+      const fuelInputs = Object.entries(rates).map(([name, burnPerSecond]) => {
+        const pool = fuelPools[name] || { stock: 0, floor: 0, netIncome: 0, grossIncome: 0, initialAvailable: 0 };
+        return {
+          name,
+          stock: pool.stock,
+          floor: pool.floor,
+          netIncome: pool.netIncome,
+          income: pool.grossIncome,
+          burnPerSecond,
+          spendable: pool.initialAvailable,
+          count: full,
+        };
+      });
+      const demand = desiredProcessorState(meta, resources, missing, needed, reserved, projectedPower, {
+        count: full,
+        fuelBudget: { count: full, full, horizon, inputs: fuelInputs },
+      });
+      const minimum = minimumCounts.get(meta) || 0;
+      if (forcedPauses.has(meta)) {
+        allocations.set(meta, {
+          meta,
+          count: 0,
+          requested: demand.on,
+          state: demand.on > 0
+            ? { on: 0, reason: "cooldown", detail: "minimum pause cooldown" }
+            : demand,
+          fuelInputs,
+        });
+        continue;
+      }
+
+      const requested = Math.max(minimum, Math.max(0, Math.min(full, Math.floor(demand.on || 0))));
+      const extraRequested = Math.max(0, requested - minimum);
+      let fuelCap = extraRequested;
+      for (const [name, burnPerSecond] of Object.entries(rates)) {
+        const pool = fuelPools[name];
+        if (!(burnPerSecond > 0) || !pool) continue;
+        fuelCap = Math.min(fuelCap, Math.max(0, Math.floor((pool.available + 1e-9) / (burnPerSecond * horizon))));
+      }
+      let powerCap = extraRequested;
+      const profile = processingProfileFor(meta);
+      const perUnitNet = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+      if (perUnitNet < 0) {
+        if (effective.delta < 0 || effective.winterDelta < 0) {
+          powerCap = 0;
+        } else {
+          const use = -perUnitNet;
+          const normalCap = Math.floor((projectedPower.delta - TUNING.powerHeadroom + 1e-9) / use);
+          const winterCap = Math.floor((projectedPower.winterDelta + 1e-9) / use);
+          powerCap = Math.min(powerCap, Math.max(0, normalCap), Math.max(0, winterCap));
+        }
+      }
+      const extra = Math.max(0, Math.min(extraRequested, fuelCap, powerCap));
+      const count = minimum + extra;
+      chargeFuel(meta, extra);
+      advancePower(meta, extra);
+
+      let state = { ...demand, on: count };
+      if (minimum > (demand.on || 0)) {
+        state = { on: count, reason: "cooldown", detail: `holding ${minimum} live during minimum run cooldown` };
+      } else if (count < requested) {
+        const powerLimited = powerCap <= fuelCap && powerCap < extraRequested;
+        state = powerLimited
+          ? { on: count, reason: "power", detail: `shared power headroom supports ${count}/${full}` }
+          : { on: count, reason: "fuel", detail: `shared fuel budget supports ${count}/${full} over ${fmt(horizon)}s` };
+      }
+      allocations.set(meta, { meta, count, requested: demand.on, state, fuelInputs });
+    }
+
+    return {
+      target,
+      targetId: target ? targetId(target) : null,
+      ledger,
+      ordered,
+      allocations,
+      fuelPools,
+      power: { effective, projected: { ...projectedPower } },
+      horizon,
+    };
+  };
+
   const optimizeProcessing = (resources, goalKey) => {
     try {
       const converters = converterBuildings();
       if (!converters.length) {
         processingPlanText = "Processing: watching converters";
-        return;
+        lastProcessorAllocation = null;
+        return null;
       }
       const target = getTargetCached(resources, goalKey);
-      const missing = target ? missingDirectCosts(target, resources) : new Set();
-      const needed = target ? resourcesNeededForTarget(target, resources) : new Set();
-      const reserved = { ...processorReservationLedger(target, resources).reserved };
-      const orderedConverters = [...converters].sort((a, b) => {
-        const wanted = (meta) => processingProfileFor(meta).outputs.some((output) => needed.has(output));
-        return Number(wanted(b)) - Number(wanted(a));
-      });
+      const allocation = sharedProcessorAllocation(target, resources);
+      lastProcessorAllocation = allocation;
       const changed = [];
-      // Running power projection for THIS pass.  Each toggle advances it by the
-      // marginal Wt it changes, so a later converter sees power as it will be
-      // after the earlier toggles in the same pass — not the stale start-of-pass
-      // reading the game's pool may still report.  This stops several consumers
-      // all resuming off one "safe" snapshot and oversubscribing Wt.
-      let projected = powerStatus();
-      const advanceProjection = (meta, fromOn, toOn) => {
-        const profile = processingProfileFor(meta);
-        const perUnitNet = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
-        const deltaWt = (toOn - fromOn) * perUnitNet;
-        projected = { ...projected, delta: projected.delta + deltaWt, winterDelta: projected.winterDelta + deltaWt };
-      };
-
-      for (const meta of orderedConverters) {
+      for (const meta of allocation.ordered) {
         const name = meta.name;
         const currentOn = Math.max(0, meta.on || 0);
-        const state = desiredProcessorState(meta, resources, missing, needed, reserved, projected);
-        // One shared 60-second budget: the selected frontier's useful
-        // processors are ordered first, and each chosen count consumes virtual
-        // headroom before the next family is evaluated.
-        for (const [input, burnPerSecond] of Object.entries(processorInputRates(meta, resources))) {
-          reserved[input] = Math.max(0, reserved[input] || 0) + state.on * burnPerSecond * PROCESSOR_FUEL_HORIZON_SECONDS;
-        }
-        const transition = processorTransitions[name] || { state: currentOn > 0 ? "run" : "pause", at: 0 };
-        const desiredMode = state.on > 0 ? "run" : "pause";
-        if (transition.at > 0 && transition.state !== desiredMode) {
-          const min = transition.state === "run" ? PROCESSOR_MIN_RUN_MS : PROCESSOR_MIN_PAUSE_MS;
-          if (Date.now() - transition.at < min) {
-            processingPlanText = `Processing: holding ${labelOf(meta)} ${transition.state === "run" ? "running" : "paused"} (cooldown)`;
-            continue;
-          }
-        }
+        const state = allocation.allocations.get(meta).state;
 
         if (state.on <= 0) {
           if (currentOn > 0) {
@@ -3937,7 +4087,6 @@
             if (setProcessorOn(meta, 0)) {
               processorTransitions[name] = { state: "pause", at: Date.now() };
               changed.push(`paused ${labelOf(meta)}${state.detail ? ` (${state.detail})` : ""}`);
-              advanceProjection(meta, currentOn, 0);
             }
           } else if (pausedProcessors[name]) {
             // Keep remembering why it is off so hysteresis/reporting hold.
@@ -3949,7 +4098,6 @@
             changed.push(currentOn > state.on
               ? `throttled ${labelOf(meta)} to ${state.on}/${meta.val || 0}${state.detail ? ` (${state.detail})` : ""}`
               : pausedProcessors[name] ? `resumed ${labelOf(meta)}` : `started ${labelOf(meta)}`);
-            advanceProjection(meta, currentOn, state.on);
           }
           delete pausedProcessors[name];
         } else if (pausedProcessors[name]) {
@@ -3973,26 +4121,22 @@
         const paused = Object.values(pausedProcessors).map((item) => item.label).filter(Boolean);
         processingPlanText = paused.length ? `Processing: paused ${paused.join(", ")}` : "Processing: converters running";
       }
+      return allocation;
     } catch (error) {
       /* ignore */
+      return null;
     }
   };
 
-  const keepHealthyConvertersStable = (resources) => {
+  const keepHealthyConvertersStable = (resources, allocation = lastProcessorAllocation) => {
     try {
-      for (const meta of converterBuildings()) {
-        if (!hasOnToggle(meta) || (meta.on || 0) > 0) continue;
-        const profile = processingProfileFor(meta);
-        const inputs = (profile.inputs.length ? profile.inputs : PROCESSOR_INPUTS[meta.name] || []).filter((name) => getRes(resources, name));
-        const outputs = (profile.outputs.length ? profile.outputs : PROCESSOR_OUTPUTS[meta.name] || []).filter((name) => getRes(resources, name));
-        if (!inputs.length || !outputs.length) continue;
-        if (inputs.every((name) => resRatio(resources, name, 1) >= 0.85) && outputs.some((name) => !resCapped(resources, name))) {
-          const transition = processorTransitions[meta.name];
-          if (!transition || Date.now() - transition.at >= PROCESSOR_MIN_PAUSE_MS) {
-            const target = getTargetCached(resources, getGoal());
-            const count = sustainableProcessorCount(meta, resources, processorReservationLedger(target, resources), PROCESSOR_FUEL_HORIZON_SECONDS);
-            if (count > 0) setProcessorOn(meta, count);
-          }
+      if (!allocation) return;
+      // This pass may only enforce the coordinated ceiling. It never computes
+      // or enables an independent "healthy" count after optimizeProcessing.
+      for (const meta of allocation.ordered) {
+        const count = allocation.allocations.get(meta)?.count || 0;
+        if ((meta.on || 0) > count) {
+          setProcessorOn(meta, count);
         }
       }
     } catch (error) {
@@ -10480,12 +10624,14 @@
     return lines;
   };
 
-  const processorFuelReportText = (meta, resources, ledger) => {
-    const budget = processorFuelBudget(meta, resources, ledger, PROCESSOR_FUEL_HORIZON_SECONDS);
-    if (!budget.inputs.length) return `sustainable ${budget.count}/${budget.full} (no resource fuel)`;
-    const inputs = budget.inputs.map((input) =>
+  const processorFuelReportText = (allocationEntry, resources) => {
+    const meta = allocationEntry.meta;
+    const full = Math.max(0, Math.floor(meta && meta.val || 0));
+    const inputs0 = allocationEntry.fuelInputs || [];
+    if (!inputs0.length) return `sustainable ${allocationEntry.count}/${full} (no resource fuel)`;
+    const inputs = inputs0.map((input) =>
       `${resTitle(resources, input.name)} stock ${fmt(input.stock)} floor ${fmt(input.floor)} income +${fmt(input.income)}/s burn ${fmt(input.burnPerSecond)}/s/ea`).join(" + ");
-    return `sustainable ${budget.count}/${budget.full} · ${inputs} · horizon ${fmt(budget.horizon)}s`;
+    return `sustainable ${allocationEntry.count}/${full} · ${inputs} · horizon ${fmt(PROCESSOR_FUEL_HORIZON_SECONDS)}s`;
   };
 
   // One-shot diagnostics dump for debugging "why did the bot just do X?".  The
@@ -10518,6 +10664,9 @@
       if (details) push(details);
       const diagnosticTarget = targetOverride || getTargetCached(resources, goal);
       const diagnosticLedger = processorReservationLedger(diagnosticTarget, resources);
+      const diagnosticAllocation = lastProcessorAllocation && lastProcessorAllocation.targetId === (diagnosticTarget ? targetId(diagnosticTarget) : null)
+        ? lastProcessorAllocation
+        : sharedProcessorAllocation(diagnosticTarget, resources, diagnosticLedger);
       push("");
       push("— ACQUISITION ROUTE —");
       for (const line of acquisitionRouteReportLines(diagnosticTarget, resources, diagnosticLedger)) push(line);
@@ -10532,11 +10681,12 @@
       push("");
       push("— PROCESSING —");
       push(processingPlanText);
-      for (const meta of converterBuildings()) {
+      for (const meta of diagnosticAllocation.ordered) {
         const profile = processingProfileFor(meta);
         const net = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
         const memo = pausedProcessors[meta.name];
-        push(`  ${labelOf(meta)}: on ${meta.on || 0}/${meta.val || 0} · ${processorFuelReportText(meta, resources, diagnosticLedger)} · net ${fmt(net)} Wt/ea${memo ? ` · paused (${memo.reason})` : ""}`);
+        const allocationEntry = diagnosticAllocation.allocations.get(meta);
+        push(`  ${labelOf(meta)}: on ${meta.on || 0}/${meta.val || 0} · ${processorFuelReportText(allocationEntry, resources)} · net ${fmt(net)} Wt/ea${memo ? ` · paused (${memo.reason})` : ""}`);
       }
       push("");
       push("— SUBSYSTEMS —");
@@ -11442,8 +11592,8 @@
       watchNewUnlocks();
       maybeObserveStars();
       refineSurplusCatnip();
-      optimizeProcessing(resources, goal);
-      keepHealthyConvertersStable(resources);
+      const processorAllocation = optimizeProcessing(resources, goal);
+      keepHealthyConvertersStable(resources, processorAllocation);
       craftTowardTarget(resources, goal);
       // The unicorn subsystem runs BEFORE the plan executor for the same reason
       // crafting does: a sacrifice can complete a ziggurat upgrade's tears bill
@@ -12114,7 +12264,7 @@
       resetTickCache();
       return desiredProcessorState(meta, resourceMap(), new Set(), new Set(), {});
     },
-    sustainableProcessorCount(meta, ledger = {}, horizonSeconds = PROCESSOR_FUEL_HORIZON_SECONDS) {
+    sustainableProcessorCount(meta, ledger = null, horizonSeconds = PROCESSOR_FUEL_HORIZON_SECONDS) {
       resetTickCache();
       return sustainableProcessorCount(meta, resourceMap(), ledger, horizonSeconds);
     },
