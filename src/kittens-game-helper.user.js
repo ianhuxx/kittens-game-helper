@@ -865,15 +865,20 @@
   const predecessorMissionFor = (name, field = "spaceMission") => spaceProgramMetas().find((program) =>
     program && program.unlocks && Array.isArray(program.unlocks[field]) && program.unlocks[field].includes(name)) || null;
 
-  const spaceBuildingUpgradeDependency = (meta) => {
+  const spaceBuildingUpgradeSource = (meta) => {
     if (!meta || !meta.name) return null;
     for (const planet of spacePlanets()) {
       for (const source of (planet && planet.buildings) || []) {
         const targets = source && source.upgrades && source.upgrades.spaceBuilding;
-        if (Array.isArray(targets) && targets.includes(meta.name) && (Number(source.val) || 0) <= 0) return source;
+        if (Array.isArray(targets) && targets.includes(meta.name)) return source;
       }
     }
     return null;
+  };
+
+  const spaceBuildingUpgradeDependency = (meta) => {
+    const source = spaceBuildingUpgradeSource(meta);
+    return source && (Number(source.val) || 0) <= 0 ? source : null;
   };
 
   const spaceNativeAdapter = (descriptor) => {
@@ -1134,6 +1139,33 @@
   const labelOf = (meta) => {
     const live = liveMetaView(meta) || meta;
     return (live && (live.label || live.title || live.name)) || "?";
+  };
+
+  // Keep late-game plan/action wording semantically distinct. A bare `time`
+  // or target label cannot tell Void Space from Chronoforge, Transcendence
+  // upgrades from the irreversible Transcend action, or name the Space
+  // building that opened a downstream containment gate.
+  const candidateActionContext = (candidate) => {
+    if (!candidate || !candidate.meta) return "no target";
+    const label = labelOf(candidate.meta);
+    if (candidate.kind === "transcendence") return `Transcendence upgrade: ${label}`;
+    if (candidate.kind === "time") {
+      const descriptor = candidate.descriptor || timeDescriptorFor(candidate.meta);
+      const family = descriptor && descriptor.subtype === "voidspace"
+        ? "Void Space"
+        : descriptor && descriptor.subtype === "chronoforge" ? "Chronoforge" : "Time";
+      return `${family} structure: ${label}`;
+    }
+    if (candidate.kind === "space") {
+      const gateSource = spaceBuildingUpgradeSource(candidate.meta);
+      if (gateSource) return `${label} (${rawSpaceLabel(gateSource)} gate)`;
+      const gateTargets = candidate.meta.upgrades && candidate.meta.upgrades.spaceBuilding;
+      if (Array.isArray(gateTargets) && gateTargets.length) {
+        const targetLabels = gateTargets.map((name) => rawSpaceLabel(spaceMetas().find((meta) => meta && meta.name === name) || { name }));
+        return `${label} (Space gate for ${targetLabels.join(", ")})`;
+      }
+    }
+    return label;
   };
 
   const evaluate = (kind, meta, resources) => {
@@ -7362,7 +7394,7 @@
     const summary = `${decision.layer || "?"}::${targetId(preferred) || "(none)"}`;
     if (summary !== lastLoggedPlanSummary) {
       lastLoggedPlanSummary = summary;
-      const label = preferred && preferred.meta ? labelOf(preferred.meta) : "no target";
+      const label = preferred && preferred.meta ? candidateActionContext(preferred) : "no target";
       const reasonExtra = decision.scienceStorageBlocker && decision.scienceStorageBlocker.blocked
         ? ` (cap-blocked: ${labelOf(decision.scienceStorageBlocker.blocked.meta)})` : "";
       pushLog(`🧠 plan layer → ${decision.layer || "?"}: ${label}${reasonExtra}`);
@@ -7513,7 +7545,7 @@
         .slice(0, 4)
         .map(([name, amount]) => `${resTitle(resources, name)} ${fmt(amount)}`)
         .join(", ");
-      pushPlanLog(`🔒 Plan locked: ${labelOf(preferred.meta)} for ${decision.layer}; remaining deficits: ${deficits || "none"}`, 20000);
+      pushPlanLog(`🔒 Plan locked: ${candidateActionContext(preferred)} for ${decision.layer}; remaining deficits: ${deficits || "none"}`, 20000);
     }
     return preferred;
   };
@@ -9255,7 +9287,7 @@
       if (target && target.affordable && !buyBenched(targetId(target))) {
         lastAutoBuy = now;
         if (buyCandidate(target)) {
-          pushLog(`🎯 plan ${target.kind} ${labelOf(target.meta)}`);
+          pushLog(`🎯 plan ${target.kind} ${candidateActionContext(target)}`);
           buyPlanText = `Buy: plan completed — ${labelOf(target.meta)}`;
           activeTarget = null;
         } else if (noteBuyFailure(targetId(target))) {
@@ -9274,7 +9306,7 @@
       if (capRelief && !sprint) {
         lastAutoBuy = now;
         if (buyCandidate(capRelief)) {
-          pushLog(`${capRelief.kind === "upgrade" ? "⚙" : capRelief.kind === "research" ? "🔬" : "🎯"} cap relief ${capRelief.kind} ${labelOf(capRelief.meta)}`);
+          pushLog(`${capRelief.kind === "upgrade" ? "⚙" : capRelief.kind === "research" ? "🔬" : "🎯"} cap relief ${capRelief.kind} ${candidateActionContext(capRelief)}`);
           buyPlanText = `Buy: spent capped resources on ${labelOf(capRelief.meta)}`;
         } else {
           noteBuyFailure(targetId(capRelief));
@@ -9321,7 +9353,7 @@
       }
       lastAutoBuy = now;
       if (buyCandidate(ready)) {
-        pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} surplus ${ready.kind} ${labelOf(ready.meta)}`);
+        pushLog(`${ready.kind === "upgrade" ? "⚙" : ready.kind === "research" ? "🔬" : "🏗"} surplus ${ready.kind} ${candidateActionContext(ready)}`);
         buyPlanText = `Buy: ${labelOf(ready.meta)} from surplus`;
       } else {
         noteBuyFailure(targetId(ready));
@@ -9465,7 +9497,7 @@
           if (buyCandidate(candidate)) {
             boughtThisTick = true;
             worked.push(`${labelOf(candidate.meta)} built`);
-            pushLog(`🏗 parallel ${candidate.kind} ${labelOf(candidate.meta)} (rank ${index + 1}; ${labelOf(target.meta)} keeps its reserves)`);
+            pushLog(`🏗 parallel ${candidate.kind} ${candidateActionContext(candidate)} (rank ${index + 1}; ${candidateActionContext(target)} keeps its reserves)`);
           } else {
             noteBuyFailure(targetId(candidate));
           }

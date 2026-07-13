@@ -1089,7 +1089,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         check(`Containment Chamber purchased from produced antimatter (${containment.val})`, containment.val > 0);
         check(`scoped Space mutation ticks explain antimatter production and containment gate`,
           scopedExplanationFor("space:sunlifterE2E", [/Sunlifter E2E/i, /Containment Chamber E2E/i, /antimatter/i], "PlanetBuildingBtnController") &&
-          scopedExplanationFor("space:containmentChamberE2E", [/Containment Chamber E2E/i, /antimatter/i, /(?:buying|completed)/i], "PlanetBuildingBtnController"));
+          scopedExplanationFor("space:containmentChamberE2E", [/Containment Chamber E2E/i, /Heatsink E2E/i, /antimatter/i, /(?:buying|completed)/i], "PlanetBuildingBtnController"));
         check(`antimatter/containment Space purchases used only native PlanetBuilding controllers`,
           ["sunlifterE2E", "heatsinkE2E", "containmentChamberE2E"].every((id) => spies.planetBuildingPurchaseIds.includes(id)) && spies.rawSpaceManagerCalls === 0);
       }
@@ -1104,7 +1104,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       if (phase === "transcendenceUpgrade") {
         check(`native Transcendence controller purchased Black Obelisk (${st.lateGame.blackObelisk.val}; calls ${spies.transcendencePurchases})`, st.lateGame.blackObelisk.val > 0 && spies.transcendencePurchases > 0);
         check(`scoped mutation tick explains the Black Obelisk upgrade action`,
-          scopedExplanationFor("transcendence:blackObeliskE2E", [/Black Obelisk E2E/i, /(?:Plan locked|plan)/i], "TranscendenceBtnController"));
+          scopedExplanationFor("transcendence:blackObeliskE2E", [/Black Obelisk E2E/i, /Transcendence/i, /(?:Plan locked|plan)/i], "TranscendenceBtnController"));
       }
       if (phase === "armedPrestige") {
         check(`persistently armed prestige executed one checkpointed Transcend`, localStorageMock.getItem("kgh.prestigeArmed") === "1" && spies.checkpoints === 1 && spies.transcendCalls === 1 && gamePage.religion.transcendenceTier === 1);
@@ -1116,7 +1116,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
         check(`native Void Space controller purchased Cryochambers (${st.lateGame.cryochambers.val}; calls ${spies.voidPurchases})`, st.lateGame.cryochambers.val > 0 && spies.voidPurchases > 0);
         check(`Void Space purchase spent the live rare-capital bill`, res("void").value < 100 && res("karma").value < 20);
         check(`scoped mutation tick explains the Cryochambers Void Space action`,
-          scopedExplanationFor("voidspace:cryochambersE2E", [/Cryochambers E2E/i, /karma/i, /void/i], "VoidSpaceBtnController"));
+          scopedExplanationFor("voidspace:cryochambersE2E", [/Cryochambers E2E/i, /Void Space/i, /karma/i, /void/i], "VoidSpaceBtnController"));
       }
 
       if (phase === "freshLifecycle") {

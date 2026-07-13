@@ -318,47 +318,106 @@ const expressionEnd = (text, start) => {
 };
 
 const maskNoise = (text, maskStrings) => {
-  const out = [...text];
-  let quote = null;
-  let lineComment = false;
-  let blockComment = false;
-  let escaped = false;
+  // Regex/string indices are UTF-16 code-unit offsets. split("") preserves
+  // those offsets across emoji; spread syntax would collapse each surrogate
+  // pair and point later definition matches at the wrong raw-source position.
+  const out = text.split("");
+  const regexPrefixKeywords = new Set(["await", "case", "delete", "do", "else", "in", "instanceof", "new", "of", "return", "throw", "typeof", "void", "yield"]);
+  const regexCanStartAt = (index) => {
+    let cursor = index - 1;
+    while (cursor >= 0 && /\s/.test(out[cursor])) cursor -= 1;
+    if (cursor < 0) return true;
+    if (/[({[=,:;!?&|+*%^~<>-]/.test(out[cursor])) return true;
+    if (!/[A-Za-z0-9_$]/.test(out[cursor])) return false;
+    const end = cursor + 1;
+    while (cursor >= 0 && /[A-Za-z0-9_$]/.test(out[cursor])) cursor -= 1;
+    return regexPrefixKeywords.has(out.slice(cursor + 1, end).join(""));
+  };
+  const modes = [{ type: "code", templateDepth: null }];
+  const mask = (index) => {
+    if (text[index] !== "\n" && text[index] !== "\r") out[index] = " ";
+  };
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
     const next = text[index + 1];
-    if (lineComment) {
-      if (char === "\n") lineComment = false;
-      else out[index] = " ";
+    const mode = modes[modes.length - 1];
+    if (mode.type === "lineComment") {
+      if (char === "\n") modes.pop();
+      else mask(index);
       continue;
     }
-    if (blockComment) {
-      if (char !== "\n" && char !== "\r") out[index] = " ";
-      if (char === "*" && next === "/") { out[index + 1] = " "; blockComment = false; index += 1; }
+    if (mode.type === "blockComment") {
+      mask(index);
+      if (char === "*" && next === "/") { mask(index + 1); modes.pop(); index += 1; }
       continue;
     }
-    if (quote) {
-      if (maskStrings && char !== "\n" && char !== "\r") out[index] = " ";
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === quote) quote = null;
+    if (mode.type === "string") {
+      if (maskStrings) mask(index);
+      if (mode.escaped) mode.escaped = false;
+      else if (char === "\\") mode.escaped = true;
+      else if (char === mode.quote) modes.pop();
       continue;
     }
-    if (char === "/" && next === "/") { out[index] = out[index + 1] = " "; lineComment = true; index += 1; continue; }
-    if (char === "/" && next === "*") { out[index] = out[index + 1] = " "; blockComment = true; index += 1; continue; }
-    if (char === "'" || char === '"' || char === "`") {
-      quote = char;
-      if (maskStrings) out[index] = " ";
+    if (mode.type === "template") {
+      if (maskStrings) mask(index);
+      if (mode.escaped) { mode.escaped = false; continue; }
+      if (char === "\\") { mode.escaped = true; continue; }
+      if (char === "`") { modes.pop(); continue; }
+      if (char === "$" && next === "{") {
+        if (maskStrings) mask(index + 1);
+        modes.push({ type: "code", templateDepth: 1 });
+        index += 1;
+      }
+      continue;
+    }
+    if (mode.templateDepth != null) {
+      if (char === "{") mode.templateDepth += 1;
+      else if (char === "}" && --mode.templateDepth === 0) {
+        if (maskStrings) mask(index);
+        modes.pop();
+        continue;
+      }
+    }
+    if (char === "/" && next === "/") { mask(index); mask(index + 1); modes.push({ type: "lineComment" }); index += 1; continue; }
+    if (char === "/" && next === "*") { mask(index); mask(index + 1); modes.push({ type: "blockComment" }); index += 1; continue; }
+    if (char === "/" && regexCanStartAt(index)) {
+      let regexEscaped = false;
+      let inCharacterClass = false;
+      if (maskStrings) mask(index);
+      for (index += 1; index < text.length; index += 1) {
+        const regexChar = text[index];
+        if (maskStrings) mask(index);
+        if (regexEscaped) { regexEscaped = false; continue; }
+        if (regexChar === "\\") { regexEscaped = true; continue; }
+        if (regexChar === "[") { inCharacterClass = true; continue; }
+        if (regexChar === "]") { inCharacterClass = false; continue; }
+        if (regexChar === "/" && !inCharacterClass) {
+          while (/[A-Za-z]/.test(text[index + 1] || "")) { index += 1; if (maskStrings) mask(index); }
+          break;
+        }
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      if (maskStrings) mask(index);
+      modes.push({ type: "string", quote: char, escaped: false });
+      continue;
+    }
+    if (char === "`") {
+      if (maskStrings) mask(index);
+      modes.push({ type: "template", escaped: false });
     }
   }
   return out.join("");
 };
 
 const functionView = (candidateSource, name) => {
+  const code = maskNoise(candidateSource, true);
   const definition = new RegExp(`\\bconst\\s+${escapeRegex(name)}\\s*=`, "g");
-  const matches = [...candidateSource.matchAll(definition)];
+  const matches = [...code.matchAll(definition)];
   if (matches.length !== 1) return { error: `${name} must have exactly one const-arrow definition (found ${matches.length})` };
   const definitionStart = matches[0].index;
-  const arrow = candidateSource.indexOf("=>", definitionStart + matches[0][0].length);
+  const arrow = code.indexOf("=>", definitionStart + matches[0][0].length);
   if (arrow < 0) return { error: `${name} is not an arrow function` };
   let start = arrow + 2;
   while (/\s/.test(candidateSource[start] || "")) start += 1;
@@ -571,15 +630,42 @@ for (const [label, makeSabotage] of directStructuralSabotages) {
   }
 }
 
+const definitionDiscoveryFailures = [];
+const buyCandidateDefinition = functionView(source, "buyCandidate");
+if (buyCandidateDefinition.error) {
+  definitionDiscoveryFailures.push("could not locate the live buyCandidate fixture definition");
+} else {
+  const commentedLiveDefinition = source.slice(0, buyCandidateDefinition.definitionStart) +
+    "/* " + source.slice(buyCandidateDefinition.definitionStart, buyCandidateDefinition.end) + " */" +
+    source.slice(buyCandidateDefinition.end);
+  if (criticalStructureIssues(commentedLiveDefinition).length === 0) {
+    definitionDiscoveryFailures.push("entirely commented buyCandidate definition escaped structural validation");
+  }
+}
+const harmlessCommentedDuplicate = `${source}\n/* const buyCandidate = () => false; */`;
+if (criticalStructureIssues(harmlessCommentedDuplicate).length > 0) {
+  definitionDiscoveryFailures.push("harmless commented buyCandidate duplicate was counted as live");
+}
+const harmlessDiplomacyDuplicate = `${source}\n/* const manageDiplomacy = () => false; */`;
+const liveDiplomacyOwnerCount = (maskNoise(harmlessDiplomacyDuplicate, true).match(/const\s+manageDiplomacy\s*=/g) || []).length;
+if (liveDiplomacyOwnerCount !== 1) {
+  definitionDiscoveryFailures.push(`harmless commented diplomacy duplicate changed live owner count to ${liveDiplomacyOwnerCount}`);
+}
+if (definitionDiscoveryFailures.length > 0) {
+  console.error("Validator definition-discovery self-tests failed:", definitionDiscoveryFailures.join("; "));
+  process.exit(1);
+}
+
 // One executor owns all diplomacy mutations. The removed legacy trade loop
 // and global no-confirm mutation are architectural regressions, not optional
 // implementation details.
-const diplomacyOwnerDefinitions = source.match(/const\s+manageDiplomacy\s*=/g) || [];
-if (diplomacyOwnerDefinitions.length !== 1 || /\bmanageTrade\b/.test(source)) {
-  console.error(`Diplomacy ownership invariant failed: owners=${diplomacyOwnerDefinitions.length}, legacy=${/\bmanageTrade\b/.test(source)}.`);
+const liveSource = maskNoise(source, true);
+const diplomacyOwnerDefinitions = liveSource.match(/const\s+manageDiplomacy\s*=/g) || [];
+if (diplomacyOwnerDefinitions.length !== 1 || /\bmanageTrade\b/.test(liveSource)) {
+  console.error(`Diplomacy ownership invariant failed: owners=${diplomacyOwnerDefinitions.length}, legacy=${/\bmanageTrade\b/.test(liveSource)}.`);
   process.exit(1);
 }
-if (/opts\.noConfirm\s*=/.test(source)) {
+if (/opts\.noConfirm\s*=/.test(liveSource)) {
   console.error("Global confirmation settings must not be mutated; irreversible actions belong to the semantic broker.");
   process.exit(1);
 }
