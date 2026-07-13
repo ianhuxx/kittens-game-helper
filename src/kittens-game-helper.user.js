@@ -99,7 +99,11 @@
   ]);
   const SAFE_ACTION_NAME = /^[A-Za-z0-9_.-]+$/;
   const IRREVERSIBLE_ACTION_COOLDOWN_MS = 30000;
+  const IRREVERSIBLE_EXECUTION_TOKEN = Symbol("kgh-managed-prestige");
+  const PRESTIGE_RECOVERY_HORIZON_SECONDS = 6 * 60 * 60;
+  const RARE_CAPITAL_RESOURCES = new Set(["alicorn", "timeCrystal", "relic", "void", "karma", "paragon"]);
   let lastIrreversibleActionAt = 0;
+  let prestigePlanText = "Prestige: automation disarmed";
 
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -121,6 +125,8 @@
     }
     invalidatePlannerState();
     syncPrestigeArmControl();
+    prestigePlanText = `Prestige: ${armed ? "ARMED" : "OFF"} · awaiting fresh projection`;
+    if (prestigeStatusEl) prestigeStatusEl.textContent = `⚠ ${prestigePlanText}`;
     return prestigeAutomationArmed();
   };
 
@@ -252,7 +258,7 @@
     return ACTION_POLICY.FORBIDDEN;
   };
 
-  const executeSemanticAction = ({ id, policy, invoke, snapshot, verify } = {}) => {
+  const executeSemanticAction = ({ id, policy, invoke, snapshot, verify, authorizationToken } = {}) => {
     const resolvedPolicy = actionPolicyFor(id);
     const result = { ok: false, reason: "", before: null, after: null };
     if (resolvedPolicy === ACTION_POLICY.FORBIDDEN) {
@@ -270,6 +276,10 @@
     const irreversible = resolvedPolicy === ACTION_POLICY.RARE_CAPITAL || resolvedPolicy === ACTION_POLICY.AUTHORIZED_PRESTIGE;
     if (irreversible && !prestigeAutomationArmed()) {
       result.reason = "prestige automation is not armed";
+      return result;
+    }
+    if (irreversible && authorizationToken !== IRREVERSIBLE_EXECUTION_TOKEN) {
+      result.reason = "managed prestige checkpoint/revalidation required";
       return result;
     }
     const now = Date.now();
@@ -751,6 +761,72 @@
     return out;
   };
 
+  const timeDescriptorFor = (meta) => {
+    if (!meta) return null;
+    try {
+      const time = window.gamePage && window.gamePage.time;
+      if (Array.isArray(time && time.chronoforgeUpgrades) && time.chronoforgeUpgrades.some((item) => item === meta || (item && item.name === meta.name))) {
+        return { subtype: "chronoforge", meta };
+      }
+      if (Array.isArray(time && time.voidspaceUpgrades) && time.voidspaceUpgrades.some((item) => item === meta || (item && item.name === meta.name))) {
+        return { subtype: "voidspace", meta };
+      }
+    } catch (error) {
+      /* unavailable Time manager */
+    }
+    return null;
+  };
+
+  const transcendenceUpgrades = () => {
+    try {
+      const religion = window.gamePage && window.gamePage.religion;
+      return Array.isArray(religion && religion.transcendenceUpgrades) ? religion.transcendenceUpgrades : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const nativeStackableAdapter = (meta, path, label) => {
+    try {
+      const game = window.gamePage;
+      const Controller = getGlobalPath(path);
+      if (!game || typeof Controller !== "function") return { available: false, reason: `native ${label} unavailable`, prices: [] };
+      const controller = new Controller(game);
+      if (!controller || typeof controller.fetchModel !== "function") return { available: false, reason: `native ${label} model unavailable`, prices: [] };
+      const model = controller.fetchModel({ id: meta.name, controller });
+      if (!model) return { available: false, reason: `native ${label} model unavailable`, prices: [] };
+      if (typeof controller.getPrices !== "function") return { available: false, reason: `native ${label} price provider unavailable`, prices: [] };
+      const prices = controller.getPrices(model);
+      if (!Array.isArray(prices) || !prices.length) return { available: false, reason: `native ${label} prices unavailable`, prices: [] };
+      return { available: true, reason: "ready", controller, model, prices };
+    } catch (error) {
+      return { available: false, reason: `native ${label} unavailable`, prices: [] };
+    }
+  };
+
+  const transcendenceNativeAdapter = (meta) => nativeStackableAdapter(
+    meta,
+    ["classes", "ui", "TranscendenceBtnController"],
+    "TranscendenceBtnController",
+  );
+
+  const timeNativeAdapter = (meta) => {
+    const descriptor = timeDescriptorFor(meta);
+    if (!descriptor) return { available: false, reason: "Time manager membership unavailable", prices: [] };
+    const controllerName = descriptor.subtype === "voidspace" ? "VoidSpaceBtnController" : "ChronoforgeBtnController";
+    return nativeStackableAdapter(meta, ["classes", "ui", "time", controllerName], controllerName);
+  };
+
+  const transcendencePricesFor = (meta) => {
+    const adapter = transcendenceNativeAdapter(meta);
+    return adapter.available ? adapter.prices : [];
+  };
+
+  const timePricesFor = (meta) => {
+    const adapter = timeNativeAdapter(meta);
+    return adapter.available ? adapter.prices : [];
+  };
+
   // Current scaled price of a stackable meta: base × priceRatio^owned. Mirrors
   // BuildingStackableBtnController for planning/affordability; the real buy still
   // goes through the game's own controller (exact discounts) in buyViaGameController.
@@ -764,7 +840,7 @@
   };
 
   // Kinds whose "owned" count is a numeric val (vs a researched flag).
-  const VAL_BASED_KINDS = new Set(["build", "space", "time", "ziggurat"]);
+  const VAL_BASED_KINDS = new Set(["build", "space", "time", "ziggurat", "transcendence"]);
 
   // Space/time candidate is open while unlocked and (for one-time missions) not
   // already built; stackable structures stay open.
@@ -789,7 +865,8 @@
         return Array.isArray(livePrices) && livePrices.length ? livePrices : meta.prices || [];
       }
       if (kind === "space") return spacePricesFor(meta);
-      if (kind === "time") return scaledStackablePrices(meta);
+      if (kind === "time") return timePricesFor(meta);
+      if (kind === "transcendence") return transcendencePricesFor(meta);
       if ((kind === "research" || kind === "policy") && window.gamePage.science.getPrices) {
         return window.gamePage.science.getPrices(meta) || meta.prices || [];
       }
@@ -1407,6 +1484,7 @@
       goalFrontier: null,
       goalClosure: null,
       goalSupport: null,
+      rareCapitalFloors: new Map(),
       fxRefreshed: new WeakSet(),
     };
   };
@@ -3797,6 +3875,13 @@
       /* ignore */
     }
     try {
+      for (const u of transcendenceUpgrades()) {
+        if (isOpen(u) && transcendenceNativeAdapter(u).available) candidates.push({ kind: "transcendence", weight: 3, meta: u });
+      }
+    } catch (error) {
+      /* ignore */
+    }
+    try {
       for (const u of zigguratUpgrades()) {
         if (zigguratUpgradeVisible(u)) candidates.push({ kind: "ziggurat", weight: 3, meta: u });
       }
@@ -3821,7 +3906,7 @@
     }
     try {
       for (const t of timeMetas()) {
-        if (spaceTimeOpen(t)) candidates.push({ kind: "time", weight: 2, meta: t });
+        if (spaceTimeOpen(t) && timeNativeAdapter(t).available) candidates.push({ kind: "time", weight: 2, meta: t, descriptor: timeDescriptorFor(t) });
       }
     } catch (error) {
       /* ignore */
@@ -5425,6 +5510,7 @@
       if (kind === "build") return buildingByName(name);
       if (kind === "upgrade") return (window.gamePage.workshop.upgrades || []).find((u) => u.name === name) || null;
       if (kind === "religion") return religionUpgrades().find((u) => u.name === name) || null;
+      if (kind === "transcendence") return transcendenceUpgrades().find((u) => u.name === name) || null;
       if (kind === "ziggurat") return zigguratUpgrades().find((u) => u.name === name) || null;
       if (kind === "space") return spaceMetas().find((m) => m.name === name) || null;
       if (kind === "time") return timeMetas().find((m) => m.name === name) || null;
@@ -5495,7 +5581,7 @@
     }
     if (directStorageBlockers(candidate.kind, candidate.meta, resources).length > 0 || isStorageMeta(candidate.meta)) return STRATEGIC_LAYERS.storage;
     if (candidate.kind === "build" && ["hut", "logHouse", "mansion"].includes(candidate.meta && candidate.meta.name)) return STRATEGIC_LAYERS.housing;
-    if (candidate.kind === "religion" || candidate.kind === "ziggurat" || candidate.kind === "space" || candidate.kind === "time" ||
+    if (candidate.kind === "religion" || candidate.kind === "ziggurat" || candidate.kind === "transcendence" || candidate.kind === "space" || candidate.kind === "time" ||
         (candidate.kind === "build" && ["temple", "ziggurat"].includes(candidate.meta && candidate.meta.name))) return STRATEGIC_LAYERS.longProject;
     return STRATEGIC_LAYERS.economy;
   };
@@ -6269,7 +6355,10 @@
       }
       for (const u of religionUpgrades()) note("religion", u, religionUpgradeVisible(u));
       for (const u of zigguratUpgrades()) note("ziggurat", u, zigguratUpgradeVisible(u));
+      for (const u of transcendenceUpgrades()) note("transcendence", u, isOpen(u) && transcendenceNativeAdapter(u).available);
       for (const b of buildingMetas()) note("build", b, !!b && b.unlocked !== false);
+      for (const descriptor of spaceDescriptors()) note("space", descriptor.meta, descriptor.gateState.open && !descriptor.completionState.purchased);
+      for (const meta of timeMetas()) note("time", meta, spaceTimeOpen(meta) && timeNativeAdapter(meta).available);
       try {
         for (const res of window.gamePage.resPool.resources || []) note("resource", { ...res, label: res.title || res.name }, !!res && res.unlocked !== false);
         const crafts = window.gamePage.workshop && window.gamePage.workshop.crafts;
@@ -7377,13 +7466,14 @@
     research: "SCIENCE",
     upgrade: "WORKSHOP UPGRADE",
     religion: "RELIGION UPGRADE",
+    transcendence: "TRANSCENDENCE UPGRADE",
     policy: "POLICY",
     time: "TIME STRUCTURE",
     festival: "FESTIVAL",
     stage: "BUILDING STAGE",
   };
 
-  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", policy: "📜", space: "🚀", time: "⏳", festival: "🎉", stage: "⇄" };
+  const KIND_ICONS = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", transcendence: "✦", policy: "📜", space: "🚀", time: "⏳", festival: "🎉", stage: "⇄" };
 
   // Space missions (orbitalLaunch, moonMission, ...) and planet buildings
   // (Cath's Satellite, Space Elevator, ...) share the "space" candidate kind
@@ -7629,6 +7719,12 @@
         opts: (name) => ({ id: name }),
       };
     }
+    if (kind === "transcendence") {
+      return {
+        path: ["classes", "ui", "TranscendenceBtnController"],
+        opts: (name) => ({ id: name }),
+      };
+    }
     if (kind === "ziggurat") {
       return {
         path: ["com", "nuclearunicorn", "game", "ui", "ZigguratBtnController"],
@@ -7651,10 +7747,11 @@
         : { path: ["com", "nuclearunicorn", "game", "ui", "SpaceProgramBtnController"], opts: (name) => ({ id: name }) };
     }
     if (kind === "time") {
-      // Chronoforge controller for CFU; Void-space metas fall through to the
-      // reservation-safe raw-metadata buy path (which pays prices + increments val).
+      const descriptor = timeDescriptorFor(meta);
+      if (!descriptor) return null;
+      const controllerName = descriptor.subtype === "voidspace" ? "VoidSpaceBtnController" : "ChronoforgeBtnController";
       return {
-        path: ["classes", "ui", "time", "ChronoforgeBtnController"],
+        path: ["classes", "ui", "time", controllerName],
         opts: (name) => ({ id: name }),
       };
     }
@@ -7788,14 +7885,6 @@
         () => game.bld && typeof game.bld.construct === "function" && game.bld.construct(name),
       );
     }
-    if (candidate.kind === "time") {
-      attempts.push(
-        () => game.time && typeof game.time.build === "function" && game.time.build(name),
-        () => game.time && typeof game.time.build === "function" && game.time.build(candidate.meta),
-        () => game.time && typeof game.time.buy === "function" && game.time.buy(name),
-        () => game.time && typeof game.time.buy === "function" && game.time.buy(candidate.meta),
-      );
-    }
     if (ALLOW_RAW_METADATA_BUY_FALLBACK) {
       attempts.push(() => buyViaRawMetadata(candidate));
     }
@@ -7866,6 +7955,59 @@
       addLedgerNeed(ledger, price.name, price.val * baseUnits);
       addCraftClosureToLedger(ledger, price.name, price.val * baseUnits, resources, depth + 1);
     }
+  };
+
+  const rareCapitalCandidates = (target) => {
+    const candidates = [];
+    const add = (kind, meta) => {
+      if (meta && meta.name && !isDeniedKey(meta.name)) candidates.push({ kind, meta });
+    };
+    if (target && target.meta) add(target.kind, target.meta);
+    if (lastStrategicDecision && lastStrategicDecision.target && lastStrategicDecision.target !== target) {
+      add(lastStrategicDecision.target.kind, lastStrategicDecision.target.meta);
+    }
+    for (const item of readQueue()) {
+      const meta = lookupMetaById(item.id);
+      const [kind] = String(item.id).split(":");
+      if (meta && !queueItemDone(item)) add(kind, meta);
+    }
+    try { for (const meta of buildingMetas()) if (meta && meta.unlocked !== false) add("build", meta); } catch (error) { /* ignore */ }
+    try { for (const meta of techList()) if (isOpen(meta)) add("research", meta); } catch (error) { /* ignore */ }
+    try { for (const meta of window.gamePage.workshop.upgrades || []) if (isOpen(meta)) add("upgrade", meta); } catch (error) { /* ignore */ }
+    try { for (const meta of religionUpgrades()) if (religionUpgradeVisible(meta)) add("religion", meta); } catch (error) { /* ignore */ }
+    try { for (const meta of zigguratUpgrades()) if (zigguratUpgradeVisible(meta)) add("ziggurat", meta); } catch (error) { /* ignore */ }
+    try { for (const meta of transcendenceUpgrades()) if (isOpen(meta) && transcendenceNativeAdapter(meta).available) add("transcendence", meta); } catch (error) { /* ignore */ }
+    try {
+      for (const descriptor of spaceDescriptors()) {
+        if (descriptor.gateState.open && (descriptor.subtype !== "mission" || !descriptor.completionState.purchased)) add("space", descriptor.meta);
+      }
+    } catch (error) { /* ignore */ }
+    try { for (const meta of timeMetas()) if (spaceTimeOpen(meta) && timeNativeAdapter(meta).available) add("time", meta); } catch (error) { /* ignore */ }
+    const unique = new Map();
+    for (const candidate of candidates) unique.set(`${candidate.kind}:${candidate.meta.name}`, candidate);
+    return [...unique.values()];
+  };
+
+  const rareCapitalFloor = (resources, target = null) => {
+    const cacheKey = target && target.meta ? `${target.kind}:${target.meta.name}` : "(none)";
+    if (tickCache.rareCapitalFloors && tickCache.rareCapitalFloors.has(cacheKey)) {
+      return { ...tickCache.rareCapitalFloors.get(cacheKey) };
+    }
+    const floor = {};
+    for (const candidate of rareCapitalCandidates(target)) {
+      for (const cost of pricesFor(candidate.kind, candidate.meta)) {
+        if (!cost || !RARE_CAPITAL_RESOURCES.has(cost.name) || !(cost.val > 0)) continue;
+        const have = resValueOf(resources, cost.name);
+        let reachable = have >= cost.val;
+        if (!reachable) {
+          const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
+          reachable = !!route.reachable && Number.isFinite(route.eta);
+        }
+        if (reachable) floor[cost.name] = Math.max(floor[cost.name] || 0, cost.val);
+      }
+    }
+    if (tickCache.rareCapitalFloors) tickCache.rareCapitalFloors.set(cacheKey, { ...floor });
+    return floor;
   };
 
   const buildTargetLedger = (target, resources) => {
@@ -7987,6 +8129,11 @@
     mergeLedger(out, unicornPathReservationLedger(resources), "unicorn path");
     mergeLedger(out, pendingPolicyReservationLedger(resources), "policy choice");
     mergeLedger(out, survivalReservationLedger(resources), "survival");
+    for (const [name, amount] of Object.entries(rareCapitalFloor(resources, target))) {
+      out.reserved[name] = Math.max(out.reserved[name] || 0, amount);
+      out.critical.add(name);
+      (out.sources[name] || (out.sources[name] = [])).push("rare capital floor");
+    }
     return out;
   };
 
@@ -8111,24 +8258,11 @@
         return;
       }
 
-      const ledger = buildTargetLedger(target, resources);
-      // A redirected sprint's chain stays reserved against surplus/cap-relief
-      // buys even though the plan target is the producer building.
-      const sprintChain = sprintRedirectChainLedger(resources, target);
-      if (sprintChain) {
-        for (const [name, amount] of Object.entries(sprintChain.reserved)) {
-          ledger.reserved[name] = Math.max(ledger.reserved[name] || 0, amount);
-        }
-        for (const name of sprintChain.critical) ledger.critical.add(name);
-      }
+      const ledger = buildReservationLedger(target, resources);
       // The pending exclusive policy's bill is culture-chain state: cap relief
       // and surplus buys below must leave that bank alone while it accrues.
       // Amounts only — the policy save is a bank hold like the unicorn path,
       // not a hard chain lock, so ledger.critical stays the target's own chain.
-      const policyHold = pendingPolicyReservationLedger(resources, goalKey);
-      for (const [name, amount] of Object.entries(policyHold.reserved)) {
-        ledger.reserved[name] = Math.max(ledger.reserved[name] || 0, amount);
-      }
       const reserved = ledger.reserved;
       const capRelief = findCapReliefPurchase(resources, goalKey, target, reserved);
       if (capRelief && !sprint) {
@@ -9167,7 +9301,227 @@
         ...[...new Set(rejected)].slice(0, 3),
       ]);
     }
-    return routes.sort((a, b) => acquisitionRoutePriority(a) - acquisitionRoutePriority(b) || a.eta - b.eta)[0];
+    const rootKinds = seen.size === 0 && Array.isArray(context.rootRouteKinds)
+      ? new Set(context.rootRouteKinds)
+      : null;
+    const eligibleRoutes = rootKinds ? routes.filter((route) => rootKinds.has(route.kind)) : routes;
+    if (!eligibleRoutes.length) {
+      return blockedAcquisitionPath(resources, name, requested, [
+        `no ${[...rootKinds].join("/")} acquisition path for ${resTitle(resources, name)}`,
+      ]);
+    }
+    return eligibleRoutes.sort((a, b) => acquisitionRoutePriority(a) - acquisitionRoutePriority(b) || a.eta - b.eta)[0];
+  };
+
+  const alicornSacrificeAdapter = () => {
+    try {
+      const button = window.gamePage && window.gamePage.religionTab && window.gamePage.religionTab.sacrificeAlicornsBtn;
+      const controller = button && button.controller;
+      const model = button && button.model;
+      if (!controller || !model || typeof controller.buyItem !== "function") {
+        return { available: false, reason: "native alicorn sacrifice button unavailable" };
+      }
+      const alicornPrice = (model.prices || []).find((price) => price && price.name === "alicorn");
+      const gainFn = controller.controllerOpts && controller.controllerOpts.gainMultiplier;
+      if (!alicornPrice || alicornPrice.val !== 25 || typeof gainFn !== "function") {
+        return { available: false, reason: "native alicorn sacrifice price/gain unavailable" };
+      }
+      const expectedGain = Number(gainFn.call(controller));
+      if (!(expectedGain > 0)) return { available: false, reason: "native alicorn sacrifice gain unavailable" };
+      return { available: true, reason: "ready", button, controller, model, price: alicornPrice.val, expectedGain };
+    } catch (error) {
+      return { available: false, reason: "native alicorn sacrifice button unavailable" };
+    }
+  };
+
+  const prestigeSnapshot = () => {
+    const game = window.gamePage || {};
+    const religion = game.religion || {};
+    const resources = resourceMap();
+    return {
+      worship: Number(religion.faith) || 0,
+      epiphany: Number(religion.faithRatio) || 0,
+      tier: Number(religion.transcendenceTier) || 0,
+      alicorn: resValueOf(resources, "alicorn"),
+      timeCrystal: resValueOf(resources, "timeCrystal"),
+    };
+  };
+
+  const transcendenceEpiphanyFloor = () => {
+    let floor = 0;
+    for (const meta of transcendenceUpgrades()) {
+      if (!isOpen(meta)) continue;
+      for (const price of transcendencePricesFor(meta)) {
+        if (price && (price.name === "epiphany" || price.name === "faithRatio")) floor = Math.max(floor, Number(price.val) || 0);
+      }
+    }
+    return floor;
+  };
+
+  const prestigeProjection = (resources, target = null) => {
+    const game = window.gamePage || {};
+    const religion = game.religion || {};
+    const worship = Number(religion.faith) || 0;
+    const epiphany = Number(religion.faithRatio) || 0;
+    const tier = Number(religion.transcendenceTier) || 0;
+    const transcend = { available: false, funded: false, ready: false, nextPrice: Infinity, retainedFloor: 0, remaining: epiphany, reason: "native Transcend unavailable" };
+    if (typeof religion._getTranscendNextPrice === "function" && typeof religion.transcend === "function") {
+      const nextPrice = Number(religion._getTranscendNextPrice());
+      const retainedFloor = transcendenceEpiphanyFloor();
+      const remaining = epiphany - nextPrice;
+      transcend.available = Number.isFinite(nextPrice) && nextPrice > 0;
+      transcend.nextPrice = nextPrice;
+      transcend.retainedFloor = retainedFloor;
+      transcend.remaining = remaining;
+      transcend.funded = transcend.available && epiphany > nextPrice && remaining >= retainedFloor;
+      transcend.ready = transcend.funded;
+      transcend.reason = !transcend.available ? "native next-tier price unavailable"
+        : epiphany <= nextPrice ? `need ${fmt(nextPrice - epiphany)} epiphany for next tier`
+        : remaining < retainedFloor ? `retained upgrade floor ${fmt(retainedFloor)} epiphany`
+        : `ready for tier ${tier + 1}; retains ${fmt(remaining)} epiphany`;
+    }
+
+    const adore = { available: false, ready: false, gain: 0, recoverySeconds: Infinity, reason: "native Adore projection unavailable" };
+    if (typeof religion.getApocryphaResetBonus === "function" && typeof religion.resetFaith === "function") {
+      const gain = Number(religion.getApocryphaResetBonus(1.01));
+      const solarRatio = typeof religion.getSolarRevolutionRatio === "function" ? Math.max(0, Number(religion.getSolarRevolutionRatio()) || 0) : 0;
+      const boostedFaithRate = Math.max(0, productionFor("faith"));
+      // Adore removes the accumulated worship that powers Solar Revolution.
+      // The live rate is therefore temporarily boosted and cannot be used as
+      // the post-Adore rebuild rate. Remove that multiplier and project from
+      // the conservative unboosted rate while Solar Revolution rebuilds.
+      const recoveryFaithRate = boostedFaithRate / (1 + solarRatio);
+      const recoverySeconds = solarRatio > 0 ? (recoveryFaithRate > 0 ? worship / recoveryFaithRate : Infinity) : 0;
+      const pendingFaith = nextFaithReligionUpgrade(resources);
+      adore.available = Number.isFinite(gain);
+      adore.gain = gain;
+      adore.recoverySeconds = recoverySeconds;
+      adore.ready = adore.available && gain > 0 && !pendingFaith && recoverySeconds <= PRESTIGE_RECOVERY_HORIZON_SECONDS;
+      adore.reason = !(gain > 0) ? "native projected epiphany gain is not positive"
+        : pendingFaith ? `pending faith purchase ${labelOf(pendingFaith.meta)}`
+        : recoverySeconds > PRESTIGE_RECOVERY_HORIZON_SECONDS ? `Solar Revolution recovery ${formatEta(recoverySeconds)} exceeds horizon`
+        : `projects +${fmt(gain)} epiphany; Solar Revolution recovery ${formatEta(recoverySeconds)}`;
+    }
+
+    const alicorn = { available: false, applicable: false, ready: false, deficit: 0, floor: 0, batchCost: 25, batchesNeeded: 0, sequenceCost: 0, sequenceGain: 0, expectedGain: 0, reason: "no active time-crystal deficit" };
+    const tcCost = target && target.meta && pricesFor(target.kind, target.meta)
+      .find((price) => price && price.name === "timeCrystal" && price.val > resValueOf(resources, "timeCrystal"));
+    if (tcCost) {
+      const adapter = alicornSacrificeAdapter();
+      const deficit = tcCost.val - resValueOf(resources, "timeCrystal");
+      const floor = rareCapitalFloor(resources, target).alicorn || 0;
+      const alicorns = resValueOf(resources, "alicorn");
+      const timeCrystal = getRes(resources, "timeCrystal");
+      const outputHeadroom = timeCrystal && timeCrystal.maxValue > 0 ? Math.max(0, timeCrystal.maxValue - (timeCrystal.value || 0)) : Infinity;
+      // The authoritative graph normally prefers passive production by route
+      // class. Prestige policy must compare viable source ETAs explicitly so a
+      // funded Leviathan trade cannot be hidden behind a very slow trickle.
+      const sourceRoutes = [
+        acquisitionPathFor(resources, "timeCrystal", tcCost.val, { finalPurchase: true, rootRouteKinds: ["passive"] }),
+        acquisitionPathFor(resources, "timeCrystal", tcCost.val, { finalPurchase: true, rootRouteKinds: ["trade"] }),
+      ].filter((route) => route.reachable && Number.isFinite(route.eta));
+      const fasterRoute = sourceRoutes.sort((a, b) => a.eta - b.eta)[0] || null;
+      const fasterSourceAvailable = !!fasterRoute && fasterRoute.eta <= PRESTIGE_RECOVERY_HORIZON_SECONDS;
+      const batchesNeeded = adapter.available ? Math.max(1, Math.ceil(deficit / adapter.expectedGain)) : 0;
+      const sequenceCost = batchesNeeded * (adapter.price || 0);
+      const sequenceGain = batchesNeeded * (adapter.expectedGain || 0);
+      alicorn.available = adapter.available;
+      alicorn.applicable = true;
+      alicorn.deficit = deficit;
+      alicorn.floor = floor;
+      alicorn.batchesNeeded = batchesNeeded;
+      alicorn.sequenceCost = sequenceCost;
+      alicorn.sequenceGain = sequenceGain;
+      alicorn.expectedGain = adapter.expectedGain || 0;
+      alicorn.ready = adapter.available && deficit > 0 && !fasterSourceAvailable && outputHeadroom >= sequenceGain && alicorns >= sequenceCost && alicorns - sequenceCost >= floor;
+      alicorn.reason = !adapter.available ? adapter.reason
+        : fasterSourceAvailable ? `${fasterRoute.kind === "trade" && fasterRoute.race ? labelOf(fasterRoute.race) : fasterRoute.kind} time-crystal route is faster (${formatEta(fasterRoute.eta)})`
+        : outputHeadroom < sequenceGain ? `time-crystal output headroom ${fmt(outputHeadroom)}/${fmt(sequenceGain)} for ${batchesNeeded} batch${batchesNeeded === 1 ? "" : "es"}`
+        : alicorns < sequenceCost ? `need ${fmt(sequenceCost - alicorns)} more alicorns for complete ${batchesNeeded}-batch sequence`
+        : alicorns - sequenceCost < floor ? `protected alicorn floor ${fmt(floor)} would be crossed by complete ${batchesNeeded}-batch sequence`
+        : `${batchesNeeded} batch${batchesNeeded === 1 ? "" : "es"} planned; execute one ${fmt(adapter.price)}-alicorn batch now for measured +${fmt(adapter.expectedGain)}`;
+    }
+
+    const cooldown = Math.max(0, IRREVERSIBLE_ACTION_COOLDOWN_MS - (Date.now() - lastIrreversibleActionAt)) / 1000;
+    const status = `${prestigeAutomationArmed() ? "ARMED" : "OFF"} · Transcend ${transcend.reason} · Adore ${adore.reason} · Alicorn ${alicorn.reason}${cooldown > 0 ? ` · cooldown ${formatEta(cooldown)}` : ""}`;
+    return { transcend, adore, alicorn, status };
+  };
+
+  const createNativeCheckpoint = () => {
+    const game = window.gamePage;
+    if (!game || typeof game.save !== "function") throw new Error("native checkpoint API unavailable");
+    if (game.save() === false) throw new Error("native checkpoint failed");
+  };
+
+  const setPrestigePlanText = (text) => {
+    prestigePlanText = text;
+    if (prestigeStatusEl) prestigeStatusEl.textContent = `⚠ ${text}`;
+  };
+
+  const managePrestige = (resources, target = null) => {
+    const projection = prestigeProjection(resources, target);
+    setPrestigePlanText(`Prestige: ${projection.status}`);
+    if (!prestigeAutomationArmed()) return false;
+    let action = null;
+    if (projection.transcend.ready) action = "transcend";
+    else if (projection.alicorn.applicable) action = projection.alicorn.ready ? "sacrificeAlicorns" : null;
+    else if (projection.adore.ready) action = "adore";
+    if (!action) return false;
+
+    let expected = null;
+    let freshBefore = null;
+    const result = executeSemanticAction({
+      id: action,
+      policy: action === "sacrificeAlicorns" ? ACTION_POLICY.RARE_CAPITAL : ACTION_POLICY.AUTHORIZED_PRESTIGE,
+      authorizationToken: IRREVERSIBLE_EXECUTION_TOKEN,
+      snapshot: prestigeSnapshot,
+      invoke: () => {
+        createNativeCheckpoint();
+        resetTickCache();
+        const freshResources = resourceMap();
+        const fresh = prestigeProjection(freshResources, target);
+        const freshAction = action === "transcend" ? fresh.transcend : action === "adore" ? fresh.adore : fresh.alicorn;
+        if (!freshAction.ready) throw new Error(`fresh ${action} revalidation failed: ${freshAction.reason}`);
+        freshBefore = prestigeSnapshot();
+        if (action === "transcend") {
+          expected = { cost: fresh.transcend.nextPrice };
+          window.gamePage.religion.transcend();
+        } else if (action === "adore") {
+          expected = { gain: fresh.adore.gain };
+          window.gamePage.religion.resetFaith(1.01, false);
+        } else {
+          const adapter = alicornSacrificeAdapter();
+          if (!adapter.available) throw new Error(adapter.reason);
+          expected = { cost: adapter.price, gain: adapter.expectedGain };
+          const bought = adapter.controller.buyItem(adapter.model, {});
+          if (!bought || !bought.itemBought) throw new Error("native alicorn sacrifice refused the batch");
+        }
+      },
+      verify: (before, after) => {
+        before = freshBefore || before;
+        if (!before || !after || !expected) return false;
+        if (action === "transcend") {
+          return after.tier === before.tier + 1 && Math.abs(after.epiphany - (before.epiphany - expected.cost)) < 1e-9;
+        }
+        if (action === "adore") {
+          return after.tier === before.tier && Math.abs(after.epiphany - (before.epiphany + expected.gain)) < 1e-9 && after.worship < before.worship;
+        }
+        return Math.abs(after.alicorn - (before.alicorn - expected.cost)) < 1e-9 && Math.abs(after.timeCrystal - (before.timeCrystal + expected.gain)) < 1e-9;
+      },
+    });
+    if (freshBefore) result.before = freshBefore;
+    if (!result.ok) {
+      setPrestigePlanText(`Prestige: ${action} blocked · ${result.reason}`);
+      pushLog(`⚠ Prestige ${action} refused after checkpoint: ${result.reason}`);
+      return false;
+    }
+    const measured = action === "transcend" ? `tier ${result.before.tier}→${result.after.tier}, epiphany ${fmt(result.before.epiphany)}→${fmt(result.after.epiphany)}`
+      : action === "adore" ? `epiphany +${fmt(result.after.epiphany - result.before.epiphany)}, worship ${fmt(result.before.worship)}→${fmt(result.after.worship)}`
+      : `alicorn ${fmt(result.before.alicorn)}→${fmt(result.after.alicorn)}, time crystals +${fmt(result.after.timeCrystal - result.before.timeCrystal)}`;
+    pushLog(`⚠ Prestige ${action}: ${measured} · checkpointed`);
+    setPrestigePlanText(`Prestige: ${action} executed · ${measured} · cooldown active`);
+    invalidatePlannerState();
+    return true;
   };
 
   const acquisitionRoutesForTarget = (target, resources) => {
@@ -9781,6 +10135,8 @@
       push(`Leader: ${leaderPlanText}`);
       push(`Reserve: ${reservePlanText}`);
       push(`Religion: ${religionPlanText}`);
+      const prestige = prestigeProjection(resources, getTargetCached(resources, goal));
+      push(`Prestige: ${prestige.status}`);
       push(`Unicorns: ${unicornPlanText}`);
       try {
         for (const line of (getUnicornPlanCached(resources).summary || []).slice(0, 4)) push(`  ${line}`);
@@ -9828,6 +10184,33 @@
         else push("  (no space content reached yet)");
       } catch (error) {
         push("  (space census unavailable)");
+      }
+      push("");
+      push("— RELIGION LATE GAME (Transcendence upgrades) —");
+      try {
+        const upgrades = transcendenceUpgrades();
+        if (!upgrades.length) push("  (no Transcendence upgrades exposed)");
+        for (const meta of upgrades) {
+          const adapter = transcendenceNativeAdapter(meta);
+          const status = meta.unlocked === false ? "locked" : adapter.available ? formatPriceList(resources, "transcendence", meta) : adapter.reason;
+          push(`  ${labelOf(meta)} ×${fmt(meta.val || 0)} · ${status}`);
+        }
+      } catch (error) {
+        push("  (Transcendence census unavailable)");
+      }
+      push("");
+      push("— TIME (Chronoforge · Void Space) —");
+      try {
+        const upgrades = timeMetas();
+        if (!upgrades.length) push("  (no Time structures exposed)");
+        for (const meta of upgrades) {
+          const descriptor = timeDescriptorFor(meta);
+          const adapter = timeNativeAdapter(meta);
+          const family = descriptor && descriptor.subtype === "voidspace" ? "Void Space" : "Chronoforge";
+          push(`  ${family} | ${labelOf(meta)} ×${fmt(meta.val || 0)} · ${meta.unlocked === false ? "locked" : adapter.available ? formatPriceList(resources, "time", meta) : adapter.reason}`);
+        }
+      } catch (error) {
+        push("  (Time census unavailable)");
       }
       push("");
       push("— TOP CANDIDATES —");
@@ -10390,6 +10773,7 @@
   let processingEl;
   let reserveStatusEl;
   let religionEl;
+  let prestigeStatusEl;
   let unicornEl;
   let festivalEl;
   let diplomacyEl;
@@ -10408,7 +10792,7 @@
 
   // Human label for a queued targetId ("build:magneto" → "🏗 Magneto"), resolved
   // against the live candidate when possible so it shows the game's own name.
-  const KIND_QUEUE_ICON = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", space: "🚀", time: "⏳", policy: "📜" };
+  const KIND_QUEUE_ICON = { build: "🏗", research: "🔬", upgrade: "⚙", religion: "☀", transcendence: "✦", space: "🚀", time: "⏳", policy: "📜" };
   const queueItemLabel = (id, candidates) => {
     const candidate = findCandidateById(candidates || [], id);
     const [kind, name] = id.split(":");
@@ -10419,8 +10803,8 @@
   // The queue picker is sorted by KIND then NAME — a fixed, browsable order.
   // Sorting by live score (the old behavior) reshuffled the list every tick,
   // which made the dropdown impossible to scan while it was open (v2.14.0).
-  const QUEUE_KIND_ORDER = ["build", "research", "upgrade", "religion", "space", "time"];
-  const QUEUE_KIND_GROUP = { build: "🏗 Buildings", research: "🔬 Research", upgrade: "⚙ Workshop", religion: "☀ Religion", space: "🚀 Space", time: "⏳ Time" };
+  const QUEUE_KIND_ORDER = ["build", "research", "upgrade", "religion", "transcendence", "space", "time"];
+  const QUEUE_KIND_GROUP = { build: "🏗 Buildings", research: "🔬 Research", upgrade: "⚙ Workshop", religion: "☀ Religion", transcendence: "✦ Transcendence", space: "🚀 Space", time: "⏳ Time" };
   const queuePickerEntries = (resources, goalKey) => {
     const candidates = getCandidatesCached(resources, goalKey);
     const queued = new Set(readQueue().map((item) => item.id));
@@ -10608,6 +10992,7 @@
     if (processingEl) processingEl.textContent = "";
     if (reserveStatusEl) reserveStatusEl.textContent = "";
     if (religionEl) religionEl.textContent = "";
+    if (prestigeStatusEl) prestigeStatusEl.textContent = "";
     if (festivalEl) festivalEl.textContent = "";
     if (diplomacyEl) diplomacyEl.textContent = "";
     if (policyEl) policyEl.textContent = "";
@@ -10663,7 +11048,9 @@
       craftTowardParallelCandidates(resources, goal);
       resetTickCache();
       resources = resourceMap();
-      managePraise(resources);
+      const prestigeTarget = getTargetCached(resources, goal);
+      const prestigeActed = managePrestige(resources, prestigeTarget);
+      if (!prestigeActed) managePraise(resources);
       // Purchases can change resource stocks, caps, unlocks and per-tick effects;
       // re-read before diplomacy/jobs so later decisions are based on the board
       // after the buy, not on the planning snapshot from before it.
@@ -10705,6 +11092,7 @@
       if (processingEl) processingEl.textContent = `⚙ ${processingPlanText}`;
       if (reserveStatusEl) reserveStatusEl.textContent = `🛡 ${reservePlanText}`;
       if (religionEl) religionEl.textContent = `☀ ${religionPlanText}`;
+      if (prestigeStatusEl) prestigeStatusEl.textContent = `⚠ ${prestigePlanText}`;
       if (unicornEl) unicornEl.textContent = `🦄 ${unicornPlanText}`;
       if (festivalEl) festivalEl.textContent = `🎉 ${festivalPlanText}`;
       if (diplomacyEl) diplomacyEl.textContent = `🤝 ${diplomacyPlanText}`;
@@ -10884,6 +11272,7 @@
 
       '<details class="kgh-details"><summary>Subsystems &amp; automation details</summary><div class="kgh-details-body">',
       '<button type="button" class="kgh-prestige-arm" style="cursor:pointer;border-radius:6px;border:1px solid #ffffff22;padding:4px;color:var(--kgh-text)" title="Explicitly authorize Transcend, Adore, and alicorn sacrifice automation">Prestige automation: OFF</button>',
+      '<small class="kgh-prestige-status" style="color:#ffb8a8">Prestige: automation disarmed</small>',
       '<small class="kgh-note"></small>',
       '<small class="kgh-jobs" style="color:#f3c37b">…</small>',
       '<small class="kgh-buy" style="color:#b8e2ff">…</small>',
@@ -10928,6 +11317,7 @@
     processingEl = box.querySelector(".kgh-processing");
     reserveStatusEl = box.querySelector(".kgh-reserve");
     religionEl = box.querySelector(".kgh-religion");
+    prestigeStatusEl = box.querySelector(".kgh-prestige-status");
     unicornEl = box.querySelector(".kgh-unicorn");
     festivalEl = box.querySelector(".kgh-festival");
     diplomacyEl = box.querySelector(".kgh-diplomacy");
@@ -11037,6 +11427,21 @@
     executeSemanticAction,
     prestigeAutomationArmed,
     setPrestigeAutomationArmed,
+    transcendenceUpgrades,
+    timeDescriptorFor,
+    timePricesFor,
+    rareCapitalFloor(target = null) {
+      resetTickCache();
+      return rareCapitalFloor(resourceMap(), target);
+    },
+    prestigeProjection(target = null) {
+      resetTickCache();
+      return prestigeProjection(resourceMap(), target);
+    },
+    managePrestige(target = null) {
+      resetTickCache();
+      return managePrestige(resourceMap(), target);
+    },
     selectStrategicTarget(goalKey = getGoal()) {
       activePlanSnapshot = { cycleId: -1, target: undefined };
       resetTickCache();

@@ -243,6 +243,19 @@ const religionUpgrades = [
   },
 ];
 
+// Task 5 late-game adapters start locked so the long-standing early/midgame
+// fixtures remain unchanged. The focused Task 5 block opens them explicitly.
+const transcendenceUpgrades = [
+  { name: "blackObeliskT5", label: "Black Obelisk T5", unlocked: false, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "relic", val: 10 }], effects: { solarRevolutionLimit: 0.05 } },
+  { name: "transcend", label: "Transcend raw action", unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 1 }], effects: {} },
+];
+const chronoforgeUpgrades = [
+  { name: "temporalBatteryT5", label: "Temporal Battery T5", unlocked: false, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "timeCrystal", val: 5 }], effects: { temporalFluxMax: 750 } },
+];
+const voidspaceUpgrades = [
+  { name: "cryochambersT5", label: "Cryochambers T5", unlocked: false, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "karma", val: 9 }, { name: "void", val: 100 }], effects: { maxKittens: 1 } },
+];
+
 const J = (name, title, value) => ({ name, title, unlocked: true, value });
 const jobs = [
   J("woodcutter", "Woodcutter", 2),
@@ -268,6 +281,16 @@ let festivalCalls = 0;
 let tradeCalls = 0;
 const diplomacyApiCalls = [];
 let sacrificeChunks = 0; // 2500-unicorn batches converted to tears
+
+let transcendenceControllerCalls = 0;
+let chronoforgeControllerCalls = 0;
+let voidspaceControllerCalls = 0;
+let rawTimeManagerCalls = 0;
+let checkpointCalls = 0;
+let transcendCalls = 0;
+let adoreCalls = 0;
+let alicornSacrificeCalls = 0;
+let nativeConfirmAccept = true;
 
 const calendar = {
   festivalDays: 0,
@@ -383,6 +406,12 @@ const pay = (prices = []) => {
 
 const gamePage = {
   opts: { noConfirm: false },
+  ui: {
+    confirm(title, message, callbackOk, callbackCancel) {
+      if (nativeConfirmAccept) callbackOk();
+      else if (callbackCancel) callbackCancel();
+    },
+  },
   resPool: {
     resources,
     get: (name) => res(name),
@@ -427,8 +456,44 @@ const gamePage = {
   },
   religion: {
     faith: 200,
+    faithRatio: 0,
+    transcendenceTier: 0,
     religionUpgrades,
     zigguratUpgrades: zigguratUpgradesMock,
+    transcendenceUpgrades,
+    getRU(name) {
+      return religionUpgrades.find((upgrade) => upgrade.name === name) || { on: 0, val: 0 };
+    },
+    getTU(name) {
+      return transcendenceUpgrades.find((upgrade) => upgrade.name === name);
+    },
+    _getTranscendNextPrice() {
+      return 100;
+    },
+    getApocryphaResetBonus(bonusRatio) {
+      return (this.faith / 1000000) * Math.pow(this.transcendenceTier + 1, 2) * bonusRatio;
+    },
+    getSolarRevolutionRatio() {
+      return this.getRU("solarRevolution").on ? this.faith / 1000000 : 0;
+    },
+    transcend() {
+      transcendCalls += 1;
+      gamePage.ui.confirm("Transcend", "Confirm", () => {
+        const price = this._getTranscendNextPrice();
+        if (this.faithRatio <= price) return;
+        this.faithRatio -= price;
+        this.transcendenceTier += 1;
+      });
+      return true;
+    },
+    resetFaith(bonusRatio) {
+      adoreCalls += 1;
+      const gain = this.getApocryphaResetBonus(bonusRatio);
+      if (!(gain > 0)) return false;
+      this.faithRatio += gain;
+      this.faith = 0.01;
+      return true;
+    },
     build(item) {
       const meta = typeof item === "string" ? religionUpgrades.find((u) => u.name === item) : item;
       if (!meta || !pay(meta.prices || [])) return false;
@@ -471,6 +536,14 @@ const gamePage = {
       },
     },
   },
+  time: {
+    chronoforgeUpgrades,
+    voidspaceUpgrades,
+    getCFU: (name) => chronoforgeUpgrades.find((upgrade) => upgrade.name === name),
+    getVSU: (name) => voidspaceUpgrades.find((upgrade) => upgrade.name === name),
+    build() { rawTimeManagerCalls += 1; return false; },
+    buy() { rawTimeManagerCalls += 1; return false; },
+  },
   // Religion tab with the game's real button shapes: the sacrifice button's
   // controller._transform (unicorns→tears at one tear per ziggurat per 2500)
   // and the zgUpgradeButtons the helper falls back to for purchases.
@@ -486,6 +559,18 @@ const gamePage = {
           res("tears").value += zigs * amount;
           sacrificeChunks += amount;
           return true;
+        },
+      },
+    },
+    sacrificeAlicornsBtn: {
+      model: { prices: [{ name: "alicorn", val: 25 }], enabled: true, visible: true },
+      controller: {
+        controllerOpts: { gainMultiplier: () => 3 },
+        buyItem(model) {
+          alicornSacrificeCalls += 1;
+          if (!pay(model?.prices || [])) return { itemBought: false, reason: "cannot-afford" };
+          res("timeCrystal").value += this.controllerOpts.gainMultiplier();
+          return { itemBought: true, reason: "paid-for" };
         },
       },
     },
@@ -512,6 +597,10 @@ const gamePage = {
   getResourcePerTick: (name, includeConversion) => {
     resourcePerTickCalls.push({ name, includeConversion });
     return Number.isFinite(perTick[name]) ? perTick[name] : 0;
+  },
+  save() {
+    checkpointCalls += 1;
+    return true;
   },
   craft(name, amount) {
     const c = craft(name);
@@ -607,6 +696,53 @@ class FakePlanetBuildingBtnController {
     return { itemBought: true };
   }
 }
+class FakeLateGameStackableController {
+  constructor(game) {
+    this.game = game;
+  }
+  fetchModel(options) {
+    const metadata = this.getMetadata(options.id);
+    return metadata ? { options, metadata } : null;
+  }
+  getPrices(model) {
+    const meta = model.metadata;
+    return (meta.prices || []).map((price) => ({
+      ...price,
+      val: price.val * Math.pow(meta.priceRatio || 1, meta.val || 0),
+    }));
+  }
+  updateEnabled() {}
+  buyItem(model) {
+    if (!model || !pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
+    model.metadata.val = (model.metadata.val || 0) + 1;
+    model.metadata.on = (model.metadata.on || 0) + 1;
+    return { itemBought: true };
+  }
+}
+class FakeTranscendenceBtnController extends FakeLateGameStackableController {
+  getMetadata(id) { return this.game.religion?.getTU(id); }
+  buyItem(model) {
+    transcendenceControllerCalls += 1;
+    return super.buyItem(model);
+  }
+}
+class FakeChronoforgeBtnController extends FakeLateGameStackableController {
+  getMetadata(id) { return this.game.time?.getCFU(id); }
+  buyItem(model) {
+    chronoforgeControllerCalls += 1;
+    return super.buyItem(model);
+  }
+}
+class FakeVoidSpaceBtnController extends FakeLateGameStackableController {
+  getMetadata(id) { return this.game.time?.getVSU(id); }
+  getPrices(model) {
+    return super.getPrices(model).map((price) => price.name === "karma" ? { ...price, val: price.val - 2 } : price);
+  }
+  buyItem(model) {
+    voidspaceControllerCalls += 1;
+    return super.buyItem(model);
+  }
+}
 const context = {
   console,
   Date: FakeDate,
@@ -633,7 +769,14 @@ const context = {
   com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController: FakeSpaceProgramBtnController } } } },
   classes: {
     diplomacy: { ui: { EmbassyButtonController: FakeEmbassyButtonController } },
-    ui: { space: { PlanetBuildingBtnController: FakePlanetBuildingBtnController } },
+    ui: {
+      TranscendenceBtnController: FakeTranscendenceBtnController,
+      space: { PlanetBuildingBtnController: FakePlanetBuildingBtnController },
+      time: {
+        ChronoforgeBtnController: FakeChronoforgeBtnController,
+        VoidSpaceBtnController: FakeVoidSpaceBtnController,
+      },
+    },
   },
 };
 context.window = context;
@@ -1432,7 +1575,7 @@ check("late game A: mismatched policy and invocation errors fail closed", !misma
 
 const armButton = panelEl(".kgh-prestige-arm");
 if (armButton) armButton.click();
-check("late game A: one panel click deliberately arms and persists prestige automation", hasPrestigeArm && dbg.prestigeAutomationArmed() === true && localStorageMock.getItem("kgh.prestigeArmed") === "1" && /Prestige automation: ARMED/.test(panelText(".kgh-prestige-arm")));
+check("late game A: one panel click deliberately arms and immediately renders prestige status", hasPrestigeArm && dbg.prestigeAutomationArmed() === true && localStorageMock.getItem("kgh.prestigeArmed") === "1" && /Prestige automation: ARMED/.test(panelText(".kgh-prestige-arm")) && /ARMED/.test(panelText(".kgh-prestige-status")));
 let prestigeCalls = 0;
 const firstPrestige = hasActionBroker
   ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { prestigeCalls += 1; } })
@@ -1440,7 +1583,8 @@ const firstPrestige = hasActionBroker
 const cooldownPrestige = hasActionBroker
   ? dbg.executeSemanticAction({ id: "adore", invoke: () => { prestigeCalls += 1; } })
   : { ok: false };
-check("late game A: irreversible actions enforce a shared cooldown", firstPrestige.ok && !cooldownPrestige.ok && prestigeCalls === 1);
+check("late game A: direct irreversible broker calls require the managed checkpoint/revalidation capability",
+  !firstPrestige.ok && !cooldownPrestige.ok && prestigeCalls === 0);
 if (hasPrestigeArm) dbg.setPrestigeAutomationArmed(false);
 check("late game A: prestige arm disarms and round-trips through storage", hasPrestigeArm && dbg.prestigeAutomationArmed() === false && localStorageMock.getItem("kgh.prestigeArmed") === "0");
 const acoustics = {
@@ -3631,6 +3775,7 @@ const nestedRouteCasesAE = [
   ["producer", "nestedProducerAE", 1, "nestedProducerTargetAE"],
   ["storage", "nestedStorageAE", 10, "nestedStorageTargetAE"],
 ];
+
 for (const [rootKind, resourceName, amount, targetName] of nestedRouteCasesAE) {
   const nestedRootAE = dbg.acquisitionPathFor(resourceName, amount, { finalPurchase: true });
   const nestedTargetCandidateAE = dbg.candidateById(`build:${targetName}`, "balanced");
@@ -5294,6 +5439,227 @@ extraTicksAM = 0;
 delete gamePage.tick;
 intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
 check("Test AM: at 1× the game is left untouched", extraTicksAM === 0);
+
+/* ---------------------------------------------------------------------
+ * Task 5 — native Time/transcendence adapters and armed prestige policy.
+ * All mutations are observable through controller/manager counters. The
+ * helper must checkpoint, revalidate, execute once, and verify exact deltas.
+ * ------------------------------------------------------------------- */
+dbg.queueClear();
+dbg.forceActiveTarget(null);
+dbg.setPrestigeAutomationArmed(false);
+const addedRareResourcesT5 = [];
+for (const [name, maxValue, title] of [
+  ["timeCrystal", 100, "Time Crystal"],
+  ["relic", 1000, "Relic"],
+  ["void", 1000, "Void"],
+  ["karma", 1000, "Karma"],
+  ["paragon", 1000, "Paragon"],
+]) {
+  if (!res(name)) {
+    const resource = R(name, 0, maxValue, title, { unlocked: true });
+    resources.push(resource);
+    addedRareResourcesT5.push(resource);
+  }
+}
+for (const resourceName of ["timeCrystal", "relic", "void", "karma", "paragon", "alicorn"]) {
+  res(resourceName).unlocked = true;
+}
+res("relic").value = 10;
+res("timeCrystal").value = 20;
+res("karma").value = 7; // live Void controller discount; raw metadata still says 9
+res("void").value = 100;
+transcendenceUpgrades[0].unlocked = true;
+transcendenceUpgrades[1].unlocked = true;
+chronoforgeUpgrades[0].unlocked = true;
+voidspaceUpgrades[0].unlocked = true;
+
+const hasTask5Adapters = typeof dbg.transcendenceUpgrades === "function" && typeof dbg.timeDescriptorFor === "function";
+const transcendenceCandidateT5 = dbg.candidateById("transcendence:blackObeliskT5");
+check("Task 5 adapter: ordinary transcendence upgrade is discovered as its own candidate kind",
+  hasTask5Adapters && dbg.transcendenceUpgrades().includes(transcendenceUpgrades[0]) && transcendenceCandidateT5?.kind === "transcendence");
+check("Task 5 adapter: raw Transcend action never becomes a candidate", !dbg.candidateById("transcendence:transcend"));
+check("Task 5 adapter: Time descriptors preserve Chronoforge/Void Space manager membership",
+  hasTask5Adapters && dbg.timeDescriptorFor(chronoforgeUpgrades[0])?.subtype === "chronoforge" && dbg.timeDescriptorFor(voidspaceUpgrades[0])?.subtype === "voidspace");
+
+fakeNow += 5000;
+dbg.forceActiveTarget(transcendenceCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 adapter: transcendence upgrade buys only through TranscendenceBtnController",
+  transcendenceUpgrades[0].val === 1 && transcendenceControllerCalls === 1);
+const chronoforgeCandidateT5 = dbg.candidateById("time:temporalBatteryT5");
+fakeNow += 5000;
+dbg.forceActiveTarget(chronoforgeCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 adapter: Chronoforge item buys only through ChronoforgeBtnController",
+  chronoforgeUpgrades[0].val === 1 && chronoforgeControllerCalls === 1 && rawTimeManagerCalls === 0);
+const voidspaceCandidateT5 = dbg.candidateById("time:cryochambersT5");
+check("Task 5 adapter: Void Space affordability uses its live controller price",
+  voidspaceCandidateT5?.affordable === true && dbg.timePricesFor?.(voidspaceUpgrades[0])?.find((price) => price.name === "karma")?.val === 7);
+fakeNow += 5000;
+dbg.forceActiveTarget(voidspaceCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
+check("Task 5 adapter: Void Space item buys only through VoidSpaceBtnController",
+  voidspaceUpgrades[0].val === 1 && voidspaceControllerCalls === 1 && rawTimeManagerCalls === 0 && res("karma").value === 0);
+
+// Keep ordinary candidates from becoming policy blockers while the prestige
+// projection fixtures exercise only native manager state.
+religionUpgrades.forEach((upgrade) => { upgrade.researched = true; upgrade.on = Math.max(1, upgrade.on || 0); });
+transcendenceUpgrades.forEach((upgrade) => { upgrade.unlocked = false; });
+chronoforgeUpgrades.forEach((upgrade) => { upgrade.unlocked = false; });
+voidspaceUpgrades.forEach((upgrade) => { upgrade.unlocked = false; });
+perTick.faith = 100;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 150;
+gamePage.religion.transcendenceTier = 1;
+const callsBeforeDisarmedT5 = { checkpointCalls, transcendCalls, adoreCalls, alicornSacrificeCalls };
+const disarmedProjectionT5 = typeof dbg.prestigeProjection === "function" ? dbg.prestigeProjection() : null;
+const disarmedManagedT5 = typeof dbg.managePrestige === "function" ? dbg.managePrestige(null) : false;
+check("Task 5 prestige: disarmed mode still projects but executes zero irreversible APIs",
+  !!disarmedProjectionT5 && disarmedManagedT5 === false && checkpointCalls === callsBeforeDisarmedT5.checkpointCalls && transcendCalls === callsBeforeDisarmedT5.transcendCalls && adoreCalls === callsBeforeDisarmedT5.adoreCalls && alicornSacrificeCalls === callsBeforeDisarmedT5.alicornSacrificeCalls);
+
+dbg.setPrestigeAutomationArmed(true);
+const nativeSaveT5 = gamePage.save;
+gamePage.save = () => { checkpointCalls += 1; return false; };
+fakeNow += 30000;
+const callsBeforeFailedCheckpointT5 = transcendCalls;
+const failedCheckpointT5 = dbg.managePrestige?.(null);
+check("Task 5 prestige: failed native checkpoint prevents Transcend", failedCheckpointT5 === false && transcendCalls === callsBeforeFailedCheckpointT5);
+gamePage.save = nativeSaveT5;
+
+// Transcend and Adore both qualify. Transcend owns this irreversible cycle.
+// The checkpoint deliberately changes epiphany by one to prove the exact
+// before-snapshot is captured AFTER checkpoint and fresh revalidation.
+fakeNow += 30000;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 150;
+gamePage.religion.transcendenceTier = 1;
+gamePage.save = () => { checkpointCalls += 1; gamePage.religion.faithRatio += 1; return true; };
+const tierBeforeT5 = gamePage.religion.transcendenceTier;
+const epiphanyBeforeT5 = gamePage.religion.faithRatio;
+const adoreBeforePriorityT5 = adoreCalls;
+const transcendManagedT5 = dbg.managePrestige?.(null);
+check("Task 5 prestige: funded Transcend checkpoints and advances exactly one tier",
+  transcendManagedT5 === true && checkpointCalls >= callsBeforeDisarmedT5.checkpointCalls + 2 && gamePage.religion.transcendenceTier === tierBeforeT5 + 1 && gamePage.religion.faithRatio === epiphanyBeforeT5 + 1 - 100);
+gamePage.save = nativeSaveT5;
+check("Task 5 prestige: when Transcend and Adore both qualify one cycle runs Transcend only", adoreCalls === adoreBeforePriorityT5);
+const callsBeforeCooldownT5 = { transcendCalls, adoreCalls };
+check("Task 5 prestige: shared irreversible cooldown blocks a second same-cycle action",
+  dbg.managePrestige?.(null) === false && transcendCalls === callsBeforeCooldownT5.transcendCalls && adoreCalls === callsBeforeCooldownT5.adoreCalls);
+
+// A separate later cycle may Adore when native projected gain is positive and
+// the measured Solar Revolution recovery lies within the policy horizon.
+fakeNow += 30000;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 10;
+const nativeSolarRatioT5 = gamePage.religion.getSolarRevolutionRatio;
+gamePage.religion.getSolarRevolutionRatio = () => 100;
+perTick.faith = 10;
+const boostedRecoveryT5 = dbg.prestigeProjection?.(null);
+check("Task 5 prestige: Adore recovery removes the temporary Solar Revolution production boost",
+  boostedRecoveryT5?.adore?.ready === false && boostedRecoveryT5?.adore?.recoverySeconds > 6 * 60 * 60);
+gamePage.religion.getSolarRevolutionRatio = nativeSolarRatioT5;
+perTick.faith = 100;
+const adoreEpiphanyBeforeT5 = gamePage.religion.faithRatio;
+const adoreManagedT5 = dbg.managePrestige?.(null);
+check("Task 5 prestige: Adore requires positive native gain and bounded Solar Revolution recovery",
+  adoreManagedT5 === true && adoreCalls === adoreBeforePriorityT5 + 1 && gamePage.religion.faithRatio > adoreEpiphanyBeforeT5 && gamePage.religion.faith === 0.01);
+
+// Alicorn Stable is a reachable direct alicorn purchase and therefore creates
+// a protected floor. The active Time target is exactly two crystals short.
+const alicornStableT5 = { name: "alicornStableT5", label: "Alicorn Stable T5", unlocked: true, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "alicorn", val: 20 }], effects: { alicornChance: 0.1 } };
+const crystalTargetT5 = { name: "crystalTargetT5", label: "Crystal Target T5", unlocked: true, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "timeCrystal", val: 3 }], effects: {} };
+zigguratUpgradesMock.push(alicornStableT5);
+chronoforgeUpgrades.push(crystalTargetT5);
+const zigguratMetaT5 = buildings.find((building) => building.name === "ziggurat");
+zigguratMetaT5.val = 1;
+zigguratMetaT5.on = 1;
+const crystalTargetCandidateT5 = { kind: "time", meta: crystalTargetT5, affordable: false };
+const savedRacesT5 = diplomacy.races.slice();
+diplomacy.races.splice(0, diplomacy.races.length); // no faster Leviathan route
+perTick.timeCrystal = 0;
+res("alicorn").value = 39.85;
+res("timeCrystal").value = 1;
+const alicornBaitT5 = { name: "alicornBaitT5", label: "Alicorn Bait T5", unlocked: true, val: 0, on: 0, prices: [{ name: "alicorn", val: 25 }], effects: { productionRatio: 1 } };
+const savedBuildingUnlocksT5 = buildings.map((building) => building.unlocked);
+for (const building of buildings) building.unlocked = false;
+buildings.push(alicornBaitT5);
+const alicornBaitCandidateT5 = dbg.candidateById("build:alicornBaitT5");
+dbg.forceActiveTarget(crystalTargetCandidateT5, "Late-game progression frontier", 0);
+fakeNow += 5000;
+dbg.executePlan();
+check("Task 5 capital: cap-relief/surplus purchases consume the complete rare-capital ledger",
+  alicornBaitCandidateT5?.affordable === true && alicornBaitT5.val === 0 && alicornStableT5.val === 0 && res("alicorn").value === 39.85);
+buildings.splice(buildings.indexOf(alicornBaitT5), 1);
+buildings.forEach((building, index) => { building.unlocked = savedBuildingUnlocksT5[index]; });
+dbg.forceActiveTarget(null);
+const rareFloorT5 = typeof dbg.rareCapitalFloor === "function" ? dbg.rareCapitalFloor(crystalTargetCandidateT5) : {};
+const blockedAlicornProjectionT5 = typeof dbg.prestigeProjection === "function" ? dbg.prestigeProjection(crystalTargetCandidateT5) : null;
+const alicornCallsBeforeFloorT5 = alicornSacrificeCalls;
+fakeNow += 30000;
+const blockedAlicornManagedT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: 39.85 state preserves Alicorn Stable 20 floor and calls zero APIs",
+  rareFloorT5.alicorn >= 20 && /protected.*floor/i.test(blockedAlicornProjectionT5?.alicorn?.reason || "") && blockedAlicornManagedT5 === false && alicornSacrificeCalls === alicornCallsBeforeFloorT5);
+
+res("alicorn").value = 50;
+res("timeCrystal").value = 1;
+fakeNow += 30000;
+perTick.timeCrystal = 0.000001; // slow passive route must not hide a funded Leviathan trade
+const immediateLeviathanT5 = { name: "leviathans", title: "Leviathans", unlocked: true, embassyLevel: 0, sells: [{ name: "timeCrystal", value: 2, chance: 1, width: 0 }] };
+diplomacy.races.push(immediateLeviathanT5);
+res("manpower").value = 1000;
+res("gold").value = 100;
+const leviathanPreferredT5 = dbg.prestigeProjection?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: funded Leviathan trade is compared explicitly even beside a slow passive route",
+  leviathanPreferredT5?.alicorn?.ready === false && /Leviathan|trade/i.test(leviathanPreferredT5?.alicorn?.reason || ""));
+diplomacy.races.splice(diplomacy.races.indexOf(immediateLeviathanT5), 1);
+perTick.timeCrystal = 0;
+
+crystalTargetT5.prices[0].val = 11; // deficit 10; four 3-crystal batches required
+const multiBatchProjectionT5 = dbg.prestigeProjection?.(crystalTargetCandidateT5);
+const callsBeforeMultiBatchT5 = alicornSacrificeCalls;
+check("Task 5 alicorn: insufficient capital for the complete whole-batch plan calls zero APIs",
+  multiBatchProjectionT5?.alicorn?.batchesNeeded === 4 && multiBatchProjectionT5?.alicorn?.ready === false && dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeMultiBatchT5);
+crystalTargetT5.prices[0].val = 3;
+
+res("alicorn").value = 100;
+res("timeCrystal").value = 1;
+res("timeCrystal").maxValue = 5;
+crystalTargetT5.prices[0].val = 5; // two batches yield six into only four headroom
+fakeNow += 30000;
+const callsBeforeSequenceHeadroomT5 = alicornSacrificeCalls;
+const sequenceHeadroomT5 = dbg.prestigeProjection?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: whole multi-batch sequence must fit output headroom before batch one",
+  sequenceHeadroomT5?.alicorn?.batchesNeeded === 2 && sequenceHeadroomT5?.alicorn?.ready === false && dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeSequenceHeadroomT5);
+crystalTargetT5.prices[0].val = 3;
+res("alicorn").value = 50;
+res("timeCrystal").value = 1;
+res("timeCrystal").maxValue = 100;
+fakeNow += 30000;
+
+res("timeCrystal").maxValue = 3; // only two headroom; native batch would gain three
+const callsBeforeHeadroomT5 = alicornSacrificeCalls;
+check("Task 5 alicorn: output headroom blocks a batch before any irreversible API call",
+  dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeHeadroomT5 && res("alicorn").value === 50 && res("timeCrystal").value === 1);
+res("timeCrystal").maxValue = 100;
+const checkpointBeforeAlicornT5 = checkpointCalls;
+const positiveAlicornT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 alicorn: exact two-crystal deficit executes one checkpointed 25-alicorn batch and verifies live gain",
+  positiveAlicornT5 === true && checkpointCalls === checkpointBeforeAlicornT5 + 1 && alicornSacrificeCalls === alicornCallsBeforeFloorT5 + 1 && res("alicorn").value === 25 && res("timeCrystal").value === 4);
+res("timeCrystal").value = 1;
+const callsBeforeAlicornCooldownT5 = alicornSacrificeCalls;
+check("Task 5 alicorn: one-batch action enters irreversible cooldown",
+  dbg.managePrestige?.(crystalTargetCandidateT5) === false && alicornSacrificeCalls === callsBeforeAlicornCooldownT5);
+check("Task 5 observability: panel and diagnostics show armed prestige projections/blockers",
+  /Prestige/i.test(panelText(".kgh-prestige-status")) && /PRESTIGE|Prestige/.test(dbg.report()) && /Chronoforge|Void Space|Transcendence/.test(dbg.report()));
+
+zigguratUpgradesMock.splice(zigguratUpgradesMock.indexOf(alicornStableT5), 1);
+chronoforgeUpgrades.splice(chronoforgeUpgrades.indexOf(crystalTargetT5), 1);
+diplomacy.races.push(...savedRacesT5);
+delete perTick.faith;
+delete perTick.timeCrystal;
+dbg.setPrestigeAutomationArmed(false);
+for (const resource of addedRareResourcesT5) resources.splice(resources.indexOf(resource), 1);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
