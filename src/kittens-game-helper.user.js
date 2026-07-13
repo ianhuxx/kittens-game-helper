@@ -362,22 +362,95 @@
       ? prices.filter((price) => price && price.name && Number.isFinite(Number(price.val)) && Number(price.val) > 0)
       : [];
   };
+  const prestigePerkUnlockNames = (perk) => {
+    const names = perk && perk.unlocks && perk.unlocks.perks;
+    return Array.isArray(names) ? names.filter((name) => typeof name === "string" && name) : [];
+  };
   const nextMetaphysicsGate = () => {
     try {
       const prestige = window.gamePage && window.gamePage.prestige;
       if (!prestige || !Array.isArray(prestige.perks)) return null;
-      for (const perk of prestige.perks) {
+      const perks = prestige.perks.filter((perk) => perk && typeof perk.name === "string" && perk.name);
+      const byName = new Map(perks.map((perk) => [perk.name, perk]));
+      const parentsByName = new Map();
+      for (const parent of perks) {
+        for (const childName of prestigePerkUnlockNames(parent)) {
+          if (!byName.has(childName)) continue;
+          if (!parentsByName.has(childName)) parentsByName.set(childName, []);
+          parentsByName.get(childName).push(parent);
+        }
+      }
+      const futureDepth = (perk, seen = new Set()) => {
+        if (!perk || seen.has(perk.name)) return 0;
+        const nextSeen = new Set(seen);
+        nextSeen.add(perk.name);
+        let depth = 0;
+        for (const childName of prestigePerkUnlockNames(perk)) {
+          const child = byName.get(childName);
+          if (!child || nextSeen.has(child.name)) continue;
+          depth = Math.max(depth, 1 + futureDepth(child, nextSeen));
+        }
+        return depth;
+      };
+      const ownedAncestryDepth = (perk, seen = new Set()) => {
+        if (!perk || seen.has(perk.name)) return 0;
+        const nextSeen = new Set(seen);
+        nextSeen.add(perk.name);
+        let depth = 0;
+        for (const parent of parentsByName.get(perk.name) || []) {
+          if (!prestigePerkOwned(parent) || nextSeen.has(parent.name)) continue;
+          depth = Math.max(depth, 1 + ownedAncestryDepth(parent, nextSeen));
+        }
+        return depth;
+      };
+      const recursiveReach = (perk) => {
+        const reached = new Set();
+        const visit = (current) => {
+          for (const childName of prestigePerkUnlockNames(current)) {
+            if (reached.has(childName)) continue;
+            const child = byName.get(childName);
+            if (!child) continue;
+            reached.add(childName);
+            visit(child);
+          }
+        };
+        visit(perk);
+        reached.delete(perk.name);
+        let paragon = 0;
+        for (const name of reached) {
+          paragon += prestigePerkPrices(byName.get(name))
+            .filter((price) => price.name === "paragon")
+            .reduce((total, price) => total + Number(price.val), 0);
+        }
+        return { count: reached.size, paragon };
+      };
+      const candidates = [];
+      for (const perk of perks) {
         if (!perk || prestigePerkOwned(perk) || perk.unlocked !== true) continue;
         const paragonCost = prestigePerkPrices(perk)
           .filter((price) => price.name === "paragon")
           .reduce((total, price) => total + Number(price.val), 0);
         if (!(paragonCost > 0)) continue;
-        return {
+        const ancestry = ownedAncestryDepth(perk);
+        const future = futureDepth(perk);
+        const reach = recursiveReach(perk);
+        candidates.push({
           meta: perk,
           label: perk.label || perk.title || perk.name,
           cost: paragonCost,
-        };
+          ancestry,
+          future,
+          span: ancestry + future,
+          reach,
+        });
       }
+      candidates.sort((a, b) => b.span - a.span
+        || b.ancestry - a.ancestry
+        || b.future - a.future
+        || b.reach.count - a.reach.count
+        || b.reach.paragon - a.reach.paragon
+        || String(a.meta.name).localeCompare(String(b.meta.name)));
+      return candidates[0] || null;
     } catch (error) {
       /* prestige metadata unavailable */
     }

@@ -5395,24 +5395,42 @@ techs.push(engineeringTechAL);
 const scienceGetAL = gamePage.science.get;
 const perkLookupsAL = [];
 gamePage.science.get = (name) => { perkLookupsAL.push(name); return scienceGetAL(name); };
+const nativeMetaphysicsFixture = () => [
+  { name: "engeneering", label: "Engineering", unlocked: true, researched: false, prices: [{ name: "paragon", val: 5 }], unlocks: { perks: ["megalomania", "goldenRatio", "codexVox"] } },
+  { name: "codexVox", label: "Codex Vox", unlocked: false, researched: false, prices: [{ name: "paragon", val: 25 }], unlocks: { perks: ["codexLogos"] } },
+  { name: "codexLogos", label: "Codex Logos", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }], unlocks: { perks: ["codexAgrum", "codexLeviathanianus"] } },
+  { name: "codexAgrum", label: "Codex Agrum", unlocked: false, researched: false, prices: [{ name: "paragon", val: 75 }], unlocks: {} },
+  { name: "megalomania", label: "Megalomania", unlocked: false, researched: false, prices: [{ name: "paragon", val: 10 }], unlocks: { perks: ["blackCodex"] } },
+  { name: "blackCodex", label: "Black Codex", unlocked: false, researched: false, prices: [{ name: "paragon", val: 25 }], unlocks: {} },
+  { name: "codexLeviathanianus", label: "Codex Leviathanianus", unlocked: false, researched: false, prices: [{ name: "paragon", val: 75 }], unlocks: {} },
+  { name: "goldenRatio", label: "Golden Ratio", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }], unlocks: { perks: ["divineProportion"] } },
+  { name: "divineProportion", label: "Divine Proportion", unlocked: false, researched: false, prices: [{ name: "paragon", val: 100 }], unlocks: { perks: ["vitruvianFeline"] } },
+  { name: "vitruvianFeline", label: "Vitruvian Feline", unlocked: false, researched: false, prices: [{ name: "paragon", val: 250 }], unlocks: { perks: ["renaissance"] } },
+  { name: "renaissance", label: "Renaissance", unlocked: false, researched: false, prices: [{ name: "paragon", val: 750 }], unlocks: {} },
+];
 gamePage.prestige = {
-  perks: [
-    { name: "engeneering", label: "Engineering", unlocked: true, researched: false, prices: [{ name: "paragon", val: 5 }] },
-    { name: "goldenRatio", label: "Golden Ratio", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }] },
-    { name: "divineProportion", label: "Divine Proportion", unlocked: false, researched: false, prices: [{ name: "paragon", val: 100 }] },
-  ],
+  perks: nativeMetaphysicsFixture(),
 };
 let advAL = dbg.resetAdvisorState();
 check("Test AL: the tech/perk name collision no longer hides the unowned Engineering perk", /next meta: Engineering \(5P/.test(advAL?.detail || ""));
 check("Test AL: the advisor never asks the science manager for native perk names", !perkLookupsAL.includes("engeneering") && !perkLookupsAL.includes("goldenRatio"));
 gamePage.prestige.perks[0].researched = true;
-gamePage.prestige.perks[1].unlocked = true;
+for (const siblingName of gamePage.prestige.perks[0].unlocks.perks) {
+  gamePage.prestige.perks.find((perk) => perk.name === siblingName).unlocked = true;
+}
 advAL = dbg.resetAdvisorState();
-check("Test AL: an owned native Engineering perk advances to live Golden Ratio 50", /next meta: Golden Ratio \(50P/.test(advAL?.detail || ""));
-gamePage.prestige.perks[1].researched = true;
-gamePage.prestige.perks[2].unlocked = true;
+check("Test AL: live sibling branches still prioritize Golden Ratio 50 after Engineering", /next meta: Golden Ratio \(50P/.test(advAL?.detail || "") && gamePage.prestige.perks.find((perk) => perk.name === "codexVox").unlocked && gamePage.prestige.perks.find((perk) => perk.name === "megalomania").unlocked);
+const goldenRatioAL = gamePage.prestige.perks.find((perk) => perk.name === "goldenRatio");
+goldenRatioAL.researched = true;
+gamePage.prestige.perks.find((perk) => perk.name === "divineProportion").unlocked = true;
 advAL = dbg.resetAdvisorState();
-check("Test AL: the live metadata chain advances again without hardcoded IDs or prices", /next meta: Divine Proportion \(100P/.test(advAL?.detail || ""));
+check("Test AL: the recursive live gateway continues to Divine Proportion 100 ahead of siblings", /next meta: Divine Proportion \(100P/.test(advAL?.detail || ""));
+const cycleAlphaAL = { name: "cycleAlphaAL", label: "Cycle Alpha", unlocked: true, researched: false, prices: [{ name: "paragon", val: 1 }], unlocks: { perks: ["cycleBetaAL"] } };
+const cycleBetaAL = { name: "cycleBetaAL", label: "Cycle Beta", unlocked: false, researched: false, prices: [{ name: "paragon", val: 1 }], unlocks: { perks: ["cycleAlphaAL"] } };
+gamePage.prestige.perks[0].unlocks.perks.push("cycleAlphaAL");
+gamePage.prestige.perks.push(cycleAlphaAL, cycleBetaAL);
+advAL = dbg.resetAdvisorState();
+check("Test AL: cyclic live unlock metadata terminates safely without displacing the main gateway", /next meta: Divine Proportion \(100P/.test(advAL?.detail || ""));
 gamePage.science.get = scienceGetAL;
 techs.splice(techs.indexOf(engineeringTechAL), 1);
 delete gamePage.prestige;
@@ -5746,17 +5764,16 @@ const unreachableWholeBillT5 = { name: "unreachableWholeBillT5", label: "Unreach
 buildings.push(unreachableWholeBillT5);
 perTick.relic = 1;
 gamePage.prestige = {
-  perks: [
-    { name: "engeneering", label: "Engineering", unlocked: true, researched: false, prices: [{ name: "paragon", val: 5 }] },
-    { name: "goldenRatio", label: "Golden Ratio", unlocked: false, researched: false, prices: [{ name: "paragon", val: 50 }] },
-  ],
+  perks: nativeMetaphysicsFixture(),
 };
 const engineeringRoadmapFloorT5 = dbg.rareCapitalFloor?.(null);
 gamePage.prestige.perks[0].researched = true;
-gamePage.prestige.perks[1].unlocked = true;
+for (const siblingName of gamePage.prestige.perks[0].unlocks.perks) {
+  gamePage.prestige.perks.find((perk) => perk.name === siblingName).unlocked = true;
+}
 const goldenRatioRoadmapFloorT5 = dbg.rareCapitalFloor?.(null);
-check("Task 5 re-review: rare floor follows native metaphysics IDs and live prices while rejecting partial bills",
-  engineeringRoadmapFloorT5?.paragon === 5 && !(engineeringRoadmapFloorT5?.relic >= 70) && goldenRatioRoadmapFloorT5?.paragon === 50);
+check("Task 5 final review: rare floor selects the strongest live gateway over unlocked sibling branches",
+  engineeringRoadmapFloorT5?.paragon === 5 && !(engineeringRoadmapFloorT5?.relic >= 70) && goldenRatioRoadmapFloorT5?.paragon === 50 && gamePage.prestige.perks.find((perk) => perk.name === "codexVox").unlocked);
 buildings.splice(buildings.indexOf(unreachableWholeBillT5), 1);
 delete perTick.relic;
 delete gamePage.prestige;
