@@ -41,7 +41,10 @@ const R = (name, value, maxValue, title, extra = {}) => ({
 /* --------------------------- game state factory ---------------------------- */
 // A faithful mid-game base; each scenario tweaks it (see applyPhase()).
 const makeState = () => {
-  const spies = { zebraTrades: 0, shipBuilt: 0, manuscriptMade: 0, compendiumMade: 0, parchmentMade: 0, festivals: 0 };
+  const spies = {
+    zebraTrades: 0, shipBuilt: 0, manuscriptMade: 0, compendiumMade: 0,
+    parchmentMade: 0, festivals: 0, boosterTicks: 0,
+  };
 
   const resources = [
     R("catnip", 2000, 8000), R("wood", 400, 2500), R("minerals", 700, 1500),
@@ -243,6 +246,7 @@ const makeState = () => {
     village, calendar, diplomacy,
     villageTab: { updateTab() {} }, bonfireTab: { updateTab() {} },
     updateResources() {}, unlock() {}, upgrade() {}, render() {},
+    tick() { spies.boosterTicks += 1; },
     getEffect: () => 0, getResCraftRatio, ticksPerSecond: 5,
     getResourcePerTick: (name) => (Number.isFinite(perTick[name]) ? perTick[name] : 0),
     craft(name, amount) {
@@ -265,7 +269,7 @@ const makeState = () => {
 
 /* ------------------------------ scenario tweaks ---------------------------- */
 const applyPhase = (st, phase) => {
-  const { res, buildings, techs, diplomacy } = st;
+  const { res, buildings, techs, diplomacy, gamePage } = st;
   const unlockTitanium = () => { const t = res("titanium"); t.unlocked = true; };
   const addZebras = () => diplomacy.races.push({ name: "zebras", title: "Zebras", hidden: false, unlocked: true, embassyLevel: 1, embassyPrices: [], buys: [{ name: "slab", val: 30 }], sells: [{ name: "titanium", value: 1.5, chance: 15 }] });
 
@@ -355,19 +359,121 @@ const applyPhase = (st, phase) => {
       getBuilding: (id) => cathBuildings.find((p) => p.name === id),
     };
     st.onTick = () => { const sc = res("starchart"); sc.value = Math.min(sc.maxValue, sc.value + 8); };
+  } else if (phase === "freshLifecycle") {
+    // A reset-shaped save deliberately retains post-reset metadata while both
+    // source buildings are at zero. The helper must rebuild those sources,
+    // open their families afterward, reserve every hidden Ziggurat reveal leg,
+    // wait for the game's native unlock, and only then buy the ordinary build.
+    const library = buildings.find((building) => building.name === "library");
+    const workshop = buildings.find((building) => building.name === "workshop");
+    for (const building of buildings) building.unlocked = false;
+    Object.assign(library, { unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 25 }] });
+    Object.assign(workshop, { unlocked: true, val: 0, on: 0, prices: [{ name: "wood", val: 25 }, { name: "minerals", val: 25 }] });
+    for (const tech of techs) if (!tech.researched) tech.unlocked = false;
+    for (const upgrade of st.workshopUpgrades) upgrade.researched = true;
+
+    const freshResearch = {
+      name: "freshResearchSim", label: "Fresh Research Sim", unlocked: true, researched: false,
+      prices: [{ name: "science", val: 10 }], effects: { scienceRatio: 0.01 },
+    };
+    const freshUpgrade = {
+      name: "freshUpgradeSim", label: "Fresh Upgrade Sim", unlocked: true, researched: false,
+      prices: [{ name: "freshPartSim", val: 1 }], effects: { mineralsRatio: 0.01 },
+    };
+    const freshPart = R("freshPartSim", 0, 0, "Fresh Part Sim");
+    const megalith = R("megalithSim", 0, 0, "Megalith Sim");
+    const freshCraft = { name: "freshPartSim", label: "Fresh Part Sim", unlocked: true, prices: [{ name: "wood", val: 1 }] };
+    const megalithCraft = { name: "megalithSim", label: "Megalith Sim", unlocked: true, prices: [{ name: "slab", val: 1 }, { name: "beam", val: 1 }] };
+    const ziggurat = {
+      name: "ziggurat", label: "Ziggurat", unlocked: false, unlockable: true,
+      defaultUnlockable: false, unlockRatio: 0.5, requiredTech: "construction",
+      val: 0, on: 0, prices: [{ name: "scaffold", val: 1 }, { name: "blueprint", val: 1 }, { name: "megalithSim", val: 1 }], effects: {},
+    };
+    techs.push(freshResearch);
+    st.workshopUpgrades.push(freshUpgrade);
+    st.resources.push(freshPart, megalith);
+    st.crafts.push(freshCraft, megalithCraft);
+    buildings.push(ziggurat);
+    res("wood").value = 500;
+    res("minerals").value = 500;
+    res("science").value = 500;
+    res("scaffold").value = 3;
+    res("blueprint").value = 1;
+    st.lifecycle = {
+      library, workshop, freshResearch, freshUpgrade, freshCraft, ziggurat, megalith,
+      nativeRevealTick: null, nativeRevealBanksSatisfied: false,
+    };
+    st.onTick = (tick) => {
+      if (!ziggurat.unlocked && megalith.value >= 0.5 && res("scaffold").value >= 0.5 && res("blueprint").value >= 0.5) {
+        ziggurat.unlocked = true;
+        st.lifecycle.nativeRevealTick = tick;
+        st.lifecycle.nativeRevealBanksSatisfied = true;
+      }
+    };
+  } else if (phase === "pollutionIndustry") {
+    // A live industrial state is climbing toward a harmful threshold. Native
+    // manager methods remain the authority; researching sequestration changes
+    // the measured slope/equilibrium while the processor can shed dirty load.
+    const pollution = R("cathPollution", 900, 0, "Cath Pollution");
+    st.resources.push(pollution);
+    for (const building of buildings) building.unlocked = false;
+    for (const tech of techs) if (!tech.researched) tech.unlocked = false;
+    for (const upgrade of st.workshopUpgrades) upgrade.researched = true;
+    for (const policy of st.policies) {
+      policy.researched = policy.name !== "tradition";
+      policy.blocked = policy.name === "tradition";
+    }
+    for (const upgrade of st.religionUpgrades) { upgrade.on = 1; upgrade.val = 1; }
+    const cleanup = {
+      name: "carbonSequestrationSim", label: "Carbon Sequestration Sim", unlocked: true, researched: false,
+      prices: [{ name: "science", val: 1 }], effects: { cathPollutionPerTickProd: -4 },
+    };
+    const dirtyFactory = {
+      name: "dirtyFactorySim", label: "Dirty Factory Sim", unlocked: true, val: 3, on: 3,
+      prices: [{ name: "wood", val: 1e9 }],
+      effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.01, cathPollutionPerTickProd: 0.5 },
+    };
+    st.workshopUpgrades.push(cleanup);
+    buildings.push(dirtyFactory);
+    res("science").value = Math.max(100, res("science").value);
+    gamePage.bld.cathPollution = 900;
+    gamePage.bld.cathPollutionPerTick = 1.5;
+    gamePage.bld.pollutionLevels = [
+      { threshold: 0, effects: {} },
+      { threshold: 500, effects: { catnipPollutionRatio: -0.05 } },
+      { threshold: 1000, effects: { catnipPollutionRatio: -0.15, happiness: -0.05 } },
+    ];
+    gamePage.bld.getPollutionPerTick = () => cleanup.researched ? -2 : Math.max(0.5, dirtyFactory.on * 0.5);
+    gamePage.bld.getPollutionLevel = () => ({
+      level: gamePage.bld.cathPollution >= 1000 ? 2 : gamePage.bld.cathPollution >= 500 ? 1 : 0,
+      effects: gamePage.bld.cathPollution >= 1000
+        ? { catnipPollutionRatio: -0.15, happiness: -0.05 }
+        : gamePage.bld.cathPollution >= 500 ? { catnipPollutionRatio: -0.05 } : {},
+    });
+    gamePage.bld.getPollutionEquilibrium = () => cleanup.researched ? 400 : 1500;
+    st.pollution = { resource: pollution, cleanup, dirtyFactory, minDirtyOn: dirtyFactory.on, peak: gamePage.bld.cathPollution };
+    st.onTick = () => {
+      const delta = gamePage.bld.getPollutionPerTick();
+      gamePage.bld.cathPollution = Math.max(0, gamePage.bld.cathPollution + delta * 4);
+      pollution.value = gamePage.bld.cathPollution;
+      st.pollution.minDirtyOn = Math.min(st.pollution.minDirtyOn, dirtyFactory.on);
+      st.pollution.peak = Math.max(st.pollution.peak, gamePage.bld.cathPollution);
+    };
   }
 };
 
 /* ------------------------------- run a scenario ---------------------------- */
-const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
+const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
   const failures = [];
   const st = makeState();
   applyPhase(st, phase);
   const { res, gamePage, spies, buildings, techs } = st;
 
   const storage = new Map();
+  const holdAutopilotForInitialEvidence = phase === "freshLifecycle" || phase === "pollutionIndustry";
   storage.set("kgh.goal", goal || "balanced");
-  storage.set("kgh.autopilot", "1");
+  storage.set("kgh.autopilot", holdAutopilotForInitialEvidence ? "0" : "1");
+  storage.set("kgh.tickSpeed", String(speed));
   const localStorageMock = { getItem: (k) => (storage.has(k) ? storage.get(k) : null), setItem: (k, v) => storage.set(k, String(v)) };
   const documentMock = { head: makeEl(), body: makeEl(), createElement: () => makeEl(), getElementById: () => null };
 
@@ -417,11 +523,30 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
     }
   }
 
-  let tickFn = null;
+  let nextTimerId = 1;
+  const timers = new Map();
+  const advanceTimers = (elapsedMs) => {
+    // This is an unattended state simulation, not a wall-clock benchmark. A
+    // four-second macrostep lets every owned lane that became due cooperate
+    // once, while collapsing redundant 100 ms polls that cannot change the
+    // fake game state between invocations.
+    for (const [id, timer] of [...timers.entries()]) {
+      timer.elapsed += elapsedMs;
+      if (timer.elapsed + 1e-9 < timer.delay) continue;
+      timer.elapsed %= timer.delay;
+      if (timers.has(id)) timer.fn();
+    }
+  };
   const context = {
     console: { log() {}, warn() {}, error() {} }, Date: FakeDate, Math, JSON, Number, isFinite,
     document: documentMock, localStorage: localStorageMock, gamePage,
-    setTimeout, clearTimeout, setInterval: (fn) => { tickFn = fn; return 1; },
+    setTimeout, clearTimeout,
+    setInterval: (fn, delay = 1) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay: Math.max(1, Number(delay) || 1), elapsed: 0 });
+      return id;
+    },
+    clearInterval: (id) => timers.delete(id),
     WeakMap, Map, Set, Promise, Array, Object,
     com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController } } } },
     classes: { ui: { space: { PlanetBuildingBtnController } } },
@@ -429,6 +554,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
   context.window = context;
   const sandbox = vm.createContext(context);
   vm.runInContext(body, sandbox, { filename: "kittens-game-helper.user.js" });
+  const dbg = context.window.__kghDebug;
 
   const panel = (sel) => {
     for (const child of documentMock.body.children) if (child.selectors && child.selectors.has(sel)) return child.selectors.get(sel).textContent;
@@ -444,6 +570,37 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
       let lastPurchaseTick = 0;
       let prevPurchases = startPurchases;
       const focusNames = new Set();
+      const lifecycleEvents = [];
+      const lifecycleSeen = new Set();
+      let lifecycleViolations = 0;
+      const lifecycleViolationReasons = [];
+      let recoveryLayerSeen = false;
+      let initialPollutionEvidence = null;
+      let maxMutationOverlaps = 0;
+      const recordLifecycle = (event) => {
+        if (!lifecycleSeen.has(event)) { lifecycleSeen.add(event); lifecycleEvents.push(event); }
+      };
+      const violateLifecycle = (tick, reason) => {
+        lifecycleViolations += 1;
+        lifecycleViolationReasons.push(`tick ${tick}: ${reason}`);
+      };
+
+      if (st.pollution) {
+        const status = dbg.pollutionStatus?.();
+        const cleanupCandidate = dbg.candidateById?.("upgrade:carbonSequestrationSim");
+        const recoveryTarget = dbg.bestPollutionRecoveryTarget?.(cleanupCandidate ? [cleanupCandidate] : []);
+        const initialRecovery = dbg.selectStrategicTarget?.("balanced");
+        recoveryLayerSeen = /Pollution recovery/.test(initialRecovery?.layer || "");
+        initialPollutionEvidence = {
+          status: status && { current: status.current, perTick: status.perTick, level: status.level, equilibrium: status.equilibrium },
+          cleanupGate: dbg.candidateGate?.("upgrade", st.pollution.cleanup)?.state,
+          cleanupMarginal: dbg.pollutionMarginalFor?.(st.pollution.cleanup),
+          recoveryTarget: recoveryTarget?.meta?.name || null,
+          selectedLayer: initialRecovery?.layer || null,
+          selectedTarget: initialRecovery?.target?.meta?.name || null,
+        };
+      }
+      if (holdAutopilotForInitialEvidence) storage.set("kgh.autopilot", "1");
 
       for (let tick = 1; tick <= ticks; tick++) {
         fakeNow += 4000;
@@ -453,8 +610,42 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
           if (!r || !r.maxValue) { if (r) r.value += rate * 4; continue; }
           r.value = Math.min(r.maxValue, Math.max(0, r.value + rate * 4));
         }
-        if (st.onTick) st.onTick();
-        if (tickFn) { try { tickFn(); } catch (e) { failures.push(`${name}: tick threw ${e.message}`); } }
+        if (st.lifecycle) {
+          const { library, workshop, freshResearch, freshUpgrade, freshCraft, ziggurat } = st.lifecycle;
+          if ((library.val || 0) <= 0 && (dbg.candidateGate?.("research", freshResearch)?.state !== "closed" || dbg.candidateById?.("research:freshResearchSim"))) violateLifecycle(tick, "research visible before Library");
+          if ((workshop.val || 0) <= 0 && (
+            dbg.candidateGate?.("upgrade", freshUpgrade)?.state !== "closed" ||
+            dbg.candidateGate?.("craft", freshCraft)?.state !== "closed" ||
+            dbg.candidateById?.("upgrade:freshUpgradeSim")
+          )) violateLifecycle(tick, "upgrade/craft visible before Workshop");
+          const lockedId = dbg.activeTargetId?.() || "";
+          if (((library.val || 0) <= 0 && lockedId === "research:freshResearchSim") ||
+              ((workshop.val || 0) <= 0 && /freshUpgradeSim|freshPartSim|ziggurat/.test(lockedId))) violateLifecycle(tick, `premature lock ${lockedId}`);
+          if (!ziggurat.unlocked && dbg.candidateById?.("build:ziggurat")) violateLifecycle(tick, "ordinary Ziggurat candidate before native reveal");
+        }
+        if (st.onTick) st.onTick(tick);
+        try { advanceTimers(4000); } catch (e) { failures.push(`${name}: timer lane threw ${e.message}`); }
+
+        const scheduler = dbg.automationSchedulerSnapshot?.();
+        maxMutationOverlaps = Math.max(maxMutationOverlaps, scheduler?.overlappingMutations || 0);
+        if (st.lifecycle) {
+          const { library, workshop, freshResearch, freshUpgrade, ziggurat, megalith } = st.lifecycle;
+          if ((library.val || 0) > 0) recordLifecycle("Library");
+          if ((workshop.val || 0) > 0) recordLifecycle("Workshop");
+          if (freshResearch.researched) recordLifecycle("research");
+          if (freshUpgrade.researched) recordLifecycle("upgrade");
+          if (megalith.value > 0) recordLifecycle("Ziggurat banks");
+          if (ziggurat.unlocked) recordLifecycle("native reveal");
+          if ((ziggurat.val || 0) > 0) recordLifecycle("Ziggurat build");
+          if (freshResearch.researched && (library.val || 0) <= 0) violateLifecycle(tick, "research bought before Library");
+          if ((freshUpgrade.researched || megalith.value > 0) && (workshop.val || 0) <= 0) violateLifecycle(tick, "upgrade/craft executed before Workshop");
+          if (ziggurat.unlocked && !st.lifecycle.nativeRevealBanksSatisfied) violateLifecycle(tick, "native reveal before aggregate banks");
+        }
+        if (st.pollution) {
+          st.pollution.minDirtyOn = Math.min(st.pollution.minDirtyOn, st.pollution.dirtyFactory.on);
+          const decision = dbg.selectStrategicTarget?.("balanced");
+          recoveryLayerSeen ||= /Pollution recovery/.test(decision?.layer || "");
+        }
 
         // COHERENCE: the "Now" line must never claim the titanium path while the
         // focus is non-titanium.
@@ -515,13 +706,42 @@ const runScenario = ({ name, phase, goal, ticks = TICKS }) => {
         check(`official Space shapes preserved (missions in programs; sattelite under Cath)`, !gamePage.space.programs.some((item) => item.name === "sattelite" || item.name === "spaceElevator") && !!sat);
       }
 
-      resolve({ name, failures, metrics: { gained, coherenceViolations, maxNoPurchaseGap, focusCount: focusNames.size, spies } });
+      if (phase === "freshLifecycle") {
+        const eventIndex = (event) => lifecycleEvents.indexOf(event);
+        check(`persisted metadata never bypassed source lifecycle (${lifecycleViolations} violations)`, lifecycleViolations === 0);
+        check(`fresh Library/Workshop rebuilt (${lifecycleEvents.join(" → ")})`, eventIndex("Library") >= 0 && eventIndex("Workshop") >= 0);
+        check(`research opens only after Library (${lifecycleEvents.join(" → ")})`, eventIndex("research") > eventIndex("Library"));
+        check(`upgrade opens only after Workshop (${lifecycleEvents.join(" → ")})`, eventIndex("upgrade") > eventIndex("Workshop"));
+        check(`Ziggurat banks open after Workshop (${lifecycleEvents.join(" → ")})`, eventIndex("Ziggurat banks") > eventIndex("Workshop"));
+        check(`native Ziggurat reveal follows its aggregate banks (${lifecycleEvents.join(" → ")})`, eventIndex("native reveal") > eventIndex("Ziggurat banks"));
+        check(`ordinary Ziggurat purchase follows native reveal (${lifecycleEvents.join(" → ")})`, eventIndex("Ziggurat build") >= eventIndex("native reveal") && eventIndex("Ziggurat build") >= 0);
+      }
+      if (phase === "pollutionIndustry") {
+        const status = dbg.pollutionStatus?.();
+        check(`pollution recovery layer became visible`, recoveryLayerSeen);
+        check(`sequestration was purchased`, st.pollution.cleanup.researched);
+        check(`native pollution slope/equilibrium became safe (delta ${status?.perTick}, equilibrium ${status?.equilibrium})`, status?.perTick < 0 && status?.equilibrium <= 500);
+        check(`pollution stayed bounded (peak ${st.pollution.peak.toFixed(1)})`, st.pollution.peak < 1000);
+        check(`nonessential dirty industry was throttled (${st.pollution.dirtyFactory.val} → ${st.pollution.minDirtyOn})`, st.pollution.minDirtyOn < st.pollution.dirtyFactory.val);
+        check(`pollution diagnostics remain explicit`, /Pollution:.*level.*delta.*equilibrium.*threshold ETA.*clean energy.*contributors/i.test(dbg.report?.() || ""));
+      }
+      if (phase === "freshLifecycle" || phase === "pollutionIndustry") {
+        check(`scheduler mutation lanes never overlapped (${maxMutationOverlaps})`, maxMutationOverlaps === 0);
+        check(`${speed}× scheduler persisted requested speed`, dbg.automationClockSnapshot?.().requestedMultiplier === speed);
+        if (speed > 1) check(`${speed}× cooperative booster advanced native ticks (${spies.boosterTicks})`, spies.boosterTicks > 0);
+      }
+
+      resolve({ name, failures, metrics: {
+        gained, coherenceViolations, maxNoPurchaseGap, focusCount: focusNames.size, spies,
+        lifecycleEvents, lifecycleViolations, recoveryLayerSeen, maxMutationOverlaps,
+        lifecycleViolationReasons, initialPollutionEvidence,
+      } });
     }, 0);
   });
 };
 
 /* -------------------------------- run all ---------------------------------- */
-const scenarios = [
+const allScenarios = [
   { name: "early-game (balanced)", phase: "early", goal: "balanced" },
   { name: "mid-game (reach space)", phase: "mid", goal: "space" },
   { name: "titanium TRAP (plan doesn't need titanium)", phase: "titaniumTrap", goal: "balanced" },
@@ -529,7 +749,15 @@ const scenarios = [
   { name: "compendium craft-chain (chemistry)", phase: "compendium", goal: "space" },
   { name: "producer prerequisite (oil well → calciner)", phase: "oilWell", goal: "production" },
   { name: "late-game space programs", phase: "space", goal: "space" },
+  { name: "fresh lifecycle + Workshop/Ziggurat (1x)", phase: "freshLifecycle", goal: "balanced", speed: 1 },
+  { name: "fresh lifecycle + Workshop/Ziggurat (50x)", phase: "freshLifecycle", goal: "balanced", speed: 50 },
+  { name: "industry + pollution mitigation (1x)", phase: "pollutionIndustry", goal: "balanced", speed: 1 },
+  { name: "industry + pollution mitigation (50x)", phase: "pollutionIndustry", goal: "balanced", speed: 50 },
 ];
+const scenarioFilter = process.env.KGH_SIM_PHASE;
+const scenarios = scenarioFilter
+  ? allScenarios.filter((scenario) => scenario.phase === scenarioFilter || scenario.name.includes(scenarioFilter))
+  : allScenarios;
 
 console.log(`Kittens Helper Simulation — ${scenarios.length} scenarios × ${TICKS} ticks\n`);
 const allFailures = [];
@@ -538,6 +766,12 @@ for (const sc of scenarios) {
   const mark = failures.length ? "✗" : "✓";
   console.log(`${mark} ${sc.name}`);
   console.log(`    purchases +${metrics.gained} · coherence-violations ${metrics.coherenceViolations} · max no-buy gap ${metrics.maxNoPurchaseGap} · focuses ${metrics.focusCount} · zebra ${metrics.spies.zebraTrades} ship ${metrics.spies.shipBuilt} manuscript ${metrics.spies.manuscriptMade.toFixed(0)} compendium ${metrics.spies.compendiumMade.toFixed(0)}`);
+  if (metrics.lifecycleEvents.length) console.log(`    lifecycle ${metrics.lifecycleEvents.join(" -> ")} · violations ${metrics.lifecycleViolations}`);
+  for (const reason of metrics.lifecycleViolationReasons) console.log(`      lifecycle evidence: ${reason}`);
+  if (sc.phase === "pollutionIndustry") {
+    console.log(`    pollution recovery-layer ${metrics.recoveryLayerSeen} · mutation-overlaps ${metrics.maxMutationOverlaps} · booster ${metrics.spies.boosterTicks}`);
+    console.log(`    pollution initial ${JSON.stringify(metrics.initialPollutionEvidence)}`);
+  }
   for (const f of failures) console.log(`      → ${f}`);
   allFailures.push(...failures);
 }
@@ -547,4 +781,4 @@ if (allFailures.length) {
   console.error(`\n✗ ${allFailures.length} simulation check(s) failed across ${scenarios.length} scenarios.`);
   process.exit(1);
 }
-console.log(`\n✓ All simulation scenarios passed — progress, coherence, no off-plan titanium, and craft-chain drive hold across game phases.`);
+console.log(`\n✓ All simulation scenarios passed — progression order, pollution recovery, scheduler isolation, coherence, and craft-chain drive hold across game phases.`);

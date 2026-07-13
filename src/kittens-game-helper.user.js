@@ -32,6 +32,15 @@
 (function kittensGameHelper() {
   "use strict";
 
+  // Userscript reinjection must replace, never stack with, the prior owner.
+  try {
+    if (window.__kghTimerOwner && typeof window.__kghTimerOwner.cancelAll === "function") {
+      window.__kghTimerOwner.cancelAll();
+    }
+  } catch (error) {
+    /* first injection */
+  }
+
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
   const PRESTIGE_ARM_KEY = "kgh.prestigeArmed";
@@ -660,6 +669,161 @@
     const requested = stageOverride == null ? Number(raw.stage) || 0 : Number(stageOverride) || 0;
     const stage = Math.max(0, Math.min(raw.stages.length - 1, requested));
     return { ...raw, ...(raw.stages[stage] || {}), stage };
+  };
+
+  /* -------------------------- lifecycle source gates ----------------------- */
+
+  // Metadata survives resets and is often populated before the UI surface that
+  // owns it exists.  Treating raw `unlocked: true` as actionable made research,
+  // workshop upgrades and advanced crafts leak into every planning surface on a
+  // fresh run.  This is the single lifecycle gate used by discovery, recursive
+  // routes, queues, reservations and the final execution recheck.
+  const CORE_CRAFTS = new Set(["wood"]); // Refine Catnip predates Workshop.
+
+  const sourceBuildingCount = (name) => {
+    try {
+      const meta = buildingMetas().find((building) => building && building.name === name);
+      return Math.max(0, Number(meta && (meta.val != null ? meta.val : meta.on)) || 0);
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const candidateButtonsFor = (kind) => {
+    const game = window.gamePage || {};
+    const tab = kind === "research" || kind === "policy" ? game.scienceTab
+      : kind === "upgrade" || kind === "craft" ? game.workshopTab
+      : kind === "religion" || kind === "ziggurat" || kind === "transcendence" ? game.religionTab
+      : kind === "space" ? game.spaceTab
+      : kind === "time" ? game.timeTab
+      : kind === "build" ? game.bonfireTab
+      : null;
+    if (!tab) return [];
+    const out = [];
+    for (const value of Object.values(tab)) {
+      if (Array.isArray(value)) out.push(...value);
+      else if (value && typeof value === "object" && (value.model || value.controller)) out.push(value);
+    }
+    return out;
+  };
+
+  const nativeCandidateModel = (kind, meta) => {
+    if (!meta || !meta.name) return null;
+    try {
+      for (const button of candidateButtonsFor(kind)) {
+        const model = button && (button.model || button);
+        const options = model && (model.options || model.opts) || button && button.opts || {};
+        const modelMeta = model && (model.metadata || model.meta);
+        const id = options.id || options.tech || options.upgrade || options.building ||
+          (modelMeta && modelMeta.name) || model && model.name || button && button.id;
+        if (id === meta.name) return model;
+      }
+    } catch (error) {
+      /* structural fallback below */
+    }
+    return null;
+  };
+
+  const requiredTechnologyFor = (meta) => {
+    if (!meta) return null;
+    const value = meta.requiredTech || meta.requiredTechnology || meta.technology || meta.tech;
+    return typeof value === "string" ? value : value && value.name || null;
+  };
+
+  const requiredTechnologyOpen = (meta) => {
+    const name = requiredTechnologyFor(meta);
+    if (!name) return true;
+    try {
+      const tech = (window.gamePage.science && window.gamePage.science.techs || [])
+        .find((candidate) => candidate && candidate.name === name);
+      return !!(tech && tech.researched);
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const candidateGate = (kind, meta) => {
+    const closed = (reason, source = "structural", model = null) => ({ state: "closed", reason, source, model });
+    const precursor = (reason, source = "structural", model = null) => ({ state: "precursor", reason, source, model });
+    const actionable = (reason, source = "structural", model = null) => ({ state: "actionable", reason, source, model });
+    if (!meta || !meta.name) return closed("missing metadata");
+
+    const model = nativeCandidateModel(kind, meta);
+    if (model) {
+      const visible = model.visible != null ? model.visible : model.isVisible;
+      if (visible === false) return closed("native model hidden", "native model", model);
+      const modelMeta = model.metadata || model.meta;
+      if (modelMeta && modelMeta.unlocked === false) return closed("native model locked", "native model", model);
+    }
+
+    if (meta.researched === true || (meta.noStackable && (Number(meta.val) || Number(meta.on) || 0) > 0)) {
+      return closed("already completed", model ? "native model" : "metadata", model);
+    }
+
+    if (kind === "research" || kind === "policy") {
+      if (!model && sourceBuildingCount("library") < 1) return closed("Library ×1 / Science surface required");
+      if (meta.unlocked === false) return closed("research metadata locked", model ? "native model" : "metadata", model);
+      return actionable(model ? "native Science model visible" : "Library ×1", model ? "native model" : "Library", model);
+    }
+
+    if (kind === "upgrade" || kind === "craft") {
+      if (kind === "craft" && CORE_CRAFTS.has(meta.name) && meta.unlocked !== false) return actionable("core craft");
+      if (!model && sourceBuildingCount("workshop") < 1) return closed("Workshop ×1 required");
+      if (meta.unlocked === false) return closed(`${kind} metadata locked`, model ? "native model" : "metadata", model);
+      return actionable(model ? "native Workshop model visible" : "Workshop ×1", model ? "native model" : "Workshop", model);
+    }
+
+    if (kind === "religion") {
+      const worshipSurface = (() => {
+        try { return Number(window.gamePage && window.gamePage.religion && window.gamePage.religion.faith) > 0; } catch (error) { return false; }
+      })();
+      if (!model && sourceBuildingCount("temple") < 1 && !worshipSurface) return closed("Temple / Religion surface required");
+      return meta.unlocked === false ? closed("religion metadata locked", "metadata", model) : actionable("Religion source open", model ? "native model" : "Temple", model);
+    }
+    if (kind === "ziggurat") {
+      if (sourceBuildingCount("ziggurat") < 1) return closed("Ziggurat ×1 required");
+      return meta.unlocked === false ? closed("ziggurat upgrade locked", "metadata", model) : actionable("Ziggurat source open", model ? "native model" : "Ziggurat", model);
+    }
+
+    if (kind === "build") {
+      const raw = rawBuildingFor(meta) || meta;
+      const live = liveMetaView(raw) || raw;
+      if (!requiredTechnologyOpen(live)) return closed(`${requiredTechnologyFor(live)} technology required`);
+      const manager = window.gamePage && window.gamePage.bld;
+      let nativeUnlocked = null;
+      let nativeUnlockable = null;
+      try {
+        if (manager && typeof manager.isUnlocked === "function") nativeUnlocked = !!manager.isUnlocked(raw.name);
+        if (manager && typeof manager.isUnlockable === "function") nativeUnlockable = !!manager.isUnlockable(raw.name);
+      } catch (error) {
+        return closed("native building gate unavailable", "native Buildings manager", model);
+      }
+      const unlocked = nativeUnlocked != null ? nativeUnlocked : live.unlocked !== false;
+      if (unlocked) return actionable(nativeUnlocked != null ? "native building unlocked" : "live building unlocked", nativeUnlocked != null ? "native Buildings manager" : "metadata", model);
+      const ratio = isFinite(live.unlockRatio) ? Math.max(0, Number(live.unlockRatio)) : 0;
+      const revealable = nativeUnlockable != null ? nativeUnlockable : !!(live.unlockable || live.defaultUnlockable);
+      if (ratio > 0 && revealable) return precursor(`aggregate reveal threshold ${fmt(ratio * 100)}%`, nativeUnlockable != null ? "native Buildings manager" : "metadata", model);
+      return closed(nativeUnlockable === false ? "native building not unlockable" : "building locked", nativeUnlockable != null ? "native Buildings manager" : "metadata", model);
+    }
+
+    if (kind === "bootstrap") {
+      const downstream = meta.downstreamName && buildingMetas().find((building) => building && building.name === meta.downstreamName);
+      const gate = downstream && candidateGate("build", downstream);
+      return gate && gate.state === "precursor" ? actionable("aggregate precursor is live", gate.source, gate.model) : closed("downstream reveal is no longer live", gate && gate.source || "metadata", gate && gate.model || null);
+    }
+
+    if (kind === "space") {
+      const descriptor = typeof spaceDescriptorFor === "function" ? spaceDescriptorFor(meta) : null;
+      return descriptor && descriptor.gateState && descriptor.gateState.open
+        ? actionable(descriptor.gateState.reason || "Space source open", "native Space controller", descriptor.gateState.model || model)
+        : closed(descriptor && descriptor.gateState && descriptor.gateState.reason || "Space source closed", "native Space controller", model);
+    }
+    if (kind === "time") {
+      const adapter = typeof timeNativeAdapter === "function" ? timeNativeAdapter(meta) : { available: false };
+      return spaceTimeOpen(meta) && adapter.available ? actionable("native Time model available", "native Time controller", adapter.model || model) : closed(adapter.reason || "Time source closed", "native Time controller", model);
+    }
+
+    return meta.unlocked === false ? closed(`${kind} metadata locked`, "metadata", model) : actionable(`${kind} metadata open`, model ? "native model" : "metadata", model);
   };
 
   // Space programs (one-time planet-unlock missions, e.g. orbitalLaunch) and
@@ -1539,14 +1703,15 @@
     const first = entry.samples[0];
     const last = entry.samples[entry.samples.length - 1];
     const span = last.t - first.t;
-    if (span < RESOURCE_TELEMETRY_MIN_SPAN_MS) return null;
+    const deliveredMultiplier = Math.max(1, automationClockSnapshot().deliveredMultiplier);
+    if (span * deliveredMultiplier < RESOURCE_TELEMETRY_MIN_SPAN_MS) return null;
     // A capped resource bar is flat because production is clipped, not because
     // its ticker is zero.  Likewise, do not bridge a known discrete action.
     if (entry.samples.some((sample) => sample.cap > 0 && sample.value >= sample.cap * 0.985)) return null;
     if (entry.discontinuityAt && entry.discontinuityAt >= first.t && entry.discontinuityAt <= last.t) return null;
     const delta = last.value - first.value;
     if (!isFinite(delta)) return null;
-    return delta / (span / 1000);
+    return delta / (span / 1000) / deliveredMultiplier;
   };
 
   const liveCapFor = (resources, name) => {
@@ -1649,7 +1814,7 @@
   const craftByName = (name) => {
     try {
       const craft = window.gamePage.workshop.getCraft && window.gamePage.workshop.getCraft(name);
-      return craft && craft.unlocked !== false ? craft : null;
+      return craft && candidateGate("craft", craft).state === "actionable" ? craft : null;
     } catch (error) {
       return null;
     }
@@ -2425,6 +2590,7 @@
   };
 
   const matchResourcePrefix = (key) => {
+    if (/pollution/i.test(String(key || ""))) return null;
     let best = null;
     for (const name of knownResourceNames()) {
       if (key.startsWith(name) && (!best || name.length > best.length)) best = name;
@@ -2465,6 +2631,9 @@
 
   const parseEffectEntry = (profile, key, value) => {
     if (!isFinite(value) || value === 0) return;
+    // Pollution is a global environmental state, not a spendable resource.
+    // Its marginal value is handled by pollutionMarginalFor/economicValue.
+    if (/pollution/i.test(String(key || ""))) return;
     if (key === "energyProduction") {
       profile.energyProduction += value;
       return;
@@ -2541,6 +2710,127 @@
     } catch (error) {
       return { prod: 0, cons: 0, delta: 0, winterProd: 0, winterDelta: 0 };
     }
+  };
+
+  /* ----------------------------- pollution model --------------------------- */
+
+  const pollutionMarginalFor = (meta) => {
+    if (!meta) return 0;
+    refreshMetaEffects(meta);
+    const live = liveMetaView(meta) || meta;
+    const effects = live.effects && typeof live.effects === "object" ? live.effects : {};
+    let marginal = 0;
+    for (const [key, value] of Object.entries(effects)) {
+      if (!/pollution.*PerTick|PerTick.*pollution/i.test(key) || !isFinite(value)) continue;
+      marginal += Number(value) || 0;
+    }
+    return marginal;
+  };
+
+  const pollutionLevelDefinitions = (manager) => {
+    const raw = manager && (manager.pollutionLevels || manager.cathPollutionLevels || manager.pollutionEffects);
+    if (Array.isArray(raw)) return raw;
+    return raw && typeof raw === "object" ? Object.values(raw) : [];
+  };
+
+  const pollutionStatus = () => {
+    const manager = window.gamePage && window.gamePage.bld || {};
+    const readNumber = (methodNames, fieldNames, fallback = 0) => {
+      for (const name of methodNames) {
+        try {
+          if (typeof manager[name] === "function") {
+            const value = manager[name]();
+            if (isFinite(value)) return Number(value);
+          }
+        } catch (error) { /* try the next native surface */ }
+      }
+      for (const name of fieldNames) if (isFinite(manager[name])) return Number(manager[name]);
+      return fallback;
+    };
+    const current = readNumber(["getPollution", "getCathPollution"], ["cathPollution", "pollution"],
+      Number((getRes(resourceMap(), "cathPollution") || {}).value) || 0);
+    const perTick = readNumber(["getPollutionPerTick", "getCathPollutionPerTick"], ["cathPollutionPerTick", "pollutionPerTick"], 0);
+    const equilibrium = readNumber(["getPollutionEquilibrium", "getCathPollutionEquilibrium"], ["cathPollutionEquilibrium", "pollutionEquilibrium"],
+      perTick > 0 ? Number.POSITIVE_INFINITY : Math.max(0, current));
+    let nativeLevel = null;
+    try {
+      if (typeof manager.getPollutionLevel === "function") nativeLevel = manager.getPollutionLevel();
+      else if (typeof manager.getCathPollutionLevel === "function") nativeLevel = manager.getCathPollutionLevel();
+    } catch (error) { /* derive from thresholds */ }
+    const definitions = pollutionLevelDefinitions(manager)
+      .map((entry, index) => ({ ...entry, level: isFinite(entry && entry.level) ? Number(entry.level) : index, threshold: Number(entry && (entry.threshold != null ? entry.threshold : entry.value)) || 0 }))
+      .sort((a, b) => a.threshold - b.threshold);
+    let level = isFinite(nativeLevel) ? Number(nativeLevel)
+      : nativeLevel && isFinite(nativeLevel.level) ? Number(nativeLevel.level)
+      : 0;
+    if (nativeLevel == null) {
+      for (const entry of definitions) if (current >= entry.threshold) level = entry.level;
+    }
+    const activeDefinition = definitions.filter((entry) => entry.threshold <= current).slice(-1)[0] || definitions[level] || null;
+    const effects = nativeLevel && nativeLevel.effects && typeof nativeLevel.effects === "object"
+      ? { ...nativeLevel.effects }
+      : activeDefinition && activeDefinition.effects && typeof activeDefinition.effects === "object" ? { ...activeDefinition.effects } : {};
+    const next = definitions.find((entry) => entry.threshold > current) || null;
+    const nextThreshold = next ? next.threshold : Number.POSITIVE_INFINITY;
+    const nextEta = perTick > 0 && isFinite(nextThreshold)
+      ? Math.max(0, nextThreshold - current) / Math.max(0.000001, perTick * nativeTicksPerSecond())
+      : Number.POSITIVE_INFINITY;
+
+    let cleanWatts = 0;
+    let totalWatts = 0;
+    const contributors = [];
+    for (const meta of buildingMetas()) {
+      if (!meta) continue;
+      const count = Math.max(0, Number(meta.on != null ? meta.on : meta.val) || 0);
+      const live = liveMetaView(meta) || meta;
+      const watts = Math.max(0, Number(live.effects && live.effects.energyProduction) || 0) * count;
+      const pollution = pollutionMarginalFor(meta) * count;
+      totalWatts += watts;
+      if (pollution <= 0) cleanWatts += watts;
+      if (pollution > 0) contributors.push({ name: meta.name, label: labelOf(meta), perTick: pollution });
+    }
+    contributors.sort((a, b) => b.perTick - a.perTick);
+    return {
+      current,
+      perTick,
+      level,
+      equilibrium,
+      nextThreshold,
+      nextEta,
+      cleanEnergyRatio: totalWatts > 0 ? Math.max(0, Math.min(1, cleanWatts / totalWatts)) : 1,
+      effects,
+      contributors,
+    };
+  };
+
+  const pollutionPenalty = (status = pollutionStatus()) => {
+    if (!status || !(status.current > 0) || !(status.perTick > 0) || status.equilibrium <= status.current) return 0;
+    let harmful = 0;
+    for (const value of Object.values(status.effects || {})) if (isFinite(value) && value < 0) harmful += Math.abs(value);
+    const distance = isFinite(status.nextThreshold) && status.nextThreshold > 0
+      ? Math.max(0, Math.min(1, 1 - (status.nextThreshold - status.current) / status.nextThreshold))
+      : 1;
+    return Math.max(0, (1 + status.level + harmful * 10) * (1 + distance * 2));
+  };
+
+  const pollutionProcessorTarget = (meta, target = null, status = pollutionStatus()) => {
+    const full = Math.max(0, Math.floor(Number(meta && meta.val) || 0));
+    if (!meta || full <= 0 || pollutionPenalty(status) <= 0 || pollutionMarginalFor(meta) <= 0) return full;
+    const profile = processingProfileFor(meta);
+    const targetNeedsOutput = !!target && profile.outputs.some((output) =>
+      pricesFor(target.kind, target.meta).some((price) => price && price.name === output && resValueOf(resourceMap(), output) < price.val));
+    const critical = /^(smelter|calciner)$/i.test(meta.name) || /smelter|calciner/i.test(labelOf(meta));
+    return targetNeedsOutput || critical || (target && target.meta === meta) ? Math.min(full, 1) : 0;
+  };
+
+  const bestPollutionRecoveryTarget = (candidates, resources = resourceMap(), status = pollutionStatus()) => {
+    if (pollutionPenalty(status) <= 0) return null;
+    const options = (candidates || [])
+      .filter((candidate) => candidate && candidate.meta && candidateGate(candidate.kind, candidate.meta).state === "actionable")
+      .map((candidate) => ({ candidate, marginal: pollutionMarginalFor(candidate.meta), eta: waitSecondsForCandidate(candidate, resources) }))
+      .filter((item) => item.marginal < 0 && isFinite(item.eta))
+      .sort((a, b) => (-b.marginal / (1 + b.eta)) - (-a.marginal / (1 + a.eta)) || a.eta - b.eta);
+    return options.length ? options[0].candidate : null;
   };
 
   const profileNetEnergy = (profile) => (profile && profile.energyProduction || 0) - (profile && profile.energyConsumption || 0);
@@ -3071,7 +3361,7 @@
   const storageBlockPressure = (resources, goal, goalKey) => {
     const pressure = {};
     const visit = (kind, meta) => {
-      if (!isOpen(meta)) return;
+      if (candidateGate(kind, meta).state !== "actionable") return;
       const blockers = directStorageBlockers(kind, meta, resources);
       if (!blockers.length || !storageBlockerIsFocused(kind, meta, goal, goalKey)) return;
       let weight = TUNING.pressureKind[kind] || 14;
@@ -3122,7 +3412,7 @@
     const out = [];
     try {
       for (const meta of buildingMetas()) {
-        if (!meta || meta.unlocked === false) continue;
+        if (!meta || candidateGate("build", meta).state !== "actionable") continue;
         const profile = metaEffectProfile(meta);
         if ((profile.perTick[name] || 0) > 0) out.push(meta);
       }
@@ -3140,7 +3430,7 @@
     const demand = {};
     const goal = GOALS[goalKey];
     const visit = (kind, meta) => {
-      if (!isOpen(meta) || !storageBlockerIsFocused(kind, meta, goal, goalKey)) return;
+      if (candidateGate(kind, meta).state !== "actionable" || !storageBlockerIsFocused(kind, meta, goal, goalKey)) return;
       for (const cost of pricesFor(kind, meta)) {
         if (!cost || !cost.name || !isFinite(cost.val) || cost.val <= 0) continue;
         if (cost.name === "titanium" || craftByName(cost.name)) continue;
@@ -3493,6 +3783,16 @@
       const projectedWinter = power.winterDelta - profile.energyConsumption;
       if (projected < TUNING.powerHeadroom) value -= TUNING.powerDeficitPenalty * (TUNING.powerHeadroom - projected);
       if (projectedWinter < 0) value -= TUNING.powerWinterPenalty * -projectedWinter;
+    }
+    const pollutionState = pollutionStatus();
+    const pollutionWeight = pollutionPenalty(pollutionState);
+    const pollutionMarginal = pollutionMarginalFor(meta);
+    if (pollutionWeight > 0) {
+      if (pollutionMarginal < 0) value += Math.min(240, -pollutionMarginal * pollutionWeight * 12);
+      if (pollutionMarginal > 0) value -= Math.min(240, pollutionMarginal * pollutionWeight * 18);
+      if ((profile.energyProduction || 0) > 0 && pollutionMarginal <= 0) {
+        value += Math.min(30, profile.energyProduction * pollutionWeight * 0.4);
+      }
     }
     return value;
   };
@@ -3949,9 +4249,9 @@
         const currentOn = Math.max(0, Math.min(meta.val || 0, Math.floor(meta.on || 0)));
         const transition = processorTransitions[meta.name];
         if (!transition || !(transition.at > 0)) continue;
-        if (currentOn > 0 && transition.state === "run" && now - transition.at < PROCESSOR_MIN_RUN_MS) {
+        if (currentOn > 0 && transition.state === "run" && gameElapsedMs(transition.at) < PROCESSOR_MIN_RUN_MS) {
           minimumCounts.set(meta, currentOn);
-        } else if (currentOn <= 0 && transition.state === "pause" && now - transition.at < PROCESSOR_MIN_PAUSE_MS) {
+        } else if (currentOn <= 0 && transition.state === "pause" && gameElapsedMs(transition.at) < PROCESSOR_MIN_PAUSE_MS) {
           forcedPauses.add(meta);
         }
       }
@@ -4073,6 +4373,7 @@
     }
 
     const allocations = new Map();
+    const pollution = pollutionStatus();
     for (const meta of ordered) {
       const full = Math.max(0, Math.floor(meta.val || 0));
       const rates = ratesByMeta.get(meta) || {};
@@ -4114,12 +4415,17 @@
         }
       }
       const extra = Math.max(0, Math.min(extraRequested, fuelCap, powerCap));
-      const count = minimum + extra;
-      chargeFuel(meta, extra);
-      advancePower(meta, extra);
+      const prePollutionCount = minimum + extra;
+      const pollutionCap = Math.max(minimum, pollutionProcessorTarget(meta, target, pollution));
+      const count = Math.min(prePollutionCount, pollutionCap);
+      const allocatedExtra = Math.max(0, count - minimum);
+      chargeFuel(meta, allocatedExtra);
+      advancePower(meta, allocatedExtra);
 
       let state = { ...demand, on: count };
-      if (minimum > (demand.on || 0)) {
+      if (count < prePollutionCount) {
+        state = { on: count, reason: "pollution", detail: `holding pollution at level ${pollution.level}` };
+      } else if (minimum > (demand.on || 0)) {
         state = { on: count, reason: "cooldown", detail: `holding ${minimum} live during minimum run cooldown` };
       } else if (count < requested) {
         const powerLimited = powerCap <= fuelCap && powerCap < extraRequested;
@@ -4304,21 +4610,21 @@
     const candidates = [];
     try {
       for (const t of window.gamePage.science.techs || []) {
-        if (isOpen(t)) candidates.push({ kind: "research", weight: 4, meta: t });
+        if (candidateGate("research", t).state === "actionable") candidates.push({ kind: "research", weight: 4, meta: t });
       }
     } catch (error) {
       /* ignore */
     }
     try {
       for (const u of window.gamePage.workshop.upgrades || []) {
-        if (isOpen(u)) candidates.push({ kind: "upgrade", weight: 3, meta: u });
+        if (candidateGate("upgrade", u).state === "actionable") candidates.push({ kind: "upgrade", weight: 3, meta: u });
       }
     } catch (error) {
       /* ignore */
     }
     try {
       for (const u of religionUpgrades()) {
-        if (religionUpgradeVisible(u)) candidates.push({ kind: "religion", weight: 3, meta: u });
+        if (religionUpgradeVisible(u) && candidateGate("religion", u).state === "actionable") candidates.push({ kind: "religion", weight: 3, meta: u });
       }
     } catch (error) {
       /* ignore */
@@ -4332,14 +4638,14 @@
     }
     try {
       for (const u of zigguratUpgrades()) {
-        if (zigguratUpgradeVisible(u)) candidates.push({ kind: "ziggurat", weight: 3, meta: u });
+        if (zigguratUpgradeVisible(u) && candidateGate("ziggurat", u).state === "actionable") candidates.push({ kind: "ziggurat", weight: 3, meta: u });
       }
     } catch (error) {
       /* ignore */
     }
     try {
       for (const b of buildingMetas()) {
-        if (b && b.unlocked !== false) candidates.push({ kind: "build", weight: 2, meta: b });
+        if (candidateGate("build", b).state === "actionable") candidates.push({ kind: "build", weight: 2, meta: b });
       }
     } catch (error) {
       /* ignore */
@@ -4393,6 +4699,7 @@
     scienceStorageUnlock: "Science storage unlock",
     storage: "Storage blocker",
     power: "Power recovery",
+    pollution: "Pollution recovery",
     production: "Production bottleneck",
     lateGameFrontier: "Late-game progression frontier",
     housing: "Housing / population",
@@ -5412,30 +5719,35 @@
   const bootstrapResourceCandidate = (resources = resourceMap()) => {
     const options = [];
     for (const raw of buildingMetas()) {
-      if (!raw || raw.unlocked !== false || !(raw.unlockable || raw.defaultUnlockable)) continue;
-      if (!hiddenBuildingBootstrapAllowed(raw)) continue;
+      if (!raw || candidateGate("build", raw).state !== "precursor") continue;
+      if (!requiredTechnologyOpen(raw) || (!requiredTechnologyFor(raw) && !hiddenBuildingBootstrapAllowed(raw))) continue;
       const live = liveMetaView(raw) || raw;
       const ratio = isFinite(live.unlockRatio) ? Math.max(0, live.unlockRatio) : null;
       if (ratio == null || ratio <= 0) continue;
-      for (const price of live.prices || raw.prices || []) {
-        if (!price || !price.name || !(price.val > 0) || !craftByName(price.name)) continue;
-        if (resourceHasDirectJobPath(price.name) || rawProductionForNeed(price.name) > 0) continue;
-        const targetAmount = Math.max(1, price.val * ratio);
-        const have = resValueOf(resources, price.name);
-        if (have >= targetAmount) continue;
-        const meta = {
-          name: `bootstrap-${price.name}-for-${raw.name}`,
-          label: `${craftLabel(price.name)} for ${labelOf(raw)}`,
-          prices: [{ name: price.name, val: targetAmount }],
-          outputName: price.name,
-          targetAmount,
-          downstreamName: raw.name,
-          downstreamLabel: labelOf(raw),
-        };
-        const candidate = { kind: "bootstrap", weight: 5, meta, ...evaluate("bootstrap", meta, resources), score: 100 };
-        const reach = capDrainReachabilityFor(resources, price.name, targetAmount);
-        if (reach.reachable && (reach.eta || 0) <= BOOTSTRAP_MAX_ETA_S) options.push({ candidate, eta: reach.eta || 0 });
-      }
+      const thresholds = (live.prices || raw.prices || [])
+        .filter((price) => price && price.name && price.val > 0)
+        .map((price) => ({ name: price.name, val: Math.max(Number.MIN_VALUE, price.val * ratio) }));
+      if (!thresholds.length) continue;
+      const missing = thresholds.filter((price) => resValueOf(resources, price.name) < price.val);
+      if (!missing.length) continue; // wait for the native unlock update
+      // Ordinary job/passive resources reveal naturally; the helper only owns
+      // aggregate craft-only thresholds that would otherwise never advance.
+      if (missing.some((price) => resourceHasDirectJobPath(price.name) || rawProductionForNeed(price.name) > 0)) continue;
+      const routes = missing.map((price) => acquisitionPathFor(resources, price.name, price.val, { finalPurchase: false }));
+      if (routes.some((route) => !route.reachable || !isFinite(route.eta) || (thresholds.length === 1 && route.eta > BOOTSTRAP_MAX_ETA_S))) continue;
+      const meta = {
+        name: `reveal-${raw.name}`,
+        label: `Reveal ${labelOf(raw)} — ${missing.map((price) => craftLabel(price.name)).join(" + ")}`,
+        prices: thresholds,
+        outputName: missing[0].name,
+        outputNames: missing.map((price) => price.name),
+        targetAmount: missing[0].val,
+        downstreamName: raw.name,
+        downstreamLabel: labelOf(raw),
+        aggregate: true,
+      };
+      const candidate = { kind: "bootstrap", weight: 5, meta, ...evaluate("bootstrap", meta, resources), score: 100 };
+      options.push({ candidate, eta: Math.max(...routes.map((route) => route.eta || 0)) });
     }
     options.sort((a, b) => a.eta - b.eta || a.candidate.meta.targetAmount - b.candidate.meta.targetAmount);
     return options.length ? options[0].candidate : null;
@@ -6381,7 +6693,7 @@
         unicornPlanText = `Unicorns: banking unicorns to sacrifice for ${served.label} (${fmt(missingTears)} tears short)`;
         return;
       }
-      if (Date.now() - lastUnicornSacrificeAt < UNICORN_SACRIFICE_MIN_MS) {
+      if (gameElapsedMs(lastUnicornSacrificeAt) < UNICORN_SACRIFICE_MIN_MS) {
         unicornPlanText = `Unicorns: sacrifice for ${served.label} queued (batching)`;
         return;
       }
@@ -6482,6 +6794,25 @@
         rejectedTopCandidates: candidates.slice(0, 3)
           .filter((target) => targetId(target) !== targetId(fuelTarget))
           .map((target) => ({ target, reason: `deferred until ${lastConverterFuelDiagnostic.fuel} stops starving the converters` })),
+      };
+    }
+
+    // Environmental recovery is conditional safety work: it sits below food,
+    // power and processor-fuel survival, but above repeated growth that would
+    // compound a rising harmful pollution level.
+    const pollutionState = pollutionStatus();
+    const pollutionTarget = bestPollutionRecoveryTarget(candidates, resources, pollutionState);
+    if (pollutionTarget) {
+      return {
+        candidates: [pollutionTarget, ...candidates.filter((candidate) => targetId(candidate) !== targetId(pollutionTarget))],
+        target: pollutionTarget,
+        layer: STRATEGIC_LAYERS.pollution,
+        reason: `pollution level ${pollutionState.level} rising ${fmt(pollutionState.perTick)}/tick toward ${fmt(pollutionState.equilibrium)}; ${labelOf(pollutionTarget.meta)} removes ${fmt(-pollutionMarginalFor(pollutionTarget.meta))}/tick`,
+        protectedChain: candidateCraftChainResources(pollutionTarget),
+        pollution: pollutionState,
+        rejectedTopCandidates: candidates.slice(0, 3)
+          .filter((candidate) => targetId(candidate) !== targetId(pollutionTarget))
+          .map((target) => ({ target, reason: "deferred until pollution is bounded" })),
       };
     }
 
@@ -6740,7 +7071,7 @@
     if (candidate.kind === "research" || candidate.kind === "upgrade" || candidate.kind === "policy") return !!candidate.meta.researched;
     if (candidate.kind === "religion") return religionUpgradePurchased(candidate.meta);
     if (VAL_BASED_KINDS.has(candidate.kind) && activeTarget && activeTarget.id === targetId(candidate)) {
-      return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && Date.now() - activeTarget.startedAt > TARGET_READY_GRACE_MS;
+      return (candidate.meta.val || 0) > (activeTarget.initialVal || 0) && gameElapsedMs(activeTarget.startedAt) > TARGET_READY_GRACE_MS;
     }
     return false;
   };
@@ -6749,7 +7080,7 @@
 
   const classifyTargetFeasibility = (candidate, resources) => {
     if (!candidate || !candidate.meta) return { status: FEASIBILITY.IMPOSSIBLE, reason: "missing target" };
-    if (!isOpen(candidate.meta) && candidate.kind !== "build") return { status: FEASIBILITY.IMPOSSIBLE, reason: "target unavailable" };
+    if (candidateGate(candidate.kind, candidate.meta).state !== "actionable") return { status: FEASIBILITY.IMPOSSIBLE, reason: "target source gate closed" };
     const solver = solveCraftChain(resources, candidate);
     if (solver.hardBlocked) {
       const hard = (solver.blockers || []).find((b) => b.kind === "finalCap" || b.kind === "stepCap" || b.kind === "unreachable");
@@ -6820,23 +7151,23 @@
         ids.add(id);
         if (knownUnlockIds && !knownUnlockIds.has(id)) fresh.push({ id, meta });
       };
-      for (const t of techList()) note("research", t, isOpen(t));
+      for (const t of techList()) note("research", t, candidateGate("research", t).state === "actionable");
       try {
-        for (const u of window.gamePage.workshop.upgrades || []) note("upgrade", u, isOpen(u));
+        for (const u of window.gamePage.workshop.upgrades || []) note("upgrade", u, candidateGate("upgrade", u).state === "actionable");
       } catch (error) {
         /* ignore */
       }
-      for (const u of religionUpgrades()) note("religion", u, religionUpgradeVisible(u));
-      for (const u of zigguratUpgrades()) note("ziggurat", u, zigguratUpgradeVisible(u));
+      for (const u of religionUpgrades()) note("religion", u, religionUpgradeVisible(u) && candidateGate("religion", u).state === "actionable");
+      for (const u of zigguratUpgrades()) note("ziggurat", u, zigguratUpgradeVisible(u) && candidateGate("ziggurat", u).state === "actionable");
       for (const u of transcendenceUpgrades()) note("transcendence", u, isOpen(u) && transcendenceNativeAdapter(u).available);
-      for (const b of buildingMetas()) note("build", b, !!b && b.unlocked !== false);
+      for (const b of buildingMetas()) note("build", b, candidateGate("build", b).state === "actionable");
       for (const descriptor of spaceDescriptors()) note("space", descriptor.meta, descriptor.gateState.open && !descriptor.completionState.purchased);
       for (const meta of timeMetas()) note("time", meta, spaceTimeOpen(meta) && timeNativeAdapter(meta).available);
       try {
         for (const res of window.gamePage.resPool.resources || []) note("resource", { ...res, label: res.title || res.name }, !!res && res.unlocked !== false);
         const crafts = window.gamePage.workshop && window.gamePage.workshop.crafts;
         for (const craft of (Array.isArray(crafts) ? crafts : Object.values(crafts || {}))) {
-          note("craft", craft, !!craft && craft.unlocked !== false);
+          note("craft", craft, candidateGate("craft", craft).state === "actionable");
         }
       } catch (error) {
         /* resources/crafts can still be booting */
@@ -6902,7 +7233,7 @@
     // the user changed queue priority, or a real emergency wins.
     if (activeTarget) {
       const locked = findCandidateById(candidates, activeTarget.id);
-      const age = now - activeTarget.startedAt;
+      const age = gameElapsedMs(activeTarget.startedAt);
       const lockedWait = locked ? waitSecondsForCandidate(locked, resources) : 0;
       const preferredWait = preferred ? waitSecondsForCandidate(preferred, resources) : Number.POSITIVE_INFINITY;
       const progress = locked ? targetProgressSignature(locked, resources) : "";
@@ -6910,7 +7241,7 @@
         activeTarget.lastProgressSignature = progress;
         activeTarget.lastProgressAt = now;
       }
-      const noProgress = now - (activeTarget.lastProgressAt || activeTarget.startedAt) > TARGET_LOCK_MAX_MS;
+      const noProgress = gameElapsedMs(activeTarget.lastProgressAt || activeTarget.startedAt) > TARGET_LOCK_MAX_MS;
       const manualQueueChanged = activeTarget.queueSignature !== JSON.stringify(readQueue());
       const feasibility = locked ? classifyTargetFeasibility(locked, resources) : { status: FEASIBILITY.IMPOSSIBLE };
       const impossible = locked && feasibility.status === FEASIBILITY.IMPOSSIBLE;
@@ -7018,7 +7349,7 @@
     // block, a long timeout, a far-cheaper research, or a much better rival.
     if (preferred) {
       const rejected = rejectedTargets.get(targetId(preferred));
-      if (rejected && now - rejected.at < PLAN_REJECT_COOLDOWN_MS) {
+      if (rejected && gameElapsedMs(rejected.at) < PLAN_REJECT_COOLDOWN_MS) {
         activePlanDebug.rejected = [{ target: preferred, reason: `recently rejected: ${rejected.reason}` }];
         return null;
       }
@@ -7704,7 +8035,7 @@
       // failsafe every tick until the pantry climbs back out of the red.
       const emergency = isFoodEmergency(resources);
       if (!emergency) {
-        if (now - lastJobRun < JOB_REBALANCE_MIN_MS && Math.floor(village.getFreeKittens()) <= 0) return;
+        if (gameElapsedMs(lastJobRun) < JOB_REBALANCE_MIN_MS && Math.floor(village.getFreeKittens()) <= 0) return;
         if (signature === lastJobSignature && Math.floor(village.getFreeKittens()) <= 0) return;
       }
       lastJobRun = now;
@@ -8375,7 +8706,7 @@
       if (bought) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
       return bought;
     }
-    if (!candidate || !candidate.meta || !candidate.meta.name) return false;
+    if (!candidate || !candidate.meta || !candidate.meta.name || candidateGate(candidate.kind, candidate.meta).state !== "actionable") return false;
     const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
     let stageChanged = false;
     const result = executeSemanticAction({
@@ -8437,7 +8768,7 @@
   const rareCapitalCandidates = (target) => {
     const candidates = [];
     const add = (kind, meta) => {
-      if (meta && meta.name && !isDeniedKey(meta.name)) candidates.push({ kind, meta });
+      if (meta && meta.name && !isDeniedKey(meta.name) && candidateGate(kind, meta).state === "actionable") candidates.push({ kind, meta });
     };
     if (target && target.meta) add(target.kind, target.meta);
     if (lastStrategicDecision && lastStrategicDecision.target && lastStrategicDecision.target !== target) {
@@ -8587,7 +8918,7 @@
       if (queueItemDone(item)) continue;
       const meta = lookupMetaById(item.id);
       const [kind] = String(item.id).split(":");
-      if (!meta) continue;
+      if (!meta || candidateGate(kind, meta).state !== "actionable") continue;
       const candidate = { kind, meta, affordable: false };
       // Reserve ONLY for queue items the bot can actually work toward right now —
       // the same reachability gate pickQueuedTarget uses to choose one.  A
@@ -8749,6 +9080,18 @@
     try {
       computeResetAdvisor();
       const now = Date.now();
+      if (activeTarget) {
+        const lockedMeta = lookupMetaById(activeTarget.id);
+        const [lockedKind] = String(activeTarget.id).split(":");
+        const gate = lockedMeta && candidateGate(lockedKind, lockedMeta);
+        if (!gate || gate.state !== "actionable") {
+          buyPlanText = `Buy: replanning — ${gate ? gate.reason : "target source disappeared"}`;
+          activeTarget = null;
+          activePlanSnapshot = { cycleId: -1, target: undefined };
+          resetTickCache();
+          return;
+        }
+      }
       const target = getTargetCached(resources, goalKey);
       const sprint = isSprintCandidate(target, resources);
       if (target) target._sprint = sprint;
@@ -8788,7 +9131,7 @@
         return;
       }
 
-      if (now - lastAutoBuy < AUTOBUY_MIN_MS) return;
+      if (gameElapsedMs(lastAutoBuy) < AUTOBUY_MIN_MS) return;
 
       if (!sprint) {
         // Exclusive picks also clear the FULL reservation ledger (manual queue,
@@ -8902,7 +9245,7 @@
       // accelerated). Execute the best swap whose net prices clear every
       // reservation floor; the atomic rebuild contract then outranks the plan
       // as usual until parity is restored.
-      if (!pendingStageRebuild && Date.now() - lastAutoBuy >= AUTOBUY_MIN_MS) {
+      if (!pendingStageRebuild && gameElapsedMs(lastAutoBuy) >= AUTOBUY_MIN_MS) {
         const swaps = stageTransitionCandidates(resources)
           .filter((candidate) => candidate && candidate.affordable && !buyBenched(targetId(candidate)) &&
             (candidate.meta.prices || []).every((price) => priceClearsParallelFloor(price, floors, resources)))
@@ -8965,7 +9308,7 @@
           // Fully banked above every floor: finish it, throttled like any buy.
           if (boughtThisTick || !candidate.affordable) continue;
           const now = Date.now();
-          if (now - lastAutoBuy < AUTOBUY_MIN_MS) continue;
+          if (gameElapsedMs(lastAutoBuy) < AUTOBUY_MIN_MS) continue;
           if (!prices.every((price) => priceClearsParallelFloor(price, floors, resources))) continue;
           lastAutoBuy = now;
           if (buyCandidate(candidate)) {
@@ -9599,7 +9942,7 @@
     ...buildingMetas().map((meta) => ({ kind: "build", meta })),
     ...spaceMetas().map((meta) => ({ kind: "space", meta })),
     ...timeMetas().map((meta) => ({ kind: "time", meta })),
-  ].filter(({ kind, meta }) => meta && meta.name && (kind === "build" ? isOpen(meta) : spaceTimeOpen(meta)));
+  ].filter(({ kind, meta }) => meta && meta.name && candidateGate(kind, meta).state === "actionable");
 
   const routeResourcesInto = (route, chain) => {
     if (!route) return chain;
@@ -10498,7 +10841,7 @@
 
   const manageDiplomacy = (resources, goalKey) => {
     try {
-      if (Date.now() - lastDiplomacyAction < 10000) return;
+      if (gameElapsedMs(lastDiplomacyAction) < 10000) return;
       const target = getTargetCached(resources, goalKey);
       const ledger = buildReservationLedger(target, resources);
       const reserved = ledger.reserved;
@@ -10756,6 +11099,10 @@
       push(`latent paused-for-power demand ${fmt(eff.latent)} Wt → effective delta ${fmt(eff.delta)} Wt (winter ${fmt(eff.winterDelta)} Wt)`);
       push(`computed deficit ${fmt(Math.max(0, -eff.delta, -eff.winterDelta))} Wt · selected/skipped: ${(lastPowerRecoveryDiagnostic && lastPowerRecoveryDiagnostic.action) || "not evaluated"}`);
       push(`converter fuel: ${(lastConverterFuelDiagnostic && lastConverterFuelDiagnostic.action) || "not evaluated"}`);
+      const pollution = pollutionStatus();
+      const contributors = (pollution.contributors || []).slice(0, 3)
+        .map((item) => `${item.label} +${fmt(item.perTick)}/tick`).join(", ") || "none";
+      push(`Pollution: level ${pollution.level} · current ${fmt(pollution.current)} · delta ${fmt(pollution.perTick)}/tick · equilibrium ${fmt(pollution.equilibrium)} · threshold ETA ${formatEta(pollution.nextEta)} · clean energy ${Math.round(pollution.cleanEnergyRatio * 100)}% · contributors ${contributors}`);
       push("");
       push("— PROCESSING —");
       push(processingPlanText);
@@ -11767,11 +12114,14 @@
   // speed because every rate it uses is read live (observed resource deltas
   // simply reflect the boosted wall clock, so ETAs remain wall-clock-true).
   const TICK_SPEED_KEY = "kgh.tickSpeed";
-  // Very high multipliers are machine-bound: each beat runs its extra ticks
-  // synchronously, so when a burst takes longer than the 200ms beat the game
-  // simply runs as fast as the machine allows instead of stacking up work.
   const TICK_SPEED_OPTIONS = [1, 2, 3, 5, 10, 20, 50];
-  const TICK_SPEED_BEAT_MS = 200; // one beat per native tick at 5/s
+  const TICK_SPEED_BEAT_MS = 200;
+  const BOOSTER_CPU_BUDGET_MS = 8;
+  const BOOSTER_MAX_CHUNK = 16;
+  const ACTION_LANE_BASE_MS = 250;
+  const ACTION_LANE_FLOOR_MS = 100;
+  const PLANNING_LANE_FLOOR_MS = 500;
+  const RENDER_LANE_MS = 500;
   let tickSpeedTimer = null;
   let tickSpeed = (() => {
     try {
@@ -11782,24 +12132,156 @@
     }
   })();
 
+  let boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
+  const nativeTicksPerSecond = () => {
+    try {
+      const value = Number(window.gamePage && window.gamePage.ticksPerSecond);
+      return value > 0 ? value : 5;
+    } catch (error) {
+      return 5;
+    }
+  };
+  const automationClockSnapshot = () => {
+    const wallNow = Date.now();
+    const nativeTps = nativeTicksPerSecond();
+    const elapsed = Math.max(0, wallNow - boosterTelemetry.startedAt);
+    const warm = elapsed < TICK_SPEED_BEAT_MS;
+    const measuredExtraTps = elapsed > 0 ? boosterTelemetry.executed * 1000 / elapsed : 0;
+    const deliveredTicksPerSecond = tickSpeed <= 1 ? nativeTps
+      : warm ? nativeTps * tickSpeed
+      : Math.min(nativeTps * tickSpeed, nativeTps + measuredExtraTps);
+    return {
+      requestedMultiplier: tickSpeed,
+      deliveredTicksPerSecond,
+      deliveredMultiplier: nativeTps > 0 ? Math.max(1, deliveredTicksPerSecond / nativeTps) : 1,
+      wallNow,
+    };
+  };
+  const gameElapsedMs = (since) => {
+    const stamp = Number(since);
+    if (!isFinite(stamp)) return 0;
+    const clock = automationClockSnapshot();
+    return Math.max(0, clock.wallNow - stamp) * clock.deliveredMultiplier;
+  };
+  const automationDelayMs = (baseMs, floorMs = 0) => Math.max(
+    Math.max(0, Number(floorMs) || 0),
+    Math.max(0, Number(baseMs) || 0) / Math.max(1, automationClockSnapshot().deliveredMultiplier),
+  );
+  const runBoosterBeat = () => {
+    const started = Date.now();
+    const elapsed = Math.max(TICK_SPEED_BEAT_MS, started - boosterTelemetry.lastBeatAt);
+    boosterTelemetry.lastBeatAt = started;
+    const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTicksPerSecond() * elapsed / 1000));
+    const maxChunk = Math.min(BOOSTER_MAX_CHUNK, due);
+    let executed = 0;
+    const game = window.gamePage;
+    if (game && typeof game.tick === "function") {
+      while (executed < maxChunk && Date.now() - started < BOOSTER_CPU_BUDGET_MS) {
+        try {
+          game.tick();
+          executed += 1;
+        } catch (error) {
+          break;
+        }
+      }
+    }
+    const dropped = Math.max(0, due - executed);
+    boosterTelemetry.executed += executed;
+    boosterTelemetry.dropped += dropped;
+    boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, budgetMs: BOOSTER_CPU_BUDGET_MS };
+    return boosterTelemetry.lastBeat;
+  };
+
+  const timerOwner = {
+    token: `kgh-${Date.now()}-${Math.random()}`,
+    timers: Object.create(null),
+    delays: Object.create(null),
+    cancelAll() {
+      for (const id of Object.values(this.timers)) {
+        try { clearInterval(id); } catch (error) { /* already cleared */ }
+      }
+      this.timers = Object.create(null);
+      this.delays = Object.create(null);
+    },
+  };
+  window.__kghTimerOwner = timerOwner;
+  let mutationLane = null;
+  let overlappingMutations = 0;
+  const subsystemFailures = Object.create(null);
+  const runNamedSubsystem = (name, fn) => {
+    try {
+      return fn();
+    } catch (error) {
+      const entry = subsystemFailures[name] || { count: 0, last: "" };
+      entry.count += 1;
+      entry.last = error && error.message || String(error);
+      subsystemFailures[name] = entry;
+      pushLog(`⚠ ${name} failed: ${entry.last}; later subsystems continue`);
+      return undefined;
+    }
+  };
+  const runSubsystemSequence = (entries) => {
+    const failures = [];
+    let attempted = 0;
+    for (const entry of entries || []) {
+      if (!entry || typeof entry.run !== "function") continue;
+      attempted += 1;
+      const before = subsystemFailures[entry.name] && subsystemFailures[entry.name].count || 0;
+      runNamedSubsystem(entry.name || "unnamed subsystem", entry.run);
+      const after = subsystemFailures[entry.name] && subsystemFailures[entry.name].count || 0;
+      if (after > before) failures.push({ name: entry.name, message: subsystemFailures[entry.name].last });
+    }
+    return { attempted, failures };
+  };
+  const withMutationLane = (name, fn) => {
+    if (mutationLane) {
+      overlappingMutations += 1;
+      return undefined;
+    }
+    mutationLane = name;
+    try { return fn(); } finally { mutationLane = null; }
+  };
+  const runActionLane = () => withMutationLane("action", () => {
+    if (!isAutopilotOn()) return;
+    resetTickCache();
+    let resources = resourceMap();
+    const goal = getGoal();
+    runNamedSubsystem("processor", () => optimizeProcessing(resources, goal));
+    runNamedSubsystem("unicorn", () => manageUnicornReligion(resources, goal));
+    resetTickCache(); resources = resourceMap();
+    runNamedSubsystem("autobuy", () => executePlan(resources, goal));
+    resetTickCache(); resources = resourceMap();
+    runNamedSubsystem("diplomacy", () => manageDiplomacy(resources, goal));
+    runNamedSubsystem("jobs", () => balanceJobs(goal, resources));
+  });
+  const armOwnedInterval = (lane, fn, delayMs) => {
+    const delayMsRounded = Math.max(1, Math.round(delayMs));
+    timerOwner.delays[lane] = delayMsRounded;
+    timerOwner.timers[lane] = setInterval(fn, delayMsRounded);
+  };
+  const armAutomationScheduler = () => {
+    timerOwner.cancelAll();
+    armOwnedInterval("planning", () => withMutationLane("planning", tick), automationDelayMs(HELPER_TICK_MS, PLANNING_LANE_FLOOR_MS));
+    armOwnedInterval("action", runActionLane, automationDelayMs(ACTION_LANE_BASE_MS, ACTION_LANE_FLOOR_MS));
+    armOwnedInterval("render", () => runNamedSubsystem("render", () => {
+      if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
+    }), RENDER_LANE_MS);
+    if (tickSpeed > 1) {
+      armOwnedInterval("booster", runBoosterBeat, TICK_SPEED_BEAT_MS);
+      tickSpeedTimer = timerOwner.timers.booster;
+    } else tickSpeedTimer = null;
+  };
+  const automationSchedulerSnapshot = () => {
+    const lanes = {};
+    for (const [name, id] of Object.entries(timerOwner.timers)) lanes[name] = { id, delayMs: timerOwner.delays[name] };
+    return { ownerToken: timerOwner.token, ownerCount: Object.keys(lanes).length, lanes, overlappingMutations, mutationLane };
+  };
+
   const applyTickSpeed = (multiplier) => {
     tickSpeed = TICK_SPEED_OPTIONS.includes(multiplier) ? multiplier : 1;
     try { localStorage.setItem(TICK_SPEED_KEY, String(tickSpeed)); } catch (error) { /* keep the in-memory choice */ }
-    if (tickSpeedTimer !== null) {
-      try { clearInterval(tickSpeedTimer); } catch (error) { /* timer already gone */ }
-      tickSpeedTimer = null;
-    }
-    if (tickSpeed <= 1) return tickSpeed;
-    const extraPerBeat = tickSpeed - 1;
-    tickSpeedTimer = setInterval(() => {
-      try {
-        const game = window.gamePage;
-        if (!game || typeof game.tick !== "function") return;
-        for (let i = 0; i < extraPerBeat; i += 1) game.tick();
-      } catch (error) {
-        /* a bad tick must not kill the booster */
-      }
-    }, TICK_SPEED_BEAT_MS);
+    boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
+    if (document.body) armAutomationScheduler();
     return tickSpeed;
   };
 
@@ -12066,11 +12548,21 @@
     applyMin(localStorage.getItem(MIN_KEY) === "1");
     renderLog();
     tick();
-    setInterval(tick, HELPER_TICK_MS);
+    armAutomationScheduler();
   };
 
   window.__kghDebug = {
     ACTION_POLICY,
+    candidateGate,
+    gameElapsedMs,
+    automationDelayMs,
+    automationClockSnapshot,
+    automationSchedulerSnapshot,
+    runBoosterBeat,
+    boosterTelemetry: () => ({ ...boosterTelemetry, lastBeat: boosterTelemetry.lastBeat && { ...boosterTelemetry.lastBeat } }),
+    subsystemFailures: () => JSON.parse(JSON.stringify(subsystemFailures)),
+    runNamedSubsystem,
+    runSubsystemSequence,
     actionPolicyFor,
     executeSemanticAction,
     prestigeAutomationArmed,
@@ -12144,6 +12636,14 @@
     },
     solveChain(candidate) {
       return solveCraftChain(resourceMap(), candidate);
+    },
+    storageBlockPressure(goalKey = getGoal()) {
+      resetTickCache();
+      return storageBlockPressure(resourceMap(), GOALS[goalKey], goalKey);
+    },
+    productionDemand(goalKey = getGoal()) {
+      resetTickCache();
+      return productionDemand(resourceMap(), goalKey);
     },
     validRaceSell(race, sell) {
       return validRaceSell(race, sell);
@@ -12324,6 +12824,14 @@
       return bestLateGameFrontier(candidates || gatherCandidates(resources, goalKey), resources, goalKey);
     },
     powerStatus,
+    pollutionStatus,
+    pollutionMarginalFor,
+    pollutionPenalty,
+    pollutionProcessorTarget,
+    bestPollutionRecoveryTarget(candidates) {
+      resetTickCache();
+      return bestPollutionRecoveryTarget(candidates || gatherCandidates(resourceMap(), getGoal()), resourceMap(), pollutionStatus());
+    },
     effectivePowerStatus,
     latentPowerDemand,
     powerRecoveryDiagnostic: () => lastPowerRecoveryDiagnostic,
@@ -12460,6 +12968,7 @@
     },
     executeStageTransitionCandidate,
     pendingStageRebuild: () => pendingStageRebuild,
+    buyFailureState: (id) => failedBuys[id] ? { ...failedBuys[id] } : null,
     tickSpeed: () => tickSpeed,
     applyTickSpeed,
     stageStatus() {

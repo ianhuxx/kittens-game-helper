@@ -132,6 +132,7 @@ const craft = (name) => crafts.find((c) => c.name === name);
 const buildings = [
   { name: "library", label: "Library", unlocked: true, val: 3, on: 3, prices: [{ name: "wood", val: 500 }], effects: { scienceMax: 250 } },
   { name: "mine", label: "Mine", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 300 }], effects: { mineralsRatio: 0.2 } },
+  { name: "workshop", label: "Workshop", unlocked: true, val: 1, on: 1, prices: [{ name: "wood", val: 100 }, { name: "minerals", val: 100 }], effects: { craftRatio: 0.06 } },
   { name: "barn", label: "Barn", unlocked: true, val: 1, on: 1, prices: [{ name: "wood", val: 1000 }], effects: { catnipMax: 5000, woodMax: 200 } },
   { name: "hut", label: "Hut", unlocked: true, val: 2, on: 2, prices: [{ name: "wood", val: 5000 }], effects: { manpowerMax: 75 } },
   {
@@ -662,6 +663,9 @@ class FakeDate extends Date {
 }
 
 const intervalFns = [];
+const intervalMs = [];
+const activeIntervalIds = new Set();
+const clearedIntervalIds = [];
 class FakeEmbassyButtonController {
   constructor(game) {
     this.game = game;
@@ -790,11 +794,17 @@ const context = {
   gamePage,
   setTimeout,
   clearTimeout,
-  setInterval: (fn) => {
+  setInterval: (fn, ms) => {
     intervalFns.push(fn);
-    return intervalFns.length - 1;
+    intervalMs.push(ms);
+    const id = intervalFns.length - 1;
+    activeIntervalIds.add(id);
+    return id;
   },
-  clearInterval: () => {},
+  clearInterval: (id) => {
+    activeIntervalIds.delete(id);
+    clearedIntervalIds.push(id);
+  },
   WeakMap,
   Map,
   Set,
@@ -5547,22 +5557,25 @@ resources.splice(resources.indexOf(alloyAN), 1);
  * nothing, the choice persists under kgh.tickSpeed, and an unknown
  * multiplier falls back to native.
  * ------------------------------------------------------------------- */
-const intervalCountAM = intervalFns.length;
 let extraTicksAM = 0;
 gamePage.tick = () => { extraTicksAM += 1; };
 check("Test AM: default speed is native 1×", dbg.tickSpeed?.() === 1);
 dbg.applyTickSpeed?.(5);
-check("Test AM: choosing 5× persists and arms one booster interval",
-  dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && intervalFns.length === intervalCountAM + 1);
+let speedSchedulerAM = dbg.automationSchedulerSnapshot?.();
+check("Test AM: choosing 5× persists and arms one owned booster lane",
+  dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && !!speedSchedulerAM?.lanes?.booster);
+fakeNow += 200;
 intervalFns[intervalFns.length - 1]();
-check("Test AM: each booster beat adds (multiplier − 1) extra game ticks", extraTicksAM === 4);
+check("Test AM: one 5× booster beat adds the due bounded extra ticks", extraTicksAM === 4);
 extraTicksAM = 0;
 dbg.applyTickSpeed?.(50);
+fakeNow += 200;
 intervalFns[intervalFns.length - 1]();
-check("Test AM: the 50× ceiling arms 49 extra ticks per beat", dbg.tickSpeed?.() === 50 && extraTicksAM === 49);
+check("Test AM: the 50× ceiling yields in a bounded chunk and drops backlog",
+  dbg.tickSpeed?.() === 50 && extraTicksAM > 0 && extraTicksAM <= 16 && dbg.boosterTelemetry?.().lastBeat?.dropped > 0);
 dbg.applyTickSpeed?.(99);
 check("Test AM: an unknown multiplier falls back to native 1×",
-  dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1");
+  dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1" && !dbg.automationSchedulerSnapshot?.().lanes?.booster);
 extraTicksAM = 0;
 delete gamePage.tick;
 intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
@@ -6322,6 +6335,273 @@ gamePage.resPool.energyCons = savedFuelT6.powerCons;
 gamePage.resPool.energyWinterProd = savedFuelT6.powerWinter;
 for (const resource of addedResourcesT6) resources.splice(resources.indexOf(resource), 1);
 dbg.forceActiveTarget(null);
+
+/* ---------------------------------------------------------------------
+ * Task 7 — lifecycle source gates, logical automation time, and pollution.
+ * These fixtures deliberately expose metadata before the game surface that
+ * owns it. Persisted post-reset metadata must never bypass Library/Workshop.
+ * ------------------------------------------------------------------- */
+const libraryT7 = buildings.find((building) => building.name === "library");
+const savedLibraryT7 = { val: libraryT7.val, on: libraryT7.on };
+const workshopT7 = buildings.find((building) => building.name === "workshop");
+const savedWorkshopT7 = { val: workshopT7.val, on: workshopT7.on };
+const researchT7 = {
+  name: "freshResearchT7", label: "Fresh Research T7", unlocked: true, researched: false,
+  prices: [{ name: "science", val: 10 }], effects: { scienceRatio: 0.01 },
+};
+const upgradeT7 = {
+  name: "freshUpgradeT7", label: "Fresh Upgrade T7", unlocked: true, researched: false,
+  prices: [{ name: "freshPartT7", val: 1 }], effects: { mineralsRatio: 0.01 },
+};
+const freshPartT7 = R("freshPartT7", 0, 0, "Fresh Part T7");
+const freshCraftT7 = { name: "freshPartT7", label: "Fresh Part T7", unlocked: true, prices: [{ name: "wood", val: 1 }] };
+techs.push(researchT7);
+workshopUpgrades.push(upgradeT7);
+resources.push(freshPartT7);
+crafts.push(freshCraftT7);
+libraryT7.val = 0; libraryT7.on = 0;
+workshopT7.val = 0; workshopT7.on = 0;
+dbg.forceActiveTarget(null);
+
+check("Task 7 lifecycle: persisted research metadata stays closed at Library ×0",
+  dbg.candidateGate?.("research", researchT7)?.state === "closed" && !dbg.candidateById("research:freshResearchT7"));
+check("Task 7 lifecycle: persisted upgrade and non-core craft metadata stay closed at Workshop ×0",
+  dbg.candidateGate?.("upgrade", upgradeT7)?.state === "closed" &&
+  dbg.candidateGate?.("craft", freshCraftT7)?.state === "closed" &&
+  !dbg.candidateById("upgrade:freshUpgradeT7") && dbg.acquisitionPathFor("freshPartT7", 1)?.reachable === false);
+check("Task 7 lifecycle: closed families are absent from pressure, demand, novelty, queue, and reservation surfaces",
+  !(dbg.storageBlockPressure?.().freshPartT7 > 0) && !(dbg.productionDemand?.().freshPartT7 > 0) &&
+  !dbg.queuePickerEntries().some((entry) => /fresh(?:Research|Upgrade)T7/.test(entry.id)) &&
+  !dbg.watchNewUnlocks?.().freshIds?.some((id) => /fresh(?:Research|Upgrade)T7/.test(id)) &&
+  !(dbg.buildReservationLedger(null)?.reserved?.freshPartT7 > 0));
+
+libraryT7.val = 1; libraryT7.on = 1;
+check("Task 7 lifecycle: Library ×1 opens research", dbg.candidateGate?.("research", researchT7)?.state === "actionable" && !!dbg.candidateById("research:freshResearchT7"));
+workshopT7.val = 1; workshopT7.on = 1;
+check("Task 7 lifecycle: Workshop ×1 opens upgrades and non-core crafts",
+  dbg.candidateGate?.("upgrade", upgradeT7)?.state === "actionable" &&
+  dbg.candidateGate?.("craft", freshCraftT7)?.state === "actionable" &&
+  !!dbg.candidateById("upgrade:freshUpgradeT7") && dbg.acquisitionPathFor("freshPartT7", 1)?.reachable === true);
+
+// Simulated reset: metadata remains open, source buildings return to zero.
+libraryT7.val = 0; libraryT7.on = 0; workshopT7.val = 0; workshopT7.on = 0;
+dbg.forceActiveTarget(null);
+check("Task 7 lifecycle: simulated reset re-closes persisted research/upgrade/craft metadata",
+  !dbg.candidateById("research:freshResearchT7") && !dbg.candidateById("upgrade:freshUpgradeT7") &&
+  dbg.acquisitionPathFor("freshPartT7", 1)?.reachable === false);
+
+// A stale upgrade lock must release on the same execution tick without being
+// recorded as a failed purchase/bench event.
+workshopT7.val = 1; workshopT7.on = 1;
+res("wood").value = Math.max(res("wood").value, 10);
+freshPartT7.value = 1;
+const liveUpgradeT7 = dbg.candidateById("upgrade:freshUpgradeT7");
+dbg.forceActiveTarget(liveUpgradeT7, "Workshop roadmap", 0);
+const failuresBeforeGateT7 = dbg.buyFailureState?.("upgrade:freshUpgradeT7")?.count || 0;
+workshopT7.val = 0; workshopT7.on = 0;
+dbg.executePlan();
+check("Task 7 lifecycle: execution-time closed gate releases stale lock without purchase benching",
+  dbg.activeTargetId?.() === null && upgradeT7.researched === false &&
+  (dbg.buyFailureState?.("upgrade:freshUpgradeT7")?.count || 0) === failuresBeforeGateT7);
+
+/* Aggregate hidden-building precursor: every reveal leg must be reachable. */
+const zigguratT7 = buildings.find((building) => building.name === "ziggurat");
+const savedZigguratT7 = {
+  unlocked: zigguratT7.unlocked, unlockable: zigguratT7.unlockable,
+  defaultUnlockable: zigguratT7.defaultUnlockable, unlockRatio: zigguratT7.unlockRatio,
+  prices: zigguratT7.prices, requiredTech: zigguratT7.requiredTech, val: zigguratT7.val, on: zigguratT7.on,
+};
+const constructionT7 = { name: "constructionT7", label: "Construction T7", unlocked: true, researched: true, prices: [], effects: {} };
+const physicsT7 = { name: "physicsT7", label: "Physics T7", unlocked: true, researched: false, prices: [], effects: {} };
+const megalithT7 = R("megalithT7", 0, 0, "Megalith T7");
+const megalithCraftT7 = { name: "megalithT7", label: "Megalith T7", unlocked: false, prices: [{ name: "slab", val: 1 }, { name: "beam", val: 1 }] };
+const blueprintCraftT7 = craft("blueprint");
+const savedBlueprintUnlockedT7 = blueprintCraftT7.unlocked;
+const savedZigguratBanksT7 = {
+  blueprint: res("blueprint").value,
+  science: [res("science").value, res("science").maxValue],
+  compedium: res("compedium").value,
+};
+techs.push(constructionT7, physicsT7);
+resources.push(megalithT7);
+crafts.push(megalithCraftT7);
+workshopT7.val = 1; workshopT7.on = 1;
+Object.assign(zigguratT7, {
+  unlocked: false, unlockable: true, defaultUnlockable: false, unlockRatio: 0.01,
+  requiredTech: "constructionT7", val: 0, on: 0,
+  prices: [{ name: "scaffold", val: 50 }, { name: "blueprint", val: 1 }, { name: "megalithT7", val: 50 }],
+});
+blueprintCraftT7.unlocked = false;
+res("blueprint").value = 0;
+res("science").maxValue = Math.max(res("science").maxValue, 50000);
+res("science").value = Math.max(res("science").value, 25000);
+res("compedium").value = Math.max(res("compedium").value, 25);
+dbg.forceActiveTarget(null);
+check("Task 7 Ziggurat: Construction plus Scaffold route but locked Blueprint produces no precursor focus",
+  dbg.candidateGate?.("build", zigguratT7)?.state === "precursor" && dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat");
+physicsT7.researched = true;
+blueprintCraftT7.unlocked = true;
+check("Task 7 Ziggurat: opening Physics while another threshold leg is unreachable still produces no focus",
+  dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat");
+megalithCraftT7.unlocked = true;
+const revealZigguratT7 = dbg.bootstrapResourceCandidate?.();
+const revealLedgerT7 = revealZigguratT7 ? dbg.buildTargetLedger(revealZigguratT7) : { reserved: {} };
+check("Task 7 Ziggurat: all reachable legs produce one aggregate Reveal Ziggurat precursor",
+  revealZigguratT7?.meta?.downstreamName === "ziggurat" && /Reveal Ziggurat/.test(revealZigguratT7.meta.label) &&
+  revealZigguratT7.meta.prices?.length === 3);
+check("Task 7 Ziggurat: precursor reserves the aggregate reachable closure instead of one fastest leg",
+  ["scaffold", "blueprint", "megalithT7"].every((name) => (revealLedgerT7.reserved[name] || 0) > 0));
+res("scaffold").value = 0.5; res("blueprint").value = 0.01; megalithT7.value = 0.5;
+zigguratT7.unlocked = true;
+dbg.forceActiveTarget(null);
+check("Task 7 Ziggurat: native unlock replaces aggregate precursor with ordinary actionable building",
+  dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat" && dbg.candidateById("build:ziggurat")?.kind === "build");
+
+/* Logical automation clock and cooperative booster contracts. */
+const clock1xT7 = dbg.automationClockSnapshot?.();
+const stampT7 = fakeNow;
+fakeNow += 1000;
+check("Task 7 clock: 1× logical elapsed time preserves wall-clock behavior",
+  clock1xT7?.requestedMultiplier === 1 && Math.abs((dbg.gameElapsedMs?.(stampT7) || 0) - 1000) < 1);
+dbg.applyTickSpeed?.(50);
+const scheduler50T7 = dbg.automationSchedulerSnapshot?.();
+check("Task 7 clock: action/planning/render lanes respect polling floors",
+  scheduler50T7?.lanes?.action?.delayMs >= 100 && scheduler50T7?.lanes?.action?.delayMs <= 250 &&
+  scheduler50T7?.lanes?.planning?.delayMs >= 250 && scheduler50T7?.lanes?.render?.delayMs >= 500);
+check("Task 7 clock: a speed change leaves exactly one owned timer per lane",
+  scheduler50T7?.ownerCount === Object.keys(scheduler50T7?.lanes || {}).length && scheduler50T7?.overlappingMutations === 0);
+let boosterTicksT7 = 0;
+gamePage.tick = () => { boosterTicksT7 += 1; fakeNow += 2; };
+fakeNow += 200;
+const boosterBeatT7 = dbg.runBoosterBeat?.();
+const clock50T7 = dbg.automationClockSnapshot?.();
+check("Task 7 clock: slow game.tick yields within CPU budget and drops backlog",
+  boosterBeatT7?.executed > 0 && boosterBeatT7.executed <= boosterBeatT7.maxChunk && boosterBeatT7.dropped >= 0 &&
+  clock50T7?.requestedMultiplier === 50 && clock50T7.deliveredMultiplier < 50);
+delete gamePage.tick;
+dbg.applyTickSpeed?.(1);
+
+/* Native-style pollution status, scoring, recovery, throttle, diagnostics. */
+const pollutionResourceT7 = R("cathPollution", 900, 0, "Cath Pollution");
+resources.push(pollutionResourceT7);
+const savedPollutionManagerT7 = {
+  cathPollution: gamePage.bld.cathPollution,
+  cathPollutionPerTick: gamePage.bld.cathPollutionPerTick,
+  pollutionLevels: gamePage.bld.pollutionLevels,
+  getPollutionPerTick: gamePage.bld.getPollutionPerTick,
+  getPollutionLevel: gamePage.bld.getPollutionLevel,
+  getPollutionEquilibrium: gamePage.bld.getPollutionEquilibrium,
+};
+gamePage.bld.cathPollution = 900;
+gamePage.bld.cathPollutionPerTick = 2;
+gamePage.bld.pollutionLevels = [
+  { threshold: 0, effects: {} },
+  { threshold: 500, effects: { catnipPollutionRatio: -0.05 } },
+  { threshold: 1000, effects: { catnipPollutionRatio: -0.15, happiness: -0.05 } },
+];
+gamePage.bld.getPollutionPerTick = () => 2;
+gamePage.bld.getPollutionLevel = () => ({ level: 1, effects: { catnipPollutionRatio: -0.05 } });
+gamePage.bld.getPollutionEquilibrium = () => 1500;
+const cleanupT7 = {
+  name: "carbonSequestrationT7", label: "Carbon Sequestration T7", unlocked: true, researched: false,
+  prices: [{ name: "science", val: 1 }], effects: { cathPollutionPerTickProd: -4 },
+};
+const dirtyPowerT7 = {
+  name: "dirtyPowerT7", label: "Dirty Power T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "wood", val: 1 }], effects: { energyProduction: 5, cathPollutionPerTickProd: 1 },
+};
+const cleanPowerT7 = {
+  name: "cleanPowerT7", label: "Clean Power T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "wood", val: 1 }], effects: { energyProduction: 5 },
+};
+workshopUpgrades.push(cleanupT7);
+buildings.push(dirtyPowerT7, cleanPowerT7);
+workshopT7.val = 1; workshopT7.on = 1;
+const pollutionStatusT7 = dbg.pollutionStatus?.();
+const cleanupProfileT7 = dbg.metaEffectProfile?.(cleanupT7);
+const cleanupCandidateT7 = dbg.candidateById("upgrade:carbonSequestrationT7");
+const dirtyCandidateT7 = dbg.candidateById("build:dirtyPowerT7");
+const cleanCandidateT7 = dbg.candidateById("build:cleanPowerT7");
+check("Task 7 pollution: native status exposes level, delta, equilibrium, threshold ETA, clean share, and effects",
+  pollutionStatusT7?.current === 900 && pollutionStatusT7?.perTick === 2 && pollutionStatusT7?.level === 1 &&
+  pollutionStatusT7?.equilibrium === 1500 && pollutionStatusT7?.nextThreshold === 1000 &&
+  Math.abs(pollutionStatusT7?.nextEta - 10) < 0.001 && pollutionStatusT7?.effects?.catnipPollutionRatio === -0.05);
+check("Task 7 pollution: pollution pseudo-resource is excluded from generic production value while cleanup remains measurable",
+  !Object.prototype.hasOwnProperty.call(cleanupProfileT7?.perTick || {}, "cathPollution") && dbg.pollutionMarginalFor?.(cleanupT7) === -4);
+check("Task 7 pollution: measured sequestration earns benefit and comparable clean generation beats dirty generation",
+  dbg.candidateScore(cleanupCandidateT7) > 0 && dbg.candidateScore(cleanCandidateT7) > dbg.candidateScore(dirtyCandidateT7));
+const recoveryT7 = dbg.bestPollutionRecoveryTarget?.([dirtyCandidateT7, cleanCandidateT7, cleanupCandidateT7]);
+check("Task 7 pollution: rising harmful pollution selects a reachable cleaner/sequestering action",
+  recoveryT7?.meta?.name === "carbonSequestrationT7");
+const pollutionDecisionT7 = dbg.selectStrategicTarget?.("balanced");
+check("Task 7 pollution: recovery layer is visible above repeated economy growth",
+  /Pollution recovery/.test(pollutionDecisionT7?.layer || "") && pollutionDecisionT7?.target?.meta?.name === "carbonSequestrationT7");
+const criticalSmelterT7 = { name: "criticalSmelterT7", label: "Critical Smelter T7", unlocked: true, val: 3, on: 3, effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.2, cathPollutionPerTickProd: 0.1 } };
+const expendablePolluterT7 = { name: "expendablePolluterT7", label: "Expendable Polluter T7", unlocked: true, val: 3, on: 3, effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.01, cathPollutionPerTickProd: 0.3 } };
+check("Task 7 pollution: nonessential polluters throttle but a critical smelter keeps one viable unit",
+  dbg.pollutionProcessorTarget?.(expendablePolluterT7, null, pollutionStatusT7) === 0 &&
+  dbg.pollutionProcessorTarget?.(criticalSmelterT7, { kind: "build", meta: criticalSmelterT7 }, pollutionStatusT7) >= 1);
+gamePage.bld.getPollutionPerTick = () => -2;
+gamePage.bld.getPollutionEquilibrium = () => 400;
+check("Task 7 pollution: falling to a safe equilibrium adds no recovery penalty and yields the layer",
+  dbg.pollutionPenalty?.(dbg.pollutionStatus?.()) === 0 && !dbg.bestPollutionRecoveryTarget?.([cleanupCandidateT7]));
+const reportPollutionT7 = dbg.report?.() || "";
+check("Task 7 pollution: diagnostics name level, delta, equilibrium, threshold ETA, clean share, and contributors",
+  /Pollution:.*level.*delta.*equilibrium.*threshold ETA.*clean energy.*contributors/i.test(reportPollutionT7));
+
+const recoveryNamesT7 = ["planner", "processor", "craft", "autobuy", "diplomacy", "jobs", "render"];
+const recoveryOrderT7 = [];
+const recoveryEntriesT7 = recoveryNamesT7.map((name) => {
+  let throws = true;
+  return {
+    name,
+    run() {
+      if (throws) { throws = false; throw new Error(`${name} sentinel`); }
+      recoveryOrderT7.push(name);
+    },
+  };
+});
+const firstRecoveryT7 = dbg.runSubsystemSequence?.(recoveryEntriesT7);
+const secondRecoveryT7 = dbg.runSubsystemSequence?.(recoveryEntriesT7);
+check("Task 7 resilience: every major subsystem failure is named while later subsystems continue",
+  firstRecoveryT7?.failures?.every((failure, index) => failure.name === recoveryNamesT7[index] && failure.message === `${failure.name} sentinel`) &&
+  firstRecoveryT7?.attempted === recoveryNamesT7.length);
+check("Task 7 resilience: subsequent ticks recover every previously failing subsystem",
+  secondRecoveryT7?.failures?.length === 0 && recoveryOrderT7.join(",") === recoveryNamesT7.join(","));
+
+// Restore Task 7 fixtures.
+for (const [key, value] of Object.entries(savedPollutionManagerT7)) {
+  if (value === undefined) delete gamePage.bld[key]; else gamePage.bld[key] = value;
+}
+workshopUpgrades.splice(workshopUpgrades.indexOf(cleanupT7), 1);
+buildings.splice(buildings.indexOf(dirtyPowerT7), 1);
+buildings.splice(buildings.indexOf(cleanPowerT7), 1);
+resources.splice(resources.indexOf(pollutionResourceT7), 1);
+Object.assign(zigguratT7, savedZigguratT7);
+blueprintCraftT7.unlocked = savedBlueprintUnlockedT7;
+res("blueprint").value = savedZigguratBanksT7.blueprint;
+res("science").value = savedZigguratBanksT7.science[0]; res("science").maxValue = savedZigguratBanksT7.science[1];
+res("compedium").value = savedZigguratBanksT7.compedium;
+techs.splice(techs.indexOf(constructionT7), 1);
+techs.splice(techs.indexOf(physicsT7), 1);
+crafts.splice(crafts.indexOf(megalithCraftT7), 1);
+resources.splice(resources.indexOf(megalithT7), 1);
+libraryT7.val = savedLibraryT7.val; libraryT7.on = savedLibraryT7.on;
+workshopT7.val = savedWorkshopT7.val; workshopT7.on = savedWorkshopT7.on;
+techs.splice(techs.indexOf(researchT7), 1);
+workshopUpgrades.splice(workshopUpgrades.indexOf(upgradeT7), 1);
+crafts.splice(crafts.indexOf(freshCraftT7), 1);
+resources.splice(resources.indexOf(freshPartT7), 1);
+dbg.forceActiveTarget(null);
+
+const predecessorTimersT7 = [...activeIntervalIds];
+vm.runInContext(body, context, { filename: "kittens-game-helper-reinjected.user.js" });
+await new Promise((resolve) => setTimeout(resolve, 100));
+const replacementDbgT7 = context.window.__kghDebug;
+const replacementSchedulerT7 = replacementDbgT7?.automationSchedulerSnapshot?.();
+check("Task 7 reinjection: every predecessor timer is cancelled and exactly one replacement owner remains",
+  predecessorTimersT7.every((id) => clearedIntervalIds.includes(id) && !activeIntervalIds.has(id)) &&
+  activeIntervalIds.size === replacementSchedulerT7?.ownerCount && replacementSchedulerT7?.ownerCount === 3);
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
