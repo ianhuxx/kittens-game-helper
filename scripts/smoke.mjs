@@ -60,6 +60,8 @@ const localStorageMock = {
   setItem: (k, v) => storage.set(k, String(v)),
   removeItem: (k) => storage.delete(k),
 };
+const NATIVE_SAVE_KEY = "com.nuclearunicorn.kittengame.savedata";
+const LCstorageMock = {};
 
 /* ------------------------------ fake game ---------------------------------- */
 
@@ -248,6 +250,8 @@ const religionUpgrades = [
 const transcendenceUpgrades = [
   { name: "blackObeliskT5", label: "Black Obelisk T5", unlocked: false, val: 0, on: 0, priceRatio: 1.15, prices: [{ name: "relic", val: 10 }], effects: { solarRevolutionLimit: 0.05 } },
   { name: "transcend", label: "Transcend raw action", unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 1 }], effects: {} },
+  { name: "tierUnlockT5", label: "Tier Unlock T5", tier: 2, unlocked: false, val: 0, on: 0, prices: [{ name: "relic", val: 20 }], effects: {} },
+  { name: "retainedFloorT5", label: "Retained Floor T5", tier: 1, unlocked: false, val: 0, on: 0, prices: [{ name: "faithRatio", val: 60 }], effects: {} },
 ];
 const chronoforgeUpgrades = [
   { name: "temporalBatteryT5", label: "Temporal Battery T5", unlocked: false, val: 0, on: 0, priceRatio: 1.25, prices: [{ name: "timeCrystal", val: 5 }], effects: { temporalFluxMax: 750 } },
@@ -291,6 +295,15 @@ let transcendCalls = 0;
 let adoreCalls = 0;
 let alicornSacrificeCalls = 0;
 let nativeConfirmAccept = true;
+let checkpointSerial = 0;
+let transcendButtonCalls = 0;
+const persistCheckpoint = (mutate = null) => {
+  checkpointCalls += 1;
+  if (typeof mutate === "function") mutate();
+  const saveData = { checkpointSerial: ++checkpointSerial };
+  LCstorageMock[NATIVE_SAVE_KEY] = JSON.stringify(saveData);
+  return saveData;
+};
 
 const calendar = {
   festivalDays: 0,
@@ -548,6 +561,17 @@ const gamePage = {
   // controller._transform (unicorns→tears at one tear per ziggurat per 2500)
   // and the zgUpgradeButtons the helper falls back to for purchases.
   religionTab: {
+    transcendBtn: {
+      model: { enabled: true, visible: true },
+      controller: { updateEnabled() {}, updateVisible() {} },
+      handler() {
+        transcendButtonCalls += 1;
+        gamePage.religion.transcend();
+        for (const upgrade of gamePage.religion.transcendenceUpgrades) {
+          if (gamePage.religion.transcendenceTier >= (upgrade.tier || Infinity)) upgrade.unlocked = true;
+        }
+      },
+    },
     sacrificeBtn: {
       model: { prices: [{ name: "unicorns", val: 2500 }] },
       controller: {
@@ -599,8 +623,7 @@ const gamePage = {
     return Number.isFinite(perTick[name]) ? perTick[name] : 0;
   },
   save() {
-    checkpointCalls += 1;
-    return true;
+    return persistCheckpoint();
   },
   craft(name, amount) {
     const c = craft(name);
@@ -752,6 +775,7 @@ const context = {
   isFinite,
   document: documentMock,
   localStorage: localStorageMock,
+  LCstorage: LCstorageMock,
   gamePage,
   setTimeout,
   clearTimeout,
@@ -1573,9 +1597,30 @@ const thrown = hasActionBroker
 check("late game A: safe execution snapshots and verifies postconditions", safeResult.ok && safeResult.before === 0 && safeResult.after === 1 && safeCalls === 1);
 check("late game A: mismatched policy and invocation errors fail closed", !mismatched.ok && !thrown.ok && safeCalls === 1);
 
+let deniedStructuredCalls = 0;
+const deniedStructuredIds = [
+  "candidate:transcendence:transcend",
+  "candidate:time:shatter",
+  "candidate:time:timeSkip",
+  "candidate:time:resetWorld",
+  "candidate:religion:sacrificeAlicorns",
+];
+const deniedStructuredResults = deniedStructuredIds.map((id) => dbg.executeSemanticAction({
+  id,
+  invoke: () => { deniedStructuredCalls += 1; },
+}));
+check("late game A review: denied names stay forbidden inside structured candidate IDs",
+  deniedStructuredResults.every((result) => result?.ok === false) && deniedStructuredCalls === 0 && deniedStructuredIds.every((id) => dbg.actionPolicyFor(id) === dbg.ACTION_POLICY.FORBIDDEN));
+
 const armButton = panelEl(".kgh-prestige-arm");
 if (armButton) armButton.click();
 check("late game A: one panel click deliberately arms and immediately renders prestige status", hasPrestigeArm && dbg.prestigeAutomationArmed() === true && localStorageMock.getItem("kgh.prestigeArmed") === "1" && /Prestige automation: ARMED/.test(panelText(".kgh-prestige-arm")) && /ARMED/.test(panelText(".kgh-prestige-status")));
+const deniedStructuredArmedResults = deniedStructuredIds.map((id) => dbg.executeSemanticAction({
+  id,
+  invoke: () => { deniedStructuredCalls += 1; },
+}));
+check("late game A review: arming cannot bypass denied names embedded in candidate IDs",
+  deniedStructuredArmedResults.every((result) => result?.ok === false) && deniedStructuredCalls === 0);
 let prestigeCalls = 0;
 const firstPrestige = hasActionBroker
   ? dbg.executeSemanticAction({ id: "transcend", invoke: () => { prestigeCalls += 1; } })
@@ -5524,8 +5569,35 @@ gamePage.save = () => { checkpointCalls += 1; return false; };
 fakeNow += 30000;
 const callsBeforeFailedCheckpointT5 = transcendCalls;
 const failedCheckpointT5 = dbg.managePrestige?.(null);
-check("Task 5 prestige: failed native checkpoint prevents Transcend", failedCheckpointT5 === false && transcendCalls === callsBeforeFailedCheckpointT5);
-gamePage.save = nativeSaveT5;
+  check("Task 5 prestige: failed native checkpoint prevents Transcend", failedCheckpointT5 === false && transcendCalls === callsBeforeFailedCheckpointT5);
+  gamePage.save = nativeSaveT5;
+
+  fakeNow += 30000;
+  gamePage.currentSaveIsBroken = true;
+  const callsBeforeBrokenSaveT5 = transcendCalls;
+  const brokenSaveManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 review: broken native save state prevents every prestige mutation",
+    brokenSaveManagedT5 === false && transcendCalls === callsBeforeBrokenSaveT5);
+  gamePage.currentSaveIsBroken = false;
+
+  fakeNow += 30000;
+  const persistedBeforeStaleT5 = LCstorageMock[NATIVE_SAVE_KEY];
+  gamePage.save = () => { checkpointCalls += 1; return { checkpointSerial: checkpointSerial + 1 }; };
+  const callsBeforeStaleSaveT5 = transcendCalls;
+  const staleSaveManagedT5 = dbg.managePrestige?.(null);
+  check("Task 5 review: a save return without a fresh persisted blob is not a checkpoint",
+    staleSaveManagedT5 === false && transcendCalls === callsBeforeStaleSaveT5 && LCstorageMock[NATIVE_SAVE_KEY] === persistedBeforeStaleT5);
+  gamePage.save = nativeSaveT5;
+
+  fakeNow += 30000;
+  transcendenceUpgrades[3].unlocked = true;
+  gamePage.religion.faith = 0;
+  gamePage.religion.faithRatio = 150;
+  const retainedFloorProjectionT5 = dbg.prestigeProjection?.(null);
+  const checkpointBeforeRetainedFloorT5 = checkpointCalls;
+  check("Task 5 review: Transcend preserves the full retained epiphany upgrade floor",
+    retainedFloorProjectionT5?.transcend?.retainedFloor === 60 && retainedFloorProjectionT5?.transcend?.ready === false && dbg.managePrestige?.(null) === false && checkpointCalls === checkpointBeforeRetainedFloorT5);
+  transcendenceUpgrades[3].unlocked = false;
 
 // Transcend and Adore both qualify. Transcend owns this irreversible cycle.
 // The checkpoint deliberately changes epiphany by one to prove the exact
@@ -5534,13 +5606,16 @@ fakeNow += 30000;
 gamePage.religion.faith = 100000;
 gamePage.religion.faithRatio = 150;
 gamePage.religion.transcendenceTier = 1;
-gamePage.save = () => { checkpointCalls += 1; gamePage.religion.faithRatio += 1; return true; };
+  transcendenceUpgrades[2].unlocked = false;
+  gamePage.save = () => persistCheckpoint(() => { gamePage.religion.faithRatio += 1; });
 const tierBeforeT5 = gamePage.religion.transcendenceTier;
 const epiphanyBeforeT5 = gamePage.religion.faithRatio;
 const adoreBeforePriorityT5 = adoreCalls;
 const transcendManagedT5 = dbg.managePrestige?.(null);
-check("Task 5 prestige: funded Transcend checkpoints and advances exactly one tier",
-  transcendManagedT5 === true && checkpointCalls >= callsBeforeDisarmedT5.checkpointCalls + 2 && gamePage.religion.transcendenceTier === tierBeforeT5 + 1 && gamePage.religion.faithRatio === epiphanyBeforeT5 + 1 - 100);
+  check("Task 5 prestige: funded Transcend checkpoints and advances exactly one tier",
+    transcendManagedT5 === true && checkpointCalls >= callsBeforeDisarmedT5.checkpointCalls + 2 && gamePage.religion.transcendenceTier === tierBeforeT5 + 1 && gamePage.religion.faithRatio === epiphanyBeforeT5 + 1 - 100);
+  check("Task 5 review: Transcend uses the native Religion button and unlocks the new tier metadata",
+    transcendButtonCalls === 1 && transcendenceUpgrades[2].unlocked === true);
 gamePage.save = nativeSaveT5;
 check("Task 5 prestige: when Transcend and Adore both qualify one cycle runs Transcend only", adoreCalls === adoreBeforePriorityT5);
 const callsBeforeCooldownT5 = { transcendCalls, adoreCalls };
@@ -5562,8 +5637,26 @@ gamePage.religion.getSolarRevolutionRatio = nativeSolarRatioT5;
 perTick.faith = 100;
 const adoreEpiphanyBeforeT5 = gamePage.religion.faithRatio;
 const adoreManagedT5 = dbg.managePrestige?.(null);
-check("Task 5 prestige: Adore requires positive native gain and bounded Solar Revolution recovery",
-  adoreManagedT5 === true && adoreCalls === adoreBeforePriorityT5 + 1 && gamePage.religion.faithRatio > adoreEpiphanyBeforeT5 && gamePage.religion.faith === 0.01);
+  check("Task 5 prestige: Adore requires positive native gain and bounded Solar Revolution recovery",
+    adoreManagedT5 === true && adoreCalls === adoreBeforePriorityT5 + 1 && gamePage.religion.faithRatio > adoreEpiphanyBeforeT5 && gamePage.religion.faith === 0.01);
+
+  fakeNow += 30000;
+  const nativeResetFaithT5 = gamePage.religion.resetFaith;
+  gamePage.religion.faith = 100000;
+  gamePage.religion.faithRatio = 10;
+  gamePage.religion.resetFaith = function faultyAdore(bonusRatio) {
+    adoreCalls += 1;
+    this.faithRatio += this.getApocryphaResetBonus(bonusRatio);
+    this.faith = 1;
+    return true;
+  };
+  const faultyAdoreManagedT5 = dbg.managePrestige?.(null);
+  gamePage.religion.resetFaith = nativeResetFaithT5;
+  gamePage.religion.faith = 100000;
+  gamePage.religion.faithRatio = 10;
+  const retryAfterFaultyAdoreT5 = dbg.managePrestige?.(null);
+  check("Task 5 review: Adore requires exact native 0.01 worship reset and failed verification starts no cooldown",
+    faultyAdoreManagedT5 === false && retryAfterFaultyAdoreT5 === true && gamePage.religion.faith === 0.01);
 
 // Alicorn Stable is a reachable direct alicorn purchase and therefore creates
 // a protected floor. The active Time target is exactly two crystals short.
@@ -5580,6 +5673,7 @@ diplomacy.races.splice(0, diplomacy.races.length); // no faster Leviathan route
 perTick.timeCrystal = 0;
 res("alicorn").value = 39.85;
 res("timeCrystal").value = 1;
+gamePage.religion.faith = 0;
 const alicornBaitT5 = { name: "alicornBaitT5", label: "Alicorn Bait T5", unlocked: true, val: 0, on: 0, prices: [{ name: "alicorn", val: 25 }], effects: { productionRatio: 1 } };
 const savedBuildingUnlocksT5 = buildings.map((building) => building.unlocked);
 for (const building of buildings) building.unlocked = false;
@@ -5593,6 +5687,31 @@ check("Task 5 capital: cap-relief/surplus purchases consume the complete rare-ca
 buildings.splice(buildings.indexOf(alicornBaitT5), 1);
 buildings.forEach((building, index) => { building.unlocked = savedBuildingUnlocksT5[index]; });
 dbg.forceActiveTarget(null);
+
+const strandedActiveRareT5 = { name: "strandedActiveRareT5", label: "Stranded Active Rare T5", unlocked: true, val: 0, on: 0, prices: [{ name: "void", val: 500 }, { name: "impossibleT5", val: 1 }], effects: {} };
+const strandedManualRareT5 = { name: "strandedManualRareT5", label: "Stranded Manual Rare T5", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 80 }, { name: "impossibleT5", val: 1 }], effects: {} };
+buildings.push(strandedActiveRareT5, strandedManualRareT5);
+perTick.relic = 0;
+const activeRareFloorT5 = dbg.rareCapitalFloor?.({ kind: "build", meta: strandedActiveRareT5, affordable: false });
+dbg.queueAdd?.("build:strandedManualRareT5", 0);
+const manualRareFloorT5 = dbg.rareCapitalFloor?.(null);
+check("Task 5 review: active and manual targets unconditionally protect full direct rare-capital costs",
+  activeRareFloorT5?.void === 500 && manualRareFloorT5?.relic === 80);
+dbg.queueClear();
+buildings.splice(buildings.indexOf(strandedActiveRareT5), 1);
+buildings.splice(buildings.indexOf(strandedManualRareT5), 1);
+
+const unreachableWholeBillT5 = { name: "unreachableWholeBillT5", label: "Unreachable Whole Bill T5", unlocked: true, val: 0, on: 0, prices: [{ name: "relic", val: 70 }, { name: "impossibleT5", val: 1 }], effects: {} };
+buildings.push(unreachableWholeBillT5);
+perTick.relic = 1;
+gamePage.prestige = { perks: [{ name: "engineering", researched: false }] };
+const roadmapAndWholeBillFloorT5 = dbg.rareCapitalFloor?.(null);
+check("Task 5 review: rare floor includes next metaphysics gate and rejects partially reachable candidate bills",
+  roadmapAndWholeBillFloorT5?.paragon === 5 && !(roadmapAndWholeBillFloorT5?.relic >= 70));
+buildings.splice(buildings.indexOf(unreachableWholeBillT5), 1);
+delete perTick.relic;
+delete gamePage.prestige;
+
 const rareFloorT5 = typeof dbg.rareCapitalFloor === "function" ? dbg.rareCapitalFloor(crystalTargetCandidateT5) : {};
 const blockedAlicornProjectionT5 = typeof dbg.prestigeProjection === "function" ? dbg.prestigeProjection(crystalTargetCandidateT5) : null;
 const alicornCallsBeforeFloorT5 = alicornSacrificeCalls;
@@ -5601,8 +5720,28 @@ const blockedAlicornManagedT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
 check("Task 5 alicorn: 39.85 state preserves Alicorn Stable 20 floor and calls zero APIs",
   rareFloorT5.alicorn >= 20 && /protected.*floor/i.test(blockedAlicornProjectionT5?.alicorn?.reason || "") && blockedAlicornManagedT5 === false && alicornSacrificeCalls === alicornCallsBeforeFloorT5);
 
+fakeNow += 30000;
+gamePage.religion.faith = 100000;
+gamePage.religion.faithRatio = 10;
+const alicornCallsBeforeAdorePriorityT5 = alicornSacrificeCalls;
+const adoreOverBlockedAlicornT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 review: a non-ready alicorn plan never blocks a ready Adore",
+  adoreOverBlockedAlicornT5 === true && alicornSacrificeCalls === alicornCallsBeforeAdorePriorityT5 && gamePage.religion.faith === 0.01);
+
 res("alicorn").value = 50;
 res("timeCrystal").value = 1;
+fakeNow += 30000;
+gamePage.religion.faith = 0.01;
+gamePage.religion.faithRatio = 10;
+const nativeSaveBeforeReselectT5 = gamePage.save;
+gamePage.save = () => persistCheckpoint(() => { gamePage.religion.faith = 100000; });
+const alicornCallsBeforeFreshReselectT5 = alicornSacrificeCalls;
+const adoreCallsBeforeFreshReselectT5 = adoreCalls;
+const freshReselectedT5 = dbg.managePrestige?.(crystalTargetCandidateT5);
+check("Task 5 review: checkpoint revalidation recomputes all projections and reselects Adore over alicorn",
+  freshReselectedT5 === true && adoreCalls === adoreCallsBeforeFreshReselectT5 + 1 && alicornSacrificeCalls === alicornCallsBeforeFreshReselectT5);
+gamePage.save = nativeSaveBeforeReselectT5;
+gamePage.religion.faith = 0;
 fakeNow += 30000;
 perTick.timeCrystal = 0.000001; // slow passive route must not hide a funded Leviathan trade
 const immediateLeviathanT5 = { name: "leviathans", title: "Leviathans", unlocked: true, embassyLevel: 0, sells: [{ name: "timeCrystal", value: 2, chance: 1, width: 0 }] };

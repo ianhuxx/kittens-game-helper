@@ -2,7 +2,7 @@
 // @name         Kittens Game Helper
 // @namespace    https://github.com/ianhuxx/kittens-game-helper
 // @version      2.20.6
-// @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. Irreversible prestige actions (reset/transcend/shatter/time-skip/alicorn sacrifice) are filtered out of every candidate and trade list, so they can never fire; the only sacrifice the helper ever performs is the bounded unicorn→tears conversion that funds the ziggurat upgrade its unicorn planner picked.
+// @description  Self-contained one-click autopilot for Kittens Game — no external library. It reads and drives the game's own API (window.gamePage) directly: it picks a plan, RESERVES the resources that plan needs so cheaper buys can't eat them, buys the plan the moment it's affordable via the game's own button controllers, and spends only true surplus on everything else. One universal decision framework — every candidate (building, research, workshop/religion upgrade, space program, time structure) is scored by what its parsed game-metadata effects are worth to the CURRENT economy (production vs scarcity, storage vs live pressure, unlocks, goal alignment) minus how long it takes to afford; no per-item keyword lists. Handles crafting, overflow conversion, converter pausing, trade, diplomacy/explorers/embassies, religion praise + upgrades, the ziggurat/unicorn economy (pastures vs ziggurat upgrades vs building more ziggurats, with bounded unicorn→tears sacrifices), festivals, star events, lookahead-aware job rebalancing, leader election, gold-overflow promotions and hunting — all natively, as a single source of truth with one tick loop and no settings races. World reset, shatter, and time-skip remain forbidden; Transcend, Adore, and alicorn sacrifice run only through explicitly armed, freshly checkpointed, reservation-safe prestige policy.
 // @author       ianhuxx
 // @match        https://kittensgame.com/web/*
 // @match        https://kittensgame.com/beta/*
@@ -24,7 +24,8 @@
  *   2. runs ONE tick loop that plans, reserves, buys, crafts, trades, manages
  *      jobs/leader/hunting/religion/festivals and claims star events — every
  *      spender consulting the same reservation so they never undercut the plan,
- *   3. keeps irreversible actions out of every candidate/trade list (isDeniedKey),
+ *   3. keeps forbidden actions out of generic candidates and routes explicitly
+ *      armed prestige actions through a checkpointed semantic broker,
  *   4. shows a panel: bottleneck, next science, plan, and a live action log.
  */
 
@@ -36,8 +37,8 @@
   const PRESTIGE_ARM_KEY = "kgh.prestigeArmed";
   const HELPER_VERSION = "2.20.6";
 
-  // Speedrun helpers are advisory and scoring nudges only: the helper still
-  // never clicks reset/transcend/sacrifice/time-skip actions.
+  // Speedrun reset helpers remain advisory. Transcend, Adore and alicorn
+  // sacrifice are managed separately by the explicitly armed prestige broker.
   const SPEEDRUN_STATE_PREFIX = "kgh.speedrun.";
   const SPEEDRUN_RUN_START_KEY = SPEEDRUN_STATE_PREFIX + "runStart";
   const SPEEDRUN_PEAK_KITTENS_KEY = SPEEDRUN_STATE_PREFIX + "peakKittens";
@@ -62,15 +63,15 @@
   ];
 
   // Irreversible / permanent / resource-burning actions. Matched by name and
-  // kept OUT of every candidate and trade list, so the helper can never reset,
-  // transcend, sacrifice, shatter time crystals or time-skip. This is the single
-  // native safety guard now that there is no external engine to disable.
+  // kept OUT of every generic candidate and trade list. Authorized prestige
+  // actions use exact semantic IDs behind a private checkpoint capability;
+  // reset, shatter and time-skip remain forbidden at every boundary.
   // NOTE: "sacrifice" staying on this list means a sacrifice BUTTON can never
   // become a plan/candidate target. The unicorn planner's bounded unicorn→tears
   // conversion (manageUnicornReligion) is a separate subsystem, like hunting or
   // praise: it only converts the measured tears deficit of the ziggurat upgrade
-  // it has chosen, at the game's live exchange rate, and never touches alicorns
-  // (alicorn sacrifice feeds time crystals / shatter and stays fully denied).
+  // it has chosen. Alicorn conversion is a separate rare-capital action that can
+  // run only through the armed, checkpointed prestige policy.
   const DENY_SUBSTRINGS = ["reset", "transcend", "sacrifice", "shatter", "timeskip"];
   const DENY_EXACT = new Set([
     "adore",
@@ -250,7 +251,7 @@
     if (ACTION_IDS.has(actionId)) return ACTION_IDS.get(actionId);
     if (actionId === "praise" || actionId === "sacrificeUnicorns") return ACTION_POLICY.SAFE_REPEATABLE;
     const candidate = /^candidate:([^:]+):([^:]+)$/.exec(actionId);
-    if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[1]) && SAFE_ACTION_NAME.test(candidate[2])) {
+    if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[1]) && SAFE_ACTION_NAME.test(candidate[2]) && !isDeniedKey(candidate[2])) {
       return ACTION_POLICY.SAFE_REPEATABLE;
     }
     const repeatable = /^(craft|trade|explore|embassy):([^:]+)$/.exec(actionId);
@@ -258,7 +259,7 @@
     return ACTION_POLICY.FORBIDDEN;
   };
 
-  const executeSemanticAction = ({ id, policy, invoke, snapshot, verify, authorizationToken } = {}) => {
+  const executeSemanticAction = ({ id, policy, invoke, snapshot, verify, authorizationToken, checkpointedBefore } = {}) => {
     const resolvedPolicy = actionPolicyFor(id);
     const result = { ok: false, reason: "", before: null, after: null };
     if (resolvedPolicy === ACTION_POLICY.FORBIDDEN) {
@@ -282,14 +283,18 @@
       result.reason = "managed prestige checkpoint/revalidation required";
       return result;
     }
+    if (irreversible && (checkpointedBefore == null || typeof checkpointedBefore !== "object")) {
+      result.reason = "fresh native checkpoint required";
+      return result;
+    }
     const now = Date.now();
     if (irreversible && lastIrreversibleActionAt && now - lastIrreversibleActionAt < IRREVERSIBLE_ACTION_COOLDOWN_MS) {
       result.reason = "irreversible action cooldown";
       return result;
     }
-    if (irreversible) lastIrreversibleActionAt = now;
     try {
-      if (typeof snapshot === "function") result.before = snapshot();
+      if (irreversible) result.before = checkpointedBefore;
+      else if (typeof snapshot === "function") result.before = snapshot();
       invoke();
       if (typeof snapshot === "function") result.after = snapshot();
       if (typeof verify === "function" && !verify(result.before, result.after)) {
@@ -300,6 +305,7 @@
       result.reason = `action invocation failed: ${error && error.message ? error.message : String(error)}`;
       return result;
     }
+    if (irreversible) lastIrreversibleActionAt = now;
     result.ok = true;
     result.reason = "executed";
     return result;
@@ -312,9 +318,8 @@
   // The helper drives the game's own API directly — there is no external engine
   // to configure, enable or fight. "Applying" the profile kicks an immediate
   // tick without weakening the game's global confirmation setting.
-  // Irreversible actions
-  // (reset/transcend/sacrifice/shatter/timeskip) never enter any candidate or
-  // trade list — isDeniedKey() filters them out — so they can never fire.
+  // Forbidden reset/shatter/time-skip actions never enter candidates. Armed
+  // Transcend/Adore/alicorn policy is isolated behind the prestige broker.
   const applyProfile = () => {
     pushLog(`▶ Autopilot applied — ${isAutopilotOn() ? "ON" : "OFF"}`);
     tick();
@@ -7994,17 +7999,53 @@
       return { ...tickCache.rareCapitalFloors.get(cacheKey) };
     }
     const floor = {};
-    for (const candidate of rareCapitalCandidates(target)) {
+    const protectedKeys = new Set();
+    const protectDirectRareCosts = (candidate) => {
+      if (!candidate || !candidate.meta) return;
+      protectedKeys.add(`${candidate.kind}:${candidate.meta.name}`);
       for (const cost of pricesFor(candidate.kind, candidate.meta)) {
         if (!cost || !RARE_CAPITAL_RESOURCES.has(cost.name) || !(cost.val > 0)) continue;
-        const have = resValueOf(resources, cost.name);
-        let reachable = have >= cost.val;
-        if (!reachable) {
-          const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
-          reachable = !!route.reachable && Number.isFinite(route.eta);
-        }
-        if (reachable) floor[cost.name] = Math.max(floor[cost.name] || 0, cost.val);
+        floor[cost.name] = Math.max(floor[cost.name] || 0, cost.val);
       }
+    };
+
+    // Active and manual targets are explicit commitments. Protect their entire
+    // direct rare bill even when the remaining route is currently unavailable;
+    // otherwise ordinary surplus work can consume the capital already banked.
+    protectDirectRareCosts(target);
+    for (const item of readQueue()) {
+      if (queueItemDone(item)) continue;
+      const meta = lookupMetaById(item.id);
+      const [kind] = String(item.id).split(":");
+      if (meta) protectDirectRareCosts({ kind, meta });
+    }
+
+    // The next core metaphysics purchase is the persistent prestige roadmap
+    // gate. Only expose it when the live prestige manager and Paragon resource
+    // are present, so fresh pre-prestige runs do not gain a phantom reservation.
+    try {
+      const prestige = window.gamePage && window.gamePage.prestige;
+      if (prestige && Array.isArray(prestige.perks) && getRes(resources, "paragon")) {
+        const nextMeta = METAPHYSICS_ORDER.find((item) => !metaphysicsResearched(item.name));
+        if (nextMeta) floor.paragon = Math.max(floor.paragon || 0, nextMeta.cost);
+      }
+    } catch (error) {
+      /* prestige roadmap unavailable */
+    }
+
+    // Opportunistic/non-manual candidates earn a rare floor only when their
+    // whole current bill is reachable. Checking a rare leg in isolation can
+    // freeze capital forever for an item blocked by an unrelated impossible leg.
+    for (const candidate of rareCapitalCandidates(target)) {
+      if (protectedKeys.has(`${candidate.kind}:${candidate.meta.name}`)) continue;
+      const bill = pricesFor(candidate.kind, candidate.meta).filter((cost) => cost && cost.name && cost.val > 0);
+      const wholeBillReachable = bill.length > 0 && bill.every((cost) => {
+        if (resValueOf(resources, cost.name) >= cost.val) return true;
+        const route = acquisitionPathFor(resources, cost.name, cost.val, { finalPurchase: true });
+        return !!route.reachable && Number.isFinite(route.eta);
+      });
+      if (!wholeBillReachable) continue;
+      protectDirectRareCosts(candidate);
     }
     if (tickCache.rareCapitalFloors) tickCache.rareCapitalFloors.set(cacheKey, { ...floor });
     return floor;
@@ -9334,6 +9375,32 @@
     }
   };
 
+  const transcendActionAdapter = () => {
+    try {
+      const button = window.gamePage && window.gamePage.religionTab && window.gamePage.religionTab.transcendBtn;
+      const controller = button && button.controller;
+      const model = button && button.model;
+      if (!button || !controller || !model || typeof button.handler !== "function") {
+        return { available: false, reason: "native Religion Transcend button unavailable" };
+      }
+      if (typeof controller.updateVisible === "function") controller.updateVisible(model);
+      if (typeof controller.updateEnabled === "function") controller.updateEnabled(model);
+      if (model.visible === false || model.enabled === false) {
+        return { available: false, reason: "native Religion Transcend button disabled" };
+      }
+      return {
+        available: true,
+        reason: "ready",
+        button,
+        controller,
+        model,
+        invoke: () => button.handler(button),
+      };
+    } catch (error) {
+      return { available: false, reason: "native Religion Transcend button unavailable" };
+    }
+  };
+
   const prestigeSnapshot = () => {
     const game = window.gamePage || {};
     const religion = game.religion || {};
@@ -9365,7 +9432,8 @@
     const epiphany = Number(religion.faithRatio) || 0;
     const tier = Number(religion.transcendenceTier) || 0;
     const transcend = { available: false, funded: false, ready: false, nextPrice: Infinity, retainedFloor: 0, remaining: epiphany, reason: "native Transcend unavailable" };
-    if (typeof religion._getTranscendNextPrice === "function" && typeof religion.transcend === "function") {
+    const transcendAdapter = transcendActionAdapter();
+    if (typeof religion._getTranscendNextPrice === "function" && transcendAdapter.available) {
       const nextPrice = Number(religion._getTranscendNextPrice());
       const retainedFloor = transcendenceEpiphanyFloor();
       const remaining = epiphany - nextPrice;
@@ -9447,10 +9515,36 @@
     return { transcend, adore, alicorn, status };
   };
 
+  const persistedNativeSaveBlob = () => {
+    try {
+      const store = window.LCstorage;
+      if (store && store["com.nuclearunicorn.kittengame.savedata"] != null) {
+        return String(store["com.nuclearunicorn.kittengame.savedata"]);
+      }
+    } catch (error) {
+      /* try browser localStorage below */
+    }
+    try {
+      const value = localStorage.getItem("com.nuclearunicorn.kittengame.savedata");
+      return value == null ? null : String(value);
+    } catch (error) {
+      return null;
+    }
+  };
+
   const createNativeCheckpoint = () => {
     const game = window.gamePage;
     if (!game || typeof game.save !== "function") throw new Error("native checkpoint API unavailable");
-    if (game.save() === false) throw new Error("native checkpoint failed");
+    if (game.currentSaveIsBroken === true) throw new Error("native save is marked broken");
+    const beforePersisted = persistedNativeSaveBlob();
+    const saveData = game.save();
+    if (!saveData || typeof saveData !== "object") throw new Error("native checkpoint failed");
+    if (game.currentSaveIsBroken === true) throw new Error("native save became broken");
+    const afterPersisted = persistedNativeSaveBlob();
+    if (afterPersisted == null || afterPersisted === beforePersisted) {
+      throw new Error("native checkpoint did not persist a fresh save");
+    }
+    return { saveData, persisted: afterPersisted };
   };
 
   const setPrestigePlanText = (text) => {
@@ -9458,58 +9552,88 @@
     if (prestigeStatusEl) prestigeStatusEl.textContent = `⚠ ${text}`;
   };
 
+  const selectPrestigeAction = (projection) => {
+    if (projection && projection.transcend && projection.transcend.ready) return "transcend";
+    if (projection && projection.adore && projection.adore.ready) return "adore";
+    if (projection && projection.alicorn && projection.alicorn.ready) return "sacrificeAlicorns";
+    return null;
+  };
+
   const managePrestige = (resources, target = null) => {
     const projection = prestigeProjection(resources, target);
     setPrestigePlanText(`Prestige: ${projection.status}`);
     if (!prestigeAutomationArmed()) return false;
-    let action = null;
-    if (projection.transcend.ready) action = "transcend";
-    else if (projection.alicorn.applicable) action = projection.alicorn.ready ? "sacrificeAlicorns" : null;
-    else if (projection.adore.ready) action = "adore";
-    if (!action) return false;
+    if (!selectPrestigeAction(projection)) return false;
+    const now = Date.now();
+    if (lastIrreversibleActionAt && now - lastIrreversibleActionAt < IRREVERSIBLE_ACTION_COOLDOWN_MS) return false;
+
+    try {
+      createNativeCheckpoint();
+    } catch (error) {
+      const reason = error && error.message ? error.message : String(error);
+      setPrestigePlanText(`Prestige: checkpoint blocked · ${reason}`);
+      pushLog(`⚠ Prestige checkpoint refused: ${reason}`);
+      return false;
+    }
+
+    resetTickCache();
+    const freshResources = resourceMap();
+    const fresh = prestigeProjection(freshResources, target);
+    const action = selectPrestigeAction(fresh);
+    if (!action) {
+      setPrestigePlanText(`Prestige: fresh revalidation found no ready action · ${fresh.status}`);
+      return false;
+    }
 
     let expected = null;
-    let freshBefore = null;
+    const checkpointedBefore = prestigeSnapshot();
+    let actionAdapter = null;
+    if (action === "transcend") {
+      actionAdapter = transcendActionAdapter();
+      if (!actionAdapter.available) return false;
+      const unlocks = transcendenceUpgrades()
+        .filter((meta) => meta && meta.unlocked === false && Number.isFinite(Number(meta.tier)) && Number(meta.tier) <= checkpointedBefore.tier + 1)
+        .filter((meta) => !meta.evaluateLocks || meta.evaluateLocks(window.gamePage))
+        .map((meta) => meta.name);
+      expected = { cost: fresh.transcend.nextPrice, unlocks };
+    } else if (action === "adore") {
+      expected = { gain: fresh.adore.gain };
+    } else {
+      actionAdapter = alicornSacrificeAdapter();
+      if (!actionAdapter.available) return false;
+      expected = { cost: actionAdapter.price, gain: actionAdapter.expectedGain };
+    }
     const result = executeSemanticAction({
       id: action,
       policy: action === "sacrificeAlicorns" ? ACTION_POLICY.RARE_CAPITAL : ACTION_POLICY.AUTHORIZED_PRESTIGE,
       authorizationToken: IRREVERSIBLE_EXECUTION_TOKEN,
+      checkpointedBefore,
       snapshot: prestigeSnapshot,
       invoke: () => {
-        createNativeCheckpoint();
-        resetTickCache();
-        const freshResources = resourceMap();
-        const fresh = prestigeProjection(freshResources, target);
-        const freshAction = action === "transcend" ? fresh.transcend : action === "adore" ? fresh.adore : fresh.alicorn;
-        if (!freshAction.ready) throw new Error(`fresh ${action} revalidation failed: ${freshAction.reason}`);
-        freshBefore = prestigeSnapshot();
         if (action === "transcend") {
-          expected = { cost: fresh.transcend.nextPrice };
-          window.gamePage.religion.transcend();
+          actionAdapter.invoke();
         } else if (action === "adore") {
-          expected = { gain: fresh.adore.gain };
           window.gamePage.religion.resetFaith(1.01, false);
         } else {
-          const adapter = alicornSacrificeAdapter();
-          if (!adapter.available) throw new Error(adapter.reason);
-          expected = { cost: adapter.price, gain: adapter.expectedGain };
-          const bought = adapter.controller.buyItem(adapter.model, {});
+          const bought = actionAdapter.controller.buyItem(actionAdapter.model, {});
           if (!bought || !bought.itemBought) throw new Error("native alicorn sacrifice refused the batch");
         }
       },
       verify: (before, after) => {
-        before = freshBefore || before;
         if (!before || !after || !expected) return false;
         if (action === "transcend") {
-          return after.tier === before.tier + 1 && Math.abs(after.epiphany - (before.epiphany - expected.cost)) < 1e-9;
+          const unlocked = expected.unlocks.every((name) => {
+            const meta = window.gamePage.religion.getTU(name);
+            return !!meta && meta.unlocked === true;
+          });
+          return after.tier === before.tier + 1 && Math.abs(after.epiphany - (before.epiphany - expected.cost)) < 1e-9 && unlocked;
         }
         if (action === "adore") {
-          return after.tier === before.tier && Math.abs(after.epiphany - (before.epiphany + expected.gain)) < 1e-9 && after.worship < before.worship;
+          return after.tier === before.tier && Math.abs(after.epiphany - (before.epiphany + expected.gain)) < 1e-9 && Math.abs(after.worship - 0.01) < 1e-12;
         }
         return Math.abs(after.alicorn - (before.alicorn - expected.cost)) < 1e-9 && Math.abs(after.timeCrystal - (before.timeCrystal + expected.gain)) < 1e-9;
       },
     });
-    if (freshBefore) result.before = freshBefore;
     if (!result.ok) {
       setPrestigePlanText(`Prestige: ${action} blocked · ${result.reason}`);
       pushLog(`⚠ Prestige ${action} refused after checkpoint: ${result.reason}`);
