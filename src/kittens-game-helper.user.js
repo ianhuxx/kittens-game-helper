@@ -40,6 +40,8 @@
   } catch (error) {
     /* first injection */
   }
+  const bootstrapGeneration = Math.max(0, Number(window.__kghBootstrapGeneration) || 0) + 1;
+  window.__kghBootstrapGeneration = bootstrapGeneration;
 
   const STORAGE_KEY = "kgh.autopilot";
   const LOG_KEY = "kgh.log";
@@ -107,8 +109,6 @@
   const RARE_CAPITAL_RESOURCES = new Set(["alicorn", "timeCrystal", "relic", "void", "karma", "paragon"]);
   let lastIrreversibleActionAt = 0;
   let prestigePlanText = "Prestige: automation disarmed";
-
-  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   // Autopilot is the only mode — on by default; the header toggle is a label for
   // the current state. Resets always stay off regardless (see isDeniedKey).
@@ -761,14 +761,14 @@
     }
 
     if (kind === "research" || kind === "policy") {
-      if (!model && sourceBuildingCount("library") < 1) return closed("Library ×1 / Science surface required");
+      if (sourceBuildingCount("library") < 1) return closed("Library ×1 / Science surface required", "Library", model);
       if (meta.unlocked === false) return closed("research metadata locked", model ? "native model" : "metadata", model);
       return actionable(model ? "native Science model visible" : "Library ×1", model ? "native model" : "Library", model);
     }
 
     if (kind === "upgrade" || kind === "craft") {
       if (kind === "craft" && CORE_CRAFTS.has(meta.name) && meta.unlocked !== false) return actionable("core craft");
-      if (!model && sourceBuildingCount("workshop") < 1) return closed("Workshop ×1 required");
+      if (sourceBuildingCount("workshop") < 1) return closed("Workshop ×1 required", "Workshop", model);
       if (meta.unlocked === false) return closed(`${kind} metadata locked`, model ? "native model" : "metadata", model);
       return actionable(model ? "native Workshop model visible" : "Workshop ×1", model ? "native model" : "Workshop", model);
     }
@@ -1629,6 +1629,7 @@
   // consumer each tick — sometimes disagreeing mid-tick. Compute once, share.
   let plannerCycleId = 0;
   let activePlanSnapshot = { cycleId: -1, target: undefined };
+  let planRevision = 0;
 
   let tickCache = {
     resources: null,
@@ -1754,8 +1755,17 @@
       return activePlanSnapshot.target;
     }
     if (tickCache.target === undefined) tickCache.target = chooseWorkTarget(resources, goalKey);
-    activePlanSnapshot = { cycleId: plannerCycleId, target: tickCache.target };
+    activePlanSnapshot = { cycleId: plannerCycleId, revision: ++planRevision, consumed: false, target: tickCache.target };
     return tickCache.target;
+  };
+
+  const consumePlanDecision = () => {
+    if (activePlanSnapshot.cycleId !== plannerCycleId || activePlanSnapshot.target === undefined) return;
+    activePlanSnapshot = { ...activePlanSnapshot, consumed: true };
+    resetTickCache();
+    // Keep the consumed target readable by reservations and diagnostics; only
+    // mutation entrypoints treat the revision as spent.
+    tickCache.target = activePlanSnapshot.target;
   };
 
   const goalKeyFor = (goal) => Object.entries(GOALS).find(([, info]) => info === goal)?.[0] || getGoal();
@@ -2728,9 +2738,48 @@
   };
 
   const pollutionLevelDefinitions = (manager) => {
-    const raw = manager && (manager.pollutionLevels || manager.cathPollutionLevels || manager.pollutionEffects);
+    // `pollutionEffects` is the live native effect map in current Kittens Game;
+    // only accept it here when an older/forked manager actually exposes levels
+    // as an array.
+    const raw = manager && (manager.pollutionLevels || manager.cathPollutionLevels ||
+      (Array.isArray(manager.pollutionEffects) ? manager.pollutionEffects : null));
     if (Array.isArray(raw)) return raw;
     return raw && typeof raw === "object" ? Object.values(raw) : [];
+  };
+
+  const pollutionEffectMap = (value) => value && typeof value === "object" && !Array.isArray(value)
+    ? { ...value }
+    : null;
+
+  const nativeNextPollutionLevel = (manager, threshold) => {
+    if (!manager || !isFinite(threshold)) return null;
+    for (const methodName of ["getPollutionLevel", "getCathPollutionLevel"]) {
+      const method = manager[methodName];
+      // Current upstream methods read manager state and accept no argument. A
+      // fork may expose a pure projection; use it only when its signature says
+      // that passing a future pollution value is supported.
+      if (typeof method !== "function" || method.length < 1) continue;
+      try {
+        const projected = method.call(manager, threshold + Math.max(0.000001, Math.abs(threshold) * 0.000001));
+        if (projected != null) return projected;
+      } catch (error) { /* definitions/fallback below remain authoritative */ }
+    }
+    return null;
+  };
+
+  const fallbackNextPollutionThreshold = (manager, current, level) => {
+    try {
+      if (!manager || typeof manager.getPollutionLevelBase !== "function") return Number.POSITIVE_INFINITY;
+      const base = Number(manager.getPollutionLevelBase());
+      if (!(base > 0)) return Number.POSITIVE_INFINITY;
+      // Native levels are logarithmic. This is only a compatibility fallback
+      // when the manager exposes no threshold definitions of its own.
+      let threshold = base * Math.pow(10, Math.max(0, Number(level) || 0));
+      while (threshold <= current && isFinite(threshold)) threshold *= 10;
+      return threshold > current ? threshold : Number.POSITIVE_INFINITY;
+    } catch (error) {
+      return Number.POSITIVE_INFINITY;
+    }
   };
 
   const pollutionStatus = () => {
@@ -2767,11 +2816,17 @@
       for (const entry of definitions) if (current >= entry.threshold) level = entry.level;
     }
     const activeDefinition = definitions.filter((entry) => entry.threshold <= current).slice(-1)[0] || definitions[level] || null;
-    const effects = nativeLevel && nativeLevel.effects && typeof nativeLevel.effects === "object"
-      ? { ...nativeLevel.effects }
-      : activeDefinition && activeDefinition.effects && typeof activeDefinition.effects === "object" ? { ...activeDefinition.effects } : {};
+    const effects = pollutionEffectMap(manager.pollutionEffects) ||
+      pollutionEffectMap(nativeLevel && nativeLevel.effects) ||
+      pollutionEffectMap(activeDefinition && activeDefinition.effects) || {};
     const next = definitions.find((entry) => entry.threshold > current) || null;
-    const nextThreshold = next ? next.threshold : Number.POSITIVE_INFINITY;
+    const nextThreshold = next ? next.threshold : fallbackNextPollutionThreshold(manager, current, level);
+    const nativeNextLevel = nativeNextPollutionLevel(manager, nextThreshold);
+    // Prefer the manager's/definition's projected native effects. If neither is
+    // available, retaining the measured current map is deliberately neutral:
+    // inventing a flat name penalty would overstate an unmeasurable transition.
+    const nextEffects = pollutionEffectMap(nativeNextLevel && nativeNextLevel.effects) ||
+      pollutionEffectMap(next && next.effects) || { ...effects };
     const nextEta = perTick > 0 && isFinite(nextThreshold)
       ? Math.max(0, nextThreshold - current) / Math.max(0.000001, perTick * nativeTicksPerSecond())
       : Number.POSITIVE_INFINITY;
@@ -2799,28 +2854,95 @@
       nextEta,
       cleanEnergyRatio: totalWatts > 0 ? Math.max(0, Math.min(1, cleanWatts / totalWatts)) : 1,
       effects,
+      nextEffects,
       contributors,
     };
   };
 
-  const pollutionPenalty = (status = pollutionStatus()) => {
-    if (!status || !(status.current > 0) || !(status.perTick > 0) || status.equilibrium <= status.current) return 0;
-    let harmful = 0;
-    for (const value of Object.values(status.effects || {})) if (isFinite(value) && value < 0) harmful += Math.abs(value);
-    const distance = isFinite(status.nextThreshold) && status.nextThreshold > 0
-      ? Math.max(0, Math.min(1, 1 - (status.nextThreshold - status.current) / status.nextThreshold))
-      : 1;
-    return Math.max(0, (1 + status.level + harmful * 10) * (1 + distance * 2));
+  const liveVillageProduction = () => {
+    try {
+      const village = window.gamePage && window.gamePage.village;
+      const production = village && typeof village.getResProduction === "function" ? village.getResProduction() : null;
+      if (!production || typeof production !== "object") return 0;
+      return Object.values(production).reduce((sum, value) =>
+        sum + (isFinite(value) && value > 0 ? Number(value) * nativeTicksPerSecond() : 0), 0);
+    } catch (error) {
+      return 0;
+    }
   };
 
-  const pollutionProcessorTarget = (meta, target = null, status = pollutionStatus()) => {
+  const liveKittenArrival = () => {
+    try {
+      const village = window.gamePage && window.gamePage.village;
+      if (!village || typeof village.calculateKittensPerTick !== "function") return 0;
+      const value = Number(village.calculateKittensPerTick());
+      return isFinite(value) && value > 0 ? value * nativeTicksPerSecond() : 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const liveSolarRevolutionRatio = () => {
+    try {
+      const religion = window.gamePage && window.gamePage.religion;
+      const value = religion && typeof religion.getSolarRevolutionRatio === "function"
+        ? Number(religion.getSolarRevolutionRatio())
+        : 0;
+      return isFinite(value) && value > 0 ? value : 0;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const pollutionEffectNumber = (effects, names) => {
+    for (const name of names) if (effects && isFinite(effects[name])) return Number(effects[name]);
+    return 0;
+  };
+
+  const pollutionUtilityLoss = (effects) => {
+    const live = effects && typeof effects === "object" ? effects : {};
+    let loss = 0;
+
+    const catnipRatio = Math.max(0, -pollutionEffectNumber(live, ["catnipPollutionRatio"]));
+    loss += Math.max(0, productionFor("catnip")) * catnipRatio;
+
+    // Upstream spells this effect `pollutionHappines`; the other names support
+    // older fixtures/forks. Happiness has a native 25% floor, so only live
+    // headroom can be damaged.
+    const happinessEffect = Math.max(0, -pollutionEffectNumber(live,
+      ["pollutionHappines", "pollutionHappiness", "happiness"]));
+    const happinessRatio = happinessEffect > 1 ? happinessEffect / 100 : happinessEffect;
+    const happinessDamage = Math.min(happinessRatio, Math.max(0, currentHappinessRatio() - 0.25));
+    loss += liveVillageProduction() * happinessDamage;
+
+    const arrivalSlowdown = Math.max(1, pollutionEffectNumber(live, ["pollutionArrivalSlowdown"]));
+    loss += liveKittenArrival() * Math.max(0, arrivalSlowdown - 1);
+
+    const solarDamage = Math.max(0, -pollutionEffectNumber(live, ["solarRevolutionPollution"]));
+    const solarAffectedProduction = Math.max(0, productionFor("catnip")) + Math.max(0, productionFor("wood"));
+    loss += liveSolarRevolutionRatio() * solarDamage * solarAffectedProduction;
+
+    return Math.max(0, loss);
+  };
+
+  const pollutionPenalty = (status = pollutionStatus()) => {
+    if (!status || !(status.current > 0) || !(status.perTick > 0) || status.equilibrium <= status.current) return 0;
+    const currentLoss = pollutionUtilityLoss(status.effects);
+    const crossesNextLevel = isFinite(status.nextThreshold) && status.equilibrium >= status.nextThreshold;
+    const nextLoss = crossesNextLevel ? pollutionUtilityLoss(status.nextEffects) : currentLoss;
+    return Math.max(currentLoss, nextLoss);
+  };
+
+  const pollutionProcessorTarget = (meta, target = null, status = pollutionStatus(), allocationMinimum = 0) => {
     const full = Math.max(0, Math.floor(Number(meta && meta.val) || 0));
+    const protectedMinimum = Math.max(0, Math.min(full, Math.floor(Number(allocationMinimum) || 0)));
     if (!meta || full <= 0 || pollutionPenalty(status) <= 0 || pollutionMarginalFor(meta) <= 0) return full;
     const profile = processingProfileFor(meta);
     const targetNeedsOutput = !!target && profile.outputs.some((output) =>
       pricesFor(target.kind, target.meta).some((price) => price && price.name === output && resValueOf(resourceMap(), output) < price.val));
     const critical = /^(smelter|calciner)$/i.test(meta.name) || /smelter|calciner/i.test(labelOf(meta));
-    return targetNeedsOutput || critical || (target && target.meta === meta) ? Math.min(full, 1) : 0;
+    const directMinimum = targetNeedsOutput || critical || (target && target.meta === meta) ? Math.min(full, 1) : 0;
+    return Math.max(protectedMinimum, directMinimum);
   };
 
   const bestPollutionRecoveryTarget = (candidates, resources = resourceMap(), status = pollutionStatus()) => {
@@ -4011,7 +4133,10 @@
       const deficit = Math.max(0, cost.val - have - craftablePotential(cost.name));
       if (deficit <= 0) continue;
       const raw = {};
-      rawPathRequirements(cost.name, deficit, raw);
+      // Processor allocation needs the actual leaf identity, not the worker
+      // category used by job-pressure scoring: a nested craft may depend on a
+      // live converter output (catalyst → part → target).
+      rawPathRequirements(cost.name, deficit, raw, 0, true);
       for (const name of Object.keys(raw)) needed.add(name);
       for (const name of converterInputNamesForOutput(cost.name)) needed.add(name);
     }
@@ -4416,7 +4541,21 @@
       }
       const extra = Math.max(0, Math.min(extraRequested, fuelCap, powerCap));
       const prePollutionCount = minimum + extra;
-      const pollutionCap = Math.max(minimum, pollutionProcessorTarget(meta, target, pollution));
+      // Pollution is the final ceiling, not a second independent allocator.
+      // Preserve the shared decision's feasible minima: one recursively
+      // target-useful unit, enough positive generation for normal/winter grid
+      // safety, plus cooldown/consumer-support minima already pre-allocated.
+      const targetMinimum = demand.on > 0 && profile.outputs.some((output) => needed.has(output))
+        ? Math.min(prePollutionCount, 1)
+        : 0;
+      const safetyWatts = perUnitNet > 0
+        ? Math.max(0, TUNING.powerHeadroom - projectedPower.delta, -projectedPower.winterDelta)
+        : 0;
+      const safetyMinimum = perUnitNet > 0
+        ? Math.min(prePollutionCount, Math.ceil(Math.max(0, safetyWatts - 1e-9) / perUnitNet))
+        : 0;
+      const allocationMinimum = Math.max(minimum, targetMinimum, safetyMinimum);
+      const pollutionCap = pollutionProcessorTarget(meta, target, pollution, allocationMinimum);
       const count = Math.min(prePollutionCount, pollutionCap);
       const allocatedExtra = Math.max(0, count - minimum);
       chargeFuel(meta, allocatedExtra);
@@ -4469,7 +4608,7 @@
           if (currentOn > 0) {
             pausedProcessors[name] = { on: currentOn, label: labelOf(meta), reason: state.reason };
             if (setProcessorOn(meta, 0)) {
-              processorTransitions[name] = { state: "pause", at: Date.now() };
+              processorTransitions[name] = { state: "pause", at: gameClockNow() };
               changed.push(`paused ${labelOf(meta)}${state.detail ? ` (${state.detail})` : ""}`);
             }
           } else if (pausedProcessors[name]) {
@@ -4478,7 +4617,7 @@
           }
         } else if (currentOn !== state.on) {
           if (setProcessorOn(meta, state.on)) {
-            processorTransitions[name] = { state: "run", at: Date.now() };
+            processorTransitions[name] = { state: "run", at: gameClockNow() };
             changed.push(currentOn > state.on
               ? `throttled ${labelOf(meta)} to ${state.on}/${meta.val || 0}${state.detail ? ` (${state.detail})` : ""}`
               : pausedProcessors[name] ? `resumed ${labelOf(meta)}` : `started ${labelOf(meta)}`);
@@ -6699,7 +6838,7 @@
       }
       const result = executeUnicornSacrifice(chunks);
       if (result.gained > 0) {
-        lastUnicornSacrificeAt = Date.now();
+        lastUnicornSacrificeAt = gameClockNow();
         // The sacrifice may have just completed the served target's tears bill:
         // drop the per-tick plan snapshot so the executor's re-read sees the
         // fresh affordability and buys THIS tick (same latency contract crafts get).
@@ -7216,7 +7355,7 @@
     // old lock as the active target. Side executors must not act on this pending
     // takeover before it actually owns the plan.
     lastStrategicDecision.preferredTarget = preferred;
-    const now = Date.now();
+    const now = gameClockNow();
     const summary = `${decision.layer || "?"}::${targetId(preferred) || "(none)"}`;
     if (summary !== lastLoggedPlanSummary) {
       lastLoggedPlanSummary = summary;
@@ -8025,7 +8164,8 @@
       const jobs = managedJobs();
       const current = {};
       for (const job of jobs) current[job.name] = Math.max(0, Math.floor(job.value || 0));
-      const now = Date.now();
+      const now = gameClockNow();
+      const wallNow = Date.now();
       const signature = jobs.map((j) => `${j.name}:${desired[j.name] || 0}`).join("|");
       // Anti-churn throttle: with no free kittens, normally rebalance at most once
       // per JOB_REBALANCE_MIN_MS and skip an unchanged plan.  But a FOOD EMERGENCY
@@ -8055,14 +8195,14 @@
       }
       refreshJobManagementUI(village);
       lastJobSignature = signature;
-      if (moved > 0 && now - lastJobLog > 15000) {
+      if (moved > 0 && wallNow - lastJobLog > 15000) {
         const after = {};
         for (const job of jobs) {
           const fresh = jobByName(job.name);
           after[job.name] = (fresh && fresh.value) || 0;
         }
         pushLog(`👷 rebalanced ${moved} kittens: ${formatJobDistribution(jobs, after)}`);
-        lastJobLog = now;
+        lastJobLog = wallNow;
       }
     } catch (error) {
       /* ignore */
@@ -8346,7 +8486,7 @@
       const target = getTargetCached(resources, goalKey);
       if (!target) return "";
       const decision = lastStrategicDecision;
-      const lockAge = activeTarget && activeTarget.id === targetId(target) ? formatEta((Date.now() - activeTarget.startedAt) / 1000) : "unlocked";
+      const lockAge = activeTarget && activeTarget.id === targetId(target) ? formatEta(gameElapsedMs(activeTarget.startedAt) / 1000) : "unlocked";
       const lockText = `ActivePlan: ${labelOf(target.meta)} · lock ${lockAge} · reason ${activePlanDebug.reason || (decision && decision.reason) || "selected"}`;
       const reserveLedger = buildReservationLedger(target, resources);
       const reserveBySource = Object.entries(reserveLedger.reserved).slice(0, 5)
@@ -8703,7 +8843,10 @@
     if (candidate && candidate.kind === "festival") {
       const before = resourceSnapshot();
       const bought = buyFestivalCandidate();
-      if (bought) markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
+      if (bought) {
+        markTelemetryDiscontinuity(resourceDeltasBetween(before, resourceSnapshot()));
+        consumePlanDecision();
+      }
       return bought;
     }
     if (!candidate || !candidate.meta || !candidate.meta.name || candidateGate(candidate.kind, candidate.meta).state !== "actionable") return false;
@@ -8731,6 +8874,7 @@
     });
     if (result.ok) {
       markTelemetryDiscontinuity(resourceDeltasBetween(result.before, result.after));
+      consumePlanDecision();
       return true;
     }
     if (actionPolicyFor(`candidate:${candidate.kind}:${candidate.meta.name}`) !== ACTION_POLICY.FORBIDDEN) {
@@ -9079,7 +9223,7 @@
   const executePlan = (resources, goalKey) => {
     try {
       computeResetAdvisor();
-      const now = Date.now();
+      const now = gameClockNow();
       if (activeTarget) {
         const lockedMeta = lookupMetaById(activeTarget.id);
         const [lockedKind] = String(activeTarget.id).split(":");
@@ -9095,6 +9239,10 @@
       const target = getTargetCached(resources, goalKey);
       const sprint = isSprintCandidate(target, resources);
       if (target) target._sprint = sprint;
+      if (activePlanSnapshot.cycleId === plannerCycleId && activePlanSnapshot.consumed) {
+        buyPlanText = `Buy: plan decision consumed — waiting for next planning cycle`;
+        return;
+      }
 
       // Plan purchases are latency-sensitive: if we just crafted the exact
       // beams/slabs/etc. for a building, raw inputs may still be draining in the
@@ -9252,7 +9400,7 @@
           .sort((a, b) => (b.meta.analysis.rankGain / Math.max(1, b.meta.analysis.payback + 1)) -
             (a.meta.analysis.rankGain / Math.max(1, a.meta.analysis.payback + 1)));
         if (swaps.length) {
-          lastAutoBuy = Date.now();
+          lastAutoBuy = gameClockNow();
           if (executeStageTransitionCandidate(swaps[0])) {
             parallelPlanText = `Parallel: staged ${labelOf(swaps[0].meta)}`;
             pushLog(`🏭 parallel stage ${labelOf(swaps[0].meta)} (${swaps[0].meta.analysis.reason}; ${labelOf(target.meta)} keeps its reserves)`);
@@ -9307,7 +9455,7 @@
         if (!shorts.length) {
           // Fully banked above every floor: finish it, throttled like any buy.
           if (boughtThisTick || !candidate.affordable) continue;
-          const now = Date.now();
+          const now = gameClockNow();
           if (gameElapsedMs(lastAutoBuy) < AUTOBUY_MIN_MS) continue;
           if (!prices.every((price) => priceClearsParallelFloor(price, floors, resources))) continue;
           lastAutoBuy = now;
@@ -10851,23 +10999,23 @@
       // the selected acquisition route, safe overflow, and only then embassies.
       if (craftDiplomacyPrerequisites(resources, goalKey) ||
           maybeAdoptZebraTradePolicy(resources, reserved, goalKey)) {
-        lastDiplomacyAction = Date.now();
+        lastDiplomacyAction = gameClockNow();
         return;
       }
       const explorerResult = maybeSendExplorers(resources, reserved);
       if (explorerResult !== false) {
-        if (explorerResult === true) lastDiplomacyAction = Date.now();
+        if (explorerResult === true) lastDiplomacyAction = gameClockNow();
         return;
       }
       const route = activeAcquisitionRoute(target, resources);
       if (maybeTradeForTargetChain(resources, ledger, goalKey, target) ||
           maybeTradeSurplus(resources, ledger, goalKey)) {
-        lastDiplomacyAction = Date.now();
+        lastDiplomacyAction = gameClockNow();
         return;
       }
       const embassyResult = maybeBuildEmbassy(resources, reserved, route);
       if (embassyResult !== false) {
-        if (embassyResult === true) lastDiplomacyAction = Date.now();
+        if (embassyResult === true) lastDiplomacyAction = gameClockNow();
         return;
       }
       const raceCount = unlockedRaces().length;
@@ -11997,33 +12145,43 @@
   };
 
   const tick = () => {
-    try {
-      plannerCycleId += 1;
-      activePlanSnapshot = { cycleId: plannerCycleId, target: undefined };
-      resetTickCache();
-      // Autopilot OFF means the helper takes NO actions — no buys, crafts,
-      // trades, hunts, job moves, leader changes, festivals, praise, policies
-      // or queue execution.  The panel just shows the OFF state and the log
-      // history so the player can decide when to flip it back on.  This is
-      // the single gate: every spender is reached through this tick.
-      if (!isAutopilotOn()) {
-        renderOffPanel();
-        return;
-      }
+    plannerCycleId += 1;
+    activePlanSnapshot = { cycleId: plannerCycleId, target: undefined };
+    resetTickCache();
+    let resources = resourceMap();
+    let goal = DEFAULT_GOAL;
+    let autopilotOn = false;
+    runNamedSubsystem("planner", () => {
+      autopilotOn = isAutopilotOn();
+      if (!autopilotOn) return;
       sampleResourceTelemetry();
-      let resources = resourceMap();
-      const goal = getGoal();
+      resources = resourceMap();
+      goal = getGoal();
       computeResetAdvisor();
       watchNewUnlocks();
       maybeObserveStars();
       refineSurplusCatnip();
-      const processorAllocation = optimizeProcessing(resources, goal);
+    });
+    // Autopilot OFF means the helper takes NO actions — no buys, crafts,
+    // trades, hunts, job moves, leader changes, festivals, praise, policies
+    // or queue execution. The planner phase owns this one global gate.
+    if (!autopilotOn) {
+      renderOffPanel();
+      return;
+    }
+    let processorAllocation = null;
+    runNamedSubsystem("processor", () => {
+      processorAllocation = optimizeProcessing(resources, goal);
       keepHealthyConvertersStable(resources, processorAllocation);
+    });
+    runNamedSubsystem("craft", () => {
       craftTowardTarget(resources, goal);
       // The unicorn subsystem runs BEFORE the plan executor for the same reason
       // crafting does: a sacrifice can complete a ziggurat upgrade's tears bill
       // this very tick, and the buy should follow immediately.
       manageUnicornReligion(resources, goal);
+    });
+    runNamedSubsystem("autobuy", () => {
       // Crafting or trade can turn a plan affordable immediately. Re-read and
       // try the locked plan BEFORE any surplus/overflow conversion, otherwise a
       // generic craft can spend the exact raw resource window the plan needed.
@@ -12046,12 +12204,16 @@
       const prestigeTarget = getTargetCached(resources, goal);
       const prestigeActed = managePrestige(resources, prestigeTarget);
       if (!prestigeActed) managePraise(resources);
+    });
+    runNamedSubsystem("diplomacy", () => {
       // Purchases can change resource stocks, caps, unlocks and per-tick effects;
       // re-read before diplomacy/jobs so later decisions are based on the board
       // after the buy, not on the planning snapshot from before it.
       resetTickCache();
       resources = resourceMap();
       manageDiplomacy(resources, goal);
+    });
+    runNamedSubsystem("jobs", () => {
       resetTickCache();
       resources = resourceMap();
       if (maybePromoteKittens(resources, goal)) {
@@ -12067,6 +12229,8 @@
       maybeHoldFestival(resources);
       festivalOpportunity(resources);
       trackActions();
+    });
+    runNamedSubsystem("render", () => {
       if (statusEl) statusEl.textContent = `Helper: ${helperRunning() ? "running ✓" : "starting…"}`;
       if (goalEl) {
         const line = getGoalLine(resources, goal);
@@ -12097,9 +12261,7 @@
       renderRankingControl(resources, goal);
       if (nowEl) nowEl.textContent = `🎯 Now: ${getNowAction(resources, goal)}`;
       lastTickAt = Date.now();
-    } catch (error) {
-      /* ignore */
-    }
+    });
   };
 
   /* ------------------------------ game speed ------------------------------- */
@@ -12133,6 +12295,10 @@
   })();
 
   let boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
+  let automationClockState = (() => {
+    const wallNow = Date.now();
+    return { wallAt: wallNow, logicalNow: wallNow, deliveredMultiplier: 1 };
+  })();
   const nativeTicksPerSecond = () => {
     try {
       const value = Number(window.gamePage && window.gamePage.ticksPerSecond);
@@ -12141,8 +12307,7 @@
       return 5;
     }
   };
-  const automationClockSnapshot = () => {
-    const wallNow = Date.now();
+  const measuredAutomationDelivery = (wallNow) => {
     const nativeTps = nativeTicksPerSecond();
     const elapsed = Math.max(0, wallNow - boosterTelemetry.startedAt);
     const warm = elapsed < TICK_SPEED_BEAT_MS;
@@ -12154,14 +12319,26 @@
       requestedMultiplier: tickSpeed,
       deliveredTicksPerSecond,
       deliveredMultiplier: nativeTps > 0 ? Math.max(1, deliveredTicksPerSecond / nativeTps) : 1,
-      wallNow,
     };
   };
+  const integrateAutomationClock = (wallNow = Date.now()) => {
+    const elapsed = Math.max(0, wallNow - automationClockState.wallAt);
+    automationClockState.logicalNow += elapsed * automationClockState.deliveredMultiplier;
+    automationClockState.wallAt = wallNow;
+    const delivery = measuredAutomationDelivery(wallNow);
+    automationClockState.deliveredMultiplier = delivery.deliveredMultiplier;
+    return {
+      ...delivery,
+      wallNow,
+      logicalNow: automationClockState.logicalNow,
+    };
+  };
+  const automationClockSnapshot = () => integrateAutomationClock();
+  const gameClockNow = () => automationClockSnapshot().logicalNow;
   const gameElapsedMs = (since) => {
     const stamp = Number(since);
     if (!isFinite(stamp)) return 0;
-    const clock = automationClockSnapshot();
-    return Math.max(0, clock.wallNow - stamp) * clock.deliveredMultiplier;
+    return Math.max(0, gameClockNow() - stamp);
   };
   const automationDelayMs = (baseMs, floorMs = 0) => Math.max(
     Math.max(0, Number(floorMs) || 0),
@@ -12169,6 +12346,7 @@
   );
   const runBoosterBeat = () => {
     const started = Date.now();
+    integrateAutomationClock(started);
     const elapsed = Math.max(TICK_SPEED_BEAT_MS, started - boosterTelemetry.lastBeatAt);
     boosterTelemetry.lastBeatAt = started;
     const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTicksPerSecond() * elapsed / 1000));
@@ -12189,29 +12367,96 @@
     boosterTelemetry.executed += executed;
     boosterTelemetry.dropped += dropped;
     boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, budgetMs: BOOSTER_CPU_BUDGET_MS };
+    integrateAutomationClock(Date.now());
     return boosterTelemetry.lastBeat;
   };
 
   const timerOwner = {
     token: `kgh-${Date.now()}-${Math.random()}`,
+    generation: bootstrapGeneration,
+    cancelled: false,
     timers: Object.create(null),
     delays: Object.create(null),
-    cancelAll() {
+    timeouts: Object.create(null),
+    timeoutDelays: Object.create(null),
+    timeoutResolvers: Object.create(null),
+    cancelIntervals() {
       for (const id of Object.values(this.timers)) {
         try { clearInterval(id); } catch (error) { /* already cleared */ }
       }
       this.timers = Object.create(null);
       this.delays = Object.create(null);
     },
+    cancelTimeout(lane) {
+      if (!Object.prototype.hasOwnProperty.call(this.timeouts, lane)) return;
+      const id = this.timeouts[lane];
+      const resolve = this.timeoutResolvers[lane];
+      try { clearTimeout(id); } catch (error) { /* already cleared */ }
+      delete this.timeouts[lane];
+      delete this.timeoutDelays[lane];
+      delete this.timeoutResolvers[lane];
+      if (typeof resolve === "function") resolve(false);
+    },
+    cancelAll() {
+      this.cancelled = true;
+      this.cancelIntervals();
+      for (const lane of Object.keys(this.timeouts)) this.cancelTimeout(lane);
+    },
   };
   window.__kghTimerOwner = timerOwner;
+  const isCurrentTimerOwner = () => !timerOwner.cancelled &&
+    window.__kghTimerOwner === timerOwner &&
+    window.__kghBootstrapGeneration === bootstrapGeneration;
+  const armOwnedTimeout = (lane, fn, delayMs) => {
+    timerOwner.cancelTimeout(lane);
+    if (!isCurrentTimerOwner()) return null;
+    const rounded = Math.max(1, Math.round(delayMs));
+    let id = null;
+    id = setTimeout(() => {
+      if (timerOwner.timeouts[lane] !== id) return;
+      delete timerOwner.timeouts[lane];
+      delete timerOwner.timeoutDelays[lane];
+      delete timerOwner.timeoutResolvers[lane];
+      if (isCurrentTimerOwner()) fn();
+    }, rounded);
+    timerOwner.timeouts[lane] = id;
+    timerOwner.timeoutDelays[lane] = rounded;
+    return id;
+  };
+  const ownedDelay = (lane, delayMs) => new Promise((resolve) => {
+    timerOwner.cancelTimeout(lane);
+    if (!isCurrentTimerOwner()) {
+      resolve(false);
+      return;
+    }
+    const rounded = Math.max(1, Math.round(delayMs));
+    let id = null;
+    id = setTimeout(() => {
+      if (timerOwner.timeouts[lane] !== id) return;
+      delete timerOwner.timeouts[lane];
+      delete timerOwner.timeoutDelays[lane];
+      delete timerOwner.timeoutResolvers[lane];
+      resolve(isCurrentTimerOwner());
+    }, rounded);
+    timerOwner.timeouts[lane] = id;
+    timerOwner.timeoutDelays[lane] = rounded;
+    timerOwner.timeoutResolvers[lane] = resolve;
+  });
   let mutationLane = null;
   let overlappingMutations = 0;
   const subsystemFailures = Object.create(null);
+  const subsystemRuns = Object.create(null);
   const runNamedSubsystem = (name, fn) => {
+    const run = subsystemRuns[name] || { attempts: 0, successes: 0, lastSuccessAt: 0, lastFailureAt: 0 };
+    run.attempts += 1;
+    subsystemRuns[name] = run;
     try {
-      return fn();
+      const result = fn();
+      run.successes += 1;
+      run.lastSuccessAt = Date.now();
+      return result;
     } catch (error) {
+      run.lastFailureAt = Date.now();
       const entry = subsystemFailures[name] || { count: 0, last: "" };
       entry.count += 1;
       entry.last = error && error.message || String(error);
@@ -12255,12 +12500,16 @@
     runNamedSubsystem("jobs", () => balanceJobs(goal, resources));
   });
   const armOwnedInterval = (lane, fn, delayMs) => {
+    if (!isCurrentTimerOwner()) return;
     const delayMsRounded = Math.max(1, Math.round(delayMs));
     timerOwner.delays[lane] = delayMsRounded;
-    timerOwner.timers[lane] = setInterval(fn, delayMsRounded);
+    timerOwner.timers[lane] = setInterval(() => {
+      if (isCurrentTimerOwner()) fn();
+    }, delayMsRounded);
   };
   const armAutomationScheduler = () => {
-    timerOwner.cancelAll();
+    if (!isCurrentTimerOwner()) return;
+    timerOwner.cancelIntervals();
     armOwnedInterval("planning", () => withMutationLane("planning", tick), automationDelayMs(HELPER_TICK_MS, PLANNING_LANE_FLOOR_MS));
     armOwnedInterval("action", runActionLane, automationDelayMs(ACTION_LANE_BASE_MS, ACTION_LANE_FLOOR_MS));
     armOwnedInterval("render", () => runNamedSubsystem("render", () => {
@@ -12274,13 +12523,25 @@
   const automationSchedulerSnapshot = () => {
     const lanes = {};
     for (const [name, id] of Object.entries(timerOwner.timers)) lanes[name] = { id, delayMs: timerOwner.delays[name] };
-    return { ownerToken: timerOwner.token, ownerCount: Object.keys(lanes).length, lanes, overlappingMutations, mutationLane };
+    return {
+      ownerToken: timerOwner.token,
+      generation: timerOwner.generation,
+      ownerCount: Object.keys(lanes).length,
+      timeoutCount: Object.keys(timerOwner.timeouts).length,
+      lanes,
+      overlappingMutations,
+      mutationLane,
+    };
   };
 
   const applyTickSpeed = (multiplier) => {
+    if (!isCurrentTimerOwner()) return tickSpeed;
+    const wallNow = Date.now();
+    integrateAutomationClock(wallNow);
     tickSpeed = TICK_SPEED_OPTIONS.includes(multiplier) ? multiplier : 1;
     try { localStorage.setItem(TICK_SPEED_KEY, String(tickSpeed)); } catch (error) { /* keep the in-memory choice */ }
-    boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
+    boosterTelemetry = { startedAt: wallNow, lastBeatAt: wallNow, executed: 0, dropped: 0, lastBeat: null };
+    integrateAutomationClock(wallNow);
     if (document.body) armAutomationScheduler();
     return tickSpeed;
   };
@@ -12290,10 +12551,12 @@
   const MIN_KEY = "kgh.min";
 
   const buildPanel = () => {
+    if (!isCurrentTimerOwner()) return;
     if (!document.body) {
-      setTimeout(buildPanel, 250);
+      armOwnedTimeout("buildPanel", buildPanel, 250);
       return;
     }
+    timerOwner.cancelTimeout("buildPanel");
     const oldPanel = document.querySelector ? document.querySelector(".kgh-panel") : null;
     if (oldPanel) oldPanel.remove();
     const oldStyle = document.getElementById("kgh-style");
@@ -12503,7 +12766,7 @@
           if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(text);
             logCopyBtn.textContent = "Copied report";
-            setTimeout(() => { logCopyBtn.textContent = "Copy"; }, 1500);
+            armOwnedTimeout("clipboardReset", () => { logCopyBtn.textContent = "Copy"; }, 1500);
           }
         } catch (error) {
           /* clipboard may be restricted; user can select manually */
@@ -12551,16 +12814,37 @@
     armAutomationScheduler();
   };
 
+  const ordinaryCooldownSnapshot = () => {
+    const logicalNow = gameClockNow();
+    const latestRejection = Math.max(0, ...Array.from(rejectedTargets.values(), (entry) => Number(entry && entry.at) || 0));
+    const latestProcessor = Math.max(0, ...Object.values(processorTransitions).map((entry) => Number(entry && entry.at) || 0));
+    const stamps = {
+      trade: lastDiplomacyAction,
+      autobuy: lastAutoBuy,
+      jobs: lastJobRun,
+      rejection: latestRejection,
+      processor: latestProcessor,
+      unicorn: lastUnicornSacrificeAt,
+    };
+    return {
+      logicalNow,
+      stamps,
+      ages: Object.fromEntries(Object.entries(stamps).map(([name, stamp]) => [name, Math.max(0, logicalNow - stamp)])),
+    };
+  };
+
   window.__kghDebug = {
     ACTION_POLICY,
     candidateGate,
     gameElapsedMs,
+    ordinaryCooldownSnapshot,
     automationDelayMs,
     automationClockSnapshot,
     automationSchedulerSnapshot,
     runBoosterBeat,
     boosterTelemetry: () => ({ ...boosterTelemetry, lastBeat: boosterTelemetry.lastBeat && { ...boosterTelemetry.lastBeat } }),
     subsystemFailures: () => JSON.parse(JSON.stringify(subsystemFailures)),
+    subsystemRunSnapshot: () => JSON.parse(JSON.stringify(subsystemRuns)),
     runNamedSubsystem,
     runSubsystemSequence,
     actionPolicyFor,
@@ -12779,7 +13063,7 @@
       activePowerRecoveryId = null;
       activeWorkshopRoadmapId = null;
       activeSprintPacingBoostId = null;
-      const startedAt = Date.now() - Math.max(0, ageMs);
+      const startedAt = gameClockNow() - Math.max(0, ageMs);
       activeTarget = candidate ? {
         id: targetId(candidate),
         startedAt,
@@ -12991,16 +13275,25 @@
 
   const waitForGame = async () => {
     for (let i = 0; i < 240; i += 1) {
-      if (gameReady()) return;
-      await delay(250);
+      if (!isCurrentTimerOwner()) return false;
+      if (gameReady()) return true;
+      const stillCurrent = await ownedDelay("waitForGame", 250);
+      // A cancelled timeout resolves false. Check the generation again after
+      // every await so a superseded closure cannot continue into panel/lane
+      // setup even if its Promise continuation was already queued.
+      if (!stillCurrent || !isCurrentTimerOwner()) return false;
     }
+    if (!isCurrentTimerOwner()) return false;
     throw new Error("Kittens Game did not finish loading.");
   };
 
   waitForGame()
-    .then(() => {
+    .then((ready) => {
+      if (!ready || !isCurrentTimerOwner()) return;
       applyProfile();
+      if (!isCurrentTimerOwner()) return;
       buildPanel();
+      if (!isCurrentTimerOwner()) return;
       applyTickSpeed(tickSpeed); // re-arm the persisted manual game speed
     })
     .catch((error) => console.error("[KGH] Failed to start:", error));

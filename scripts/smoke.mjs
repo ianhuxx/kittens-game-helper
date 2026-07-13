@@ -6359,10 +6359,25 @@ techs.push(researchT7);
 workshopUpgrades.push(upgradeT7);
 resources.push(freshPartT7);
 crafts.push(freshCraftT7);
+const savedScienceTabT7 = gamePage.scienceTab;
+const savedWorkshopTabT7 = gamePage.workshopTab;
+gamePage.scienceTab = {
+  buttons: [{ model: { options: { id: researchT7.name }, metadata: researchT7, visible: true } }],
+};
+gamePage.workshopTab = {
+  buttons: [
+    { model: { options: { id: upgradeT7.name }, metadata: upgradeT7, visible: true } },
+    { model: { options: { id: freshCraftT7.name }, metadata: freshCraftT7, visible: true } },
+  ],
+};
 libraryT7.val = 0; libraryT7.on = 0;
 workshopT7.val = 0; workshopT7.on = 0;
 dbg.forceActiveTarget(null);
 
+check("Task 7 review: stale visible native models cannot bypass Library/Workshop x0",
+  dbg.candidateGate?.("research", researchT7)?.state === "closed" &&
+  dbg.candidateGate?.("upgrade", upgradeT7)?.state === "closed" &&
+  dbg.candidateGate?.("craft", freshCraftT7)?.state === "closed");
 check("Task 7 lifecycle: persisted research metadata stays closed at Library ×0",
   dbg.candidateGate?.("research", researchT7)?.state === "closed" && !dbg.candidateById("research:freshResearchT7"));
 check("Task 7 lifecycle: persisted upgrade and non-core craft metadata stay closed at Workshop ×0",
@@ -6457,12 +6472,60 @@ dbg.forceActiveTarget(null);
 check("Task 7 Ziggurat: native unlock replaces aggregate precursor with ordinary actionable building",
   dbg.bootstrapResourceCandidate?.()?.meta?.downstreamName !== "ziggurat" && dbg.candidateById("build:ziggurat")?.kind === "build");
 
+/* A fast action lane may consume a plan decision once, never replay it. */
+const fastReplayT7 = {
+  name: "fastReplayT7", label: "Fast Replay T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "wood", val: 1 }], effects: { mineralsRatio: 1000 },
+};
+buildings.push(fastReplayT7);
+res("wood").value = Math.max(res("wood").value, 20);
+dbg.forceActiveTarget(dbg.candidateById("build:fastReplayT7"), "Economy growth", 0);
+dbg.applyTickSpeed?.(1);
+const replaySchedulerT7 = dbg.automationSchedulerSnapshot?.();
+const replayPlanningT7 = intervalFns[replaySchedulerT7.lanes.planning.id];
+const replayActionT7 = intervalFns[replaySchedulerT7.lanes.action.id];
+fakeNow += replaySchedulerT7.lanes.planning.delayMs;
+replayPlanningT7();
+const replayCountAfterPlanT7 = fastReplayT7.val;
+fakeNow += replaySchedulerT7.lanes.action.delayMs;
+replayActionT7();
+fakeNow += replaySchedulerT7.lanes.action.delayMs;
+replayActionT7();
+check("Task 7 review: real-cadence fast lane consumes one plan decision exactly once",
+  replayCountAfterPlanT7 === 1 && fastReplayT7.val === replayCountAfterPlanT7);
+buildings.splice(buildings.indexOf(fastReplayT7), 1);
+dbg.forceActiveTarget(null);
+
 /* Logical automation clock and cooperative booster contracts. */
 const clock1xT7 = dbg.automationClockSnapshot?.();
-const stampT7 = fakeNow;
+const stampT7 = clock1xT7?.logicalNow ?? fakeNow;
 fakeNow += 1000;
 check("Task 7 clock: 1× logical elapsed time preserves wall-clock behavior",
   clock1xT7?.requestedMultiplier === 1 && Math.abs((dbg.gameElapsedMs?.(stampT7) || 0) - 1000) < 1);
+
+dbg.applyTickSpeed?.(1);
+const transitionStartT7 = dbg.automationClockSnapshot?.();
+const namedCooldownStartT7 = dbg.ordinaryCooldownSnapshot?.();
+fakeNow += 1000;
+const beforeFastT7 = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(50);
+const fastStartT7 = dbg.automationClockSnapshot?.();
+fakeNow += 100;
+const afterFastT7 = dbg.automationClockSnapshot?.();
+dbg.applyTickSpeed?.(1);
+fakeNow += 1000;
+const transitionEndT7 = dbg.automationClockSnapshot?.();
+const namedCooldownEndT7 = dbg.ordinaryCooldownSnapshot?.();
+const expectedTransitionLogicalT7 = 1000 + 100 * (fastStartT7?.deliveredMultiplier || 0) + 1000;
+const namedCooldownsT7 = ["trade", "autobuy", "jobs", "rejection", "processor", "unicorn"];
+check("Task 7 review: 1x->50x->1x integrates named ordinary cooldown ages without retroactive rescaling",
+  Number.isFinite(transitionStartT7?.logicalNow) &&
+  Math.abs((beforeFastT7.logicalNow - transitionStartT7.logicalNow) - 1000) < 1 &&
+  Math.abs((afterFastT7.logicalNow - fastStartT7.logicalNow) - 100 * fastStartT7.deliveredMultiplier) < 1 &&
+  Math.abs((transitionEndT7.logicalNow - transitionStartT7.logicalNow) - expectedTransitionLogicalT7) < 1 &&
+  namedCooldownsT7.every((name) => Math.abs(
+    (namedCooldownEndT7?.ages?.[name] || 0) - (namedCooldownStartT7?.ages?.[name] || 0) - expectedTransitionLogicalT7,
+  ) < 1));
 dbg.applyTickSpeed?.(50);
 const scheduler50T7 = dbg.automationSchedulerSnapshot?.();
 check("Task 7 clock: action/planning/render lanes respect polling floors",
@@ -6536,11 +6599,142 @@ check("Task 7 pollution: rising harmful pollution selects a reachable cleaner/se
 const pollutionDecisionT7 = dbg.selectStrategicTarget?.("balanced");
 check("Task 7 pollution: recovery layer is visible above repeated economy growth",
   /Pollution recovery/.test(pollutionDecisionT7?.layer || "") && pollutionDecisionT7?.target?.meta?.name === "carbonSequestrationT7");
+
+const utilityPollutionLevelsT7 = gamePage.bld.pollutionLevels;
+const utilityGetPollutionLevelT7 = gamePage.bld.getPollutionLevel;
+const utilityCatnipPerTickT7 = perTick.catnip;
+const utilityHappinessT7 = gamePage.village.happiness;
+const utilityArrivalT7 = gamePage.village.calculateKittensPerTick;
+const utilitySolarRatioT7 = gamePage.religion.getSolarRevolutionRatio;
+const pollutionUtilityPenaltyT7 = (currentEffects, nextEffects = currentEffects) => {
+  gamePage.bld.pollutionLevels = [
+    { threshold: 0, effects: {} },
+    { threshold: 500, effects: currentEffects },
+    { threshold: 1000, effects: nextEffects },
+  ];
+  gamePage.bld.getPollutionLevel = () => ({ level: 1, effects: currentEffects });
+  return dbg.pollutionPenalty(dbg.pollutionStatus());
+};
+
+perTick.catnip = 1;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const lowCatnipPollutionUtilityT7 = pollutionUtilityPenaltyT7({ catnipPollutionRatio: -0.05 });
+perTick.catnip = 12;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const highCatnipPollutionUtilityT7 = pollutionUtilityPenaltyT7({ catnipPollutionRatio: -0.05 });
+check("Task 7 review: pollution utility scales with live catnip production",
+  highCatnipPollutionUtilityT7 > lowCatnipPollutionUtilityT7);
+
+perTick.catnip = 0;
+gamePage.village.happiness = 0.26;
+const floorHappinessPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionHappines: -0.1 });
+gamePage.village.happiness = 1.1;
+const highHappinessPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionHappines: -0.1 });
+check("Task 7 review: pollution utility respects live happiness headroom",
+  highHappinessPollutionUtilityT7 > floorHappinessPollutionUtilityT7);
+
+gamePage.village.calculateKittensPerTick = () => 0.001;
+const lowArrivalPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionArrivalSlowdown: 2 });
+gamePage.village.calculateKittensPerTick = () => 0.1;
+const highArrivalPollutionUtilityT7 = pollutionUtilityPenaltyT7({ pollutionArrivalSlowdown: 2 });
+check("Task 7 review: pollution utility scales with live kitten-arrival rate",
+  highArrivalPollutionUtilityT7 > lowArrivalPollutionUtilityT7);
+
+gamePage.village.calculateKittensPerTick = () => 0;
+gamePage.religion.getSolarRevolutionRatio = () => 0.1;
+const lowSolarPollutionUtilityT7 = pollutionUtilityPenaltyT7({ solarRevolutionPollution: -0.25 });
+gamePage.religion.getSolarRevolutionRatio = () => 2;
+const highSolarPollutionUtilityT7 = pollutionUtilityPenaltyT7({ solarRevolutionPollution: -0.25 });
+check("Task 7 review: pollution utility scales with live Solar Revolution strength",
+  highSolarPollutionUtilityT7 > lowSolarPollutionUtilityT7);
+
+perTick.catnip = 5;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
+const mildThresholdPollutionUtilityT7 = pollutionUtilityPenaltyT7(
+  { catnipPollutionRatio: -0.01 },
+  { catnipPollutionRatio: -0.02 },
+);
+const severeThresholdPollutionUtilityT7 = pollutionUtilityPenaltyT7(
+  { catnipPollutionRatio: -0.01 },
+  { catnipPollutionRatio: -0.5 },
+);
+check("Task 7 review: pollution utility prices the native next-level effect transition",
+  severeThresholdPollutionUtilityT7 > mildThresholdPollutionUtilityT7);
+
+gamePage.bld.pollutionLevels = utilityPollutionLevelsT7;
+gamePage.bld.getPollutionLevel = utilityGetPollutionLevelT7;
+perTick.catnip = utilityCatnipPerTickT7;
+gamePage.village.happiness = utilityHappinessT7;
+gamePage.village.calculateKittensPerTick = utilityArrivalT7;
+gamePage.religion.getSolarRevolutionRatio = utilitySolarRatioT7;
+dbg.clearResourceTelemetry("catnip");
+dbg.productionFor("catnip");
 const criticalSmelterT7 = { name: "criticalSmelterT7", label: "Critical Smelter T7", unlocked: true, val: 3, on: 3, effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.2, cathPollutionPerTickProd: 0.1 } };
 const expendablePolluterT7 = { name: "expendablePolluterT7", label: "Expendable Polluter T7", unlocked: true, val: 3, on: 3, effects: { mineralsPerTickCon: -0.5, ironPerTickProd: 0.01, cathPollutionPerTickProd: 0.3 } };
 check("Task 7 pollution: nonessential polluters throttle but a critical smelter keeps one viable unit",
   dbg.pollutionProcessorTarget?.(expendablePolluterT7, null, pollutionStatusT7) === 0 &&
   dbg.pollutionProcessorTarget?.(criticalSmelterT7, { kind: "build", meta: criticalSmelterT7 }, pollutionStatusT7) >= 1);
+
+// Allocation-level review: neither safety role is discoverable by a token.
+// The generator's live watts are required to preserve the 1 Wt grid headroom;
+// the converter makes a nested craft input for the selected target. Pollution
+// may remove only the third, genuinely nonessential family.
+const savedPollutionAllocationT7 = {
+  powerProd: gamePage.resPool.energyProd,
+  powerCons: gamePage.resPool.energyCons,
+  powerWinter: gamePage.resPool.energyWinterProd,
+  minerals: [res("minerals").value, res("minerals").maxValue],
+};
+const criticalCatalystT7 = R("criticalCatalystT7", 0, 100, "Critical Catalyst T7");
+const criticalPartT7 = R("criticalPartT7", 0, 100, "Critical Part T7");
+const criticalPartCraftT7 = { name: "criticalPartT7", label: "Critical Part T7", unlocked: true, prices: [{ name: "criticalCatalystT7", val: 1 }] };
+const pollutingGridSupportT7 = {
+  name: "pollutingGridSupportT7", label: "Polluting Grid Support T7", unlocked: true, val: 2, on: 1,
+  prices: [], effects: { energyProduction: 4, cathPollutionPerTickProd: 0.4 },
+};
+const routedCriticalConverterT7 = {
+  name: "routedCriticalConverterT7", label: "Routed Critical Converter T7", unlocked: true, val: 2, on: 0,
+  prices: [], effects: { mineralsPerTickCon: -0.01, criticalCatalystT7PerTickProd: 0.1, cathPollutionPerTickProd: 0.2 },
+};
+const unrelatedPolluterT7 = {
+  name: "unrelatedPolluterT7", label: "Unrelated Polluter T7", unlocked: true, val: 2, on: 0,
+  prices: [], effects: { mineralsPerTickCon: -0.01, ironPerTickProd: 0.1, cathPollutionPerTickProd: 0.3 },
+};
+const routedCriticalTargetT7 = {
+  name: "routedCriticalTargetT7", label: "Routed Critical Target T7", unlocked: true, val: 0, on: 0,
+  prices: [{ name: "criticalPartT7", val: 10 }], effects: {},
+};
+resources.push(criticalCatalystT7, criticalPartT7);
+crafts.push(criticalPartCraftT7);
+buildings.push(pollutingGridSupportT7, routedCriticalConverterT7, unrelatedPolluterT7, routedCriticalTargetT7);
+res("minerals").value = 1000; res("minerals").maxValue = 1000;
+gamePage.resPool.energyProd = 4; gamePage.resPool.energyCons = 3; gamePage.resPool.energyWinterProd = 4;
+const routedCriticalCandidateT7 = dbg.candidateById("build:routedCriticalTargetT7");
+dbg.forceActiveTarget(routedCriticalCandidateT7, "Late-game progression frontier", 0);
+const gridSupportAllocationT7 = dbg.sustainableProcessorCount?.(pollutingGridSupportT7, { reserved: {} }, 60);
+const routedCriticalAllocationT7 = dbg.sustainableProcessorCount?.(routedCriticalConverterT7, { reserved: {} }, 60);
+const unrelatedPolluterAllocationT7 = dbg.sustainableProcessorCount?.(unrelatedPolluterT7, { reserved: {} }, 60);
+check("Task 7 review: pollution preserves the shared grid-support minimum",
+  gridSupportAllocationT7 >= 1);
+check("Task 7 review: pollution preserves the recursively target-useful converter minimum",
+  routedCriticalAllocationT7 >= 1);
+check("Task 7 review: pollution still throttles nonessential processor capacity",
+  unrelatedPolluterAllocationT7 === 0);
+dbg.forceActiveTarget(null);
+buildings.splice(buildings.indexOf(pollutingGridSupportT7), 1);
+buildings.splice(buildings.indexOf(routedCriticalConverterT7), 1);
+buildings.splice(buildings.indexOf(unrelatedPolluterT7), 1);
+buildings.splice(buildings.indexOf(routedCriticalTargetT7), 1);
+crafts.splice(crafts.indexOf(criticalPartCraftT7), 1);
+resources.splice(resources.indexOf(criticalCatalystT7), 1);
+resources.splice(resources.indexOf(criticalPartT7), 1);
+res("minerals").value = savedPollutionAllocationT7.minerals[0]; res("minerals").maxValue = savedPollutionAllocationT7.minerals[1];
+gamePage.resPool.energyProd = savedPollutionAllocationT7.powerProd;
+gamePage.resPool.energyCons = savedPollutionAllocationT7.powerCons;
+gamePage.resPool.energyWinterProd = savedPollutionAllocationT7.powerWinter;
 gamePage.bld.getPollutionPerTick = () => -2;
 gamePage.bld.getPollutionEquilibrium = () => 400;
 check("Task 7 pollution: falling to a safe equilibrium adds no recovery penalty and yields the layer",
@@ -6569,6 +6763,46 @@ check("Task 7 resilience: every major subsystem failure is named while later sub
 check("Task 7 resilience: subsequent ticks recover every previously failing subsystem",
   secondRecoveryT7?.failures?.length === 0 && recoveryOrderT7.join(",") === recoveryNamesT7.join(","));
 
+/* The real planning callback must isolate a production-phase failure.  The
+   existing synthetic sequence is useful diagnostics coverage, but it cannot
+   prove that tick() actually routes its live work through that boundary. */
+const productionSchedulerT7 = dbg.automationSchedulerSnapshot?.();
+const productionPlanningT7 = intervalFns[productionSchedulerT7?.lanes?.planning?.id];
+const productionRunsBeforeT7 = dbg.subsystemRunSnapshot?.();
+const savedStorageGetT7 = localStorageMock.getItem;
+let throwGoalReadT7 = true;
+localStorageMock.getItem = (key) => {
+  if (key === "kgh.goal" && throwGoalReadT7) {
+    throwGoalReadT7 = false;
+    throw new Error("real planner sentinel");
+  }
+  return savedStorageGetT7(key);
+};
+fakeNow += productionSchedulerT7?.lanes?.planning?.delayMs || 2000;
+productionPlanningT7?.();
+localStorageMock.getItem = savedStorageGetT7;
+const productionRunsAfterFailureT7 = dbg.subsystemRunSnapshot?.();
+const productionFailuresAfterFailureT7 = dbg.subsystemFailures?.();
+fakeNow += productionSchedulerT7?.lanes?.planning?.delayMs || 2000;
+productionPlanningT7?.();
+const productionRunsAfterRecoveryT7 = dbg.subsystemRunSnapshot?.();
+const productionLaterNamesT7 = ["processor", "craft", "autobuy", "diplomacy", "jobs", "render"];
+const productionRunCountT7 = (snapshot, name, field) => snapshot?.[name]?.[field] || 0;
+check("Task 7 review: real production tick isolates one planner failure, runs later phases, and recovers next tick",
+  typeof productionPlanningT7 === "function" &&
+  productionFailuresAfterFailureT7?.planner?.last === "real planner sentinel" &&
+  productionRunCountT7(productionRunsAfterFailureT7, "planner", "attempts") -
+    productionRunCountT7(productionRunsBeforeT7, "planner", "attempts") === 1 &&
+  productionRunCountT7(productionRunsAfterFailureT7, "planner", "successes") -
+    productionRunCountT7(productionRunsBeforeT7, "planner", "successes") === 0 &&
+  productionLaterNamesT7.every((name) =>
+    productionRunCountT7(productionRunsAfterFailureT7, name, "attempts") -
+      productionRunCountT7(productionRunsBeforeT7, name, "attempts") === 1) &&
+  ["planner", ...productionLaterNamesT7].every((name) =>
+    productionRunCountT7(productionRunsAfterRecoveryT7, name, "successes") -
+      productionRunCountT7(productionRunsAfterFailureT7, name, "successes") === 1) &&
+  dbg.automationSchedulerSnapshot?.().overlappingMutations === productionSchedulerT7?.overlappingMutations);
+
 // Restore Task 7 fixtures.
 for (const [key, value] of Object.entries(savedPollutionManagerT7)) {
   if (value === undefined) delete gamePage.bld[key]; else gamePage.bld[key] = value;
@@ -6592,6 +6826,8 @@ techs.splice(techs.indexOf(researchT7), 1);
 workshopUpgrades.splice(workshopUpgrades.indexOf(upgradeT7), 1);
 crafts.splice(crafts.indexOf(freshCraftT7), 1);
 resources.splice(resources.indexOf(freshPartT7), 1);
+if (savedScienceTabT7 === undefined) delete gamePage.scienceTab; else gamePage.scienceTab = savedScienceTabT7;
+if (savedWorkshopTabT7 === undefined) delete gamePage.workshopTab; else gamePage.workshopTab = savedWorkshopTabT7;
 dbg.forceActiveTarget(null);
 
 const predecessorTimersT7 = [...activeIntervalIds];
@@ -6602,6 +6838,72 @@ const replacementSchedulerT7 = replacementDbgT7?.automationSchedulerSnapshot?.()
 check("Task 7 reinjection: every predecessor timer is cancelled and exactly one replacement owner remains",
   predecessorTimersT7.every((id) => clearedIntervalIds.includes(id) && !activeIntervalIds.has(id)) &&
   activeIntervalIds.size === replacementSchedulerT7?.ownerCount && replacementSchedulerT7?.ownerCount === 3);
+
+// Exercise the real async bootstrap, not the debug scheduler: two injections
+// begin while both gameReady() and document.body are false. The second must own
+// and cancel the first one's pending readiness timeout before either can resume.
+const savedBootstrapGamePageT7 = context.gamePage;
+const savedBootstrapBodyT7 = documentMock.body;
+const savedBootstrapSetTimeoutT7 = context.setTimeout;
+const savedBootstrapClearTimeoutT7 = context.clearTimeout;
+const activeBootstrapTimeoutsT7 = new Set();
+const clearedBootstrapTimeoutsT7 = new Set();
+context.setTimeout = (fn, ms, ...args) => {
+  let id = null;
+  id = setTimeout(() => {
+    activeBootstrapTimeoutsT7.delete(id);
+    fn(...args);
+  }, ms);
+  activeBootstrapTimeoutsT7.add(id);
+  return id;
+};
+context.clearTimeout = (id) => {
+  clearedBootstrapTimeoutsT7.add(id);
+  activeBootstrapTimeoutsT7.delete(id);
+  clearTimeout(id);
+};
+context.gamePage = null;
+documentMock.body = null;
+vm.runInContext(body, context, { filename: "kittens-game-helper-bootstrap-predecessor.user.js" });
+const bootstrapPredecessorOwnerT7 = context.window.__kghTimerOwner;
+const bootstrapPredecessorTimeoutsT7 = [...activeBootstrapTimeoutsT7];
+vm.runInContext(body, context, { filename: "kittens-game-helper-bootstrap-replacement.user.js" });
+const bootstrapReplacementOwnerT7 = context.window.__kghTimerOwner;
+check("Task 7 review: bootstrap timeout handles are owned by the live window owner",
+  bootstrapReplacementOwnerT7 !== bootstrapPredecessorOwnerT7 &&
+  Object.keys(bootstrapReplacementOwnerT7?.timeouts || {}).length === 1 &&
+  activeBootstrapTimeoutsT7.size === 1);
+check("Task 7 review: reinjection cancels every predecessor bootstrap timeout",
+  bootstrapPredecessorOwnerT7?.cancelled === true &&
+  Object.keys(bootstrapPredecessorOwnerT7?.timeouts || {}).length === 0 &&
+  bootstrapPredecessorTimeoutsT7.every((id) => clearedBootstrapTimeoutsT7.has(id)));
+
+context.gamePage = savedBootstrapGamePageT7;
+documentMock.body = savedBootstrapBodyT7;
+await new Promise((resolve) => setTimeout(resolve, 350));
+const bootstrapReplacementSchedulerT7 = context.window.__kghDebug?.automationSchedulerSnapshot?.();
+const bootstrapReplacementIntervalIdsT7 = new Set(
+  Object.values(bootstrapReplacementSchedulerT7?.lanes || {}).map((lane) => lane.id),
+);
+const resumedPredecessorIntervalsT7 = [...activeIntervalIds]
+  .filter((id) => !bootstrapReplacementIntervalIdsT7.has(id));
+const savedBootstrapGetItemT7 = localStorageMock.getItem;
+const savedBootstrapAutopilotT7 = storage.get("kgh.autopilot");
+let predecessorBootstrapMutationReadsT7 = 0;
+localStorageMock.getItem = (key) => {
+  if (key === "kgh.autopilot") predecessorBootstrapMutationReadsT7 += 1;
+  return savedBootstrapGetItemT7(key);
+};
+storage.set("kgh.autopilot", "0");
+for (const id of resumedPredecessorIntervalsT7) intervalFns[id]?.();
+localStorageMock.getItem = savedBootstrapGetItemT7;
+if (savedBootstrapAutopilotT7 === undefined) storage.delete("kgh.autopilot");
+else storage.set("kgh.autopilot", savedBootstrapAutopilotT7);
+check("Task 7 review: stale bootstrap generation cannot arm lanes or mutate after readiness",
+  bootstrapReplacementSchedulerT7?.ownerCount === 3 && activeIntervalIds.size === 3 &&
+  resumedPredecessorIntervalsT7.length === 0 && predecessorBootstrapMutationReadsT7 === 0);
+context.setTimeout = savedBootstrapSetTimeoutT7;
+context.clearTimeout = savedBootstrapClearTimeoutT7;
 
 if (failures.length) {
   console.error(`\n✗ ${failures.length} smoke check(s) failed`);
