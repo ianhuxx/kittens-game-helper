@@ -211,6 +211,7 @@ const makeState = () => {
     },
     bld: {
       buildingsData: buildings,
+      get: (name) => buildings.find((building) => building.name === name) || null,
       getPrices: (name) => (buildings.find((b) => b.name === name) || {}).prices || [],
       build(name) {
         const b = buildings.find((x) => x.name === name);
@@ -714,9 +715,10 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
   storage.set("kgh.goal", goal || "balanced");
   storage.set("kgh.autopilot", holdAutopilotForInitialEvidence ? "0" : "1");
   storage.set("kgh.tickSpeed", String(speed));
-  if (phase === "armedPrestige") storage.set("kgh.prestigeArmed", "1");
+  const armedRareCandidatePhase = ["leviathanDeparture", "transcendenceUpgrade", "voidSpace"].includes(phase);
+  if (phase === "armedPrestige" || armedRareCandidatePhase) storage.set("kgh.prestigeArmed", "1");
   const localStorageMock = { getItem: (k) => (storage.has(k) ? storage.get(k) : null), setItem: (k, v) => storage.set(k, String(v)) };
-  if (phase === "armedPrestige") {
+  if (phase === "armedPrestige" || armedRareCandidatePhase) {
     gamePage.save = () => {
       const saveData = { checkpoint: ++spies.checkpoints };
       storage.set("com.nuclearunicorn.kittengame.savedata", JSON.stringify(saveData));
@@ -751,6 +753,17 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       return { itemBought: true };
     }
   }
+  class BuildingBtnModernController {
+    constructor(game) { this.game = game; }
+    fetchModel(options) {
+      const metadata = this.game.bld?.get(options.building);
+      return metadata ? { options, metadata } : null;
+    }
+    off(model, amount = 1) { model.metadata.on = Math.max(0, model.metadata.on - amount); }
+    offAll(model) { model.metadata.on = 0; }
+    on(model, amount = 1) { model.metadata.on = Math.min(model.metadata.val, model.metadata.on + amount); }
+    onAll(model) { model.metadata.on = model.metadata.val; }
+  }
   class PlanetBuildingBtnController {
     constructor(game) { this.game = game; }
     fetchModel(options) {
@@ -762,6 +775,10 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
       return (meta.prices || []).map((price) => ({ ...price, val: price.val * Math.pow(meta.priceRatio || 1.15, meta.val || 0) }));
     }
     updateEnabled() {}
+    off(model, amount = 1) { model.metadata.on = Math.max(0, model.metadata.on - amount); }
+    offAll(model) { model.metadata.on = 0; }
+    on(model, amount = 1) { model.metadata.on = Math.min(model.metadata.val, model.metadata.on + amount); }
+    onAll(model) { model.metadata.on = model.metadata.val; }
     buyItem(model) {
       const prices = this.getPrices(model);
       if (prices.some((price) => (res(price.name)?.value || 0) < price.val)) return { itemBought: false };
@@ -859,6 +876,7 @@ const runScenario = ({ name, phase, goal, ticks = TICKS, speed = 1 }) => {
     WeakMap, Map, Set, Promise, Array, Object,
     com: { nuclearunicorn: { game: { ui: { SpaceProgramBtnController } } } },
     classes: { ui: {
+      btn: { BuildingBtnModernController },
       TranscendenceBtnController,
       space: { PlanetBuildingBtnController },
       time: { ChronoforgeBtnController, VoidSpaceBtnController },

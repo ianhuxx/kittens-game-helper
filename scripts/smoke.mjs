@@ -443,6 +443,7 @@ const gamePage = {
   },
   bld: {
     buildingsData: buildings,
+    get: (name) => buildings.find((building) => building.name === name) || null,
     // Real buildings scale price by priceRatio^val; mocks without a priceRatio
     // keep ratio 1, so every pre-existing test sees identical numbers.
     getPrices: (name) => {
@@ -666,6 +667,30 @@ const intervalFns = [];
 const intervalMs = [];
 const activeIntervalIds = new Set();
 const clearedIntervalIds = [];
+const buildingToggleControllerCalls = [];
+class FakeBuildingBtnModernController {
+  constructor(game) { this.game = game; }
+  fetchModel(options) {
+    const metadata = this.game.bld?.get(options.building);
+    return metadata ? { options, metadata } : null;
+  }
+  off(model, amount = 1) {
+    model.metadata.on = Math.max(0, model.metadata.on - amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "off" });
+  }
+  offAll(model) {
+    model.metadata.on = 0;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: 0, api: "offAll" });
+  }
+  on(model, amount = 1) {
+    model.metadata.on = Math.min(model.metadata.val, model.metadata.on + amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "on" });
+  }
+  onAll(model) {
+    model.metadata.on = model.metadata.val;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "onAll" });
+  }
+}
 class FakeEmbassyButtonController {
   constructor(game) {
     this.game = game;
@@ -727,6 +752,22 @@ class FakePlanetBuildingBtnController {
     }));
   }
   updateEnabled() {}
+  off(model, amount = 1) {
+    model.metadata.on = Math.max(0, model.metadata.on - amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "spaceOff" });
+  }
+  offAll(model) {
+    model.metadata.on = 0;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: 0, api: "spaceOffAll" });
+  }
+  on(model, amount = 1) {
+    model.metadata.on = Math.min(model.metadata.val, model.metadata.on + amount);
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "spaceOn" });
+  }
+  onAll(model) {
+    model.metadata.on = model.metadata.val;
+    buildingToggleControllerCalls.push({ name: model.metadata.name, on: model.metadata.on, api: "spaceOnAll" });
+  }
   buyItem(model) {
     if (!model || !pay(this.getPrices(model))) return { itemBought: false, reason: "resources" };
     model.metadata.val = (model.metadata.val || 0) + 1;
@@ -815,6 +856,7 @@ const context = {
   classes: {
     diplomacy: { ui: { EmbassyButtonController: FakeEmbassyButtonController } },
     ui: {
+      btn: { BuildingBtnModernController: FakeBuildingBtnModernController },
       TranscendenceBtnController: FakeTranscendenceBtnController,
       space: { PlanetBuildingBtnController: FakePlanetBuildingBtnController },
       time: {
@@ -1256,6 +1298,7 @@ res("iron").maxValue = 300;
 fakeNow += 25000;
 tickFn();
 check("converters: an idle converter is switched ON when inputs are healthy and output wanted", blastForge.on === blastForge.val && blastForge.val >= 3);
+check("converters final review: processor enablement uses the native Building controller", buildingToggleControllerCalls.some((call) => call.name === "blastForge"));
 
 /* Stage 9 — base-economy starvation guard throttles a running converter when an
    input is critically low AND already net-draining, instead of pinning it at 0. */
@@ -1265,6 +1308,7 @@ res("minerals").maxValue = 1000;
 fakeNow += 25000;
 tickFn();
 check("converters: running converter throttled to protect a starved, draining input", blastForge.on === 0);
+check("converters final review: processor throttling uses the native Building controller", buildingToggleControllerCalls.some((call) => call.name === "blastForge" && call.on === 0 && call.api === "offAll"));
 
 /* Stage 10 — input recovers well above the resume threshold → converter
    restarts (hysteresis: it does NOT flap back on at the same low level it
@@ -1614,6 +1658,8 @@ check("late game A: exact and structured action policies are classified", hasAct
   dbg.actionPolicyFor("candidate:build:library") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
   dbg.actionPolicyFor("craft:beam") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
   dbg.actionPolicyFor("trade:zebras") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
+  dbg.actionPolicyFor("candidateRare:time:temporalBattery") === dbg.ACTION_POLICY.RARE_CAPITAL &&
+  dbg.actionPolicyFor("candidate:transcendence:epiphanyUpgrade") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
   dbg.actionPolicyFor("praise") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
   dbg.actionPolicyFor("sacrificeUnicorns") === dbg.ACTION_POLICY.SAFE_REPEATABLE &&
   dbg.actionPolicyFor("sacrificeAlicorns") === dbg.ACTION_POLICY.RARE_CAPITAL &&
@@ -4131,7 +4177,7 @@ check("Task 3: trade batches stop at uranium/time-crystal output headroom and un
 /* Task 3 review: a partial output slot smaller than one expected yield is not
    permission to overflow, and each Dragon input floor must bind on its own. */
 const savedCultureReviewAE = res("culture").value;
-res("titanium").value = 10000;
+res("titanium").value = 100000;
 res("manpower").value = 10000;
 res("gold").value = 10000;
 res("uranium").value = 99.5;
@@ -4161,6 +4207,27 @@ const volatileTargetBatchAE = dbg.boundedTradeBatch(volatileRouteAE, { reserved:
 const volatileOverflowBatchAE = dbg.safeOverflowTradeBatch?.(volatileDragonsAE, { reserved: {} });
 check("Task 3 final review: maximum high-variance yield, not expected yield, protects targeted and surplus output headroom",
   dbg.maximumTradeYield?.(volatileDragonsAE, volatileUraniumSellAE) === 4 && volatileTargetBatchAE === 0 && volatileOverflowBatchAE === 0);
+
+const savedSpiceCollateralAE = { value: res("spice").value, maxValue: res("spice").maxValue, unlocked: res("spice").unlocked };
+const collateralSpiceSellAE = { name: "spice", value: 5, chance: 1, width: 0 };
+const collateralDragonsAE = { ...dragonsAE, name: "collateralDragonsAE", sells: [volatileUraniumSellAE, collateralSpiceSellAE] };
+const collateralRouteAE = {
+  ...volatileRouteAE,
+  nextStep: { ...volatileRouteAE.nextStep, race: collateralDragonsAE },
+};
+res("spice").unlocked = true;
+res("spice").value = 99;
+res("spice").maxValue = 100;
+res("uranium").value = 0;
+const collateralTargetBatchAE = dbg.boundedTradeBatch(collateralRouteAE, { reserved: {} });
+check("Task 3 final review: targeted trade also protects every collateral output's worst-case headroom", collateralTargetBatchAE === 0);
+Object.assign(res("spice"), savedSpiceCollateralAE);
+
+res("titanium").value = 100000;
+res("manpower").value = 10000;
+res("gold").value = 10000;
+const multiBatchTradeEtaAE = dbg.tradePathSecondsFor(volatileDragonsAE, "uranium", 151);
+check("Task 3 final review: banked inputs still include cooldown ETA between four native trade batches", multiBatchTradeEtaAE >= 30 && multiBatchTradeEtaAE < 40);
 
 const isolatedFloorBatchAE = (floorName, floor, stock) => {
   res("titanium").value = 10000;
@@ -5704,12 +5771,12 @@ let speedSchedulerAM = dbg.automationSchedulerSnapshot?.();
 check("Test AM: choosing 5× persists and arms one owned booster lane",
   dbg.tickSpeed?.() === 5 && localStorageMock.getItem("kgh.tickSpeed") === "5" && !!speedSchedulerAM?.lanes?.booster);
 fakeNow += 200;
-intervalFns[intervalFns.length - 1]();
+await intervalFns[intervalFns.length - 1]();
 check("Test AM: one 5× booster beat adds the due bounded extra ticks", extraTicksAM === 4);
 extraTicksAM = 0;
 dbg.applyTickSpeed?.(50);
 fakeNow += 200;
-intervalFns[intervalFns.length - 1]();
+await intervalFns[intervalFns.length - 1]();
 check("Test AM: the 50× ceiling yields in a bounded chunk and drops backlog",
   dbg.tickSpeed?.() === 50 && extraTicksAM === 49 && dbg.boosterTelemetry?.().lastBeat?.maxChunk === 16 && dbg.boosterTelemetry?.().lastBeat?.dropped === 0);
 dbg.applyTickSpeed?.(99);
@@ -5717,7 +5784,7 @@ check("Test AM: an unknown multiplier falls back to native 1×",
   dbg.tickSpeed?.() === 1 && localStorageMock.getItem("kgh.tickSpeed") === "1" && !dbg.automationSchedulerSnapshot?.().lanes?.booster);
 extraTicksAM = 0;
 delete gamePage.tick;
-intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
+await intervalFns[intervalFns.length - 1](); // a stale beat with no game.tick must no-op
 check("Test AM: at 1× the game is left untouched", extraTicksAM === 0);
 
 /* ---------------------------------------------------------------------
@@ -5765,22 +5832,29 @@ check("Task 5 adapter: Time descriptors preserve Chronoforge/Void Space manager 
 fakeNow += 5000;
 dbg.forceActiveTarget(transcendenceCandidateT5, "Late-game progression frontier", 0);
 dbg.executePlan();
+check("Task 5 final review: disarmed rare-capital candidate performs no purchase and no checkpoint",
+  transcendenceUpgrades[0].val === 0 && transcendenceControllerCalls === 0 && checkpointCalls === 0);
+dbg.setPrestigeAutomationArmed(true);
+fakeNow += 30000;
+dbg.forceActiveTarget(transcendenceCandidateT5, "Late-game progression frontier", 0);
+dbg.executePlan();
 check("Task 5 adapter: transcendence upgrade buys only through TranscendenceBtnController",
-  transcendenceUpgrades[0].val === 1 && transcendenceControllerCalls === 1);
+  transcendenceUpgrades[0].val === 1 && transcendenceControllerCalls === 1 && checkpointCalls === 1);
 const chronoforgeCandidateT5 = dbg.candidateById("time:temporalBatteryT5");
-fakeNow += 5000;
+fakeNow += 30000;
 dbg.forceActiveTarget(chronoforgeCandidateT5, "Late-game progression frontier", 0);
 dbg.executePlan();
 check("Task 5 adapter: Chronoforge item buys only through ChronoforgeBtnController",
-  chronoforgeUpgrades[0].val === 1 && chronoforgeControllerCalls === 1 && rawTimeManagerCalls === 0);
+  chronoforgeUpgrades[0].val === 1 && chronoforgeControllerCalls === 1 && rawTimeManagerCalls === 0 && checkpointCalls === 2);
 const voidspaceCandidateT5 = dbg.candidateById("time:cryochambersT5");
 check("Task 5 adapter: Void Space affordability uses its live controller price",
   voidspaceCandidateT5?.affordable === true && dbg.timePricesFor?.(voidspaceUpgrades[0])?.find((price) => price.name === "karma")?.val === 7);
-fakeNow += 5000;
+fakeNow += 30000;
 dbg.forceActiveTarget(voidspaceCandidateT5, "Late-game progression frontier", 0);
 dbg.executePlan();
 check("Task 5 adapter: Void Space item buys only through VoidSpaceBtnController",
-  voidspaceUpgrades[0].val === 1 && voidspaceControllerCalls === 1 && rawTimeManagerCalls === 0 && res("karma").value === 0);
+  voidspaceUpgrades[0].val === 1 && voidspaceControllerCalls === 1 && rawTimeManagerCalls === 0 && res("karma").value === 0 && checkpointCalls === 3);
+dbg.setPrestigeAutomationArmed(false);
 
 // Keep ordinary candidates from becoming policy blockers while the prestige
 // projection fixtures exercise only native manager state.
@@ -5900,7 +5974,7 @@ gamePage.tick = () => { prestigeDeliveredTicksT7Review += 1; };
 dbg.applyTickSpeed?.(50);
 for (let beat = 0; beat < 10; beat += 1) {
   fakeNow += 200;
-  dbg.runBoosterBeat?.();
+  await dbg.runBoosterBeat?.();
 }
 const prestigeLogicalEndT7Review = dbg.automationClockSnapshot?.().logicalNow;
 const callsBeforeWallCooldownT7Review = { transcendCalls, adoreCalls };
@@ -6724,7 +6798,7 @@ check("Task 7 clock: a speed change leaves exactly one owned timer per lane",
 let boosterTicksT7 = 0;
 gamePage.tick = () => { boosterTicksT7 += 1; fakeNow += 2; };
 fakeNow += 200;
-const boosterBeatT7 = dbg.runBoosterBeat?.();
+const boosterBeatT7 = await dbg.runBoosterBeat?.();
 const clock50T7 = dbg.automationClockSnapshot?.();
 const partialScheduler50T7 = dbg.automationSchedulerSnapshot?.();
 check("Task 7 clock: slow game.tick yields within CPU budget and drops backlog",
@@ -6741,7 +6815,7 @@ check("Task 7 final review: partial delivery promptly re-arms only adaptive lane
 
 gamePage.tick = () => { boosterTicksT7 += 1; };
 fakeNow += 200;
-dbg.runBoosterBeat?.();
+await dbg.runBoosterBeat?.();
 const steadyClock50T7 = dbg.automationClockSnapshot?.();
 const steadyScheduler50T7 = dbg.automationSchedulerSnapshot?.();
 check("Task 7 final review: steady delivery updates materially changed rounded adaptive delays only",
@@ -6754,7 +6828,7 @@ check("Task 7 final review: steady delivery updates materially changed rounded a
   steadyScheduler50T7?.ownerCount === 4 && activeIntervalIds.size === 4 && steadyScheduler50T7?.overlappingMutations === 0);
 
 fakeNow += 200;
-dbg.runBoosterBeat?.();
+await dbg.runBoosterBeat?.();
 const unchangedScheduler50T7 = dbg.automationSchedulerSnapshot?.();
 check("Task 7 final review: unchanged rounded delays preserve adaptive timer identity and ownership",
   unchangedScheduler50T7?.lanes?.action?.id === steadyScheduler50T7?.lanes?.action?.id &&
@@ -6790,7 +6864,7 @@ for (const speed of selectableSpeedsT7R) {
   let deliveredTicks = 0;
   gamePage.tick = () => { deliveredTicks += 1; };
   fakeNow += 200;
-  const beat = dbg.runBoosterBeat?.();
+  const beat = await dbg.runBoosterBeat?.();
   const end = dbg.automationClockSnapshot?.();
   const scheduler = dbg.automationSchedulerSnapshot?.();
   selectableDeliveryT7R.push({ speed, startWall, start, end, beat, deliveredTicks, endWall: fakeNow, scheduler });
@@ -6823,7 +6897,7 @@ for (const speed of [20, 50]) {
   let deliveredTicks = 0;
   gamePage.tick = () => { deliveredTicks += 1; };
   fakeNow += 200;
-  const beat = dbg.runBoosterBeat?.();
+  const beat = await dbg.runBoosterBeat?.();
   const end = dbg.automationClockSnapshot?.();
   cappedDeliveryT7R.push({ speed, startWall, start, end, beat, deliveredTicks, endWall: fakeNow });
 }
@@ -6832,6 +6906,7 @@ const capped50T7R = cappedDeliveryT7R[1];
 check("Task 7 final review: chunking limits each inner burst without capping total capable 20x/50x delivery",
   capped20T7R.deliveredTicks === 19 && capped50T7R.deliveredTicks === 49 &&
   capped20T7R.beat.dropped === 0 && capped50T7R.beat.dropped === 0 &&
+  capped20T7R.beat.yieldedChunks >= 1 && capped50T7R.beat.yieldedChunks >= 3 &&
   Math.abs((capped20T7R.end.logicalNow - capped20T7R.start.logicalNow) -
     ((capped20T7R.endWall - capped20T7R.startWall) + capped20T7R.deliveredTicks * nativeTickLogicalMsT7R)) < 1 &&
   Math.abs((capped50T7R.end.logicalNow - capped50T7R.start.logicalNow) -
@@ -6844,7 +6919,7 @@ const partialStartT7R = dbg.automationClockSnapshot?.();
 let partialDeliveredTicksT7R = 0;
 gamePage.tick = () => { partialDeliveredTicksT7R += 1; fakeNow += 2; };
 fakeNow += 200;
-const partialBeatT7R = dbg.runBoosterBeat?.();
+const partialBeatT7R = await dbg.runBoosterBeat?.();
 const partialEndT7R = dbg.automationClockSnapshot?.();
 check("Task 7 re-review: CPU-limited partial delivery adds exact completed-tick progress",
   partialDeliveredTicksT7R > 0 && partialDeliveredTicksT7R < partialBeatT7R?.maxChunk &&
@@ -6865,7 +6940,7 @@ const afterUndeliveredFastT7R = dbg.automationClockSnapshot?.();
 let transitionDeliveredTicksT7R = 0;
 gamePage.tick = () => { transitionDeliveredTicksT7R += 1; };
 fakeNow += 100;
-const transitionBeatT7R = dbg.runBoosterBeat?.();
+const transitionBeatT7R = await dbg.runBoosterBeat?.();
 const afterDeliveredFastT7R = dbg.automationClockSnapshot?.();
 dbg.applyTickSpeed?.(1);
 fakeNow += 1000;
@@ -6903,7 +6978,7 @@ gamePage.tick = () => {
   telemetryDeliveredTicksT7R += 1;
   telemetryClockT7R.value += 2;
 };
-const telemetryBeatT7R = dbg.runBoosterBeat?.();
+const telemetryBeatT7R = await dbg.runBoosterBeat?.();
 dbg.applyTickSpeed?.(1);
 dbg.sampleResourceTelemetry?.();
 const transitionObservedProductionT7R = dbg.productionFor?.("telemetryClockT7R");
@@ -6929,17 +7004,26 @@ dbg.applyTickSpeed?.(50);
 gamePage.tick = () => { gamePage.timer.ticksTotal += 1; };
 fakeNow += 200;
 const observedBoosterStartT7 = dbg.automationClockSnapshot?.();
-const observedBoosterBeatT7 = dbg.runBoosterBeat?.();
+const observedBoosterBeatT7 = await dbg.runBoosterBeat?.();
 const observedBoosterEndT7 = dbg.automationClockSnapshot?.();
 check("Task 7 final review: public native ticks gate logical time and booster counter changes are not double-counted",
   Math.abs(observedClockIdleT7.logicalNow - observedClockStartT7.logicalNow) < 1 &&
   Math.abs((observedClockNativeT7.logicalNow - observedClockIdleT7.logicalNow) - 1000) < 1 &&
   observedBoosterBeatT7?.executed === 49 &&
   Math.abs((observedBoosterEndT7.logicalNow - observedBoosterStartT7.logicalNow) - 49 * nativeTickLogicalMsT7R) < 1);
+dbg.applyTickSpeed?.(1);
+gamePage.timer.ticksTotal = 2000;
+dbg.resetAutomationNativeSample?.();
+dbg.automationClockSnapshot?.();
+fakeNow += 1000;
+gamePage.timer.ticksTotal += 2;
+const throttledNativeClockT7 = dbg.automationClockSnapshot?.();
+check("Task 7 final review: scheduler telemetry measures throttled native TPS from the public tick counter",
+  Math.abs((throttledNativeClockT7?.observedNativeTicksPerSecond || 0) - 2) < 0.001 &&
+  Math.abs((throttledNativeClockT7?.logicalNow - observedBoosterEndT7.logicalNow) - 400) < 1);
 delete gamePage.tick;
 delete gamePage.timer;
 dbg.resetAutomationNativeSample?.();
-dbg.applyTickSpeed?.(1);
 
 /* Native-style pollution status, scoring, recovery, throttle, diagnostics. */
 const pollutionResourceT7 = R("cathPollution", 900, 0, "Cath Pollution");

@@ -254,8 +254,11 @@
     if (["praise", "sacrificeUnicorns", "observeStars", "holdFestival", "huntAll", "promoteKittens", "boosterTicks"].includes(actionId)) {
       return ACTION_POLICY.SAFE_REPEATABLE;
     }
-    const candidate = /^candidate:([^:]+):([^:]+)$/.exec(actionId);
-    if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[1]) && SAFE_ACTION_NAME.test(candidate[2]) && !isDeniedKey(candidate[2])) {
+    const candidate = /^(candidate|candidateRare):([^:]+):([^:]+)$/.exec(actionId);
+    if (candidate && SAFE_CANDIDATE_KINDS.has(candidate[2]) && SAFE_ACTION_NAME.test(candidate[3]) && !isDeniedKey(candidate[3])) {
+      if (candidate[1] === "candidateRare") {
+        return ACTION_POLICY.RARE_CAPITAL;
+      }
       return ACTION_POLICY.SAFE_REPEATABLE;
     }
     const repeatable = /^(craft|trade|explore|embassy):([^:]+)$/.exec(actionId);
@@ -1443,12 +1446,12 @@
     const blockedExtras = blockedTechChainAdditions(resources);
     if (blockedExtras) for (const name of blockedExtras) names.add(name);
     if (names.size) {
-      stickyTargetChainReserve = { until: Date.now() + 120000, names, label: labelOf(target.meta) };
+      stickyTargetChainReserve = { until: gameClockNow() + 120000, names, label: labelOf(target.meta) };
     }
     return names;
   };
 
-  const stickyReservesResource = (name) => stickyTargetChainReserve.names.has(name) && Date.now() < stickyTargetChainReserve.until;
+  const stickyReservesResource = (name) => stickyTargetChainReserve.names.has(name) && gameClockNow() < stickyTargetChainReserve.until;
 
   // --- native reservation status ---------------------------------------------
   // The helper is now the ONLY actor that spends resources, and every spender it
@@ -2133,9 +2136,9 @@
     const measured = withActionResourceDeltas(() => craftUnits(name, units));
     if (measured.result) {
       craftPlanText = `Craft: made ${fmt(units * (1 + craftRatioFor(name)))} ${craftLabel(name)}`;
-      if (Date.now() - lastCraftLog > 15000) {
+      if (gameElapsedMs(lastCraftLog) > 15000) {
         pushLog(`🧰 ${craftPlanText}: ${measured.suffix}${target ? `; reason ${labelOf(target.meta)} chain` : ""}`);
-        lastCraftLog = Date.now();
+        lastCraftLog = gameClockNow();
       }
       return units >= wantUnits;
     }
@@ -2256,10 +2259,10 @@
           const value = (input && input.value) || 0;
           const reserve = overflowInputFloor(target, resources, price.name, name, helpsTarget);
           maxUnits = Math.min(maxUnits, Math.floor(Math.max(0, value - reserve) / price.val));
-          if (value - reserve <= 0 && (reservedNeedsFor(target, resources)[price.name] || 0) > 0 && Date.now() - lastOverflowLog > 20000) {
+          if (value - reserve <= 0 && (reservedNeedsFor(target, resources)[price.name] || 0) > 0 && gameElapsedMs(lastOverflowLog) > 20000) {
             const sources = buildReservationLedger(target, resources).sources[price.name] || [];
             pushLog(`📦 Overflow skipped: ${resTitle(resources, price.name)} reserved for ${sources[0] || "active plan"}.`);
-            lastOverflowLog = Date.now();
+            lastOverflowLog = gameClockNow();
           }
         }
         if (!isFinite(maxUnits) || maxUnits < 1) continue;
@@ -2279,12 +2282,12 @@
         overflowPlanText = activeCraft
           ? `Craft-before-reserve: converted capped resources into ${craftLabel(best.name)}`
           : `Overflow: converted surplus into ${craftLabel(best.name)}`;
-        if (Date.now() - lastOverflowLog > 20000) {
+        if (gameElapsedMs(lastOverflowLog) > 20000) {
           const hot = craftPricesFor(craftByName(best.name)).filter((price) => price && wouldWasteResource(resources, price.name));
           const capped = hot.map((price) => `${resTitle(resources, price.name)} at ${fmt(resRatio(resources, price.name) * 100)}%`).join("+");
           const advance = activeCraft ? ` for ${labelOf(target.meta)}. This is rolling craft cost, not a hard storage blocker` : "; reason overflow/capped storage";
           pushLog(`📦 ${overflowPlanText}${capped ? ` (${capped})` : ""}: ${measured.suffix}${advance}`);
-          lastOverflowLog = Date.now();
+          lastOverflowLog = gameClockNow();
         }
       }
     } catch (error) {
@@ -3178,7 +3181,7 @@
       housingId: targetId(expansion.candidate),
       baselineVal: Number(expansion.candidate.meta && expansion.candidate.meta.val) || 0,
       gatewayId: targetId(gateway),
-      createdAt: Date.now(),
+      createdAt: gameClockNow(),
     };
     persistExpansionCheckpoint(state);
     return { phase: "housing", gateway, state, expansion };
@@ -4176,13 +4179,40 @@
   const setProcessorOn = (meta, count) => {
     if (!meta || !isFinite(count)) return false;
     const next = Math.max(0, Math.min(meta.val || 0, Math.floor(count)));
-    if ((meta.on || 0) === next) return false;
+    const current = Math.max(0, Number(meta.on) || 0);
+    if (current === next) return false;
+    const kind = isSpacePlanetBuilding(meta) ? "space" : "build";
+    const spec = controllerSpecFor(kind, meta);
+    const Controller = spec && getGlobalPath(spec.path);
+    if (typeof Controller !== "function") return false;
+    let controller;
+    let model;
+    try {
+      controller = new Controller(window.gamePage);
+      model = controller && typeof controller.fetchModel === "function"
+        ? controller.fetchModel({ ...spec.opts(meta.name), controller })
+        : null;
+    } catch (error) {
+      return false;
+    }
+    if (!model) return false;
     const result = executeSemanticAction({
       id: `processor:${meta.name}`,
       policy: ACTION_POLICY.SAFE_REPEATABLE,
       snapshot: () => Math.max(0, Number(meta.on) || 0),
       invoke: () => {
-        meta.on = next;
+        const delta = Math.abs(next - current);
+        if (next < current) {
+          if (next === 0 && typeof controller.offAll === "function") controller.offAll(model);
+          else if (typeof controller.off === "function") controller.off(model, delta);
+          else throw new Error("native processor off controller unavailable");
+        } else if (next === (Number(meta.val) || 0) && typeof controller.onAll === "function") {
+          controller.onAll(model);
+        } else if (typeof controller.on === "function") {
+          controller.on(model, delta);
+        } else {
+          throw new Error("native processor on controller unavailable");
+        }
         refreshAfterProcessorChange();
       },
       verify: (_before, after) => after === next,
@@ -4470,7 +4500,6 @@
 
     const minimumCounts = new Map();
     const forcedPauses = new Set();
-    const now = Date.now();
     if (respectCooldown) {
       for (const meta of converters) {
         const currentOn = Math.max(0, Math.min(meta.val || 0, Math.floor(meta.on || 0)));
@@ -4738,9 +4767,9 @@
         }
         const forText = target && changed.some((item) => /started|resumed/.test(item)) ? ` for ${labelOf(target.meta)}` : "";
         processingPlanText = `Processing: ${changed.join("; ")}${forText}`;
-        if (Date.now() - lastProcessingLog > 20000) {
+        if (gameElapsedMs(lastProcessingLog) > 20000) {
           pushLog(`⚙ ${processingPlanText}`);
-          lastProcessingLog = Date.now();
+          lastProcessingLog = gameClockNow();
         }
       } else {
         const paused = Object.values(pausedProcessors).map((item) => item.label).filter(Boolean);
@@ -5579,7 +5608,7 @@
     if (activeSprint) {
       const check = sprintStillValid(activeSprint, candidates, resources);
       if (check.valid) {
-        activeSprint.lastValidatedAt = Date.now();
+        activeSprint.lastValidatedAt = gameClockNow();
         activeSprint.candidate = check.candidate;
         activeSprint.solver = check.solver;
         activeSprint.protectedChain = check.solver.protectedChain.size ? check.solver.protectedChain : activeSprint.protectedChain;
@@ -5595,8 +5624,8 @@
       activeSprint = {
         id: targetId(best.candidate),
         techName: best.candidate.meta.name,
-        startedAt: Date.now(),
-        lastValidatedAt: Date.now(),
+        startedAt: gameClockNow(),
+        lastValidatedAt: gameClockNow(),
         reason: isNearResourceCap(resources, "science") ? "science at cap" : "actionable research chain",
         protectedChain: best.solver.protectedChain,
         blockers: best.solver.blockers,
@@ -6403,7 +6432,7 @@
   const stageTransitionCandidates = (resources = resourceMap()) => {
     const options = [];
     const verdicts = [];
-    const now = Date.now();
+    const now = gameClockNow();
     for (const raw of buildingMetas()) {
       // val 0 is deliberately allowed: switching an empty stack is free (no
       // refund, no downtime), which is exactly the post-reset "Hydro Plant
@@ -6483,14 +6512,15 @@
           buildingName: raw.name,
           stage: Number(raw.stage) || 0,
           targetCount: candidate.meta.analysis.parityCount,
-          startedAt: Date.now(),
+          startedAt: gameClockNow(),
           analysis: candidate.meta.analysis,
         });
       } else if (pendingStageRebuild && pendingStageRebuild.buildingName === raw.name) {
         setPendingStageRebuild(null);
       }
-      stageCooldownUntil[raw.name] = Date.now() + STAGE_COOLDOWN_MS;
-      stageReverseGuard[raw.name] = { direction: candidate.meta.delta, until: Date.now() + STAGE_REVERSE_COOLDOWN_MS };
+      const logicalNow = gameClockNow();
+      stageCooldownUntil[raw.name] = logicalNow + STAGE_COOLDOWN_MS;
+      stageReverseGuard[raw.name] = { direction: candidate.meta.delta, until: logicalNow + STAGE_REVERSE_COOLDOWN_MS };
       return true;
     } catch (error) {
       return false;
@@ -7352,7 +7382,7 @@
 
   const switchRejected = (from, to, why, details = {}) => {
     activePlanDebug.rejected = [{ target: to, reason: why }];
-    if (Date.now() - (activePlanDebug.lastRejectLog || 0) > 20000) {
+    if (gameElapsedMs(activePlanDebug.lastRejectLog || 0) > 20000) {
       const scoreGain = details.scoreGain != null ? details.scoreGain : candidateScoreGain(from, to);
       const pct = Math.round(scoreGain * 100);
       const neededPct = Math.round(PLAN_SCORE_GAIN_THRESHOLD * 100);
@@ -7372,7 +7402,7 @@
         ? `improvement ${fmt(absDelta)} (${Math.max(0, pct)}%)`
         : `no score improvement (${fmt(absDelta)}, ${pct}%)`;
       pushLog(`🔒 Plan switch rejected: ${to ? labelOf(to.meta) : "none"} score ${fmt(toScore)} vs current ${from ? labelOf(from.meta) : "none"} ${fmt(fromScore)}; ${scoreText}; ETA candidate ${formatEta(details.preferredWait)} vs current ${formatEta(details.lockedWait)}; ${whyText}`);
-      activePlanDebug.lastRejectLog = Date.now();
+      activePlanDebug.lastRejectLog = gameClockNow();
     }
   };
 
@@ -7391,7 +7421,7 @@
 
   const noveltyBoostFor = (candidate) => {
     const until = noveltyUntil[targetId(candidate)];
-    return until && until > Date.now() ? TUNING.noveltyBoost : 0;
+    return until && until > gameClockNow() ? TUNING.noveltyBoost : 0;
   };
 
   const watchNewUnlocks = () => {
@@ -7426,7 +7456,7 @@
         /* resources/crafts can still be booting */
       }
       if (knownUnlockIds && fresh.length) {
-        const now = Date.now();
+        const now = gameClockNow();
         for (const item of fresh) noveltyUntil[item.id] = now + NOVELTY_MS;
         resourceNamesCache = { count: -1, names: [] };
         activeTarget = null; // replan with the newcomers in the running
@@ -7453,7 +7483,7 @@
   const logThrottle = Object.create(null);
 
   const pushPlanLog = (text, throttleMs = 15000) => {
-    const now = Date.now();
+    const now = gameClockNow();
     if (now - (logThrottle[text] || 0) < throttleMs) return;
     logThrottle[text] = now;
     pushLog(text);
@@ -8263,9 +8293,9 @@
           shortfall -= take;
         }
         jobPlanText = "Jobs: ⚠ EMERGENCY farming — pantry empty, feeding kittens first";
-        if (Date.now() - lastStarvationLog > 10000) {
+        if (gameElapsedMs(lastStarvationLog) > 10000) {
           pushLog(`🚑 Starvation failsafe: farming ${desired.farmer}/${total} kittens (catnip ${fmt(productionFor("catnip"))}/s)`);
-          lastStarvationLog = Date.now();
+          lastStarvationLog = gameClockNow();
         }
       }
     }
@@ -8304,7 +8334,6 @@
       const current = {};
       for (const job of jobs) current[job.name] = Math.max(0, Math.floor(job.value || 0));
       const now = gameClockNow();
-      const wallNow = Date.now();
       const signature = jobs.map((j) => `${j.name}:${desired[j.name] || 0}`).join("|");
       // Anti-churn throttle: with no free kittens, normally rebalance at most once
       // per JOB_REBALANCE_MIN_MS and skip an unchanged plan.  But a FOOD EMERGENCY
@@ -8345,14 +8374,14 @@
       }
       refreshJobManagementUI(village);
       lastJobSignature = signature;
-      if (moved > 0 && wallNow - lastJobLog > 15000) {
+      if (moved > 0 && gameElapsedMs(lastJobLog) > 15000) {
         const after = {};
         for (const job of jobs) {
           const fresh = jobByName(job.name);
           after[job.name] = (fresh && fresh.value) || 0;
         }
         pushLog(`👷 rebalanced ${moved} kittens: ${formatJobDistribution(jobs, after)}`);
-        lastJobLog = wallNow;
+        lastJobLog = gameClockNow();
       }
     } catch (error) {
       /* ignore */
@@ -8408,12 +8437,12 @@
         if (!action.ok) return;
         const measured = formatActionDeltas(action.before, action.after, new Set(["manpower", "furs", "ivory"]));
         markTelemetryDiscontinuity(measured.deltas);
-        if (Date.now() - lastHuntLog > 30000) {
+        if (gameElapsedMs(lastHuntLog) > 30000) {
           const chainLabel = sprint && sprint.candidate ? labelOf(sprint.candidate.meta) : "research";
           const reason = chainHuntNeed ? `furs for ${chainLabel} chain` : economyNeed > 0.5 ? "luxuries/mood" : "catpower near cap";
           const legacyPhrase = chainHuntNeed ? `; sent hunters for furs for ${chainLabel} chain` : "";
           pushLog(`🏹 hunting: ${measured.suffix}; reason ${reason}${legacyPhrase}`);
-          lastHuntLog = Date.now();
+          lastHuntLog = gameClockNow();
         }
       }
     } catch (error) {
@@ -9009,11 +9038,38 @@
       return bought;
     }
     if (!candidate || !candidate.meta || !candidate.meta.name || candidateGate(candidate.kind, candidate.meta).state !== "actionable") return false;
+    const rareCapitalPrices = pricesFor(candidate.kind, candidate.meta)
+      .filter((price) => price && price.name && price.val > 0 && RARE_CAPITAL_RESOURCES.has(price.name));
+    // Classification is driven exclusively by the live price list.  A plain
+    // epiphany-priced transcendence upgrade is repeatable, while any candidate
+    // that actually consumes a protected rare-capital resource gets the arm,
+    // checkpoint and wall-clock cooldown contract.
+    const rareCapitalAction = rareCapitalPrices.length > 0;
+    const actionId = `${rareCapitalAction ? "candidateRare" : "candidate"}:${candidate.kind}:${candidate.meta.name}`;
+    const actionPolicy = rareCapitalAction ? ACTION_POLICY.RARE_CAPITAL : ACTION_POLICY.SAFE_REPEATABLE;
+    let checkpointedBefore = null;
+    if (rareCapitalAction) {
+      if (!prestigeAutomationArmed()) return false;
+      const wallNow = Date.now();
+      if (lastIrreversibleActionAt && wallNow - lastIrreversibleActionAt < IRREVERSIBLE_ACTION_COOLDOWN_MS) return false;
+      try {
+        createNativeCheckpoint();
+      } catch (error) {
+        buyPlanText = `Buy: ${labelOf(candidate.meta)} checkpoint blocked · ${error && error.message || String(error)}`;
+        return false;
+      }
+      resetTickCache();
+      if (candidateGate(candidate.kind, candidate.meta).state !== "actionable" ||
+          !canPayPrices(pricesFor(candidate.kind, candidate.meta))) return false;
+      checkpointedBefore = resourceSnapshot();
+    }
     const initialVal = VAL_BASED_KINDS.has(candidate.kind) ? candidate.meta.val || 0 : 0;
     let stageChanged = false;
     const result = executeSemanticAction({
-      id: `candidate:${candidate.kind}:${candidate.meta.name}`,
-      policy: ACTION_POLICY.SAFE_REPEATABLE,
+      id: actionId,
+      policy: actionPolicy,
+      authorizationToken: rareCapitalAction ? IRREVERSIBLE_EXECUTION_TOKEN : undefined,
+      checkpointedBefore,
       snapshot: resourceSnapshot,
       invoke: () => {
         if (candidate.kind === "stage") {
@@ -9036,7 +9092,7 @@
       consumePlanDecision();
       return true;
     }
-    if (actionPolicyFor(`candidate:${candidate.kind}:${candidate.meta.name}`) !== ACTION_POLICY.FORBIDDEN) {
+    if (actionPolicyFor(actionId) !== ACTION_POLICY.FORBIDDEN) {
       activePlanSnapshot = { cycleId: -1, target: undefined };
       resetTickCache();
     }
@@ -9368,12 +9424,12 @@
   const failedBuys = {};
   const buyBenched = (id) => {
     const entry = failedBuys[id];
-    return !!entry && entry.until > Date.now();
+    return !!entry && entry.until > gameClockNow();
   };
   const noteBuyFailure = (id) => {
     const entry = failedBuys[id] || { count: 0, until: 0 };
     entry.count += 1;
-    entry.until = Date.now() + (entry.count >= 3 ? 300000 : 12000);
+    entry.until = gameClockNow() + (entry.count >= 3 ? 300000 : 12000);
     failedBuys[id] = entry;
     return entry.count >= 3;
   };
@@ -9890,6 +9946,19 @@
   // plan reservations) can pay, but never more than is needed to cover the
   // current titanium demand, and never enough to overflow the titanium cap.
   const MAX_TRADE_BATCH = 50;
+  const DIPLOMACY_ACTION_MIN_MS = 10000;
+  const tradeExecutionBatchSize = () => {
+    try {
+      const diplomacy = window.gamePage && window.gamePage.diplomacy;
+      return diplomacy && typeof diplomacy.tradeMultiple === "function" ? MAX_TRADE_BATCH : 1;
+    } catch (error) {
+      return 1;
+    }
+  };
+  const tradeExecutionDelaySeconds = (trades) => Math.max(
+    0,
+    Math.ceil(Math.max(0, Number(trades) || 0) / tradeExecutionBatchSize()) - 1,
+  ) * DIPLOMACY_ACTION_MIN_MS / 1000;
   const reservationFloorFor = (reserved, name) => {
     if (!reserved || !name) return 0;
     if (name === "manpower" || name === "catpower") {
@@ -9960,8 +10029,22 @@
     if (headroom <= 0) return 0;
     const headroomBound = isFinite(headroom) ? Math.max(0, Math.floor(headroom / maximum)) : Number.POSITIVE_INFINITY;
     if (headroomBound <= 0) return 0;
+    // Every trade can also award collateral goods.  Bound the batch against
+    // each live sell's worst-case yield so targeting uranium cannot silently
+    // overflow spice, blueprints, or any other secondary output.
+    let collateralHeadroomBound = Number.POSITIVE_INFINITY;
+    for (const collateral of race.sells || []) {
+      if (!collateral || !validRaceSell(race, collateral)) continue;
+      const collateralOutput = getRes(liveResources, collateral.name);
+      if (!collateralOutput || !(collateralOutput.maxValue > 0)) continue;
+      const collateralMaximum = maximumTradeYield(race, collateral);
+      if (!(collateralMaximum > 0)) continue;
+      const collateralHeadroom = Math.max(0, collateralOutput.maxValue - resourceValue(liveResources, collateral.name));
+      collateralHeadroomBound = Math.min(collateralHeadroomBound, Math.floor(collateralHeadroom / collateralMaximum));
+    }
+    if (collateralHeadroomBound <= 0) return 0;
     const routeBound = step.trades > 0 ? Math.ceil(step.trades) : Number.POSITIVE_INFINITY;
-    return Math.max(0, Math.min(affordable, deficitBound, headroomBound, routeBound, MAX_TRADE_BATCH));
+    return Math.max(0, Math.min(affordable, deficitBound, headroomBound, collateralHeadroomBound, routeBound, MAX_TRADE_BATCH));
   };
 
   const craftDiplomacyPrerequisites = (resources, goalKey) => {
@@ -10506,6 +10589,7 @@
             rejected.push(...(input.blockers || []));
           } else eta = Math.max(eta, input.eta);
         }
+        eta += tradeExecutionDelaySeconds(trades);
         if (reachable) {
           routes.push(reachableAcquisitionPath(name, requested, "trade", eta, {
             inputs,
@@ -11034,7 +11118,7 @@
     if (!sell) return Number.POSITIVE_INFINITY;
     const yieldPerTrade = tradeSellExpected(sell, race);
     if (yieldPerTrade <= 0) return Number.POSITIVE_INFINITY;
-    const tradesNeeded = amount / yieldPerTrade;
+    const tradesNeeded = Math.max(1, Math.ceil(amount / yieldPerTrade));
     const prices = tradePricesForRace(race);
     if (!prices.length) return Number.POSITIVE_INFINITY;
     let worst = 0;
@@ -11044,7 +11128,7 @@
       const sec = secondsToAccumulate(price.name, total, resources);
       if (sec > worst) worst = sec;
     }
-    return worst;
+    return worst + tradeExecutionDelaySeconds(tradesNeeded);
   };
 
   // For each demand resource in the chain, pick the FASTER of crafting it
@@ -11294,7 +11378,7 @@
 
   const manageDiplomacy = (resources, goalKey) => {
     try {
-      if (gameElapsedMs(lastDiplomacyAction) < 10000) return;
+      if (gameElapsedMs(lastDiplomacyAction) < DIPLOMACY_ACTION_MIN_MS) return;
       const target = getTargetCached(resources, goalKey);
       const ledger = buildReservationLedger(target, resources);
       const reserved = ledger.reserved;
@@ -12092,18 +12176,9 @@
     if (!meta) return false;
     const candidate = { kind: "policy", meta, ...evaluate("policy", meta, resourceMap()) };
     if (!candidate.affordable) return false;
-    for (const attempt of purchaseAttemptsFor(candidate)) {
-      try {
-        attempt();
-      } catch (error) {
-        /* try next API shape */
-      }
-      if (purchaseComplete(candidate, 0)) {
-        pushLog(`📜 policy ${labelOf(meta)}`);
-        return true;
-      }
-    }
-    return false;
+    const bought = buyCandidate(candidate);
+    if (bought) pushLog(`📜 policy ${labelOf(meta)}`);
+    return bought;
   };
 
   const leaderOpportunity = (goalKey, resources) => {
@@ -12146,7 +12221,7 @@
   };
 
   const maybeLogLeaderDecision = (text, minMs = 60000) => {
-    const now = Date.now();
+    const now = gameClockNow();
     if (now - lastLeaderDecisionLog < minMs) return;
     lastLeaderDecisionLog = now;
     pushLog(text);
@@ -12154,7 +12229,7 @@
 
   const maybeSelectLeader = (goalKey, resources) => {
     try {
-      const now = Date.now();
+      const now = gameClockNow();
       const village = window.gamePage.village;
       if (!village || typeof village.makeLeader !== "function") return false;
       const opportunity = leaderOpportunity(goalKey, resources);
@@ -12210,7 +12285,7 @@
       const village = window.gamePage.village;
       const gold = getRes(resources, "gold");
       if (!village || !gold || !(gold.maxValue > 0)) return false;
-      const now = Date.now();
+      const now = gameClockNow();
       if (now < nextPromoteAttempt) return false;
       const target = getTargetCached(resources, goalKey);
       const reserved = target && !target.affordable ? reservedNeedsFor(target, resources) : {};
@@ -12655,7 +12730,15 @@
   let boosterTelemetry = { startedAt: Date.now(), lastBeatAt: Date.now(), executed: 0, dropped: 0, lastBeat: null };
   let automationClockState = (() => {
     const wallNow = Date.now();
-    return { wallAt: wallNow, logicalNow: wallNow, nativeSample: null, nativeObserved: 0 };
+    return {
+      wallAt: wallNow,
+      logicalNow: wallNow,
+      nativeSample: null,
+      nativeObserved: 0,
+      nativeRateWindowAt: wallNow,
+      nativeRateWindowTicks: 0,
+      observedNativeTicksPerSecond: null,
+    };
   })();
   const nativeTicksPerSecond = () => {
     try {
@@ -12667,12 +12750,17 @@
   };
   const measuredAutomationDelivery = (wallNow) => {
     const nativeTps = nativeTicksPerSecond();
+    const observedNativeTps = Number.isFinite(automationClockState.observedNativeTicksPerSecond)
+      ? Math.max(0, automationClockState.observedNativeTicksPerSecond)
+      : nativeTps;
     const elapsed = Math.max(0, wallNow - boosterTelemetry.startedAt);
     const measuredExtraTps = elapsed > 0 ? boosterTelemetry.executed * 1000 / elapsed : 0;
-    const deliveredTicksPerSecond = tickSpeed <= 1 ? nativeTps
-      : Math.min(nativeTps * tickSpeed, nativeTps + measuredExtraTps);
+    const deliveredTicksPerSecond = tickSpeed <= 1 ? observedNativeTps
+      : Math.min(nativeTps * tickSpeed, observedNativeTps + measuredExtraTps);
     return {
       requestedMultiplier: tickSpeed,
+      nominalNativeTicksPerSecond: nativeTps,
+      observedNativeTicksPerSecond: observedNativeTps,
       deliveredTicksPerSecond,
       deliveredMultiplier: nativeTps > 0 ? Math.max(1, deliveredTicksPerSecond / nativeTps) : 1,
     };
@@ -12697,7 +12785,10 @@
   const resetAutomationNativeSample = () => {
     automationClockState.nativeSample = null;
     automationClockState.nativeObserved = 0;
+    automationClockState.nativeRateWindowTicks = 0;
+    automationClockState.observedNativeTicksPerSecond = null;
     automationClockState.wallAt = Date.now();
+    automationClockState.nativeRateWindowAt = automationClockState.wallAt;
   };
   const integrateAutomationClock = (wallNow = Date.now()) => {
     const elapsed = Math.max(0, wallNow - automationClockState.wallAt);
@@ -12707,6 +12798,16 @@
         const completed = Math.max(0, nativeTick - automationClockState.nativeSample);
         automationClockState.logicalNow += completed * 1000 / nativeTicksPerSecond();
         automationClockState.nativeObserved += completed;
+        automationClockState.nativeRateWindowTicks += completed;
+        const rateElapsed = Math.max(0, wallNow - automationClockState.nativeRateWindowAt);
+        if (rateElapsed >= 1000) {
+          automationClockState.observedNativeTicksPerSecond = automationClockState.nativeRateWindowTicks * 1000 / rateElapsed;
+          automationClockState.nativeRateWindowAt = wallNow;
+          automationClockState.nativeRateWindowTicks = 0;
+        }
+      } else {
+        automationClockState.nativeRateWindowAt = wallNow;
+        automationClockState.nativeRateWindowTicks = 0;
       }
       automationClockState.nativeSample = nativeTick;
     } else if (!Number.isFinite(automationClockState.nativeSample)) {
@@ -12735,26 +12836,34 @@
     Math.max(0, Number(floorMs) || 0),
     Math.max(0, Number(baseMs) || 0) / Math.max(1, automationClockSnapshot().deliveredMultiplier),
   );
-  const runBoosterBeat = () => {
-    const started = Date.now();
-    integrateAutomationClock(started);
-    const elapsed = Math.max(TICK_SPEED_BEAT_MS, started - boosterTelemetry.lastBeatAt);
-    boosterTelemetry.lastBeatAt = started;
-    const nativeTps = nativeTicksPerSecond();
-    const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTps * elapsed / 1000));
-    const maxChunk = Math.min(BOOSTER_MAX_CHUNK, due);
-    let executed = 0;
-    let boosterFailed = false;
-    const game = window.gamePage;
-    if (due > 0 && game && typeof game.tick === "function") {
-      executeSemanticAction({
-        id: "boosterTicks",
-        policy: ACTION_POLICY.SAFE_REPEATABLE,
-        snapshot: readNativeTickCount,
-        invoke: () => {
-          while (!boosterFailed && executed < due && Date.now() - started < BOOSTER_CPU_BUDGET_MS) {
-            const chunkEnd = Math.min(due, executed + BOOSTER_MAX_CHUNK);
-            while (executed < chunkEnd && Date.now() - started < BOOSTER_CPU_BUDGET_MS) {
+  let boosterBeatRunning = false;
+  const runBoosterBeat = () => (async () => {
+    if (boosterBeatRunning) return boosterTelemetry.lastBeat;
+    boosterBeatRunning = true;
+    try {
+      const started = Date.now();
+      integrateAutomationClock(started);
+      const elapsed = Math.max(TICK_SPEED_BEAT_MS, started - boosterTelemetry.lastBeatAt);
+      boosterTelemetry.lastBeatAt = started;
+      const nativeTps = nativeTicksPerSecond();
+      const due = tickSpeed <= 1 ? 0 : Math.max(0, Math.floor((tickSpeed - 1) * nativeTps * elapsed / 1000));
+      const maxChunk = Math.min(BOOSTER_MAX_CHUNK, due);
+      let executed = 0;
+      let cpuSpent = 0;
+      let boosterFailed = false;
+      let yieldedChunks = 0;
+      const game = window.gamePage;
+      while (due > 0 && game && typeof game.tick === "function" && !boosterFailed &&
+          executed < due && cpuSpent < BOOSTER_CPU_BUDGET_MS) {
+        const chunkStarted = Date.now();
+        const chunkStartExecuted = executed;
+        const chunkEnd = Math.min(due, executed + BOOSTER_MAX_CHUNK);
+        const action = executeSemanticAction({
+          id: "boosterTicks",
+          policy: ACTION_POLICY.SAFE_REPEATABLE,
+          snapshot: readNativeTickCount,
+          invoke: () => {
+            while (executed < chunkEnd && cpuSpent + Date.now() - chunkStarted < BOOSTER_CPU_BUDGET_MS) {
               try {
                 game.tick();
                 executed += 1;
@@ -12763,22 +12872,31 @@
                 break;
               }
             }
-          }
-        },
-        verify: (before, after) => executed > 0 && (before === null || after === null || after >= before + executed),
-      });
+          },
+          verify: (before, after) => executed > chunkStartExecuted &&
+            (before === null || after === null || after >= before + executed - chunkStartExecuted),
+        });
+        cpuSpent += Math.max(0, Date.now() - chunkStarted);
+        if (!action.ok || executed === chunkStartExecuted) break;
+        if (executed < due && cpuSpent < BOOSTER_CPU_BUDGET_MS) {
+          yieldedChunks += 1;
+          if (!await ownedDelay("boosterYield", 1)) break;
+        }
+      }
+      const dropped = Math.max(0, due - executed);
+      boosterTelemetry.executed += executed;
+      boosterTelemetry.dropped += dropped;
+      boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, yieldedChunks, budgetMs: BOOSTER_CPU_BUDGET_MS };
+      const nativeAfterBooster = readNativeTickCount();
+      if (nativeAfterBooster !== null) automationClockState.nativeSample = nativeAfterBooster;
+      automationClockState.logicalNow += executed * 1000 / nativeTps;
+      const delivery = integrateAutomationClock(Date.now());
+      refreshAdaptiveScheduler(delivery.deliveredMultiplier);
+      return boosterTelemetry.lastBeat;
+    } finally {
+      boosterBeatRunning = false;
     }
-    const dropped = Math.max(0, due - executed);
-    boosterTelemetry.executed += executed;
-    boosterTelemetry.dropped += dropped;
-    boosterTelemetry.lastBeat = { due, executed, dropped, maxChunk, budgetMs: BOOSTER_CPU_BUDGET_MS };
-    const nativeAfterBooster = readNativeTickCount();
-    if (nativeAfterBooster !== null) automationClockState.nativeSample = nativeAfterBooster;
-    automationClockState.logicalNow += executed * 1000 / nativeTps;
-    const delivery = integrateAutomationClock(Date.now());
-    refreshAdaptiveScheduler(delivery.deliveredMultiplier);
-    return boosterTelemetry.lastBeat;
-  };
+  })();
 
   const timerOwner = {
     token: `kgh-${Date.now()}-${Math.random()}`,
@@ -12913,7 +13031,8 @@
     const delayMsRounded = Math.max(1, Math.round(delayMs));
     timerOwner.delays[lane] = delayMsRounded;
     timerOwner.timers[lane] = setInterval(() => {
-      if (isCurrentTimerOwner()) fn();
+      if (isCurrentTimerOwner()) return fn();
+      return undefined;
     }, delayMsRounded);
   };
   const replaceOwnedInterval = (lane, fn, delayMs) => {
@@ -12973,6 +13092,7 @@
 
   const applyTickSpeed = (multiplier) => {
     if (!isCurrentTimerOwner()) return tickSpeed;
+    timerOwner.cancelTimeout("boosterYield");
     const wallNow = Date.now();
     integrateAutomationClock(wallNow);
     tickSpeed = TICK_SPEED_OPTIONS.includes(multiplier) ? multiplier : 1;

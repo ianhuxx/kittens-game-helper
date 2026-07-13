@@ -503,6 +503,23 @@ const criticalStructureIssues = (candidateSource) => {
   requireText("executeSemanticAction", /authorizationToken\s*!==\s*IRREVERSIBLE_EXECUTION_TOKEN/, "require the irreversible authorization token");
   requireText("executeSemanticAction", /checkpointedBefore\s*==\s*null/, "require a fresh checkpoint object");
   requireText("executeSemanticAction", /lastIrreversibleActionAt/, "enforce the irreversible-action cooldown");
+  requireCalls("buyCandidate", ["prestigeAutomationArmed", "createNativeCheckpoint"]);
+  requireCalls("buyPolicyChoice", ["buyCandidate"]);
+  requireText("buyCandidate", /RARE_CAPITAL_RESOURCES/, "classify live rare-capital prices before execution");
+  requireText("buyCandidate", /rareCapitalAction\s*=\s*rareCapitalPrices\s*\.\s*length\s*>\s*0/, "derive rare-capital policy exclusively from live prices");
+  requireText("buyCandidate", /authorizationToken\s*:\s*rareCapitalAction\s*\?\s*IRREVERSIBLE_EXECUTION_TOKEN/, "pass the rare-capital authorization capability");
+  requireText("actionPolicyFor", /candidateRare/, "classify structured rare-capital candidate actions");
+  requireText("actionPolicyFor", /candidate\s*\[\s*1\s*\]\s*===\s*"candidateRare"/, "reserve rare-capital policy for explicitly price-classified candidate IDs");
+
+  // Processor state changes must go through the game's public controller APIs;
+  // assigning metadata.on directly bypasses native effects and UI invariants.
+  requireCalls("setProcessorOn", ["controllerSpecFor", "getGlobalPath"]);
+  requireText("setProcessorOn", /controller\s*\.\s*(?:onAll|on)\s*\(/, "use the native controller enable API");
+  requireText("setProcessorOn", /controller\s*\.\s*(?:offAll|off)\s*\(/, "use the native controller disable API");
+  const processorView = view("setProcessorOn");
+  if (!processorView.error && /\bmeta\s*\.\s*on\s*=/.test(processorView.uncommented)) {
+    issues.push("setProcessorOn must not assign raw metadata.on");
+  }
 
   // The policy boundary reads the persistent arm on every decision, and the
   // getter itself must read the dedicated localStorage key.
@@ -538,10 +555,14 @@ const criticalStructureIssues = (candidateSource) => {
   requireCalls("resourceNeeds", ["acquisitionPathFor", "actionableTradeRouteFor", "scoreAcquisitionRouteInputs"]);
   requireCalls("diplomacyResourcePressure", ["activeAcquisitionRoute"]);
   requireCalls("acquisitionPathFor", ["acquisitionPathFor"]);
+  requireCalls("acquisitionPathFor", ["tradeExecutionDelaySeconds"]);
   requireCalls("acquisitionRoutesForTarget", ["acquisitionPathFor"]);
   requireCalls("actionableTradeRouteFor", ["actionableTradeRoutesIn"]);
   requireCalls("scoreAcquisitionRouteInputs", ["scoreAcquisitionRouteInputs"]);
   view("boundedTradeBatch");
+  requireCalls("boundedTradeBatch", ["maximumTradeYield"]);
+  requireText("boundedTradeBatch", /race\s*\.\s*sells/, "bound every collateral trade output");
+  requireCalls("tradePathSecondsFor", ["tradeExecutionDelaySeconds"]);
   requireCalls("buildReservationLedger", ["buildTargetLedger", "rareCapitalFloor"]);
   requireCalls("reservedNeedsFor", ["buildReservationLedger"]);
   requireCalls("activeAcquisitionRoute", ["acquisitionRoutesForTarget", "actionableTradeRouteFor"]);
@@ -559,6 +580,23 @@ const criticalStructureIssues = (candidateSource) => {
   requireCalls("buyViaGameController", ["controllerSpecFor"]);
   const buyView = view("buyViaGameController");
   if (!buyView.error && !memberCalls(buyView, "controller", "buyItem")) issues.push("buyViaGameController must execute the selected native controller");
+
+  // Ordinary automation cooldowns age on delivered logical game time. Only
+  // irreversible suppression, telemetry sampling and scheduler watchdogs may
+  // use raw wall time.
+  for (const owner of [
+    "refreshStickyTargetChainReserve", "stickyReservesResource", "stageTransitionCandidates",
+    "executeStageTransitionCandidate", "buyBenched", "noteBuyFailure", "maybeLogLeaderDecision",
+    "maybeSelectLeader", "maybePromoteKittens", "pushPlanLog",
+  ]) {
+    const ownerView = view(owner);
+    if (!ownerView.error && /\bDate\s*\.\s*now\s*\(/.test(ownerView.uncommented)) {
+      issues.push(`${owner} must use delivered logical game time, not Date.now`);
+    }
+  }
+  requireCalls("runBoosterBeat", ["ownedDelay"]);
+  requireText("runBoosterBeat", /yieldedChunks/, "report cooperative event-loop yields between booster chunks");
+  requireText("integrateAutomationClock", /observedNativeTicksPerSecond/, "measure observed native TPS from the public tick counter");
 
   return issues;
 };
@@ -596,6 +634,9 @@ const structuralSabotageProbes = [
   ["leader broker path", "maybeSelectLeader", "executeSemanticAction"],
   ["promotion broker path", "maybePromoteKittens", "executeSemanticAction"],
   ["booster broker path", "runBoosterBeat", "executeSemanticAction"],
+  ["booster cooperative yield", "runBoosterBeat", "ownedDelay"],
+  ["manual policy broker path", "buyPolicyChoice", "buyCandidate"],
+  ["rare candidate checkpoint path", "buyCandidate", "createNativeCheckpoint"],
   ["semantic action policy", "actionPolicyFor", "isDeniedKey"],
   ["persistent arm read", "executeSemanticAction", "prestigeAutomationArmed"],
   ["native prestige checkpoint", "managePrestige", "createNativeCheckpoint"],
@@ -603,6 +644,9 @@ const structuralSabotageProbes = [
   ["planning acquisition graph", "resourceNeeds", "acquisitionPathFor"],
   ["pressure acquisition graph", "diplomacyResourcePressure", "activeAcquisitionRoute"],
   ["diplomacy acquisition graph", "maybeTradeForTargetChain", "boundedTradeBatch"],
+  ["trade acquisition cooldown ETA", "acquisitionPathFor", "tradeExecutionDelaySeconds"],
+  ["trade comparison cooldown ETA", "tradePathSecondsFor", "tradeExecutionDelaySeconds"],
+  ["processor native controller selection", "setProcessorOn", "controllerSpecFor"],
   ["Time pricing normalization", "timeNativeAdapter", "timeDescriptorFor"],
   ["Time execution normalization", "controllerSpecFor", "timeDescriptorFor"],
 ];
