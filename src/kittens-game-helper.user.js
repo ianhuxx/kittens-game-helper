@@ -3929,6 +3929,7 @@
       fuelPools[name] = { name, stock, floor, netIncome, grossIncome, liveBurn: liveBurn[name], available, initialAvailable: available };
     }
 
+    const rawPower = powerStatus();
     const effective = effectivePowerStatus();
     let liveNetEnergy = 0;
     for (const meta of converters) {
@@ -3936,8 +3937,8 @@
       liveNetEnergy += Math.max(0, Math.floor(meta.on || 0)) * ((profile.energyProduction || 0) - (profile.energyConsumption || 0));
     }
     const projectedPower = {
-      delta: effective.delta - liveNetEnergy,
-      winterDelta: effective.winterDelta - liveNetEnergy,
+      delta: rawPower.delta - liveNetEnergy,
+      winterDelta: rawPower.winterDelta - liveNetEnergy,
     };
 
     const minimumCounts = new Map();
@@ -3979,7 +3980,8 @@
       advancePower(meta, count);
     }
 
-    const allocations = new Map();
+    const fuelInputsByMeta = new Map();
+    const demandByMeta = new Map();
     for (const meta of ordered) {
       const full = Math.max(0, Math.floor(meta.val || 0));
       const rates = ratesByMeta.get(meta) || {};
@@ -3996,10 +3998,86 @@
           count: full,
         };
       });
-      const demand = desiredProcessorState(meta, resources, missing, needed, reserved, projectedPower, {
+      fuelInputsByMeta.set(meta, fuelInputs);
+      demandByMeta.set(meta, desiredProcessorState(meta, resources, missing, needed, reserved, projectedPower, {
         count: full,
         fuelBudget: { count: full, full, horizon, inputs: fuelInputs },
-      });
+      }));
+    }
+
+    const reserveFuel = (meta, count, available) => {
+      if (!(count > 0)) return true;
+      const debits = [];
+      for (const [name, burnPerSecond] of Object.entries(ratesByMeta.get(meta) || {})) {
+        const debit = count * burnPerSecond * horizon;
+        if ((available[name] || 0) + 1e-9 < debit) return false;
+        debits.push([name, debit]);
+      }
+      for (const [name, debit] of debits) available[name] = Math.max(0, (available[name] || 0) - debit);
+      return true;
+    };
+
+    // A target-useful consumer can need one of the same-fuel processors to make
+    // its power. Reserve the consumer in a trial budget first, then commit only
+    // the smallest producer fleet that makes that requested count power-safe.
+    // The consumer still executes first below; this pre-allocation merely keeps
+    // its indispensable generators from losing their fuel to that priority.
+    const usefulConsumer = ordered.find((meta) => {
+      const profile = processingProfileFor(meta);
+      const netEnergy = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
+      return netEnergy < 0 && !forcedPauses.has(meta) && profile.outputs.some((output) => needed.has(output));
+    });
+    if (usefulConsumer && rawPower.delta >= 0 && rawPower.winterDelta >= 0) {
+      const consumerMinimum = minimumCounts.get(usefulConsumer) || 0;
+      const consumerFull = Math.max(0, Math.floor(usefulConsumer.val || 0));
+      const consumerDemand = demandByMeta.get(usefulConsumer) || { on: 0 };
+      const consumerRequested = Math.max(consumerMinimum, Math.max(0, Math.min(consumerFull, Math.floor(consumerDemand.on || 0))));
+      const consumerNet = profileNetEnergy(processingProfileFor(usefulConsumer));
+      const producers = ordered
+        .filter((meta) => !forcedPauses.has(meta) && profileNetEnergy(processingProfileFor(meta)) > 0)
+        .sort((a, b) => profileNetEnergy(processingProfileFor(b)) - profileNetEnergy(processingProfileFor(a)));
+
+      for (let consumerExtra = consumerRequested - consumerMinimum; consumerExtra > 0; consumerExtra -= 1) {
+        const trialFuel = Object.fromEntries(Object.entries(fuelPools).map(([name, pool]) => [name, pool.available]));
+        if (!reserveFuel(usefulConsumer, consumerExtra, trialFuel)) continue;
+        const use = -consumerNet;
+        let wattsNeeded = Math.max(
+          0,
+          TUNING.powerHeadroom + consumerExtra * use - projectedPower.delta,
+          consumerExtra * use - projectedPower.winterDelta,
+        );
+        const support = [];
+        for (const producer of producers) {
+          if (!(wattsNeeded > 1e-9)) break;
+          const minimum = minimumCounts.get(producer) || 0;
+          const full = Math.max(0, Math.floor(producer.val || 0));
+          const demand = demandByMeta.get(producer) || { on: 0 };
+          const requested = Math.max(minimum, Math.max(0, Math.min(full, Math.floor(demand.on || 0))));
+          const extraCapacity = Math.max(0, requested - minimum);
+          const perUnitNet = profileNetEnergy(processingProfileFor(producer));
+          const wanted = Math.min(extraCapacity, Math.ceil((wattsNeeded - 1e-9) / perUnitNet));
+          let count = wanted;
+          while (count > 0 && !reserveFuel(producer, count, trialFuel)) count -= 1;
+          if (!(count > 0)) continue;
+          support.push([producer, count]);
+          wattsNeeded = Math.max(0, wattsNeeded - count * perUnitNet);
+        }
+        if (wattsNeeded > 1e-9) continue;
+        for (const [producer, count] of support) {
+          minimumCounts.set(producer, (minimumCounts.get(producer) || 0) + count);
+          chargeFuel(producer, count);
+          advancePower(producer, count);
+        }
+        break;
+      }
+    }
+
+    const allocations = new Map();
+    for (const meta of ordered) {
+      const full = Math.max(0, Math.floor(meta.val || 0));
+      const rates = ratesByMeta.get(meta) || {};
+      const fuelInputs = fuelInputsByMeta.get(meta) || [];
+      const demand = demandByMeta.get(meta) || { on: 0, reason: "fuel", detail: "no shared allocation" };
       const minimum = minimumCounts.get(meta) || 0;
       if (forcedPauses.has(meta)) {
         allocations.set(meta, {
@@ -4026,7 +4104,7 @@
       const profile = processingProfileFor(meta);
       const perUnitNet = (profile.energyProduction || 0) - (profile.energyConsumption || 0);
       if (perUnitNet < 0) {
-        if (effective.delta < 0 || effective.winterDelta < 0) {
+        if (rawPower.delta < 0 || rawPower.winterDelta < 0) {
           powerCap = 0;
         } else {
           const use = -perUnitNet;
@@ -4059,7 +4137,7 @@
       ordered,
       allocations,
       fuelPools,
-      power: { effective, projected: { ...projectedPower } },
+      power: { raw: rawPower, effective, projected: { ...projectedPower } },
       horizon,
     };
   };

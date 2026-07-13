@@ -6186,6 +6186,55 @@ check("Task 6 review: diagnostics print the same shared allocation used by execu
   /Reactor T6:.*sustainable 0\/1/i.test(sharedAllocationReportT6) &&
   /Lunar Outpost T6:.*sustainable 1\/1/i.test(sharedAllocationReportT6));
 
+// P1 review: a target-useful power consumer may need the fleet allocator to
+// retain the minimum shared-fuel generator count first. With 0 Wt base power,
+// one Reactor supplies the 3 Lunar Outposts plus the 1 Wt safety headroom; the
+// exact uranium budget must not start an optional second Reactor afterward.
+reactorT6.val = 2;
+reactorT6.on = 1;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 0;
+res("uranium").value = 100;
+perTick.uranium = 1.5; // +7.5/s net + 1/s live Reactor burn = 8.5/s gross.
+dbg.clearResourceTelemetry?.("uranium");
+gamePage.resPool.energyProd = 5;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 5;
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 P1: minimum Reactor generation is pre-allocated before the prioritized Lunar fleet",
+  reactorT6.on === 1 && lunarOutpostT6.on === 3);
+
+// P1 review: build a real paused-for-power memo, age out its pause cooldown,
+// then provide raw power equal to 3 Lunar demand + the 1 Wt safety headroom.
+// Latent demand is a planning signal and must not be subtracted a second time
+// inside the fleet allocation that is itself deciding how much can resume.
+reactorT6.val = 0;
+reactorT6.on = 0;
+lunarOutpostT6.val = 3;
+lunarOutpostT6.on = 3;
+res("uranium").value = 100;
+perTick.uranium = 0; // net zero while all three consume the 7.5/s outside supply.
+dbg.clearResourceTelemetry?.("uranium");
+gamePage.resPool.energyProd = 0;
+gamePage.resPool.energyCons = 1;
+gamePage.resPool.energyWinterProd = 0;
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 P1 fixture: Lunar fleet is paused with latent power demand", lunarOutpostT6.on === 0 && dbg.latentPowerDemand?.() >= 3);
+perTick.uranium = 1.5; // +7.5/s outside supply with Lunar now off.
+dbg.clearResourceTelemetry?.("uranium");
+gamePage.resPool.energyProd = 4;
+gamePage.resPool.energyCons = 0;
+gamePage.resPool.energyWinterProd = 4;
+fakeNow += 21000;
+dbg.forceActiveTarget(null);
+dbg.optimizeProcessing();
+check("Task 6 P1: raw power at fleet demand plus headroom resumes a latent-paused Lunar fleet",
+  lunarOutpostT6.on === 3);
+
 dbg.queueClear();
 delete perTick.unobtainium;
 buildings.splice(buildings.indexOf(backgroundProcessorT6), 1);
