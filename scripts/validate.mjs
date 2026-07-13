@@ -420,10 +420,10 @@ const functionView = (candidateSource, name) => {
   const arrow = code.indexOf("=>", definitionStart + matches[0][0].length);
   if (arrow < 0) return { error: `${name} is not an arrow function` };
   let start = arrow + 2;
-  while (/\s/.test(candidateSource[start] || "")) start += 1;
-  const end = candidateSource[start] === "{"
-    ? matchingDelimiter(candidateSource, start, "{", "}")
-    : expressionEnd(candidateSource, start);
+  while (/\s/.test(code[start] || "")) start += 1;
+  const end = code[start] === "{"
+    ? matchingDelimiter(code, start, "{", "}")
+    : expressionEnd(code, start);
   if (end < 0) return { error: `${name} body could not be extracted` };
   const raw = candidateSource.slice(start, end + 1);
   return {
@@ -431,7 +431,7 @@ const functionView = (candidateSource, name) => {
     start,
     end: end + 1,
     raw,
-    code: maskNoise(raw, true),
+    code: code.slice(start, end + 1),
     uncommented: maskNoise(raw, false),
   };
 };
@@ -443,7 +443,7 @@ const constBindingView = (candidateSource, name) => {
   if (matches.length !== 1) return { error: `${name} must have exactly one live const binding (found ${matches.length})` };
   const start = matches[0].index;
   const valueStart = start + matches[0][0].length;
-  const end = expressionEnd(candidateSource, valueStart);
+  const end = expressionEnd(code, valueStart);
   if (end < 0) return { error: `${name} binding could not be extracted` };
   return { start, end: end + 1, raw: candidateSource.slice(start, end + 1) };
 };
@@ -653,6 +653,30 @@ if (liveDiplomacyOwnerCount !== 1) {
 }
 if (definitionDiscoveryFailures.length > 0) {
   console.error("Validator definition-discovery self-tests failed:", definitionDiscoveryFailures.join("; "));
+  process.exit(1);
+}
+
+const boundaryDiscoveryFailures = [];
+const blockBoundaryFixture = [
+  "const guardedBlockFixture = () => {",
+  "  const braceRegex = /}/;",
+  '  const braceString = "}";',
+  '  const braceTemplate = `template } ${"}"}`;',
+  "  /* comment } */",
+  "  requiredBlockCall();",
+  "};",
+].join("\n");
+const guardedBlockView = functionView(blockBoundaryFixture, "guardedBlockFixture");
+if (guardedBlockView.error || !calls(guardedBlockView, "requiredBlockCall")) {
+  boundaryDiscoveryFailures.push("brace-bearing regex truncated a required block-body call");
+}
+const expressionBoundaryFixture = "const guardedExpressionFixture = () => /;/ && requiredExpressionCall();";
+const guardedExpressionView = functionView(expressionBoundaryFixture, "guardedExpressionFixture");
+if (guardedExpressionView.error || !calls(guardedExpressionView, "requiredExpressionCall")) {
+  boundaryDiscoveryFailures.push("semicolon-bearing regex truncated a required expression-body call");
+}
+if (boundaryDiscoveryFailures.length > 0) {
+  console.error("Validator boundary-discovery self-tests failed:", boundaryDiscoveryFailures.join("; "));
   process.exit(1);
 }
 
